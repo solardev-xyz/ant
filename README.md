@@ -2,6 +2,22 @@
 
 Ant is a lightweight Swarm light node written in Rust.
 
+Project status: Ant is in early development. Wire formats, CLI flags, and
+on-disk files may change; do not treat this as a stable, production-grade node
+implementation yet.
+
+Implemented so far:
+
+- Mainnet join: default bootnodes (e.g. `/dnsaddr/mainnet.ethswarm.org`) or
+  custom ones; libp2p stack: TCP, DNS, Noise, Yamux, identify, ping, streams;
+  outbound BZZ Swarm handshake on `/swarm/handshake/14.0.0/handshake`, then
+  dialing via bootstrap and hive-sourced peer hints (default target: hundreds of
+  peers with a completed BZZ handshake).
+- Identity and state: persisted secp256k1 Swarm identity and overlay, optional
+  on-disk peer snapshot for warm restarts.
+- Control: Unix domain socket for `antctl` — `status` (incl. JSON), `version`,
+  `top` (live TUI), `peers reset`.
+
 The workspace is organized as reusable core crates plus two binaries:
 
 - `antd`: daemon entry point for running a local node.
