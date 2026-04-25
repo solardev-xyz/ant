@@ -1,0 +1,783 @@
+# Ant — Implementation Plan
+
+**Project:** Ant — a lightweight Swarm light node.
+**Primary deployment:** embeddable Rust library (`libant`) consumed by native iOS and Android apps via UniFFI.
+**Secondary deployment:** `antd` daemon for macOS, Linux, Windows, and Raspberry Pi — shipped as signed binaries with platform-appropriate service integration (systemd / launchd / Windows Service).
+
+A from-scratch Rust implementation of a Swarm light node with upload and postage-stamp management. The embedded mobile library is the primary product, with a per-platform artifact size target in the single-digit megabytes. The same core compiles to a standalone `antd` binary for desktop and single-board computers, enabling a personal-node use case (always-on home node, desktop companion, self-hosted gateway) in addition to mobile.
+
+---
+
+## 1. Goals & Non-Goals
+
+### Goals
+
+- Run a Swarm **light node** (downloads + uploads) embedded in mobile apps.
+- Full **postage-stamp management** on device from v1 (purchase, top-up, dilute, per-chunk signing).
+- Full **SWAP / chequebook** support, required to pay forwarders for pushsync.
+- Ship as **one Rust library** with typed Swift + Kotlin bindings generated from a single IDL.
+- **Artifact size target: 6–10 MB stripped per platform** on mobile (vs. 30–60 MB for `bee-lite`). Desktop / Pi have no hard size budget.
+- Ship `antd` as a **supported secondary deployment** on macOS (Intel + Apple Silicon), Linux (x86_64 + aarch64), Windows (x86_64), and Raspberry Pi 3+ (aarch64) — signed binaries, installers, and service-unit templates.
+- Interoperate with the public Swarm mainnet (no fork, no private network).
+
+### Non-Goals (v1)
+
+- Full node features: chunk storage/forwarding, pullsync, storage/bandwidth incentives, staking, redistribution lottery.
+- PSS / GSOC messaging.
+- Cheque cashing (we send cheques, never receive them as a consumer-class node).
+- Exotic libp2p transports (QUIC, WebRTC, WebSocket, relay) on mobile. May be enabled later for desktop / Pi behind cargo feature flags.
+- 32-bit ARM (Pi Zero / Pi 1) as a first-class target — best-effort only.
+- ACT (access control trie), advanced feeds, custom redundancy schemes. Deferred to v2.
+
+### Explicit constraints
+
+- **Language:** Rust (stable channel; nightly only for optional size-shrinking `build-std`).
+- **Binding layer:** UniFFI → Swift `.xcframework` + Kotlin `.aar`.
+- **Chain:** Gnosis Chain mainnet only. Testnet (Sepolia-based dev network) for development.
+- **No Ethereum full client.** All chain interactions go through a user-configurable JSON-RPC endpoint.
+
+---
+
+## 2. Reference Architecture
+
+```
+┌──────────────────────────────────┐   ┌──────────────────────────┐
+│   Mobile App (Swift / Kotlin)    │   │        antd CLI          │
+│    UI, onboarding, key UX        │   │  dev + interop harness   │
+└──────────────┬───────────────────┘   └───────────┬──────────────┘
+               │  UniFFI typed bindings            │ direct Rust API
+┌──────────────▼───────────────────────────────────▼──────────────┐
+│                   libant (cdylib + staticlib)                   │
+│                                                                 │
+│  ┌───────────────┐  ┌──────────────────┐  ┌──────────────────┐  │
+│  │  Public API   │  │  Config / Keys   │  │  Event / Status  │  │
+│  └───────┬───────┘  └────────┬─────────┘  └────────┬─────────┘  │
+│          │                   │                     │            │
+│  ┌───────▼─────────────────────────────────────────▼────────┐   │
+│  │                       Node Core                          │   │
+│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌────────────┐   │   │
+│  │  │ Retrieval│ │ Pushsync │ │  Hive    │ │ Accounting │   │   │
+│  │  └──────────┘ └──────────┘ └──────────┘ └────────────┘   │   │
+│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌────────────┐   │   │
+│  │  │   BMT    │ │ Mantaray │ │  Stamps  │ │    SWAP    │   │   │
+│  │  └──────────┘ └──────────┘ └──────────┘ └────────────┘   │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  ┌────────────────┐  ┌────────────────┐  ┌──────────────────┐   │
+│  │   libp2p       │  │  Gnosis RPC    │  │  Local Storage   │   │
+│  │  (TCP/Noise/   │  │  (alloy +      │  │  (SQLite +       │   │
+│  │   Yamux/Kad)   │  │   JSON-RPC)    │  │   chunk cache)   │   │
+│  └────────────────┘  └────────────────┘  └──────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+`antd` and the mobile apps share the exact same `libant` core; only the outer shell differs. This keeps protocol behavior identical across dev and production and makes `antd` a faithful interop target.
+
+---
+
+## 3. Technology Stack
+
+### Language & tooling
+
+- **Rust** (MSRV: pin to latest stable minus one at start of project).
+- **cargo workspaces** for cleanly separated crates.
+- **`cross`** for Linux/ARM cross-compilation (Raspberry Pi, ARM servers, musl static builds).
+- **`cargo-ndk`** for Android builds (aarch64, armv7, x86_64 for emulator).
+- **`cargo-lipo` / xcframework tooling** for iOS (aarch64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-ios-sim).
+- **GitHub Actions native runners** for macOS (Intel + Apple Silicon), Linux, and Windows.
+- **UniFFI (latest stable)** for Swift + Kotlin binding generation from one `.udl` file. Mobile only — desktop / server binaries depend on `ant-node` directly.
+- **Nix flake** (optional but recommended) for reproducible toolchain across engineers + CI.
+
+### Core crates
+
+| Concern | Crate | Notes |
+|---|---|---|
+| libp2p | `libp2p` | Features: `tcp`, `dns`, `noise`, `yamux`, `identify`, `kad`, `request-response`, `macros`. Nothing else. |
+| Async runtime | `tokio` | Single-threaded flyweight: `rt`, `macros`, `net`, `time`, `sync`, `fs`. |
+| Ethereum | `alloy-*` | Modular; pull only `rpc-client`, `primitives`, `signer-local`, `sol-types`, `contract`, `consensus`. Avoid `ethers-rs` (monolithic). |
+| Crypto | `k256`, `sha3`, `sha2`, `hmac`, `hkdf`, `chacha20poly1305` | `k256` keeps us inside RustCrypto, no OpenSSL. |
+| Protobuf | `prost` + `prost-build` | For pushsync / retrieval / hive messages. |
+| Storage | `rusqlite` (bundled) | Plus optional `sqlcipher` for encryption at rest. |
+| Serde | `serde`, `serde_json`, `bincode` | JSON for RPC; bincode for internal persistence. |
+| RLP | `alloy-rlp` | Smaller than the standalone `rlp` crate. |
+| Bindings | `uniffi`, `uniffi-bindgen` | Mobile only. Swift + Kotlin from one IDL. |
+| Error handling | `thiserror` (lib), `anyhow` (binary/tests only) | Never leak `anyhow` across FFI. |
+| Tracing | `tracing`, `tracing-subscriber` | Wire through to OSLog / logcat / stdout per platform. |
+| Config | `figment` or hand-rolled | Keep it tiny. |
+| Desktop key storage | `keyring` (feature-gated) | macOS Keychain, Windows DPAPI / Credential Manager, Linux Secret Service. |
+| Desktop service | `windows-service` (feature-gated) | Windows Service integration for `antd`. Linux/macOS use systemd/launchd unit files, not crate code. |
+
+### Build-profile for size
+
+```toml
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = false
+incremental = false
+```
+
+Optional further shrink (nightly): `cargo +nightly build -Z build-std=std,panic_abort -Z build-std-features=panic_immediate_abort --target <triple>`.
+
+### Dependency policy
+
+**Always track the latest stable versions of all third-party dependencies.** No version ever pinned out of inertia.
+
+- **Cargo.toml uses caret requirements** (e.g. `tokio = "1"`) so `cargo update` picks up non-breaking upgrades continuously.
+- **`Cargo.lock` is committed** for reproducible builds of the binary / artifact crates (`antd`, `ant-ffi`), but we never rely on it to hold us back on library upgrades.
+- **Rust toolchain:** pinned to **latest stable** in `rust-toolchain.toml`. MSRV claim is "current stable"; we do not promise old-toolchain support.
+- **Dependency-hygiene PRs:** a dedicated upgrade workflow does:
+  - `cargo update` (lockfile refresh) — always applied.
+  - `cargo upgrade --incompatible` (from `cargo-edit`) — reviewed, applied when green.
+  - Rust toolchain bump when a new stable lands.
+  - Test suite + mainnet smoke must pass before the PR merges.
+- **Dependabot / Renovate** generate PRs continuously for interim bumps.
+- **`cargo-outdated`** in CI fails the build if any dependency is more than **one minor version** behind latest stable.
+- **`cargo-deny`** enforces: no yanked versions, no duplicate major versions of the same crate, allowed licenses only, no known-advisory versions (via `cargo-audit` integration).
+- **`cargo-vet`** tracks human-reviewed audits of new crate versions entering the tree. Reused for supply-chain review.
+- **Exception policy:** a dependency may be held back only with a dated `# PINNED: reason, review by YYYY-MM-DD` comment in `Cargo.toml`. Anything past its review date blocks CI.
+- **Single version per crate:** if two transitive deps force us onto two majors of the same crate, the upgrade is itself a blocking task — we don't carry duplicate majors into release artifacts (this is both a size and a security concern).
+
+This policy is explicitly *in tension* with the §13 / §14 guidance to "pin versions." There is no contradiction: **we pin precisely to the latest stable, then we continuously rebase that pin onto new stable releases**. Pinning is for reproducibility and security review, not for freezing.
+
+**Key dependencies we will carry** (versions intentionally not listed — CI enforces "latest stable"):
+
+- `libp2p`, `tokio`, `alloy-*`, `k256`, `sha3`, `sha2`, `hmac`, `hkdf`, `chacha20poly1305`
+- `prost`, `rusqlite`, `serde`, `serde_json`, `bincode`, `alloy-rlp`
+- `uniffi`, `thiserror`, `tracing`, `tracing-subscriber`
+- `keyring`, `windows-service` (platform-gated)
+
+If you're reading this file to pick versions for a `Cargo.toml`, **do not copy version numbers out of this plan** — run `cargo search <crate>` or check `crates.io` at the moment you're adding the dependency.
+
+### Platform matrix
+
+The same `libant` core compiles to every target below. Platform-specific behaviour lives behind cargo features on the outer crates (`ant-ffi` for mobile, `antd` for desktop/server) and on the key-storage backend selection — **never** inside protocol crates.
+
+| Class | Target triple | Artifact | Tier | Notes |
+|---|---|---|---|---|
+| **iOS device** | `aarch64-apple-ios` | `.xcframework` via `ant-ffi` | 1 | ≤ 10 MB stripped budget. |
+| **iOS simulator (Apple Silicon)** | `aarch64-apple-ios-sim` | `.xcframework` | 1 | Packed into same `.xcframework` as device slice. |
+| **iOS simulator (Intel)** | `x86_64-apple-ios` | `.xcframework` | 2 | Kept only as long as Intel Macs are on support. |
+| **Android arm64** | `aarch64-linux-android` | `.aar` via `ant-ffi` | 1 | ≤ 10 MB stripped budget. |
+| **Android armv7** | `armv7-linux-androideabi` | `.aar` | 1 | Older devices; same budget. |
+| **Android x86_64** | `x86_64-linux-android` | `.aar` | 2 | Emulator-only in practice. |
+| **macOS Apple Silicon** | `aarch64-apple-darwin` | `antd` binary + `.dmg` | 1 | Signed + notarized. |
+| **macOS Intel** | `x86_64-apple-darwin` | `antd` binary + `.dmg` | 1 | Universal binary via `lipo`. |
+| **Linux x86_64 (glibc)** | `x86_64-unknown-linux-gnu` | `antd` binary + `.deb` / `.rpm` | 1 | Default server target. |
+| **Linux x86_64 (musl)** | `x86_64-unknown-linux-musl` | static `antd` | 1 | For containers / scratch images. |
+| **Linux aarch64 (glibc)** | `aarch64-unknown-linux-gnu` | `antd` binary + `.deb` | 1 | **Raspberry Pi 4/5, Pi Zero 2 W, ARM servers** (64-bit OS). |
+| **Linux aarch64 (musl)** | `aarch64-unknown-linux-musl` | static `antd` | 2 | Portable across distros. |
+| **Linux armv7** | `armv7-unknown-linux-gnueabihf` | `antd` binary | 3 | 32-bit Raspberry Pi OS on Pi 2/3/4. Best-effort. |
+| **Windows x86_64** | `x86_64-pc-windows-msvc` | `antd.exe` + MSI | 1 | Requires VS build tools on builder. |
+
+**Tiers:**
+
+- **Tier 1 — supported:** built in CI on every PR, tested against mainnet, shipped as signed artifacts.
+- **Tier 2 — supported, reduced coverage:** built in CI, shipped but without per-PR blocking tests.
+- **Tier 3 — best-effort:** not in CI by default; accept patches; no release guarantee.
+
+### CI build matrix
+
+Single GitHub Actions workflow, one job per (target, channel) pair:
+
+- **Per-PR (fast):** `clippy`, `rustfmt`, `cargo test` on `x86_64-unknown-linux-gnu` + `aarch64-apple-darwin`; cross-compile smoke-build on `aarch64-linux-android` and `aarch64-apple-ios` to catch target-specific regressions.
+- **Per-merge-to-main (full):** the full Tier-1 matrix above, producing release artifacts as build artifacts (unsigned). Tier-2 targets built and archived. Mainnet interop suite executed against the `x86_64-unknown-linux-gnu` build of `antd`.
+- **Release tag:** produces signed + notarized artifacts for every Tier-1 platform, SBOM, and checksums.
+
+### Per-platform key-storage backend
+
+The `KeyProvider` abstraction (§5.10) is the same on every platform; only the default backend differs:
+
+| Platform | Default backend | Crate |
+|---|---|---|
+| iOS | Secure Enclave + Keychain | `security-framework` |
+| Android | StrongBox / Keystore | JNI bridge via `ant-ffi` |
+| macOS | Keychain | `keyring` |
+| Windows | DPAPI / Credential Manager | `keyring` |
+| Linux desktop | Secret Service (GNOME / KDE) | `keyring` |
+| Linux headless / Pi / containers | Encrypted keystore file (Argon2id + AES-GCM), unlocked by passphrase or systemd-creds | in-tree, `ant-crypto` |
+| All (optional) | Hardware wallet (Ledger / Trezor) | `hidapi`-based, v2 |
+
+The headless backend is the only one we own end-to-end; the rest are thin adapters over OS APIs. The `KeyProvider` interface guarantees that private key bytes never exist in `libant` memory — all signing is a callback.
+
+### Desktop packaging
+
+Delivered alongside the Tier-1 builds:
+
+- **macOS:** universal `antd` binary, `.dmg` with optional menu-bar wrapper, code-signed + notarized. `launchd` `.plist` template for always-on use.
+- **Windows:** MSI installer with an option to register a Windows Service. Authenticode-signed.
+- **Linux:** `.deb` + `.rpm` + tarball. `systemd` unit file, `ant` user + `/var/lib/ant` data dir, `ExecStart=/usr/bin/antd --config /etc/ant/antd.toml`.
+- **Raspberry Pi:** same `.deb` as Linux aarch64, plus an opinionated install script (`curl | sh`) that handles first-run key setup and optional Tailscale onboarding for "phone delegates to home Pi" scenarios.
+- **Docker:** multi-arch image (`linux/amd64`, `linux/arm64`) built from the musl static binary, under ~15 MB.
+
+---
+
+## 4. Workspace Layout
+
+```
+ant/
+├── Cargo.toml                  # workspace root
+├── rust-toolchain.toml         # pinned toolchain
+├── crates/
+│   ├── ant-crypto/             # secp256k1, keccak, BMT, signatures, overlay derivation
+│   ├── ant-p2p/                # libp2p host, BZZ handshake, Hive hints, peer snapshot
+│   ├── ant-control/            # local daemon control protocol and socket transport
+│   ├── ant-node/               # high-level orchestrator: wires active crates together
+│   ├── antd/                   # standalone daemon: CLI, config loader, signal handling
+│   └── antctl/                 # local control client and live status TUI
+│
+│   # Planned after M1.1:
+│   ├── ant-store/              # SQLite schema + migrations + repositories
+│   ├── ant-chunk/              # Chunk types, serialization, content-addressed chunks, SOCs
+│   ├── ant-mantaray/           # Manifest (binary trie) construction + traversal
+│   ├── ant-retrieval/          # Retrieval protocol (client only)
+│   ├── ant-pushsync/           # Pushsync protocol (client only)
+│   ├── ant-accounting/         # Peer debit/credit ledger + threshold logic
+│   ├── ant-chain/              # Gnosis RPC, ABIs, tx signing, nonce mgmt
+│   ├── ant-stamps/             # Batch state, per-chunk signing, bucket tracking
+│   ├── ant-swap/               # Chequebook deploy, cheque issuance, EIP-712 signing
+│   └── ant-ffi/                # UniFFI bindings: public API surface, error mapping
+├── uniffi/
+│   └── ant.udl                 # Interface definition consumed by ant-ffi
+├── ios/                        # Xcode project that consumes the xcframework
+├── android/                    # Gradle module that consumes the aar
+└── xtask/                      # cargo xtask for build orchestration
+```
+
+Each crate owns its data model and exposes a small API. `ant-node` is the only crate that knows about everything. `ant-control` is local operator plumbing only and must not leak into protocol crates. `ant-ffi` is the only crate that knows about UniFFI. `antd` is a thin shell around `ant-node` that adds CLI argument parsing, config loading, and signal handling — it must never reach around the core to touch lower crates directly, so that the daemon and the mobile library remain behaviorally identical.
+
+---
+
+## 5. Protocol Scope — What We Actually Build
+
+### 5.1 libp2p host
+
+- Single TCP transport, IPv4 + IPv6.
+- Security: Noise XX.
+- Muxer: Yamux.
+- Identify protocol.
+- Kademlia for forwarding-Kademlia neighborhood discovery.
+- `request-response` behavior for retrieval / pushsync framing.
+- **Peer ID = libp2p identity** derived from secp256k1 node key (compatible with bee's overlay derivation).
+
+### 5.2 Overlay + Hive
+
+- Overlay address = `keccak256(eth_address || network_id || nonce)`, truncated per Swarm spec.
+- Hive v2 peer exchange: request peers close to our overlay depth, maintain routing table bins.
+- Implement neighborhood depth tracking (simplified: we only need enough peers to route retrieval / pushsync targets).
+
+### 5.3 Retrieval (client)
+
+- Single-stream protobuf request/response.
+- Verify chunk integrity: `keccak256(span || payload) == reference` for content-addressed chunks; signature verification for single-owner chunks (SOCs).
+- Optional in-memory LRU cache keyed by chunk reference; SQLite-backed persistent cache behind a size cap.
+
+### 5.4 BMT + Chunking
+
+- Chunk size: 4096 bytes payload + 8-byte span.
+- BMT hash over 128-segment binary Merkle tree using keccak256.
+- Streaming chunker that turns arbitrary byte input into a tree of chunks, yielding the root reference.
+- Handle small files (single chunk), normal files, and large files (multi-level intermediate chunks).
+
+### 5.5 Mantaray (manifests)
+
+- Binary trie encoding for path → reference mapping.
+- Minimum viable: construct a manifest from a flat list of `(path, reference, metadata)` entries and traverse by path.
+- Support "root metadata" node for website-style manifests (index document, error document) — needed for `bzz://` resolution.
+
+### 5.6 Pushsync (client only)
+
+- Push chunk → nearest neighbors via forwarding-Kademlia routing.
+- Receive signed receipt from storer peer; verify signature corresponds to overlay.
+- Retry with alternative routing on timeout / bad receipt.
+- Account each peer hop for SWAP (see §5.8).
+
+### 5.7 Postage stamps
+
+- `PostageStamp` contract on Gnosis Chain: buy batch, top-up, dilute, read batch state.
+- Local persistence of each batch: `batch_id`, `owner_key`, `depth`, `bucket_depth`, `amount`, `normalized_balance`, `buckets[]` (bucket counters).
+- Per-chunk stamp: sign `keccak256(chunk_addr || batch_id || index || timestamp)` with batch owner key.
+- Bucket tracking: maintain per-bucket counters so we never exceed `2^bucket_depth` stamps per bucket.
+- Expiry calculation: `stamp_alive = normalized_balance > current_total_outpayment`. Poll chain periodically; warn app before expiry.
+
+### 5.8 SWAP / Chequebook
+
+- `ChequebookFactory` → deploy per-device chequebook at first run. Chequebook holds xBZZ used to pay forwarders.
+- `Chequebook` contract: we only call `increaseBalance` and issue off-chain cheques; cashing is the counterparty's job.
+- Off-chain accounting per peer: `paymentThreshold`, `disconnectThreshold`, `earlyPayment` logic per bee spec.
+- Cheque signing: EIP-712 typed data: `(chequebook, beneficiary, cumulativePayout)` signed by chequebook owner key.
+- Persist outstanding cheques; re-issue the highest cumulative payout on peer reconnect.
+
+### 5.9 Gnosis Chain plumbing
+
+- JSON-RPC client over HTTPS using `alloy-rpc-client`.
+- ABI encoding for: `ERC20` (xBZZ, xDAI balance checks, approvals), `PostageStamp`, `ChequebookFactory`, `Chequebook`.
+- Transaction signing: EIP-155 legacy + EIP-1559; default to EIP-1559 on Gnosis.
+- Nonce manager: local monotonic counter, re-sync on reorgs / rejections.
+- Gas estimation with a small safety multiplier; fee-bumping on stuck txs.
+- Confirmation waiter: configurable block depth (default 2 on Gnosis).
+
+### 5.10 Key management
+
+- Three keys per device:
+  1. **Node key** (secp256k1): libp2p identity + overlay.
+  2. **Wallet key** (secp256k1): pays gas, owns chequebook, signs cheques.
+  3. **Batch owner key(s)** (secp256k1): signs postage stamps. Often same as wallet key, but modelled separately so batches can be imported.
+- Keys live **outside the Rust lib**: mobile app provides them to the library via a `KeyProvider` trait exposed through UniFFI, backed by:
+  - iOS: Secure Enclave + Keychain
+  - Android: StrongBox / Keystore (hardware-backed when available)
+- Rust library never persists raw private keys; it only holds public keys + signs through the callback.
+
+---
+
+## 6. Data Model & Persistence
+
+Single SQLite database, versioned migrations. Core tables:
+
+| Table | Purpose |
+|---|---|
+| `config` | Key-value app config, schema version. |
+| `peers` | Known peers, overlay, multiaddrs, last-seen, reputation counters. |
+| `chunks` | Content-addressed chunk cache (payload blob + last-access). |
+| `batches` | Owned / imported postage batches. |
+| `batch_buckets` | Per-batch bucket counters (sharded table). |
+| `cheques_issued` | Per-peer latest cumulative payout. |
+| `cheques_received` | Stored for audit even though we don't cash on v1. |
+| `chain_state` | Latest block, nonce, pending tx tracking. |
+| `uploads` | User-level upload jobs with status, reference, manifest metadata. |
+
+Chunks may optionally live on disk (one file per chunk in sharded dirs) if we find SQLite BLOB pressure is significant under load.
+
+---
+
+## 7. Public API (FFI Surface)
+
+Keep the UniFFI surface small and stable. Sketch:
+
+```idl
+namespace ant {};
+
+interface Node {
+  [Throws=AntError]
+  constructor(Config config, KeyProvider keys);
+
+  void start();
+  void stop();
+  NodeStatus status();
+
+  // retrieval
+  [Throws=AntError] bytes download(Reference reference);
+  [Throws=AntError] Reference resolve_path(Reference manifest, string path);
+
+  // upload
+  [Throws=AntError] UploadHandle upload_bytes(bytes data, UploadOptions opts);
+  [Throws=AntError] UploadHandle upload_manifest(sequence<ManifestEntry> entries, UploadOptions opts);
+
+  // stamps
+  [Throws=AntError] Batch buy_batch(u8 depth, string amount_plur);
+  sequence<Batch> list_batches();
+  [Throws=AntError] void topup_batch(BatchId id, string amount_plur);
+  [Throws=AntError] void dilute_batch(BatchId id, u8 new_depth);
+
+  // swap
+  [Throws=AntError] ChequebookInfo chequebook();
+  [Throws=AntError] void deploy_chequebook(string deposit_plur);
+
+  // events
+  void set_event_listener(EventListener listener);
+};
+
+callback interface KeyProvider {
+  bytes public_key(KeyRole role);
+  bytes sign(KeyRole role, bytes digest);
+};
+
+callback interface EventListener {
+  void on_event(AntEvent event);
+};
+```
+
+All amounts that cross FFI are strings (PLUR / wei) to avoid precision loss; no `BigInt` in UniFFI.
+
+---
+
+## 8. UX & Onboarding Design (mandatory before coding uploads)
+
+The product has to solve three onboarding problems or uploads will be unusable on day one:
+
+### 8.1 Funding ceremony
+
+- User needs xDAI (gas) + xBZZ (stamps + chequebook deposit) on Gnosis Chain.
+- **Recommended pattern:** app backend runs a *relayer* that:
+  - Funds the user's wallet with a minimal xDAI bootstrap (once, per device, rate-limited).
+  - Optionally sells xBZZ in-app (fiat on-ramp via a third-party provider) or sponsors first batch.
+- Power users: accept an import flow for existing wallets.
+
+### 8.2 Chequebook pre-deploy
+
+- Chequebook deploy is a blocking tx before the first upload. Options:
+  1. **Ship a sponsored deploy** via the relayer: relayer fronts gas, user signs the deploy via EIP-2771 meta-tx, chequebook ends up owned by the user. Best UX.
+  2. **Deploy on first app launch** with a clear progress UI ("Preparing your storage…"). Acceptable fallback.
+  3. **Background deploy** right after wallet funding, before the user even tries to upload.
+
+### 8.3 Stamp UX
+
+- Never surface `depth`, `amount`, `bucket_depth` in the primary UI.
+- Offer presets: "Quick share (1 day, ~1k files)", "Long-term (1 year, ~100k files)", etc. Compute parameters behind the scenes.
+- Show expiry as a calendar date with a colored status (green / yellow / red).
+- Auto top-up at a user-configurable threshold, with a hard-limit per day to prevent runaway spend.
+
+### 8.4 Background behavior
+
+- iOS: use BGProcessingTask / BGAppRefreshTask for periodic chain polling and chunk-upload resumption.
+- Android: WorkManager foreground service for active uploads, regular workers for polling.
+- The Rust lib must support **graceful suspend/resume**: save state, close sockets, drop memory; reconnect on resume without re-downloading state from chain.
+
+### 8.5 Key recovery
+
+- Export / import using BIP-39 seed phrase for the wallet key (optionally the node key too).
+- Cloud backup is **opt-in** and must be explicit; default is local-only.
+
+---
+
+## 9. Phased Delivery Plan
+
+The work is organized around **three capability milestones**, each of which is independently demoable and, in the case of M1 and M2, independently *shippable* as an internal or external product in its own right:
+
+1. **M1 — Peer discovery & connection.** The node joins the Swarm network and maintains a healthy peer set. No data movement yet. Proves the hardest infrastructure piece (libp2p + overlay + BZZ handshake + Kademlia) in isolation. Split into **M1.0** (basic mainnet connection via `antd`) and **M1.1** (stable neighborhood via Hive + Kademlia).
+2. **M2 — Ultra-light node (download only).** The node retrieves any mainnet reference. Shippable as a standalone "Ant Reader" app. No chain, no keys beyond libp2p identity, no xDAI/xBZZ required.
+3. **M3 — Light node (uploads + stamps + SWAP).** Full read/write node with on-device stamp management and honest payments. The GA product.
+
+A post-M3 **hardening track** covers UX polish, backgrounding, and beta — without which the product isn't fit to ship, but where the protocol risk is already retired.
+
+Each milestone is subdivided into phases that end with a concrete demo.
+
+---
+
+### Milestone 1 — Peer discovery & connection
+
+Goal: the embedded node connects to Swarm mainnet, completes the BZZ handshake with real bee peers, exchanges peers via Hive, and maintains Kademlia routing table bins consistent with the neighborhood of our overlay address. All development at this stage happens against the `antd` binary; mobile packaging is deferred to the end of M2 where it's meaningful to demo.
+
+#### Phase 0 — Foundations + basic mainnet connection — **M1.0**
+
+Keep the workspace tiny: only the crates needed to dial bee peers, survive the BZZ handshake, expose enough operator control to debug a long-running daemon, and gather the peer data needed for M1.1. No SQLite, no UniFFI, no mobile artifacts yet.
+
+- Workspace skeleton with `ant-crypto`, `ant-p2p`, `ant-node`, `ant-control`, `antd`, and `antctl`.
+- CI (GitHub Actions), lint (`clippy -D warnings`), format (`rustfmt`), pre-commit.
+- `ant-crypto`: secp256k1 key handling, keccak256, Ethereum address derivation, overlay address derivation (`keccak256(eth_address ‖ network_id_le ‖ nonce)`), BZZ address signing + verification. Unit tests against vectors cross-checked with a local `bee`.
+- `ant-p2p`:
+  - libp2p host using **secp256k1 identity** (not ed25519), TCP + DNS transports, Noise XX, Yamux, Identify, Ping.
+  - `/swarm/handshake/14.0.0/handshake` protobuf implementation (Syn / SynAck / Ack), including bee-compatible half-close behavior.
+  - Recursive `/dnsaddr/mainnet.ethswarm.org` resolution and grouped peer dials.
+  - Connection lifecycle: reconnect with bounded exponential backoff, log handshake outcome with overlay + agent version, and maintain a target peer pipeline.
+  - Drain bee post-handshake pricing streams and parse Hive peer broadcasts into dial hints.
+  - Persist a temporary JSON peer snapshot for warm restarts until `ant-store` replaces it.
+- `antd`: CLI with `--data-dir`, `--network-id`, `--bootnodes`, `--log-level`, `--key-file`, `--external-address`, control-socket, and peerstore options; generates a persistent node key + nonce on first run; `tracing-subscriber` for human-readable logs.
+- `antctl`: `status`, `top`, `version`, and `peers reset` for live daemon inspection.
+
+**Exit (M1.0):** `antd` running on a laptop connects to live mainnet bee peers, completes the BZZ handshake, fills at least a small peer set from bootnode/Hive hints, survives a restart from the JSON peer snapshot, and stays connected across network blips. Log output matches roughly:
+
+```
+INFO antd: loaded identity eth=0x1a2b…c4 overlay=0x7f3e…91
+INFO ant_p2p: dialing /ip4/…/tcp/1634/p2p/16Uiu2HAm…
+INFO ant_p2p: libp2p connected agent="bee/2.7.0"
+INFO ant_p2p: bzz handshake ok overlay=0x2c4a…8e full_node=true
+INFO ant_p2p: peer set size=1
+```
+
+#### Phase 1 — Stable neighborhood via Hive + Kademlia — **M1.1**
+
+- Extend `ant-p2p` with:
+  - **Hive v2** peer exchange: keep the current inbound Hive peer broadcast parser, add any missing request path needed to actively ask peers for closer addresses, verify signed BZZ addresses before promotion, and enqueue dials by routing need instead of FIFO only.
+  - **Forwarding Kademlia** routing: bin-based routing table keyed on XOR distance from our overlay; neighborhood depth tracking; pluggable peer-selection for later protocols.
+  - Peer health and replacement policy: distinguish dial failure, handshake failure, post-handshake disconnect, and long-lived healthy peer.
+- `ant-store`: minimal SQLite schema for peers, routing snapshot, and `config` key-value. Migrate the current JSON peer snapshot API behind the store so `antd` behaviour stays stable.
+- `ant-node`: orchestrator wiring that owns the node loop, applies backpressure, and surfaces status.
+- Foundational cross-compile pipeline: produce stub `.xcframework` + `.aar` from a "hello-world" UniFFI crate so M2 can hit the ground running on mobile.
+- Operator acceptance:
+  - `antctl top` shows connected peers, selected-peer detail, last BZZ handshake, and routing/neighborhood summary.
+  - `antctl peers reset` and daemon startup `--reset-peerstore` remain supported after the SQLite migration.
+  - A 24-hour soak script writes a compact acceptance report: peer count over time, routing-bin coverage, reconnects, handshakes, and disconnect reasons.
+
+**Exit (M1.1):** `antd` run for 24 hours against mainnet maintains a stable peer set across suspend/resume, and its Kademlia routing bins match a parallel `bee` node's view of the same neighborhood within a small tolerance. This is the real M1 checkpoint — after this we trust the infrastructure.
+
+---
+
+### Milestone 2 — Ultra-light node: download only
+
+Goal: the node retrieves any reference from mainnet, including multi-chunk files and path-addressed content inside a mantaray manifest. No chain interaction, no wallet. This is a complete, shippable read-only product.
+
+#### Phase 2 — Retrieval
+
+- `ant-retrieval`: client protocol, protobuf messaging, stream multiplexing over libp2p `request-response`.
+- Chunk verification: BMT root check for content-addressed chunks; signature check for single-owner chunks.
+- Chunk cache (SQLite or sharded file store) with size cap and LRU eviction.
+- Retry / alternate-peer selection on failure.
+
+**Exit:** Mobile sample app downloads a known single-chunk and multi-chunk Swarm reference from mainnet.
+
+#### Phase 3 — Mantaray traversal + high-level download API
+
+- `ant-mantaray`: binary-trie decoder, path traversal, root-metadata handling.
+- `download(Reference)` → bytes, and `resolve_path(Reference, String)` → Reference, both over FFI.
+- Streaming download API so large files don't require holding the whole payload in memory.
+
+**Exit:** Sample app opens a `bzz://` reference with a path and renders the content (e.g., an image or a JSON file inside a directory manifest).
+
+#### Phase 4 — Ultra-light packaging + release-candidate
+
+- Size budget enforcement in CI (fail PRs that push `.xcframework` / `.aar` past the M2 budget).
+- Foreground + background suspend/resume for reads.
+- Observability bridges (OSLog / logcat).
+- Internal beta of the download-only build.
+
+**Exit (M2):** Independently shippable ultra-light library. Per-platform artifact ≤ ~5 MB stripped (lighter than the full M3 target because no chain / SWAP / stamps code).
+
+---
+
+### Milestone 3 — Light node: uploads + stamps + SWAP
+
+Goal: everything in M2, plus honest on-device uploading with on-chain postage-stamp management and SWAP-based payment to forwarders.
+
+#### Phase 5 — Chain plumbing, reads first
+
+- `ant-chain`: alloy-based RPC client, ABIs for `ERC20`, `PostageStamp`, `ChequebookFactory`, `Chequebook`.
+- Nonce manager, confirmation waiter, fee-bumping scaffolding (not yet exercised).
+- `KeyProvider` FFI contract finalized; iOS Keychain + Android Keystore backends wired in.
+- Read-only flows: show wallet balances, read an existing batch, read chequebook state.
+
+**Exit:** Mobile app reads and displays an on-chain batch and chequebook for the embedded wallet. No writes yet.
+
+#### Phase 6 — Single-chunk upload with pre-provisioned stamps
+
+- `ant-pushsync`: client protocol, receipt verification.
+- `ant-stamps`: per-chunk signing, bucket counters, atomic persistence. Batch injected via configuration — no on-chain purchase yet.
+- Accounting stub: record peer debits but do not yet pay.
+
+**Exit:** Upload a single chunk to mainnet with a pre-provisioned batch. End-to-end roundtrip: upload → reference → download via the same embedded node.
+
+#### Phase 7 — SWAP
+
+- `ant-accounting`: per-peer ledger, payment / disconnect thresholds, early-payment logic.
+- `ant-swap`: chequebook deploy via factory, EIP-712 cheque signing, cheque issuance on threshold, re-issue on reconnect.
+- Integrate with pushsync so every forwarder hop is paid honestly.
+
+**Exit:** Upload ~1 GB of chunks via pushsync while paying peers; peers never disconnect us for non-payment.
+
+#### Phase 8 — On-device stamp lifecycle
+
+- On-chain batch purchase, top-up, dilute.
+- Expiry monitoring and app-level events.
+- Harden bucket-counter persistence against crash mid-upload (write counter before emitting the chunk to the wire).
+
+**Exit:** End-to-end user flow: buy a batch, upload files, top it up, dilute it — all initiated from the device.
+
+#### Phase 9 — Streaming uploads + mantaray construction
+
+- Streaming chunker with on-the-fly BMT tree construction.
+- `ant-mantaray` construction path (previously we only traversed).
+- `upload_manifest` API for multi-file directory uploads.
+
+**Exit (M3):** Upload a multi-file directory as a single mantaray manifest and retrieve files by path — full read/write parity with a `bee` light node for the supported protocol subset.
+
+---
+
+### Hardening track
+
+Not a capability milestone, but required before GA.
+
+#### Phase 10 — UX, background, resilience
+
+- Graceful suspend/resume on iOS + Android (sockets, timers, chain pollers).
+- Upload resumption across app kill / relaunch.
+- Onboarding flow wired: relayer-sponsored funding, chequebook pre-deploy, stamp presets.
+- Nonce-race resilience, reorg handling, fee-bumping in anger.
+- Crash recovery paths for every durable state transition.
+
+**Exit:** App survives being killed mid-upload, relaunched, and finishes the upload. Cold-start to "ready to upload" under 30 s for a returning user.
+
+#### Phase 11 — Interop, beta, polish
+
+- Continuous interop against latest `bee` mainnet release in CI.
+- External beta with opt-in telemetry (local-first, no PII).
+- Performance / battery / data profiling; iterate.
+- Documentation pass: integration guide, API reference, onboarding playbook.
+
+**Exit:** Public beta on both stores.
+
+---
+
+### Milestone summary
+
+| Milestone | Phases | Demo |
+|---|---|---|
+| **M1.0 Basic mainnet connection** | 0 | `antd` connects to mainnet + completes BZZ handshake |
+| **M1.1 Stable neighborhood** | 1 | Stable peer set + correct Kademlia routing bins over 24 h |
+| **M2 Ultra-light (download)** | 2, 3, 4 | Download any reference + path resolution; shippable read-only build |
+| **M3 Light node (upload + stamps + SWAP)** | 5, 6, 7, 8, 9 | Buy batch → upload directory → retrieve by path, all on device |
+| **Hardening** | 10, 11 | Public beta with survived-kill uploads and mainnet interop |
+
+M1 and M2 can be parallelized by a second engineer starting on chain plumbing in Phase 5. Add buffer for unknowns — Swarm's protocols have undocumented edges, and the first honest interop run against `bee` always surfaces something.
+
+### Optional early releases
+
+The milestone structure deliberately supports three pre-GA checkpoints, each useful in its own right:
+
+- **End of M1.0:** **`antd` dogfood release.** Internal-only daemon that peer with mainnet. Zero user value but huge team morale and infrastructure validation signal: a handful of engineers run `antd` on their laptops, file bugs, and the BZZ handshake hardens fast against the wild variety of bee peers out there.
+- **End of M1.1:** **internal "Ant Probe" dev tool.** Still no user-facing value, but now provides a stable mainnet-connected node that retrieval work (M2) can be built on top of with confidence. Good point to onboard additional engineers.
+- **End of M2:** **shippable public "Ant Reader" app / SDK.** Lets you learn UX and distribution without having to solve the xDAI/xBZZ/chequebook problem yet. Highly recommended — de-risks the hardest *product* problems before you finish the hardest *protocol* problems.
+
+---
+
+## 10. Testing Strategy
+
+### Unit tests
+
+- Cryptography: BMT against bee test vectors; SOC signatures; cheque EIP-712 hashes.
+- ABI encoding against known tx hashes.
+- Mantaray round-trip on generated trees.
+- Bucket counter state machines (property tests with `proptest`).
+
+### Integration tests
+
+- Golden-path interop against a **locally-run bee node** in a Docker container. This is the single most important test surface.
+- Each protocol (hive, retrieval, pushsync) has a harness that speaks to a bee container.
+- Chain tests against a **local Gnosis dev chain** (`anvil --fork <rpc>` against an archived block, or `nethermind --init`).
+
+### End-to-end tests
+
+- Headless mobile test app driving upload/download scenarios.
+- Fuzzing: protobuf decoders with `cargo-fuzz`; ABI decoders; manifest parsers.
+
+### Mainnet smoke tests
+
+- CI job that does one download of a known reference and one small upload against mainnet. Alert on regression.
+
+### Device matrix
+
+- iOS: oldest-supported device (aim for iOS 16+), plus current flagship.
+- Android: low-end (4 GB RAM / arm64) + flagship, plus emulator for CI.
+
+---
+
+## 11. Observability
+
+- `tracing` everywhere; spans for upload jobs, downloads, chain calls.
+- FFI exposes a `set_log_sink` so the host app bridges:
+  - iOS: `OSLog`
+  - Android: `android.util.Log` via `log` crate + `android_logger`
+- Structured events for UI: `AntEvent::UploadProgress { job, bytes, total }`, `ChequeIssued`, `BatchExpiring`, etc.
+- **No telemetry to our backend by default.** Opt-in only, anonymized.
+
+---
+
+## 12. Size Budget
+
+| Component | Target (stripped) |
+|---|---|
+| libp2p (TCP/Noise/Yamux/Kad) | ≤ 2.5 MB |
+| Protocols (retrieval, pushsync, hive, BMT, mantaray) | ≤ 1.0 MB |
+| Stamps + SWAP + accounting | ≤ 0.7 MB |
+| Alloy + RPC + ABI + signing | ≤ 1.0 MB |
+| Tokio (single-threaded) + prost + sqlite | ≤ 2.5 MB |
+| Crypto (k256, sha3, sha2, chacha20) | ≤ 0.6 MB |
+| Glue + UniFFI scaffolding | ≤ 0.5 MB |
+| **Total per platform** | **≤ 8.8 MB** |
+
+Tracked as a CI check that fails the build if `.xcframework` or `.aar` grows past the threshold for a release build.
+
+---
+
+## 13. Security Considerations
+
+- **Private keys never leave the secure hardware.** All signing through the `KeyProvider` callback; Rust holds only public keys.
+- **No untrusted deserialization into `Vec<u8>`** without size caps; protobuf messages have explicit max-size limits.
+- **Chain call allowlist:** only the specific contracts we know about; refuse generic `eth_call` surface from the host app.
+- **Stamp replay / over-issue:** bucket counters persisted atomically before the chunk leaves the device; stamp signatures include monotonic bucket index.
+- **Cheque replay:** cumulative payout is monotonically increasing per peer; we never sign a cheque with a lower value than previously sent.
+- **Key compromise:** wallet key controls chequebook funds + batches. Offer a panic-withdraw flow to drain the chequebook to a recovery address.
+- **Supply chain:** audit crates via `cargo-vet`, gate with `cargo-deny` and `cargo-audit`, reproducible builds via committed `Cargo.lock`. Versions pinned in the lockfile are continuously rebased onto latest stable per the §3 dependency policy — we never freeze dependencies for long.
+
+---
+
+## 14. Risks & Mitigations
+
+| Risk | Likelihood | Impact | Mitigation |
+|---|---|---|---|
+| Upstream protocol changes in `bee` | High | Medium | Track bee releases; mainnet interop tests in CI; version the wire format. |
+| Forwarding Kademlia bugs | Medium | High | Strong integration test harness against live bee; conservative initial peer-selection. |
+| iOS background-kill during uploads | High | Medium | Resumable upload state in SQLite; BGProcessingTask. |
+| Gnosis Chain reorgs | Low | Medium | Wait for N confirmations (configurable); idempotent tx retry. |
+| Stamp over-issuance leading to chunk rejection | Medium | High | Atomic bucket-counter writes; refuse upload if counter can't be persisted first. |
+| xBZZ / xDAI acquisition blocks new users | High | High | Relayer-sponsored onboarding; clear "bring your own" path for power users. |
+| Artifact size creeps past budget | Medium | Low | CI gate; per-crate size regression dashboard. |
+| Libp2p API churn | Medium | Low | Continuous upgrade policy (§3); dedicated upgrade PRs for breaking changes; interop smoke tests gate the merge. |
+
+---
+
+## 15. Upstream Tracking
+
+- Subscribe to `ethersphere/bee` releases.
+- Maintain a compatibility matrix: our version ↔ bee versions we're known to interop with.
+- Participate in Swarm community channels for early warning on protocol changes.
+- Keep a "spec conformance" doc mapping each bee spec section to our implementation location.
+
+---
+
+## 16. Open Questions
+
+1. **Do we support encrypted uploads in v1?** Adds ChaCha20 handling + key embedding in reference. Small code cost; larger UX cost (key sharing). Recommend: deferred to v1.1.
+2. **Single wallet or separate node/wallet keys?** Simpler UX with one; cleaner isolation with two. Recommend: two keys, shared recovery seed.
+3. **Does the app always run its own node, or can it fall back to a gateway?** Fallback is nice but doubles the retrieval code path. Recommend: node-only, ship the smallest node possible.
+4. **xBZZ on-ramp inside the app or external?** External first to avoid regulatory overhead; revisit in v2.
+5. **Windows / desktop ports?** Not in v1 scope but keep FFI clean so it's trivial later.
+
+---
+
+## 17. Definition of Done for v1
+
+- [ ] Mobile apps on iOS and Android can:
+  - [ ] Onboard a new user including wallet funding, chequebook deploy, first batch purchase — all within a single flow under 5 minutes.
+  - [ ] Download any Swarm mainnet reference.
+  - [ ] Upload a single file (any size up to 4 GB) and share the reference.
+  - [ ] Upload a directory as a mantaray manifest and retrieve by path.
+  - [ ] Manage batches: buy, top-up, dilute, list, expiry warnings.
+  - [ ] Survive app kill mid-upload and resume on next launch.
+- [ ] Mainnet interop tests pass against the latest bee release.
+- [ ] Per-platform artifact under 10 MB stripped.
+- [ ] Key material never reaches the Rust library unencrypted.
+- [ ] External security review of crypto + SWAP + stamp code.
+- [ ] Documentation: integration guide, API reference, onboarding playbook for app teams.
+
+---
+
+## Appendix A — Bee spec sections we need to implement
+
+- Overlay address derivation
+- Binary Merkle Tree (BMT) hash
+- Content-addressed chunks
+- Single-owner chunks
+- Mantaray manifests
+- Hive v2 peer exchange
+- Forwarding Kademlia routing
+- Retrieval protocol
+- Pushsync protocol
+- Postage stamps (structure, signing, verification we don't do but must produce valid stamps)
+- SWAP accounting + cheque format (EIP-712)
+- Chequebook contract interface
+- PostageStamp contract interface
+
+## Appendix B — Bee spec sections we deliberately do **not** implement
+
+- Pullsync
+- Storage incentives / redistribution game
+- Staking contract
+- PSS / GSOC messaging
+- ACT (access control trie)
+- Feeds beyond basic SOC usage
+- Trojan chunks
+- Cheque cashing
+- Advanced redundancy (erasure-coded uploads) — parked for v2

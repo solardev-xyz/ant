@@ -1,4 +1,3 @@
 # Agent Notes
 
-- Local research and planning notes live in `research/plan.md`.
-- The `research/` directory is intentionally ignored and should not be committed.
+- The implementation plan lives in `PLAN.md` at the repo root.

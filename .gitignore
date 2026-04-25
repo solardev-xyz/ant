@@ -1,9 +1,6 @@
 # Rust build artifacts
 /target/
 
-# Local research notes
-/research/
-
 # Local environment and secrets
 .env
 .env.*
