@@ -161,6 +161,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ant-retrieval"
+version = "0.1.0"
+dependencies = [
+ "ant-crypto",
+ "futures",
+ "hex",
+ "libp2p",
+ "libp2p-stream",
+ "prost",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "unsigned-varint 0.8.0",
+]
+
+[[package]]
 name = "antctl"
 version = "0.1.0"
 dependencies = [
