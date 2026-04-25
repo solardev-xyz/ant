@@ -68,6 +68,19 @@ enum Command {
         #[command(subcommand)]
         command: PeersCommand,
     },
+    /// Retrieve a single chunk by 32-byte reference and write it out.
+    ///
+    /// Today this only handles raw content-addressed chunks (the data
+    /// returned by bee's `/bytes/<ref>` endpoint). Multi-chunk files and
+    /// `/bzz/` mantaray manifests need the joiner / mantaray decoder
+    /// landing in a follow-up.
+    Get {
+        /// Hex-encoded 32-byte chunk reference; with or without a `0x` prefix.
+        reference: String,
+        /// Path to write the chunk bytes to. Defaults to stdout.
+        #[arg(long, short = 'o')]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -134,8 +147,73 @@ fn main() -> Result<()> {
                 other => bail!("unexpected response: {other:?}"),
             }
         }
+        Command::Get { reference, out } => {
+            run_get(&socket, &reference, out.as_deref(), opt.json)?;
+        }
     }
     Ok(())
+}
+
+/// Fetch a chunk and write it to `out` (or stdout). With `--json`, prints
+/// a `{ ok, reference, bytes }` envelope to stdout instead of the raw
+/// payload, since shells generally won't render binary cleanly.
+fn run_get(socket: &Path, reference: &str, out: Option<&Path>, json: bool) -> Result<()> {
+    let resp = request_sync(
+        socket,
+        &Request::Get {
+            reference: reference.to_string(),
+        },
+    )
+    .with_context(|| format!("talk to antd at {}", socket.display()))?;
+    let data = match resp {
+        Response::Bytes { hex } => decode_hex_payload(&hex)?,
+        Response::Error { message } => bail!("antd: {message}"),
+        other => bail!("unexpected response: {other:?}"),
+    };
+
+    if let Some(path) = out {
+        std::fs::write(path, &data)
+            .with_context(|| format!("write chunk to {}", path.display()))?;
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "ok": true,
+                    "reference": reference,
+                    "bytes": data.len(),
+                    "out": path.display().to_string(),
+                })
+            );
+        } else {
+            eprintln!("wrote {} bytes to {}", data.len(), path.display());
+        }
+    } else if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "reference": reference,
+                "bytes": data.len(),
+                "hex": format!("0x{}", hex::encode(&data)),
+            })
+        );
+    } else {
+        use std::io::Write;
+        // Write to stdout. We never decode the payload as text — bee
+        // chunks are arbitrary binary; the caller is responsible for
+        // piping into something that handles bytes (e.g.
+        // `antctl get … | xxd | head`).
+        io::stdout().lock().write_all(&data)?;
+    }
+    Ok(())
+}
+
+/// Decode a `0x`-prefixed (or bare) hex string from the daemon's
+/// `Response::Bytes`. The daemon controls the format; we still validate
+/// because a corrupted socket would otherwise silently drop bytes.
+fn decode_hex_payload(s: &str) -> Result<Vec<u8>> {
+    let stripped = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    hex::decode(stripped).context("decode response hex")
 }
 
 fn fetch_status(socket: &Path) -> Result<StatusSnapshot> {

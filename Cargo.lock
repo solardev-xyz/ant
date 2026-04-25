@@ -187,6 +187,7 @@ dependencies = [
  "clap",
  "crossterm",
  "dirs",
+ "hex",
  "ratatui",
  "serde_json",
 ]

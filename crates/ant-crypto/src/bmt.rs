@@ -196,6 +196,20 @@ mod tests {
         assert!(cac_valid(&addr, &wire));
     }
 
+    /// Smoke vector: the live gateway file at
+    /// `https://api.gateway.ethswarm.org/bytes/804180…0ab4` (416 raw
+    /// bytes) must hash back to that reference. Skipped when the file
+    /// isn't present locally — only run as a one-shot during smoke
+    /// validation, not as part of the regular suite.
+    #[test]
+    #[ignore = "requires /tmp/swarm_smoke.bin from the live gateway"]
+    fn smoke_gateway_chunk_matches_reference() {
+        let payload = std::fs::read("/tmp/swarm_smoke.bin").unwrap();
+        let (addr, _wire) = cac_new(&payload).unwrap();
+        let want = hex32("804180d0c9d98019a176f03c32a32e906946ab5319024df8ed13126e514a0ab4");
+        assert_eq!(addr, want);
+    }
+
     /// Oversize payload is refused before hashing; we never construct a
     /// chunk we couldn't put on the wire.
     #[test]

@@ -13,5 +13,6 @@ anyhow.workspace = true
 clap.workspace = true
 crossterm = "0.29.0"
 dirs = "6.0.0"
+hex.workspace = true
 ratatui = "0.30.0"
 serde_json.workspace = true
