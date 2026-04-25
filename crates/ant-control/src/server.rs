@@ -16,13 +16,18 @@ pub enum ServerError {
 }
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
-/// How long to wait for the node loop to acknowledge a mutating command before
-/// replying to the client with a timeout error. Commands like `PeersReset` are
-/// near-instant, but if the node loop is wedged we don't want to hang the
-/// socket handler indefinitely.
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long to wait for the node loop to acknowledge a near-instant
+/// command (e.g. `PeersReset`). If the node loop is wedged we don't want
+/// to hang the socket handler indefinitely.
+const FAST_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+/// Cap for commands that may take a network round-trip (retrieval). Sized
+/// to comfortably cover `ant_retrieval::retrieve_chunk`'s own 10 s
+/// timeout plus per-attempt overhead, without hanging the socket forever
+/// if the node loop wedges.
+const NETWORK_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// A mutating command issued by a client and forwarded to the node loop.
+/// A mutating or network-touching command issued by a client and forwarded
+/// to the node loop.
 ///
 /// The node loop owns state that needs a single-writer path (the peerstore,
 /// the swarm), so `serve()` does not touch it directly; instead it relays a
@@ -33,13 +38,22 @@ pub enum ControlCommand {
     /// Drop the on-disk peerstore snapshot and clear the in-memory dedup
     /// state. Does not disconnect current peers.
     ResetPeerstore { ack: oneshot::Sender<ControlAck> },
+    /// Retrieve a chunk by 32-byte reference. The node loop picks the
+    /// closest BZZ peer, runs `ant_retrieval::retrieve_chunk`, and acks
+    /// with the verified payload bytes (or an error string).
+    GetChunk {
+        reference: [u8; 32],
+        ack: oneshot::Sender<ControlAck>,
+    },
 }
 
 /// Node-loop reply to a [`ControlCommand`]. Serialized back to the client as
-/// `Response::Ok` or `Response::Error`.
+/// `Response::Ok`, `Response::Bytes`, or `Response::Error` depending on the
+/// variant.
 #[derive(Debug, Clone)]
 pub enum ControlAck {
     Ok { message: String },
+    Bytes { data: Vec<u8> },
     Error { message: String },
 }
 
@@ -116,11 +130,29 @@ async fn handle_connection(
             protocol_version: PROTOCOL_VERSION,
         }),
         Ok(Request::PeersReset) => {
-            dispatch_command(command_tx.as_ref(), |ack| ControlCommand::ResetPeerstore {
-                ack,
-            })
+            dispatch_command(
+                command_tx.as_ref(),
+                FAST_COMMAND_TIMEOUT,
+                |ack| ControlCommand::ResetPeerstore { ack },
+            )
             .await
         }
+        Ok(Request::Get { reference }) => match parse_reference(&reference) {
+            Ok(addr) => {
+                dispatch_command(
+                    command_tx.as_ref(),
+                    NETWORK_COMMAND_TIMEOUT,
+                    |ack| ControlCommand::GetChunk {
+                        reference: addr,
+                        ack,
+                    },
+                )
+                .await
+            }
+            Err(e) => Response::Error {
+                message: format!("bad reference: {e}"),
+            },
+        },
         Err(e) => Response::Error {
             message: format!("bad request: {e}"),
         },
@@ -139,6 +171,7 @@ async fn handle_connection(
 /// client.
 async fn dispatch_command<F>(
     command_tx: Option<&mpsc::Sender<ControlCommand>>,
+    timeout: Duration,
     build: F,
 ) -> Response
 where
@@ -155,19 +188,35 @@ where
             message: "daemon node loop is no longer accepting commands".to_string(),
         };
     }
-    match tokio::time::timeout(COMMAND_TIMEOUT, ack_rx).await {
+    match tokio::time::timeout(timeout, ack_rx).await {
         Ok(Ok(ControlAck::Ok { message })) => Response::Ok { message },
+        Ok(Ok(ControlAck::Bytes { data })) => Response::Bytes {
+            hex: format!("0x{}", hex::encode(data)),
+        },
         Ok(Ok(ControlAck::Error { message })) => Response::Error { message },
         Ok(Err(_)) => Response::Error {
             message: "daemon dropped the command without replying".to_string(),
         },
         Err(_) => Response::Error {
-            message: format!(
-                "daemon did not ack within {} seconds",
-                COMMAND_TIMEOUT.as_secs()
-            ),
+            message: format!("daemon did not ack within {} seconds", timeout.as_secs()),
         },
     }
+}
+
+/// Parse a 32-byte chunk reference. Accepts `0x`-prefixed or bare hex.
+/// Lower- or upper-case is fine. Anything else is rejected before the
+/// command hits the node loop so the caller gets a tidy error.
+fn parse_reference(s: &str) -> Result<[u8; 32], String> {
+    let stripped = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    if stripped.len() != 64 {
+        return Err(format!(
+            "reference must be 32 bytes (64 hex chars); got {}",
+            stripped.len()
+        ));
+    }
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(stripped, &mut out).map_err(|e| format!("invalid hex: {e}"))?;
+    Ok(out)
 }
 
 #[cfg(unix)]

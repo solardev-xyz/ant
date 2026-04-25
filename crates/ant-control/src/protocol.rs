@@ -24,6 +24,11 @@ pub enum Request {
     /// dedup set without disconnecting current peers. The next restart will
     /// bootstrap fresh from bootnodes.
     PeersReset,
+    /// Retrieve the chunk at `reference` from the network. The 32-byte
+    /// reference is a `0x`-prefixed hex string. The daemon answers with
+    /// [`Response::Bytes`] carrying the verified chunk payload (without
+    /// the span prefix).
+    Get { reference: String },
 }
 
 /// Daemon → client response.
@@ -37,6 +42,13 @@ pub enum Response {
     /// what the daemon did.
     Ok {
         message: String,
+    },
+    /// Hex-encoded chunk payload returned by [`Request::Get`]. Hex (rather
+    /// than base64 or raw binary) keeps the wire format newline-delimited
+    /// JSON for now; we'll revisit when multi-chunk fetches need streaming.
+    Bytes {
+        /// `0x`-prefixed lowercase hex of the payload bytes.
+        hex: String,
     },
     Error {
         message: String,

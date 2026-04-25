@@ -596,7 +596,7 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
                 peerstore.flush();
             }
             Some(cmd) = recv_command(commands.as_mut()) => {
-                handle_control_command(&mut state, &mut peerstore, cmd);
+                handle_control_command(&mut state, &mut peerstore, &control, cmd);
             }
             _ = &mut shutdown => {
                 info!(target: "ant_p2p", "shutdown signal; flushing peerstore");
@@ -623,7 +623,12 @@ async fn recv_command(
 /// Apply a control-socket command against the node loop's single-writer
 /// state. Keep the match exhaustive so a newly-added variant on the wire is
 /// noisily rejected instead of silently dropped.
-fn handle_control_command(state: &mut SwarmState, peerstore: &mut PeerStore, cmd: ControlCommand) {
+fn handle_control_command(
+    state: &mut SwarmState,
+    peerstore: &mut PeerStore,
+    control: &Control,
+    cmd: ControlCommand,
+) {
     match cmd {
         ControlCommand::ResetPeerstore { ack } => {
             let evicted = peerstore.clear();
@@ -637,6 +642,44 @@ fn handle_control_command(state: &mut SwarmState, peerstore: &mut PeerStore, cmd
             );
             info!(target: "ant_p2p", "{msg}");
             let _ = ack.send(ControlAck::Ok { message: msg });
+        }
+        ControlCommand::GetChunk { reference, ack } => {
+            // Pick the best peer up-front (synchronously, no allocations
+            // beyond the existing routing entries) and hand the actual
+            // libp2p round-trip off to a spawned task. Keeps the swarm
+            // event loop free for new connections / hive gossip while the
+            // retrieve is in flight.
+            let candidate = state.routing.closest_peer(&reference, &[]);
+            let Some((peer, _overlay)) = candidate else {
+                let _ = ack.send(ControlAck::Error {
+                    message: "no peers available; wait for handshakes to complete".to_string(),
+                });
+                return;
+            };
+            let mut control = control.clone();
+            tokio::spawn(async move {
+                let res = ant_retrieval::retrieve_chunk(&mut control, peer, reference).await;
+                let reply = match res {
+                    Ok(chunk) => {
+                        debug!(
+                            target: "ant_p2p",
+                            %peer,
+                            payload_bytes = chunk.payload().len(),
+                            "retrieval ok",
+                        );
+                        ControlAck::Bytes {
+                            data: chunk.payload().to_vec(),
+                        }
+                    }
+                    Err(e) => {
+                        debug!(target: "ant_p2p", %peer, "retrieval failed: {e}");
+                        ControlAck::Error {
+                            message: format!("retrieval from {peer}: {e}"),
+                        }
+                    }
+                };
+                let _ = ack.send(reply);
+            });
         }
     }
 }

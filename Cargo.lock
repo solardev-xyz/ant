@@ -106,6 +106,7 @@ dependencies = [
 name = "ant-control"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -143,6 +144,7 @@ version = "0.1.0"
 dependencies = [
  "ant-control",
  "ant-crypto",
+ "ant-retrieval",
  "futures",
  "hex",
  "hickory-resolver",
