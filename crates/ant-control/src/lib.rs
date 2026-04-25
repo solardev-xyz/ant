@@ -13,7 +13,7 @@ mod server;
 
 pub use protocol::{
     HandshakeReport, IdentityInfo, PeerConnectionInfo, PeerConnectionState, PeerInfo,
-    PeerPipelineEntry, ProtocolError, Request, Response, StatusSnapshot, VersionInfo,
+    PeerPipelineEntry, ProtocolError, Request, Response, RoutingInfo, StatusSnapshot, VersionInfo,
     PROTOCOL_VERSION,
 };
 

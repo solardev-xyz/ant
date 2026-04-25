@@ -82,6 +82,27 @@ pub struct PeerInfo {
     /// Monotonic time from process start to reaching `node_limit` BZZ peers.
     #[serde(default)]
     pub time_to_node_limit_s: Option<f64>,
+    /// Forwarding-Kademlia routing table summary (per-bin peer counts).
+    /// Empty `bins` on older daemons.
+    #[serde(default)]
+    pub routing: RoutingInfo,
+}
+
+/// Snapshot of the forwarding-Kademlia routing table: how many BZZ peers
+/// we currently have, indexed by proximity order to our overlay. `bins[i]`
+/// is the count of peers in PO bin `i` (0 = farthest, 31 = closest).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RoutingInfo {
+    /// Local Swarm overlay as a `0x`-prefixed hex string. Empty when the
+    /// daemon has no peers and hasn't computed it yet.
+    #[serde(default)]
+    pub base_overlay: String,
+    /// Total entries in the routing table (== number of BZZ peers we have).
+    #[serde(default)]
+    pub size: u32,
+    /// Per-bin peer counts. Always 32 elements when populated.
+    #[serde(default)]
+    pub bins: Vec<u32>,
 }
 
 /// Connection / pipeline state for a peer, aligned with the daemon’s swarm view.

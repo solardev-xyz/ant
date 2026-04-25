@@ -4,12 +4,17 @@ use crate::dial::{bootstrap_dial_opts, endpoint_host, first_multiaddr_per_peer};
 use crate::dnsaddr;
 use crate::handshake::{handshake_outbound, HandshakeError, HandshakeInfo, PROTOCOL_HANDSHAKE};
 use crate::peerstore::PeerStore;
+use crate::routing::{Overlay, RoutingTable};
 use crate::sinks;
 use ant_control::{
     ControlAck, ControlCommand, HandshakeReport, PeerConnectionInfo, PeerConnectionState,
-    PeerPipelineEntry, StatusSnapshot,
+    PeerPipelineEntry, RoutingInfo, StatusSnapshot,
 };
-use ant_crypto::{OVERLAY_NONCE_LEN, SECP256K1_SECRET_LEN};
+use ant_crypto::{
+    ethereum_address_from_public_key, overlay_from_ethereum_address, OVERLAY_NONCE_LEN,
+    SECP256K1_SECRET_LEN,
+};
+use k256::ecdsa::{SigningKey, VerifyingKey};
 use futures::StreamExt;
 use libp2p::core::connection::ConnectedPoint;
 use libp2p::identify;
@@ -214,6 +219,11 @@ struct SwarmState {
     failed: Vec<PeerFailure>,
     pending: HashMap<PeerId, PendingPhase>,
     bzz_peers: HashSet<PeerId>,
+    /// Forwarding-Kademlia routing table populated as each outbound BZZ
+    /// handshake completes; consumed by the retrieval client to pick which
+    /// peer to ask for a given chunk. Mirrors `bzz_peers` but carries the
+    /// overlay alongside the peer-id and indexes by proximity order.
+    routing: RoutingTable,
     /// All peer ids we've ever had a hint for, whether enqueued or already
     /// dialed. Stops hive's Peers broadcasts from queueing the same peer
     /// repeatedly as every bootnode gossips its neighbourhood to us.
@@ -230,7 +240,7 @@ struct SwarmState {
 }
 
 impl SwarmState {
-    fn new(target_peers: usize) -> Self {
+    fn new(target_peers: usize, base_overlay: Overlay) -> Self {
         Self {
             dialing: HashSet::new(),
             dial_started: HashMap::new(),
@@ -239,6 +249,7 @@ impl SwarmState {
             failed: Vec::new(),
             pending: HashMap::new(),
             bzz_peers: HashSet::new(),
+            routing: RoutingTable::new(base_overlay),
             seen_hints: HashSet::new(),
             hint_queue: VecDeque::new(),
             target_peers,
@@ -407,9 +418,47 @@ fn sync_peer_pipeline(status: &Option<watch::Sender<StatusSnapshot>>, state: &mu
     const FAIL_TTL: Duration = Duration::from_secs(60);
     state.failed.retain(|f| f.at.elapsed() < FAIL_TTL);
     let Some(tx) = status else { return };
+    let routing = routing_snapshot(&state.routing);
     tx.send_modify(|st| {
         st.peers.peer_pipeline = build_peer_pipeline_entries(state, &st.peers.connected_peers);
+        st.peers.routing = routing.clone();
     });
+}
+
+/// Build a `RoutingInfo` that mirrors the live routing table for the
+/// control snapshot. Cheap (32 entries) so we recompute on every pipeline
+/// sync rather than try to track deltas.
+fn routing_snapshot(table: &RoutingTable) -> RoutingInfo {
+    let counts = table.bin_counts();
+    RoutingInfo {
+        base_overlay: format!("0x{}", hex::encode(table.base())),
+        size: table.len() as u32,
+        bins: counts.iter().map(|c| *c as u32).collect(),
+    }
+}
+
+/// Push a routing-only update to the status snapshot. Used right after
+/// `routing.admit` so `antctl top` reflects new peers without waiting for
+/// the next pipeline-sync tick.
+fn sync_routing_snapshot(status: &Option<watch::Sender<StatusSnapshot>>, table: &RoutingTable) {
+    let Some(tx) = status else { return };
+    let routing = routing_snapshot(table);
+    tx.send_modify(|st| st.peers.routing = routing);
+}
+
+/// Compute our own Swarm overlay from the BZZ signing secret + nonce. This
+/// is the same derivation the BZZ handshake uses, just lifted out so the
+/// routing table can pin its base address before the first peer connects.
+fn local_overlay_from_secret(
+    signing_secret: &[u8; SECP256K1_SECRET_LEN],
+    overlay_nonce: &[u8; OVERLAY_NONCE_LEN],
+    network_id: u64,
+) -> Overlay {
+    let sk = SigningKey::from_bytes(signing_secret.into())
+        .expect("signing_secret was validated at startup");
+    let vk = VerifyingKey::from(&sk);
+    let eth = ethereum_address_from_public_key(&vk);
+    overlay_from_ethereum_address(&eth, network_id, overlay_nonce)
 }
 
 /// Run forever. Keeps a running handshake pipeline (capacity =
@@ -454,7 +503,12 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     if let Some(s) = &cfg.status {
         s.send_modify(|st| st.peers.node_limit = target_peers as u32);
     }
-    let mut state = SwarmState::new(target_peers);
+    let base_overlay = local_overlay_from_secret(
+        &cfg.signing_secret,
+        &cfg.overlay_nonce,
+        cfg.network_id,
+    );
+    let mut state = SwarmState::new(target_peers, base_overlay);
     let mut peerstore = match cfg.peerstore_path.clone() {
         Some(p) => PeerStore::load(p),
         None => PeerStore::disabled(),
@@ -773,6 +827,10 @@ fn handle_swarm_event(
             state.dial_hint_addr.remove(&peer_id);
             let was_pending = state.pending.remove(&peer_id).is_some();
             let was_bzz = state.bzz_peers.remove(&peer_id);
+            // Drop the routing entry alongside `bzz_peers`; otherwise the
+            // forwarder would keep picking a peer we have no live
+            // connection to.
+            state.routing.forget(&peer_id);
             if was_bzz {
                 info!(
                     target: "ant_p2p",
@@ -861,6 +919,10 @@ fn handle_drive_outcome(
         DriveOutcome::Ok(info) => {
             let first_bzz_in_session = state.bzz_peers.is_empty();
             state.bzz_peers.insert(peer);
+            // The remote_overlay was just verified by `handshake_outbound`
+            // (signature recovers to an Ethereum address whose overlay
+            // matches the declared one), so admitting it is safe.
+            state.routing.admit(peer, info.remote_overlay);
             let peer_set_size = state.peer_set_size();
             state.failed.retain(|f| f.peer != peer);
             *backoff = MIN_BACKOFF;
@@ -873,6 +935,7 @@ fn handle_drive_outcome(
                 state.target_peers,
             );
             record_handshake(&cfg.status, peer, &info, peer_agents.get(&peer).cloned());
+            sync_routing_snapshot(&cfg.status, &state.routing);
             // Persist the working dial address. We only ever record outbound
             // peers — for inbound connections we don't yet have a guaranteed-
             // reachable multiaddr, so we let those become hints via hive

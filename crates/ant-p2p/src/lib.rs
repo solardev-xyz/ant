@@ -5,11 +5,13 @@ mod dial;
 pub mod dnsaddr;
 mod handshake;
 mod peerstore;
+pub mod routing;
 mod sinks;
 mod underlay;
 
 pub use behaviour::{run, RunConfig, RunError, DEFAULT_TARGET_PEERS};
 pub use handshake::{HandshakeError, HandshakeInfo, PROTOCOL_HANDSHAKE};
+pub use routing::{proximity, RoutingTable, NUM_BINS, OVERLAY_LEN};
 
 use libp2p::multiaddr::Multiaddr;
 use std::time::Duration;
