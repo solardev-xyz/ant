@@ -32,9 +32,7 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 pub enum ControlCommand {
     /// Drop the on-disk peerstore snapshot and clear the in-memory dedup
     /// state. Does not disconnect current peers.
-    ResetPeerstore {
-        ack: oneshot::Sender<ControlAck>,
-    },
+    ResetPeerstore { ack: oneshot::Sender<ControlAck> },
 }
 
 /// Node-loop reply to a [`ControlCommand`]. Serialized back to the client as
@@ -117,11 +115,12 @@ async fn handle_connection(
             agent,
             protocol_version: PROTOCOL_VERSION,
         }),
-        Ok(Request::PeersReset) => dispatch_command(
-            command_tx.as_ref(),
-            |ack| ControlCommand::ResetPeerstore { ack },
-        )
-        .await,
+        Ok(Request::PeersReset) => {
+            dispatch_command(command_tx.as_ref(), |ack| ControlCommand::ResetPeerstore {
+                ack,
+            })
+            .await
+        }
         Err(e) => Response::Error {
             message: format!("bad request: {e}"),
         },

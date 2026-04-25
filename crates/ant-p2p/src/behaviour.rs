@@ -65,6 +65,8 @@ pub struct RunConfig {
     /// commands like `antctl peers reset` will fail with
     /// `"daemon has no control-command channel wired up"`.
     pub commands: Option<mpsc::Receiver<ControlCommand>>,
+    /// Baseline for cold-start elapsed metrics (`time_to_first_peer_s`, etc.).
+    pub process_start: std::time::Instant,
 }
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
@@ -567,11 +569,7 @@ async fn recv_command(
 /// Apply a control-socket command against the node loop's single-writer
 /// state. Keep the match exhaustive so a newly-added variant on the wire is
 /// noisily rejected instead of silently dropped.
-fn handle_control_command(
-    state: &mut SwarmState,
-    peerstore: &mut PeerStore,
-    cmd: ControlCommand,
-) {
+fn handle_control_command(state: &mut SwarmState, peerstore: &mut PeerStore, cmd: ControlCommand) {
     match cmd {
         ControlCommand::ResetPeerstore { ack } => {
             let evicted = peerstore.clear();
@@ -861,10 +859,19 @@ fn handle_drive_outcome(
     };
     match outcome {
         DriveOutcome::Ok(info) => {
+            let first_bzz_in_session = state.bzz_peers.is_empty();
             state.bzz_peers.insert(peer);
+            let peer_set_size = state.peer_set_size();
             state.failed.retain(|f| f.peer != peer);
             *backoff = MIN_BACKOFF;
-            log_handshake_ok(&info, state.peer_set_size(), pipeline_ms);
+            log_handshake_ok(&info, peer_set_size, pipeline_ms);
+            record_peer_session_milestones(
+                &cfg.status,
+                cfg.process_start,
+                first_bzz_in_session,
+                peer_set_size,
+                state.target_peers,
+            );
             record_handshake(&cfg.status, peer, &info, peer_agents.get(&peer).cloned());
             // Persist the working dial address. We only ever record outbound
             // peers — for inbound connections we don't yet have a guaranteed-
@@ -1082,6 +1089,29 @@ fn peer_endpoint(endpoint: &ConnectedPoint) -> (String, String) {
             ("inbound".to_string(), send_back_addr.to_string())
         }
     }
+}
+
+/// Record one-shot session timings for UIs (e.g. `antctl top`).
+fn record_peer_session_milestones(
+    status: &Option<watch::Sender<StatusSnapshot>>,
+    process_start: std::time::Instant,
+    first_bzz_in_session: bool,
+    peer_set_size: usize,
+    target_peers: usize,
+) {
+    let Some(s) = status else { return };
+    let elapsed = process_start.elapsed().as_secs_f64();
+    s.send_modify(|st| {
+        if first_bzz_in_session {
+            st.peers.time_to_first_peer_s.get_or_insert(elapsed);
+        }
+        // Guard against the (currently unreachable but cheap to defend against)
+        // case where a future caller wires `RunConfig::target_peers = 0`
+        // directly without going through `state.target_peers` normalisation.
+        if target_peers > 0 && peer_set_size >= target_peers {
+            st.peers.time_to_node_limit_s.get_or_insert(elapsed);
+        }
+    });
 }
 
 fn record_handshake(

@@ -6,6 +6,7 @@ use ant_p2p::{run, RunConfig};
 use libp2p::identity::Keypair;
 use libp2p::multiaddr::Multiaddr;
 use std::path::PathBuf;
+use std::time::Instant;
 use thiserror::Error;
 use tokio::sync::{mpsc, watch};
 
@@ -32,6 +33,8 @@ pub struct NodeConfig {
     /// mutating `antctl` subcommands (`peers reset`, …) will fail with a
     /// "channel not wired up" error.
     pub commands: Option<mpsc::Receiver<ControlCommand>>,
+    /// Baseline for `PeerInfo` cold-start timings (`antctl top` milestones).
+    pub process_start: Instant,
 }
 
 impl NodeConfig {
@@ -51,6 +54,7 @@ impl NodeConfig {
             status: None,
             peerstore_path: None,
             commands: None,
+            process_start: Instant::now(),
         }
     }
 
@@ -73,6 +77,11 @@ impl NodeConfig {
         self.commands = Some(commands);
         self
     }
+
+    pub fn with_process_start(mut self, t: Instant) -> Self {
+        self.process_start = t;
+        self
+    }
 }
 
 /// Run the M1.0 node loop until the process is interrupted.
@@ -88,6 +97,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<(), NodeError> {
         target_peers: 0,
         peerstore_path: cfg.peerstore_path,
         commands: cfg.commands,
+        process_start: cfg.process_start,
     })
     .await?;
     Ok(())

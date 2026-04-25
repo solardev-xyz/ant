@@ -125,10 +125,7 @@ fn main() -> Result<()> {
             match resp {
                 Response::Ok { message } => {
                     if opt.json {
-                        println!(
-                            "{}",
-                            serde_json::json!({ "ok": true, "message": message })
-                        );
+                        println!("{}", serde_json::json!({ "ok": true, "message": message }));
                     } else {
                         println!("{message}");
                     }
@@ -166,7 +163,14 @@ fn run_top(socket: &Path, interval_ms: u64) -> Result<()> {
             match fetch_status(socket) {
                 Ok(snap) => {
                     let idx = selection.current_index(&snap);
-                    render_top(terminal.terminal_mut(), &snap, socket, interval_ms, page, idx)?;
+                    render_top(
+                        terminal.terminal_mut(),
+                        &snap,
+                        socket,
+                        interval_ms,
+                        page,
+                        idx,
+                    )?;
                     last_status = Some(snap);
                     last_error = None;
                 }
@@ -198,7 +202,14 @@ fn run_top(socket: &Path, interval_ms: u64) -> Result<()> {
             if redraw {
                 if let Some(snap) = &last_status {
                     let idx = selection.current_index(snap);
-                    render_top(terminal.terminal_mut(), snap, socket, interval_ms, page, idx)?;
+                    render_top(
+                        terminal.terminal_mut(),
+                        snap,
+                        socket,
+                        interval_ms,
+                        page,
+                        idx,
+                    )?;
                 } else if let Some(error) = &last_error {
                     render_top_error(terminal.terminal_mut(), socket, interval_ms, page, error)?;
                 }
@@ -266,7 +277,14 @@ fn short_peer_id(id: &str) -> String {
         return id.to_string();
     }
     let pre: String = id.chars().take(4).collect();
-    let suf: String = id.chars().rev().take(4).collect::<String>().chars().rev().collect();
+    let suf: String = id
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
     format!("{pre}…{suf}")
 }
 
@@ -753,7 +771,7 @@ fn draw_nodes_page(
     let [progress_area, table_area, detail_area] = vertical_chunks(
         area,
         [
-            Constraint::Length(3),
+            Constraint::Length(4),
             Constraint::Percentage(58),
             Constraint::Percentage(42),
         ],
@@ -763,14 +781,8 @@ fn draw_nodes_page(
     draw_node_details(frame, detail_area, s, now, selected);
 }
 
+/// `Connected` progress bar + cold-start timing line (one bordered box, `antctl top`).
 fn draw_connected_progress(frame: &mut Frame, area: TuiRect, s: &StatusSnapshot) {
-    let limit = s.peers.node_limit.max(1);
-    let connected = ready_count_for_gauge(s).min(limit);
-    let ratio = connected as f64 / limit as f64;
-    draw_progress_gauge(frame, area, &progress_label(connected, limit), ratio);
-}
-
-fn draw_progress_gauge(frame: &mut Frame, area: TuiRect, label: &str, ratio: f64) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
@@ -779,10 +791,48 @@ fn draw_progress_gauge(frame: &mut Frame, area: TuiRect, label: &str, ratio: f64
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let [bar_area, time_area] =
+        vertical_chunks(inner, [Constraint::Length(1), Constraint::Length(1)]);
+
+    let limit = s.peers.node_limit.max(1);
+    let connected = ready_count_for_gauge(s).min(limit);
+    let ratio = connected as f64 / limit as f64;
+    draw_gauge_line(frame, bar_area, &progress_label(connected, limit), ratio);
+
+    let m = peer_milestone_line(s);
+    let time_line = if m.is_empty() {
+        Line::default()
+    } else {
+        Line::from(Span::styled(
+            format!(" {m} "),
+            Style::default()
+                .bg(Color::Blue)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    frame.render_widget(
+        Paragraph::new(time_line).style(Style::default().bg(Color::Blue).fg(Color::White)),
+        time_area,
+    );
+}
+
+/// Populated as milestones occur (`antd` p2p loop); only non-empty `Option`s are shown.
+fn peer_milestone_line(s: &StatusSnapshot) -> String {
+    let n = s.peers.node_limit.max(1);
+    let mut parts = Vec::new();
+    if let Some(t) = s.peers.time_to_first_peer_s {
+        parts.push(format!("Time to first peer: {:.3}s", t));
+    }
+    if let Some(t) = s.peers.time_to_node_limit_s {
+        parts.push(format!("Time to {n} nodes: {:.3}s", t));
+    }
+    parts.join("  ")
+}
+
+fn draw_gauge_line(frame: &mut Frame, area: TuiRect, label: &str, ratio: f64) {
     let prefix = format!(" Connected: {label} ");
-    let bar_width = inner
-        .width
-        .saturating_sub(prefix.chars().count() as u16 + 3) as usize;
+    let bar_width = area.width.saturating_sub(prefix.chars().count() as u16 + 3) as usize;
     let filled = ((bar_width as f64 * ratio).round() as usize).min(bar_width);
     let empty = bar_width - filled;
     let line = Line::from(vec![
@@ -824,7 +874,7 @@ fn draw_progress_gauge(frame: &mut Frame, area: TuiRect, label: &str, ratio: f64
     ]);
     frame.render_widget(
         Paragraph::new(line).style(Style::default().bg(Color::Blue)),
-        inner,
+        area,
     );
 }
 
@@ -837,12 +887,32 @@ fn draw_disconnected_nodes_page(frame: &mut Frame, area: TuiRect, error: &str) {
     let [progress_area, table_area, detail_area] = vertical_chunks(
         area,
         [
-            Constraint::Length(3),
+            Constraint::Length(4),
             Constraint::Percentage(58),
             Constraint::Percentage(42),
         ],
     );
-    draw_progress_gauge(frame, progress_area, "000/???", 0.0);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::Blue));
+    let inner = block.inner(progress_area);
+    frame.render_widget(block, progress_area);
+    let [bar_area, time_area] =
+        vertical_chunks(inner, [Constraint::Length(1), Constraint::Length(1)]);
+    draw_gauge_line(frame, bar_area, "000/???", 0.0);
+    let waiting = Line::from(Span::styled(
+        " (waiting for antd) ",
+        Style::default()
+            .bg(Color::Blue)
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(
+        Paragraph::new(waiting).style(Style::default().bg(Color::Blue).fg(Color::White)),
+        time_area,
+    );
     draw_empty_nodes_table(frame, table_area);
     let rows = [
         kv("daemon", "disconnected"),
@@ -1086,7 +1156,11 @@ fn draw_node_details(
                     kv("state", pipeline_state_label(row.state)),
                     kv(
                         "ip",
-                        if row.ip.is_empty() { "-" } else { row.ip.as_str() },
+                        if row.ip.is_empty() {
+                            "-"
+                        } else {
+                            row.ip.as_str()
+                        },
                     ),
                 ];
                 if let Some(peer) = full {

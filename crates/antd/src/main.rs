@@ -12,7 +12,7 @@ use k256::ecdsa::SigningKey;
 use libp2p::identity::{self, Keypair};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
 use tracing_subscriber::EnvFilter;
 
@@ -87,6 +87,7 @@ struct IdentityFile {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let process_start = Instant::now();
     let opt = Opt::parse();
     let data_dir = expand_tilde(&opt.data_dir);
     std::fs::create_dir_all(&data_dir).with_context(|| format!("create data dir {data_dir:?}"))?;
@@ -214,6 +215,7 @@ async fn main() -> Result<()> {
     let node_fut = run_node(
         NodeConfig::mainnet_default(signing_secret, overlay_nonce, bootnodes, libp2p_keypair)
             .with_status(status_tx)
+            .with_process_start(process_start)
             .with_external_addrs(external_addrs)
             .with_peerstore_path(peerstore_path)
             .with_commands(cmd_rx),
@@ -225,8 +227,7 @@ async fn main() -> Result<()> {
     }
 
     let control_path = control_socket.clone();
-    let control_fut =
-        ant_control::serve(control_path, AGENT.to_string(), status_rx, Some(cmd_tx));
+    let control_fut = ant_control::serve(control_path, AGENT.to_string(), status_rx, Some(cmd_tx));
     tracing::info!(
         target: "antd",
         "control socket at {}",

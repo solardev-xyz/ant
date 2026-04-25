@@ -35,8 +35,12 @@ pub enum Response {
     /// Generic acknowledgement for commands that have no structured payload
     /// (e.g. `PeersReset`). `message` carries a human-readable summary of
     /// what the daemon did.
-    Ok { message: String },
-    Error { message: String },
+    Ok {
+        message: String,
+    },
+    Error {
+        message: String,
+    },
 }
 
 /// Everything `antctl status` wants to show.
@@ -72,6 +76,12 @@ pub struct PeerInfo {
     #[serde(default)]
     pub peer_pipeline: Vec<PeerPipelineEntry>,
     pub last_handshake: Option<HandshakeReport>,
+    /// Monotonic time from process start to first BZZ peer (seconds, e.g. for `antctl top`).
+    #[serde(default)]
+    pub time_to_first_peer_s: Option<f64>,
+    /// Monotonic time from process start to reaching `node_limit` BZZ peers.
+    #[serde(default)]
+    pub time_to_node_limit_s: Option<f64>,
 }
 
 /// Connection / pipeline state for a peer, aligned with the daemon’s swarm view.
