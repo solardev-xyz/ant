@@ -12,8 +12,9 @@ mod client;
 mod server;
 
 pub use protocol::{
-    HandshakeReport, IdentityInfo, PeerConnectionInfo, PeerInfo, ProtocolError, Request, Response,
-    StatusSnapshot, VersionInfo, PROTOCOL_VERSION,
+    HandshakeReport, IdentityInfo, PeerConnectionInfo, PeerConnectionState, PeerInfo,
+    PeerPipelineEntry, ProtocolError, Request, Response, StatusSnapshot, VersionInfo,
+    PROTOCOL_VERSION,
 };
 
 #[cfg(unix)]

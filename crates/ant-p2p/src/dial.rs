@@ -7,12 +7,38 @@
 //! bootnode TXT records always include the peer id, and without it we can't
 //! match returning `ConnectionEstablished` events back to a handshake target.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU8;
 
 use libp2p::multiaddr::Protocol;
 use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::{Multiaddr, PeerId};
+
+/// For UI: first IP literal or DNS label in a multiaddr.
+pub fn endpoint_host(ma: &Multiaddr) -> String {
+    for p in ma.iter() {
+        match p {
+            Protocol::Ip4(ip) => return ip.to_string(),
+            Protocol::Ip6(ip) => return ip.to_string(),
+            Protocol::Dns4(d) | Protocol::Dns6(d) | Protocol::Dnsaddr(d) => {
+                return d.to_string();
+            }
+            _ => {}
+        }
+    }
+    String::new()
+}
+
+/// One multiaddr per peer (first seen) for hint / bootstrap dials.
+pub fn first_multiaddr_per_peer(addrs: &[Multiaddr]) -> HashMap<PeerId, Multiaddr> {
+    let mut m = HashMap::new();
+    for a in addrs {
+        if let Some(pid) = extract_peer_id(a) {
+            m.entry(pid).or_insert_with(|| a.clone());
+        }
+    }
+    m
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IpVersion {

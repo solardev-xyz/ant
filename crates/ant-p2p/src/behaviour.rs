@@ -1,11 +1,14 @@
 //! Tokio libp2p swarm: dial bootnodes, open `/swarm/handshake/14.0.0/handshake` via `libp2p_stream`, Identify + Ping.
 
-use crate::dial::bootstrap_dial_opts;
+use crate::dial::{bootstrap_dial_opts, endpoint_host, first_multiaddr_per_peer};
 use crate::dnsaddr;
 use crate::handshake::{handshake_outbound, HandshakeError, HandshakeInfo, PROTOCOL_HANDSHAKE};
 use crate::peerstore::PeerStore;
 use crate::sinks;
-use ant_control::{ControlAck, ControlCommand, HandshakeReport, PeerConnectionInfo, StatusSnapshot};
+use ant_control::{
+    ControlAck, ControlCommand, HandshakeReport, PeerConnectionInfo, PeerConnectionState,
+    PeerPipelineEntry, StatusSnapshot,
+};
 use ant_crypto::{OVERLAY_NONCE_LEN, SECP256K1_SECRET_LEN};
 use futures::StreamExt;
 use libp2p::core::connection::ConnectedPoint;
@@ -89,10 +92,10 @@ const HINT_CHAN_CAP: usize = 512;
 const HINT_DIAL_BATCH: usize = 4;
 /// Default target peer count if `RunConfig::target_peers` is left at zero.
 /// Bee's mainnet neighbourhood typically fans out to a few hundred peers
-/// once kademlia stabilises; 300 keeps us in that ballpark while leaving
-/// plenty of headroom under the raised `RLIMIT_NOFILE` we bump to at
-/// `antd` startup.
-pub const DEFAULT_TARGET_PEERS: usize = 300;
+/// once kademlia stabilises; 100 keeps us connected to a useful slice of
+/// that fan-out while staying cheap on CPU/FDs and well under the raised
+/// `RLIMIT_NOFILE` we bump to at `antd` startup.
+pub const DEFAULT_TARGET_PEERS: usize = 100;
 /// Wall-clock cadence for flushing the peerstore snapshot to disk. Trades
 /// off "how much state can we lose on a SIGKILL" against IO churn under
 /// peer churn. 30 s strikes a balance: a fresh restart still warms within
@@ -162,30 +165,51 @@ enum PendingPhase {
     AwaitingIdentify {
         sig: oneshot::Sender<()>,
         addr: Multiaddr,
+        identify_started: Instant,
+        /// `Some` when we were the dialer and recorded a start in `dial_started`.
+        dial_ms: Option<u64>,
     },
     /// Identify sent; the spawned task is opening the BZZ stream and running
     /// the handshake. Kept for cleanup on disconnect plus the dialed addr we
     /// hand to the peerstore on success.
-    Handshaking { addr: Multiaddr },
+    Handshaking {
+        addr: Multiaddr,
+        handshake_started: Instant,
+        dial_ms: Option<u64>,
+        identifying_ms: u64,
+    },
 }
 
 impl PendingPhase {
     fn dialed_addr(&self) -> Multiaddr {
         match self {
             PendingPhase::AwaitingIdentify { addr, .. } => addr.clone(),
-            PendingPhase::Handshaking { addr } => addr.clone(),
+            PendingPhase::Handshaking { addr, .. } => addr.clone(),
         }
     }
 }
 
 /// Swarm-loop accounting: which peers we're mid-handshake with, which have
 /// completed, and the dial backlog from hive gossip.
+struct PeerFailure {
+    peer: PeerId,
+    at: Instant,
+}
+
 struct SwarmState {
     /// Peers we've dialed but haven't yet seen a `ConnectionEstablished` or
     /// `OutgoingConnectionError` for. Counting these against `target_peers`
     /// is what stops us from firing 4 dials per event-loop iteration and
     /// ballooning the peer set past the cap on fast connections.
     dialing: HashSet<PeerId>,
+    /// Wall time when `dialing.insert` happened (outbound dials only).
+    dial_started: HashMap<PeerId, Instant>,
+    /// A representative dial address for `antctl` (first hint / bootnode multiaddr).
+    dial_hint_addr: HashMap<PeerId, Multiaddr>,
+    /// `disconnect_peer_id` was called; connection not fully torn down yet.
+    closing: HashSet<PeerId>,
+    /// Recent dial or handshake failures (pruned in [`sync_peer_pipeline`]).
+    failed: Vec<PeerFailure>,
     pending: HashMap<PeerId, PendingPhase>,
     bzz_peers: HashSet<PeerId>,
     /// All peer ids we've ever had a hint for, whether enqueued or already
@@ -194,17 +218,30 @@ struct SwarmState {
     seen_hints: HashSet<PeerId>,
     hint_queue: VecDeque<sinks::PeerHint>,
     target_peers: usize,
+    /// Order in which peers first appeared in the pipeline. Used as the sort
+    /// key in [`build_peer_pipeline_entries`] so new peers are appended to
+    /// the bottom of the rendered table instead of jumping around as their
+    /// state advances. Pruned to whatever's currently in the pipeline on
+    /// every rebuild so it can't grow unbounded across long sessions.
+    peer_order: HashMap<PeerId, u64>,
+    next_peer_order: u64,
 }
 
 impl SwarmState {
     fn new(target_peers: usize) -> Self {
         Self {
             dialing: HashSet::new(),
+            dial_started: HashMap::new(),
+            dial_hint_addr: HashMap::new(),
+            closing: HashSet::new(),
+            failed: Vec::new(),
             pending: HashMap::new(),
             bzz_peers: HashSet::new(),
             seen_hints: HashSet::new(),
             hint_queue: VecDeque::new(),
             target_peers,
+            peer_order: HashMap::new(),
+            next_peer_order: 0,
         }
     }
 
@@ -229,6 +266,148 @@ impl SwarmState {
         }
         self.hint_queue.push_back(hint);
     }
+}
+
+fn record_swarm_failure(state: &mut SwarmState, peer: PeerId) {
+    state.failed.retain(|f| f.peer != peer);
+    state.failed.push(PeerFailure {
+        peer,
+        at: Instant::now(),
+    });
+    const MAX_FAIL: usize = 64;
+    if state.failed.len() > MAX_FAIL {
+        let drain = state.failed.len() - MAX_FAIL;
+        state.failed.drain(0..drain);
+    }
+}
+
+fn classify_pipeline_state(
+    peer: PeerId,
+    state: &SwarmState,
+    conn: Option<&PeerConnectionInfo>,
+) -> PeerConnectionState {
+    if state.closing.contains(&peer) {
+        return PeerConnectionState::Closing;
+    }
+    if state.bzz_peers.contains(&peer) {
+        return PeerConnectionState::Ready;
+    }
+    if let Some(phase) = state.pending.get(&peer) {
+        return match phase {
+            PendingPhase::AwaitingIdentify { .. } => PeerConnectionState::Identifying,
+            PendingPhase::Handshaking { .. } => PeerConnectionState::Handshaking,
+        };
+    }
+    if state.dialing.contains(&peer) {
+        return PeerConnectionState::Dialing;
+    }
+    if let Some(c) = conn {
+        return if c.bzz_overlay.is_some() {
+            PeerConnectionState::Ready
+        } else {
+            PeerConnectionState::Handshaking
+        };
+    }
+    if state.failed.iter().any(|f| f.peer == peer) {
+        return PeerConnectionState::Failed;
+    }
+    PeerConnectionState::Ready
+}
+
+fn ip_for_pipeline_row(
+    peer: PeerId,
+    state: &SwarmState,
+    conn: Option<&PeerConnectionInfo>,
+) -> String {
+    if let Some(c) = conn {
+        if let Ok(ma) = c.address.parse::<Multiaddr>() {
+            let h = endpoint_host(&ma);
+            if !h.is_empty() {
+                return h;
+            }
+        }
+    }
+    if let Some(phase) = state.pending.get(&peer) {
+        return endpoint_host(&phase.dialed_addr());
+    }
+    if let Some(ma) = state.dial_hint_addr.get(&peer) {
+        return endpoint_host(ma);
+    }
+    String::new()
+}
+
+fn build_peer_pipeline_entries(
+    state: &mut SwarmState,
+    connected: &[PeerConnectionInfo],
+) -> Vec<PeerPipelineEntry> {
+    let mut by_id: HashMap<PeerId, &PeerConnectionInfo> = HashMap::new();
+    for c in connected {
+        if let Ok(p) = c.peer_id.parse::<PeerId>() {
+            by_id.insert(p, c);
+        }
+    }
+    let mut all: HashSet<PeerId> = HashSet::new();
+    for p in &state.closing {
+        all.insert(*p);
+    }
+    for f in &state.failed {
+        all.insert(f.peer);
+    }
+    for p in &state.dialing {
+        all.insert(*p);
+    }
+    for p in state.pending.keys() {
+        all.insert(*p);
+    }
+    for p in &state.bzz_peers {
+        all.insert(*p);
+    }
+    for p in by_id.keys() {
+        all.insert(*p);
+    }
+
+    // Drop ordering for peers that have left the pipeline so the map can't
+    // grow unbounded over a long-running daemon. Done before assigning new
+    // sequence numbers so a peer that disappears and reappears gets sent to
+    // the bottom of the list (treated as a new peer).
+    state.peer_order.retain(|p, _| all.contains(p));
+
+    let mut rows: Vec<(u64, PeerPipelineEntry)> = Vec::with_capacity(all.len());
+    for peer in all {
+        let order = *state.peer_order.entry(peer).or_insert_with(|| {
+            let n = state.next_peer_order;
+            state.next_peer_order = state.next_peer_order.wrapping_add(1);
+            n
+        });
+        let conn = by_id.get(&peer).copied();
+        let st = classify_pipeline_state(peer, state, conn);
+        let ip = ip_for_pipeline_row(peer, state, conn);
+        rows.push((
+            order,
+            PeerPipelineEntry {
+                peer_id: peer.to_string(),
+                state: st,
+                ip,
+            },
+        ));
+    }
+    rows.sort_by_key(|(order, _)| *order);
+    rows.into_iter().map(|(_, e)| e).collect()
+}
+
+/// Time between full peer-pipeline rebuilds. Bootstrap fires hundreds of
+/// swarm events per second; without a floor here we'd rebuild + serialize a
+/// 200+ row pipeline (and grab the watch's write lock) on every event,
+/// starving `ant_control::serve` enough that `antctl top` reads time out.
+const PIPELINE_SYNC_INTERVAL: Duration = Duration::from_millis(100);
+
+fn sync_peer_pipeline(status: &Option<watch::Sender<StatusSnapshot>>, state: &mut SwarmState) {
+    const FAIL_TTL: Duration = Duration::from_secs(60);
+    state.failed.retain(|f| f.at.elapsed() < FAIL_TTL);
+    let Some(tx) = status else { return };
+    tx.send_modify(|st| {
+        st.peers.peer_pipeline = build_peer_pipeline_entries(state, &st.peers.connected_peers);
+    });
 }
 
 /// Run forever. Keeps a running handshake pipeline (capacity =
@@ -310,6 +489,9 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     flush_timer.tick().await;
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
+    let mut last_pipeline_sync = Instant::now()
+        .checked_sub(PIPELINE_SYNC_INTERVAL)
+        .unwrap_or_else(Instant::now);
 
     loop {
         fill_pipeline_from_hints(&mut swarm, &mut state);
@@ -321,6 +503,10 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
             &mut last_bootstrap_at,
         )
         .await;
+        if last_pipeline_sync.elapsed() >= PIPELINE_SYNC_INTERVAL {
+            sync_peer_pipeline(&cfg.status, &mut state);
+            last_pipeline_sync = Instant::now();
+        }
 
         tokio::select! {
             ev = swarm.select_next_some() => {
@@ -428,6 +614,11 @@ fn fill_pipeline_from_hints(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmSt
         match swarm.dial(opts) {
             Ok(()) => {
                 state.dialing.insert(peer_id);
+                state.dial_started.insert(peer_id, Instant::now());
+                state.failed.retain(|f| f.peer != peer_id);
+                if let Some(a) = hint.addrs.first() {
+                    state.dial_hint_addr.insert(peer_id, a.clone());
+                }
                 dialed += 1;
                 debug!(
                     target: "ant_p2p",
@@ -512,6 +703,8 @@ fn handle_swarm_event(
             peer_id, endpoint, ..
         } => {
             state.dialing.remove(&peer_id);
+            state.dial_hint_addr.remove(&peer_id);
+            state.failed.retain(|f| f.peer != peer_id);
             // Only dialer connections need our outbound BZZ handshake — bee
             // initiates the handshake over the listener direction itself.
             let ConnectedPoint::Dialer { address, .. } = endpoint else {
@@ -524,11 +717,17 @@ fn handle_swarm_event(
                 return;
             }
             let (tx, rx) = oneshot::channel();
+            let dial_ms = state
+                .dial_started
+                .remove(&peer_id)
+                .map(|t| t.elapsed().as_millis() as u64);
             state.pending.insert(
                 peer_id,
                 PendingPhase::AwaitingIdentify {
                     sig: tx,
                     addr: address.clone(),
+                    identify_started: Instant::now(),
+                    dial_ms,
                 },
             );
             let listen_addrs: Vec<Multiaddr> = swarm.listeners().cloned().collect();
@@ -550,17 +749,30 @@ fn handle_swarm_event(
             // 10 s on the peerstore being populated. `Event::Sent` is our
             // signal that we've pushed our identify to the remote, so it's
             // now safe to open the BZZ stream.
-            if let Some(PendingPhase::AwaitingIdentify { sig, addr }) =
-                state.pending.remove(&peer_id)
+            if let Some(PendingPhase::AwaitingIdentify {
+                sig,
+                addr,
+                identify_started,
+                dial_ms,
+            }) = state.pending.remove(&peer_id)
             {
-                state
-                    .pending
-                    .insert(peer_id, PendingPhase::Handshaking { addr });
+                let identifying_ms = identify_started.elapsed().as_millis() as u64;
+                state.pending.insert(
+                    peer_id,
+                    PendingPhase::Handshaking {
+                        addr,
+                        handshake_started: Instant::now(),
+                        dial_ms,
+                        identifying_ms,
+                    },
+                );
                 let _ = sig.send(());
                 trace!(target: "ant_p2p", %peer_id, "identify sent; unblocking handshake");
             }
         }
         SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+            state.closing.remove(&peer_id);
+            state.dial_hint_addr.remove(&peer_id);
             let was_pending = state.pending.remove(&peer_id).is_some();
             let was_bzz = state.bzz_peers.remove(&peer_id);
             if was_bzz {
@@ -587,11 +799,20 @@ fn handle_swarm_event(
         }
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
             if let Some(p) = peer_id {
+                // `dial_started` is set by the two paths that *we* drive
+                // (bootstrap_dial, fill_pipeline_from_hints). Any other
+                // outbound dial — e.g. a libp2p-internal redial or a stray
+                // address book attempt — would otherwise pollute the
+                // pipeline with `Failed` rows the operator never asked for.
+                let was_tracked = state.dial_started.remove(&p).is_some();
                 state.dialing.remove(&p);
-                // Only count failures for peers we already know — hint-only
-                // peers don't have an entry yet, so a hive-discovered dud
-                // doesn't pollute the snapshot. Stored entries that go dud
-                // get evicted after [`MAX_FAIL_COUNT`] consecutive failures.
+                state.dial_hint_addr.remove(&p);
+                if was_tracked {
+                    record_swarm_failure(state, p);
+                }
+                // Stored entries that go dud get evicted after
+                // [`MAX_FAIL_COUNT`] consecutive failures; the peerstore
+                // already noops for unknown peers.
                 peerstore.record_failure(&p);
             }
             // Bootnode dial failures are noisy during rotation; demote to
@@ -623,12 +844,27 @@ fn handle_drive_outcome(
     // Pull the dialed addr out of pending before we drop the entry: it's the
     // multiaddr we want to persist for redial. Entry may already be gone if
     // ConnectionClosed beat us here (e.g. bee dropped us mid-handshake).
-    let dialed_addr = state.pending.remove(&peer).map(|p| p.dialed_addr());
+    let pending_removed = state.pending.remove(&peer);
+    let dialed_addr = pending_removed.as_ref().map(PendingPhase::dialed_addr);
+    let pipeline_ms = match &pending_removed {
+        Some(PendingPhase::Handshaking {
+            handshake_started,
+            dial_ms,
+            identifying_ms,
+            ..
+        }) => Some(OutboundPipelineMs {
+            dial_ms: *dial_ms,
+            identifying_ms: *identifying_ms,
+            handshake_ms: handshake_started.elapsed().as_millis() as u64,
+        }),
+        _ => None,
+    };
     match outcome {
         DriveOutcome::Ok(info) => {
             state.bzz_peers.insert(peer);
+            state.failed.retain(|f| f.peer != peer);
             *backoff = MIN_BACKOFF;
-            log_handshake_ok(&info, state.peer_set_size());
+            log_handshake_ok(&info, state.peer_set_size(), pipeline_ms);
             record_handshake(&cfg.status, peer, &info, peer_agents.get(&peer).cloned());
             // Persist the working dial address. We only ever record outbound
             // peers — for inbound connections we don't yet have a guaranteed-
@@ -639,14 +875,27 @@ fn handle_drive_outcome(
         }
         DriveOutcome::OpenFailed(e) => {
             debug!(target: "ant_p2p", %peer, "open handshake stream: {e}");
+            mark_for_disconnect(state, swarm, peer);
+            record_swarm_failure(state, peer);
             peerstore.record_failure(&peer);
-            let _ = swarm.disconnect_peer_id(peer);
         }
         DriveOutcome::HandshakeFailed(e) => {
             warn!(target: "ant_p2p", %peer, "bzz handshake failed: {e}");
+            mark_for_disconnect(state, swarm, peer);
+            record_swarm_failure(state, peer);
             peerstore.record_failure(&peer);
-            let _ = swarm.disconnect_peer_id(peer);
         }
+    }
+}
+
+/// Tear down a peer and mark it `Closing` for the duration of the wind-down.
+/// `disconnect_peer_id` returns `Err` if there is no live connection (e.g.
+/// remote already closed); in that case `ConnectionClosed` won't fire and we
+/// must clear `closing` ourselves to avoid a sticky pipeline row.
+fn mark_for_disconnect(state: &mut SwarmState, swarm: &mut Swarm<AntBehaviour>, peer: PeerId) {
+    state.closing.insert(peer);
+    if swarm.disconnect_peer_id(peer).is_err() {
+        state.closing.remove(&peer);
     }
 }
 
@@ -875,7 +1124,18 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-fn log_handshake_ok(info: &HandshakeInfo, peer_set_size: usize) {
+/// Sub-second breakdown for a completed **outbound** (dialer) pipeline.
+struct OutboundPipelineMs {
+    dial_ms: Option<u64>,
+    identifying_ms: u64,
+    handshake_ms: u64,
+}
+
+fn log_handshake_ok(
+    info: &HandshakeInfo,
+    peer_set_size: usize,
+    pipeline_ms: Option<OutboundPipelineMs>,
+) {
     let ov = hex::encode(info.remote_overlay);
     let prefix = ov.chars().take(6).collect::<String>();
     let suffix = ov.chars().rev().take(2).collect::<String>();
@@ -884,6 +1144,23 @@ fn log_handshake_ok(info: &HandshakeInfo, peer_set_size: usize) {
         "bzz handshake ok overlay={prefix}…{suffix} full_node={} peer_set_size={peer_set_size}",
         info.remote_full_node,
     );
+    if let Some(p) = pipeline_ms {
+        let dial = p
+            .dial_ms
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "n/a".to_string());
+        let total_ms = p
+            .dial_ms
+            .map(|d| d + p.identifying_ms + p.handshake_ms)
+            .unwrap_or(p.identifying_ms + p.handshake_ms);
+        debug!(
+            target: "ant_p2p",
+            "outbound peer_pipeline_ms peer_set_size={peer_set_size} dial_ms={dial} \
+             identifying_ms={} handshake_ms={} total_ms={total_ms}",
+            p.identifying_ms,
+            p.handshake_ms,
+        );
+    }
 }
 
 /// Expand every `/dnsaddr/` entry into concrete peer multiaddrs, group by
@@ -901,6 +1178,7 @@ async fn bootstrap_dial(
         return;
     }
     let resolved = dnsaddr::resolve_all(bootnodes.iter().cloned()).await;
+    let first_for_peer = first_multiaddr_per_peer(&resolved);
     let opts_list = bootstrap_dial_opts(resolved);
     if opts_list.is_empty() {
         warn!(
@@ -929,6 +1207,11 @@ async fn bootstrap_dial(
                 actually_dialed += 1;
                 if let Some(p) = peer {
                     state.dialing.insert(p);
+                    state.dial_started.insert(p, Instant::now());
+                    state.failed.retain(|f| f.peer != p);
+                    if let Some(a) = first_for_peer.get(&p) {
+                        state.dial_hint_addr.insert(p, a.clone());
+                    }
                     info!(target: "ant_p2p", peer=%p, "dialing bootnode");
                 }
             }

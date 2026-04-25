@@ -67,7 +67,34 @@ pub struct PeerInfo {
     pub node_limit: u32,
     #[serde(default)]
     pub connected_peers: Vec<PeerConnectionInfo>,
+    /// Unified peer rows for UIs (e.g. `antctl top`); includes dialing / pipeline
+    /// states not present in `connected_peers` alone. Empty on older daemons.
+    #[serde(default)]
+    pub peer_pipeline: Vec<PeerPipelineEntry>,
     pub last_handshake: Option<HandshakeReport>,
+}
+
+/// Connection / pipeline state for a peer, aligned with the daemon’s swarm view.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum PeerConnectionState {
+    #[default]
+    Ready,
+    Dialing,
+    Identifying,
+    Handshaking,
+    Failed,
+    Closing,
+}
+
+/// One row in `PeerInfo::peer_pipeline` (full `peer_id`; clients may shorten for display).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerPipelineEntry {
+    pub peer_id: String,
+    pub state: PeerConnectionState,
+    /// Best-effort remote endpoint for UI (e.g. `192.0.2.1` or a DNS name).
+    #[serde(default)]
+    pub ip: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

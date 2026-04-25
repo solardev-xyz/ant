@@ -3,7 +3,9 @@
 //! Speaks to the daemon over its Unix-domain control socket (NDJSON,
 //! `ant-control::Request` / `Response`).
 
-use ant_control::{request_sync, Request, Response, StatusSnapshot};
+use ant_control::{
+    request_sync, PeerConnectionInfo, PeerConnectionState, Request, Response, StatusSnapshot,
+};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use crossterm::{
@@ -21,6 +23,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Paragraph, Row, Table, Tabs},
     Frame, Terminal,
 };
+use std::collections::HashMap;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -156,22 +159,14 @@ fn run_top(socket: &Path, interval_ms: u64) -> Result<()> {
     let mut last_status: Option<StatusSnapshot> = None;
     let mut last_error: Option<String> = None;
     let mut page = TopPage::Nodes;
-    let mut selected_node = 0usize;
+    let mut selection = NodeSelection::default();
 
     loop {
         if Instant::now() >= next_refresh {
             match fetch_status(socket) {
                 Ok(snap) => {
-                    selected_node =
-                        clamp_selection(selected_node, snap.peers.connected_peers.len());
-                    render_top(
-                        terminal.terminal_mut(),
-                        &snap,
-                        socket,
-                        interval_ms,
-                        page,
-                        selected_node,
-                    )?;
+                    let idx = selection.current_index(&snap);
+                    render_top(terminal.terminal_mut(), &snap, socket, interval_ms, page, idx)?;
                     last_status = Some(snap);
                     last_error = None;
                 }
@@ -193,44 +188,17 @@ fn run_top(socket: &Path, interval_ms: u64) -> Result<()> {
             if should_quit(&event) {
                 break;
             }
-            if let Some(next_page) = page.after_event(&event) {
+            let redraw = if let Some(next_page) = page.after_event(&event) {
                 page = next_page;
+                true
+            } else {
+                handle_selection_event(&event, &mut selection, last_status.as_ref())
+                    || matches!(event, Event::Resize(_, _))
+            };
+            if redraw {
                 if let Some(snap) = &last_status {
-                    render_top(
-                        terminal.terminal_mut(),
-                        snap,
-                        socket,
-                        interval_ms,
-                        page,
-                        selected_node,
-                    )?;
-                } else if let Some(error) = &last_error {
-                    render_top_error(terminal.terminal_mut(), socket, interval_ms, page, error)?;
-                }
-            } else if let Some(next_selection) =
-                selected_node_after_event(&event, selected_node, last_status.as_ref())
-            {
-                selected_node = next_selection;
-                if let Some(snap) = &last_status {
-                    render_top(
-                        terminal.terminal_mut(),
-                        snap,
-                        socket,
-                        interval_ms,
-                        page,
-                        selected_node,
-                    )?;
-                }
-            } else if matches!(event, Event::Resize(_, _)) {
-                if let Some(snap) = &last_status {
-                    render_top(
-                        terminal.terminal_mut(),
-                        snap,
-                        socket,
-                        interval_ms,
-                        page,
-                        selected_node,
-                    )?;
+                    let idx = selection.current_index(snap);
+                    render_top(terminal.terminal_mut(), snap, socket, interval_ms, page, idx)?;
                 } else if let Some(error) = &last_error {
                     render_top_error(terminal.terminal_mut(), socket, interval_ms, page, error)?;
                 }
@@ -248,22 +216,106 @@ fn clamp_selection(selected: usize, len: usize) -> usize {
     }
 }
 
-fn selected_node_after_event(
+/// Rows shown in the Nodes table (pipeline view when the daemon populates it).
+fn peer_list_len(s: &StatusSnapshot) -> usize {
+    if !s.peers.peer_pipeline.is_empty() {
+        s.peers.peer_pipeline.len()
+    } else {
+        s.peers.connected_peers.len()
+    }
+}
+
+/// Position-pinned selection: the cursor sticks to the row index the user
+/// navigated to, regardless of how peers churn underneath. Default is row 0
+/// — when the user hasn't moved yet the cursor stays glued to the top, so
+/// the visible header row never drifts as new peers stream in. Once the
+/// user presses Up/Down the index becomes "sticky" on that line: peers
+/// added or removed below don't move it, peers added or removed above
+/// don't either (we honour the index as a coordinate, not an anchor on a
+/// specific peer). The index is only clamped if the list shrinks past it.
+#[derive(Default)]
+struct NodeSelection {
+    index: usize,
+}
+
+impl NodeSelection {
+    fn current_index(&self, s: &StatusSnapshot) -> usize {
+        let len = peer_list_len(s);
+        if len == 0 {
+            0
+        } else {
+            self.index.min(len - 1)
+        }
+    }
+
+    fn move_by(&mut self, s: &StatusSnapshot, delta: isize) {
+        let len = peer_list_len(s);
+        if len == 0 {
+            self.index = 0;
+            return;
+        }
+        let cur = self.current_index(s) as isize;
+        let next = (cur + delta).clamp(0, len as isize - 1) as usize;
+        self.index = next;
+    }
+}
+
+fn short_peer_id(id: &str) -> String {
+    let c = id.chars().count();
+    if c <= 9 {
+        return id.to_string();
+    }
+    let pre: String = id.chars().take(4).collect();
+    let suf: String = id.chars().rev().take(4).collect::<String>().chars().rev().collect();
+    format!("{pre}…{suf}")
+}
+
+fn pipeline_state_label(st: PeerConnectionState) -> &'static str {
+    match st {
+        PeerConnectionState::Dialing => "Dialing",
+        PeerConnectionState::Identifying => "Identifying",
+        PeerConnectionState::Handshaking => "Handshaking",
+        PeerConnectionState::Ready => "Ready",
+        PeerConnectionState::Failed => "Failed",
+        PeerConnectionState::Closing => "Closing",
+    }
+}
+
+fn ready_count_for_gauge(s: &StatusSnapshot) -> u32 {
+    if !s.peers.peer_pipeline.is_empty() {
+        s.peers
+            .peer_pipeline
+            .iter()
+            .filter(|p| p.state == PeerConnectionState::Ready)
+            .count() as u32
+    } else {
+        s.peers.connected_peers.len() as u32
+    }
+}
+
+/// Returns true if the event was consumed and the caller should redraw.
+fn handle_selection_event(
     event: &Event,
-    selected: usize,
+    selection: &mut NodeSelection,
     status: Option<&StatusSnapshot>,
-) -> Option<usize> {
-    let len = status?.peers.connected_peers.len();
-    if len == 0 {
-        return None;
+) -> bool {
+    let Some(snap) = status else { return false };
+    if peer_list_len(snap) == 0 {
+        return false;
     }
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-            KeyCode::Up => Some(selected.saturating_sub(1)),
-            KeyCode::Down => Some((selected + 1).min(len - 1)),
-            _ => None,
+            KeyCode::Up => {
+                selection.move_by(snap, -1);
+                true
+            }
+            KeyCode::Down => {
+                selection.move_by(snap, 1);
+                true
+            }
+            _ => false,
         },
-        _ => None,
+        _ => false,
     }
 }
 
@@ -713,7 +765,7 @@ fn draw_nodes_page(
 
 fn draw_connected_progress(frame: &mut Frame, area: TuiRect, s: &StatusSnapshot) {
     let limit = s.peers.node_limit.max(1);
-    let connected = (s.peers.connected_peers.len() as u32).min(limit);
+    let connected = ready_count_for_gauge(s).min(limit);
     let ratio = connected as f64 / limit as f64;
     draw_progress_gauge(frame, area, &progress_label(connected, limit), ratio);
 }
@@ -800,19 +852,26 @@ fn draw_disconnected_nodes_page(frame: &mut Frame, area: TuiRect, error: &str) {
     draw_panel(frame, detail_area, "Details", &rows);
 }
 
-fn draw_empty_nodes_table(frame: &mut Frame, area: TuiRect) {
-    let rows = vec![Row::new(vec![
-        "(waiting for antd)".to_string(),
-        "-".to_string(),
-        "-".to_string(),
-        "-".to_string(),
-    ])];
-    let header = Row::new(vec!["peer id", "address", "agent", "type"]).style(
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    );
-    let block = Block::default()
+const NODES_HEADER: [&str; 6] = ["peer id", "state", "ip", "type", "agent", "version"];
+/// Gap between adjacent columns; `column_spacing(2)` so each column gets
+/// exactly two spaces of breathing room before the next one starts.
+const NODES_COLUMN_SPACING: u16 = 2;
+/// Fixed column widths picked once at startup so the table doesn't reflow
+/// between frames. Each width is `max(header, an upper bound on the longest
+/// cell ever rendered)`:
+///
+/// * `peer id` — `short_peer_id` always emits `XXXX…YYYY` (9 chars); 10
+///   leaves room for the `(none yet)` placeholder when the daemon has no
+///   peers yet.
+/// * `status` — longest pipeline label is `Identifying`/`Handshaking` (11).
+/// * `ip` — fits IPv4 `255.255.255.255` (15); rarer IPv6 / DNS values clip.
+/// * `type` — `light` is the longest of `full` / `light` / `-` (5).
+/// * `agent` — `bee` is 3; allow up to 8 for future clients without reflow.
+/// * `version` — `10.20.30` (8) covers any plausible semver core.
+const NODES_COLUMN_WIDTHS: [u16; 6] = [10, 11, 15, 5, 8, 8];
+
+fn nodes_table_block() -> Block<'static> {
+    Block::default()
         .title(" Nodes ")
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
@@ -822,26 +881,91 @@ fn draw_empty_nodes_table(frame: &mut Frame, area: TuiRect) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )
-        .style(Style::default().bg(Color::Blue));
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Percentage(32),
-            Constraint::Percentage(32),
-            Constraint::Percentage(24),
-            Constraint::Length(8),
-        ],
+        .style(Style::default().bg(Color::Blue))
+}
+
+fn nodes_header_row() -> Row<'static> {
+    Row::new(NODES_HEADER.to_vec()).style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
     )
-    .header(header)
-    .column_spacing(1)
-    .style(Style::default().bg(Color::Blue).fg(Color::White))
-    .block(block);
+}
+
+fn node_kind_label(full: Option<bool>) -> &'static str {
+    match full {
+        Some(true) => "full",
+        Some(false) => "light",
+        None => "-",
+    }
+}
+
+/// Split a libp2p Identify `agent_version` into a short name and a clean
+/// semver. Bee advertises `bee/2.7.1-61fab37b go1.25.2 linux/amd64`, so we
+/// take the part before the first `/` as the agent name and the leading
+/// numeric-dot run after it as the version (dropping the `-<gitsha>` and any
+/// `go<x>/<arch>` trailers).
+fn parse_agent_version(raw: &str) -> (String, String) {
+    if raw.is_empty() {
+        return (String::new(), String::new());
+    }
+    let (name, rest) = match raw.split_once('/') {
+        Some((n, r)) => (n.trim(), r),
+        None => return (raw.trim().to_string(), String::new()),
+    };
+    let version_field = rest.split_whitespace().next().unwrap_or("");
+    let version: String = version_field
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    let version = version.trim_end_matches('.').to_string();
+    let version = if version.is_empty() {
+        version_field.to_string()
+    } else {
+        version
+    };
+    (name.to_string(), version)
+}
+
+fn dash_if_empty(s: &str) -> String {
+    if s.is_empty() {
+        "-".to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+fn nodes_constraints() -> [Constraint; 6] {
+    [
+        Constraint::Length(NODES_COLUMN_WIDTHS[0]),
+        Constraint::Length(NODES_COLUMN_WIDTHS[1]),
+        Constraint::Length(NODES_COLUMN_WIDTHS[2]),
+        Constraint::Length(NODES_COLUMN_WIDTHS[3]),
+        Constraint::Length(NODES_COLUMN_WIDTHS[4]),
+        Constraint::Length(NODES_COLUMN_WIDTHS[5]),
+    ]
+}
+
+fn draw_empty_nodes_table(frame: &mut Frame, area: TuiRect) {
+    let rows = vec![Row::new(vec![
+        "(waiting…)".to_string(),
+        "-".to_string(),
+        "-".to_string(),
+        "-".to_string(),
+        "-".to_string(),
+        "-".to_string(),
+    ])];
+    let table = Table::new(rows, nodes_constraints())
+        .header(nodes_header_row())
+        .column_spacing(NODES_COLUMN_SPACING)
+        .style(Style::default().bg(Color::Blue).fg(Color::White))
+        .block(nodes_table_block());
     frame.render_widget(table, area);
 }
 
 fn draw_nodes_table(frame: &mut Frame, area: TuiRect, s: &StatusSnapshot, selected: usize) {
     let visible_rows = area.height.saturating_sub(3).max(1) as usize;
-    let total = s.peers.connected_peers.len();
+    let total = peer_list_len(s);
     let selected = clamp_selection(selected, total);
     let start = if total <= visible_rows {
         0
@@ -852,70 +976,88 @@ fn draw_nodes_table(frame: &mut Frame, area: TuiRect, s: &StatusSnapshot, select
     };
     let end = (start + visible_rows).min(total);
 
-    let rows: Vec<Row> = if s.peers.connected_peers.is_empty() {
-        vec![Row::new(vec![
+    // Pipeline rows carry only peer_id / state / ip; type and agent live on
+    // `connected_peers`, so index by id once and look up per row.
+    let by_id: HashMap<&str, &PeerConnectionInfo> = s
+        .peers
+        .connected_peers
+        .iter()
+        .map(|p| (p.peer_id.as_str(), p))
+        .collect();
+
+    let cells: Vec<Vec<String>> = if total == 0 {
+        vec![vec![
             "(none yet)".to_string(),
             "-".to_string(),
             "-".to_string(),
             "-".to_string(),
-        ])]
+            "-".to_string(),
+            "-".to_string(),
+        ]]
+    } else if !s.peers.peer_pipeline.is_empty() {
+        (start..end)
+            .map(|idx| {
+                let p = &s.peers.peer_pipeline[idx];
+                let conn = by_id.get(p.peer_id.as_str()).copied();
+                let (agent, version) =
+                    parse_agent_version(conn.map(|c| c.agent_version.as_str()).unwrap_or(""));
+                vec![
+                    short_peer_id(&p.peer_id),
+                    pipeline_state_label(p.state).to_string(),
+                    dash_if_empty(&p.ip),
+                    node_kind_label(conn.and_then(|c| c.full_node)).to_string(),
+                    dash_if_empty(&agent),
+                    dash_if_empty(&version),
+                ]
+            })
+            .collect()
     } else {
-        s.peers
-            .connected_peers
-            .iter()
-            .enumerate()
-            .skip(start)
-            .take(end - start)
-            .map(|(idx, peer)| {
-                let row = Row::new(vec![
-                    peer.peer_id.clone(),
-                    peer.address.clone(),
-                    unknown_if_empty(&peer.agent_version).to_string(),
-                    node_type(peer).to_string(),
-                ]);
-                if idx == selected {
-                    row.style(
-                        Style::default()
-                            .bg(Color::Cyan)
-                            .fg(Color::Black)
-                            .add_modifier(Modifier::BOLD),
-                    )
+        (start..end)
+            .map(|idx| {
+                let peer = &s.peers.connected_peers[idx];
+                let status = if peer.bzz_overlay.is_some() {
+                    "Ready"
                 } else {
-                    row
-                }
+                    "Handshaking"
+                };
+                let (agent, version) = parse_agent_version(&peer.agent_version);
+                vec![
+                    short_peer_id(&peer.peer_id),
+                    status.to_string(),
+                    status_addr_ip(peer),
+                    node_kind_label(peer.full_node).to_string(),
+                    dash_if_empty(&agent),
+                    dash_if_empty(&version),
+                ]
             })
             .collect()
     };
 
-    let header = Row::new(vec!["peer id", "address", "agent", "type"]).style(
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    );
-    let block = Block::default()
-        .title(" Nodes ")
-        .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title_style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
-        .style(Style::default().bg(Color::Blue));
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Percentage(32),
-            Constraint::Percentage(32),
-            Constraint::Percentage(24),
-            Constraint::Length(8),
-        ],
-    )
-    .header(header)
-    .column_spacing(1)
-    .style(Style::default().bg(Color::Blue).fg(Color::White))
-    .block(block);
+    let highlight = Style::default()
+        .bg(Color::Cyan)
+        .fg(Color::Black)
+        .add_modifier(Modifier::BOLD);
+
+    let rows: Vec<Row> = cells
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| {
+            // `i` indexes into the visible window; offset by `start` to map
+            // back onto the absolute selection cursor.
+            let row = Row::new(c);
+            if total > 0 && start + i == selected {
+                row.style(highlight)
+            } else {
+                row
+            }
+        })
+        .collect();
+
+    let table = Table::new(rows, nodes_constraints())
+        .header(nodes_header_row())
+        .column_spacing(NODES_COLUMN_SPACING)
+        .style(Style::default().bg(Color::Blue).fg(Color::White))
+        .block(nodes_table_block());
 
     frame.render_widget(table, area);
 }
@@ -927,47 +1069,103 @@ fn draw_node_details(
     now: u64,
     selected: usize,
 ) {
-    let selected = clamp_selection(selected, s.peers.connected_peers.len());
-    let rows = match s.peers.connected_peers.get(selected) {
-        Some(peer) => {
-            let mut rows = vec![
-                kv("peer_id", &peer.peer_id),
-                kv("direction", &peer.direction),
-                kv("address", &peer.address),
-                kv("agent", unknown_if_empty(&peer.agent_version)),
-                kv(
-                    "connected",
-                    &format_duration(now.saturating_sub(peer.connected_at_unix)),
-                ),
-            ];
-            if let Some(overlay) = &peer.bzz_overlay {
-                rows.push(kv("overlay", overlay));
+    let n = peer_list_len(s);
+    let selected = clamp_selection(selected, n);
+    let rows: Vec<PanelRow> = if n == 0 {
+        vec![kv("node", "(none selected)")]
+    } else if !s.peers.peer_pipeline.is_empty() {
+        match s.peers.peer_pipeline.get(selected) {
+            Some(row) => {
+                let full = s
+                    .peers
+                    .connected_peers
+                    .iter()
+                    .find(|p| p.peer_id == row.peer_id);
+                let mut rows = vec![
+                    kv("peer_id", &row.peer_id),
+                    kv("state", pipeline_state_label(row.state)),
+                    kv(
+                        "ip",
+                        if row.ip.is_empty() { "-" } else { row.ip.as_str() },
+                    ),
+                ];
+                if let Some(peer) = full {
+                    rows.extend(detail_rows_from_connection(peer, now));
+                }
+                rows
             }
-            if let Some(full_node) = peer.full_node {
-                rows.push(kv(
-                    "kind",
-                    if full_node { "full-node" } else { "light-node" },
-                ));
-            }
-            if let Some(at) = peer.last_bzz_at_unix {
-                rows.push(kv(
-                    "bzz age",
-                    &format!("{} ago", format_duration(now.saturating_sub(at))),
-                ));
-            }
-            rows
+            None => vec![kv("node", "(none selected)")],
         }
-        None => vec![kv("node", "(none selected)")],
+    } else {
+        match s.peers.connected_peers.get(selected) {
+            Some(peer) => {
+                let mut r = vec![
+                    kv("peer_id", &peer.peer_id),
+                    kv(
+                        "state",
+                        if peer.bzz_overlay.is_some() {
+                            "Ready"
+                        } else {
+                            "Handshaking"
+                        },
+                    ),
+                    kv("ip", &status_addr_ip(peer)),
+                ];
+                r.extend(detail_rows_from_connection(peer, now));
+                r
+            }
+            None => vec![kv("node", "(none selected)")],
+        }
     };
     draw_panel(frame, area, "Details", &rows);
 }
 
-fn node_type(peer: &ant_control::PeerConnectionInfo) -> &str {
-    match peer.full_node {
-        Some(true) => "full",
-        Some(false) => "light",
-        None => "unknown",
+fn status_addr_ip(peer: &PeerConnectionInfo) -> String {
+    extract_ip_from_multiaddr_str(&peer.address)
+}
+
+fn extract_ip_from_multiaddr_str(a: &str) -> String {
+    const PREFIXES: &[&str] = &["/ip4/", "/ip6/", "/dns4/", "/dns6/", "/dnsaddr/"];
+    let earliest = PREFIXES
+        .iter()
+        .filter_map(|p| a.find(p).map(|i| (i, *p)))
+        .min_by_key(|&(i, _)| i);
+    if let Some((start, prefix)) = earliest {
+        let after = &a[start + prefix.len()..];
+        let end = after.find('/').unwrap_or(after.len());
+        if end > 0 {
+            return after[..end].to_string();
+        }
     }
+    "-".to_string()
+}
+
+fn detail_rows_from_connection(peer: &PeerConnectionInfo, now: u64) -> Vec<PanelRow> {
+    let mut rows = vec![
+        kv("direction", &peer.direction),
+        kv("address", &peer.address),
+        kv("agent", unknown_if_empty(&peer.agent_version)),
+        kv(
+            "connected",
+            &format_duration(now.saturating_sub(peer.connected_at_unix)),
+        ),
+    ];
+    if let Some(overlay) = &peer.bzz_overlay {
+        rows.push(kv("overlay", overlay));
+    }
+    if let Some(full_node) = peer.full_node {
+        rows.push(kv(
+            "kind",
+            if full_node { "full-node" } else { "light-node" },
+        ));
+    }
+    if let Some(at) = peer.last_bzz_at_unix {
+        rows.push(kv(
+            "bzz age",
+            &format!("{} ago", format_duration(now.saturating_sub(at))),
+        ));
+    }
+    rows
 }
 
 fn unknown_if_empty(value: &str) -> &str {

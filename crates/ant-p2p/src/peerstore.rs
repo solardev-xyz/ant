@@ -31,8 +31,8 @@ use tracing::{debug, warn};
 /// yesterday's bootnodes don't accumulate across restarts.
 const MAX_FAIL_COUNT: u32 = 5;
 /// Soft cap on persisted entries. 1000 × ~250 B/entry ≈ 250 KB on disk; well
-/// under any reasonable per-process budget. With `DEFAULT_TARGET_PEERS = 300`
-/// this gives 3× headroom for churn between restarts.
+/// under any reasonable per-process budget. With `DEFAULT_TARGET_PEERS = 100`
+/// this gives ~10× headroom for churn between restarts.
 const MAX_ENTRIES: usize = 1000;
 /// Bumped on incompatible schema changes; older / newer files are rejected
 /// rather than silently mis-parsed.

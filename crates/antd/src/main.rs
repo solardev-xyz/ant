@@ -242,7 +242,7 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Bump the soft `RLIMIT_NOFILE` to the hard cap so a 300-peer set + dial
+/// Bump the soft `RLIMIT_NOFILE` to the hard cap so a busy peer set + dial
 /// fan-out doesn't trip the default 1024-fd ulimit on macOS / Linux. We
 /// silently keep whatever the OS already gave us if the bump fails — running
 /// with too few fds is a degraded but legitimate state, not a startup error.
