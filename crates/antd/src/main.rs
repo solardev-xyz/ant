@@ -6,11 +6,14 @@ use ant_crypto::{
     random_secp256k1_secret, SECP256K1_SECRET_LEN,
 };
 use ant_node::{run_node, NodeConfig};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
+use fs4::{FileExt, TryLockError};
 use k256::ecdsa::SigningKey;
 use libp2p::identity::{self, Keypair};
 use serde::{Deserialize, Serialize};
+use std::fs::{File, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
@@ -97,6 +100,11 @@ async fn main() -> Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&opt.log_level)),
         )
         .init();
+
+    // Held for the lifetime of the daemon: dropping the `File` releases the
+    // advisory `flock`. Bound at function scope (not in a helper) so it stays
+    // alive until `main` returns.
+    let _instance_lock = acquire_instance_lock(&data_dir.join("antd.lock"))?;
 
     raise_nofile_soft_limit();
 
@@ -241,6 +249,55 @@ async fn main() -> Result<()> {
             Err(e) => Err(anyhow::anyhow!("control socket: {e}")),
         },
     }
+}
+
+/// Take an exclusive advisory lock on `<data-dir>/antd.lock` so a second
+/// `antd` against the same data directory fails fast instead of silently
+/// joining the listen queue on `antd.sock` (which leads to split-brain
+/// answers — half your `antctl` calls hit the new daemon, half the old).
+///
+/// Uses `flock(2)` via fs4. The lock lives on the file *descriptor*, so it
+/// is released automatically when the process exits — clean shutdown,
+/// panic, OOM, or `kill -9`. No stale-pid guesswork required.
+fn acquire_instance_lock(lock_path: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)
+        .with_context(|| format!("open instance lock {lock_path:?}"))?;
+    match FileExt::try_lock(&file) {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => {
+            let owner = std::fs::read_to_string(lock_path).unwrap_or_default();
+            let owner = owner.trim();
+            let hint = if owner.is_empty() {
+                String::new()
+            } else {
+                format!(" (pid {owner})")
+            };
+            return Err(anyhow!(
+                "another antd is already running against {}{hint}; \
+                 refusing to start (delete the file only if you're sure no antd is alive)",
+                lock_path.display(),
+            ));
+        }
+        Err(TryLockError::Error(e)) => {
+            return Err(anyhow!(e)).with_context(|| format!("flock {lock_path:?}"));
+        }
+    }
+    let mut writable = &file;
+    writable.set_len(0).ok();
+    writable.seek(SeekFrom::Start(0)).ok();
+    writeln!(writable, "{}", std::process::id()).ok();
+    tracing::info!(
+        target: "antd",
+        "acquired instance lock {} (pid {})",
+        lock_path.display(),
+        std::process::id(),
+    );
+    Ok(file)
 }
 
 /// Bump the soft `RLIMIT_NOFILE` to the hard cap so a busy peer set + dial
