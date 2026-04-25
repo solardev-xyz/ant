@@ -1,0 +1,13 @@
+[package]
+name = "ant-node"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+ant-control = { path = "../ant-control" }
+ant-crypto = { path = "../ant-crypto" }
+ant-p2p = { path = "../ant-p2p" }
+libp2p.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true

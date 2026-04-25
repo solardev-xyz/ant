@@ -1,0 +1,26 @@
+[package]
+name = "antd"
+version = "0.1.0"
+edition.workspace = true
+
+[[bin]]
+name = "antd"
+path = "src/main.rs"
+
+[dependencies]
+ant-control = { path = "../ant-control" }
+ant-crypto = { path = "../ant-crypto" }
+ant-node = { path = "../ant-node" }
+ant-p2p = { path = "../ant-p2p" }
+k256.workspace = true
+libp2p.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+anyhow.workspace = true
+dirs = "6.0.0"
+rlimit = "0.11.0"

@@ -1,0 +1,17 @@
+[package]
+name = "antctl"
+version = "0.1.0"
+edition.workspace = true
+
+[[bin]]
+name = "antctl"
+path = "src/main.rs"
+
+[dependencies]
+ant-control = { path = "../ant-control" }
+anyhow.workspace = true
+clap.workspace = true
+crossterm = "0.29.0"
+dirs = "6.0.0"
+ratatui = "0.30.0"
+serde_json.workspace = true

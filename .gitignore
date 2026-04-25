@@ -1,0 +1,26 @@
+# Rust build artifacts
+/target/
+
+# Local research notes
+/research/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs and temporary files
+*.log
+tmp/
+temp/
+
+# Coverage output
+/coverage/
+tarpaulin-report.html
