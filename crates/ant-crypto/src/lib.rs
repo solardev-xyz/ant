@@ -1,8 +1,13 @@
 //! Secp256k1 keys, Keccak-256, Ethereum and Swarm overlay addresses, and Bee-compatible
 //! BZZ handshake signing (EIP-191 prefixed digest).
+//!
+//! Also exposes the chunk-level primitives: BMT hashing and content-addressed chunk
+//! validation, see [`bmt`].
 
+pub mod bmt;
 mod error;
 
+pub use bmt::{bmt_hash_with_span, bmt_root, cac_new, cac_valid, CHUNK_SIZE, SPAN_SIZE};
 pub use error::CryptoError;
 
 use k256::ecdsa::{RecoveryId, Signature, SigningKey, VerifyingKey};
