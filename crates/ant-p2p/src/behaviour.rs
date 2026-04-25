@@ -681,7 +681,159 @@ fn handle_control_command(
                 let _ = ack.send(reply);
             });
         }
+        ControlCommand::GetBytes { reference, ack } => {
+            // Multi-chunk raw bytes: snapshot peers, build a routing-aware
+            // fetcher, and drive the joiner inside a spawned task. The
+            // joiner does its own per-chunk fetch + CAC verify; we only
+            // need to feed it the root chunk.
+            let peers = state.routing.snapshot();
+            if peers.is_empty() {
+                let _ = ack.send(ControlAck::Error {
+                    message: "no peers available; wait for handshakes to complete".to_string(),
+                });
+                return;
+            }
+            let control = control.clone();
+            tokio::spawn(async move {
+                let reply = run_get_bytes(control, peers, reference).await;
+                let _ = ack.send(reply);
+            });
+        }
+        ControlCommand::GetBzz {
+            reference,
+            path,
+            ack,
+        } => {
+            let peers = state.routing.snapshot();
+            if peers.is_empty() {
+                let _ = ack.send(ControlAck::Error {
+                    message: "no peers available; wait for handshakes to complete".to_string(),
+                });
+                return;
+            }
+            let control = control.clone();
+            tokio::spawn(async move {
+                let reply = run_get_bzz(control, peers, reference, path).await;
+                let _ = ack.send(reply);
+            });
+        }
     }
+}
+
+/// Spawned task body for `Request::GetBytes`. Fetches the root chunk via
+/// `RoutingFetcher`, then hands it to `ant_retrieval::join`. Pulled out
+/// of `handle_control_command` so the latter stays small and the async
+/// pieces are exercise-able without spinning up a swarm.
+async fn run_get_bytes(
+    control: Control,
+    peers: Vec<(libp2p::PeerId, [u8; 32])>,
+    reference: [u8; 32],
+) -> ControlAck {
+    use ant_retrieval::{join, ChunkFetcher, RoutingFetcher, DEFAULT_MAX_FILE_BYTES};
+    let mut fetcher = RoutingFetcher::new(control, peers);
+    let root = match fetcher.fetch(reference).await {
+        Ok(b) => b,
+        Err(e) => {
+            return ControlAck::Error {
+                message: format!("fetch root chunk {}: {e}", hex::encode(reference)),
+            }
+        }
+    };
+    match join(&mut fetcher, &root, DEFAULT_MAX_FILE_BYTES).await {
+        Ok(data) => {
+            debug!(
+                target: "ant_p2p",
+                root = %hex::encode(reference),
+                bytes = data.len(),
+                "joiner produced file",
+            );
+            ControlAck::Bytes { data }
+        }
+        Err(e) => ControlAck::Error {
+            message: format!("join {}: {e}", hex::encode(reference)),
+        },
+    }
+}
+
+/// Spawned task body for `Request::GetBzz`. Walks the manifest at
+/// `reference`, resolves `path`, then runs the joiner against the
+/// resolved data ref.
+async fn run_get_bzz(
+    control: Control,
+    peers: Vec<(libp2p::PeerId, [u8; 32])>,
+    reference: [u8; 32],
+    path: String,
+) -> ControlAck {
+    use ant_retrieval::{
+        join, lookup_path, ChunkFetcher, ManifestError, RoutingFetcher, DEFAULT_MAX_FILE_BYTES,
+    };
+
+    let mut fetcher = RoutingFetcher::new(control, peers);
+    let lookup = match lookup_path(&mut fetcher, reference, &path).await {
+        Ok(r) => r,
+        Err(ManifestError::NotAManifest) => {
+            return ControlAck::Error {
+                message: format!(
+                    "{} is not a mantaray manifest; try `antctl get` (raw chunk) or fetch via /bytes",
+                    hex::encode(reference)
+                ),
+            }
+        }
+        Err(e) => {
+            return ControlAck::Error {
+                message: format!("manifest lookup '{path}': {e}"),
+            }
+        }
+    };
+    let data_ref = lookup.data_ref;
+    debug!(
+        target: "ant_p2p",
+        manifest = %hex::encode(reference),
+        path = %path,
+        data_ref = %hex::encode(data_ref),
+        content_type = ?lookup.content_type,
+        "manifest resolved",
+    );
+
+    // Now fetch the file body itself. Reuse the same fetcher so the
+    // blacklist / peer ordering carries over from the manifest walk.
+    let root = match fetcher.fetch(data_ref).await {
+        Ok(b) => b,
+        Err(e) => {
+            return ControlAck::Error {
+                message: format!("fetch data root {}: {e}", hex::encode(data_ref)),
+            }
+        }
+    };
+    let data = match join(&mut fetcher, &root, DEFAULT_MAX_FILE_BYTES).await {
+        Ok(d) => d,
+        Err(e) => {
+            return ControlAck::Error {
+                message: format!("join data {}: {e}", hex::encode(data_ref)),
+            }
+        }
+    };
+    let filename = lookup
+        .metadata
+        .get("Filename")
+        .cloned()
+        .or_else(|| derive_filename_from_path(&path));
+    ControlAck::BzzBytes {
+        data,
+        content_type: lookup.content_type,
+        filename,
+    }
+}
+
+/// Heuristic fallback: if mantaray didn't carry a `Filename` metadata
+/// key (some uploaders skip it), use the last segment of the request
+/// path so `antctl get -o` can still pick a sensible default.
+fn derive_filename_from_path(path: &str) -> Option<String> {
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.rsplit('/').next().map(|s| s.to_string())
 }
 
 /// Drain the hint queue into live libp2p dials until we hit either the peer

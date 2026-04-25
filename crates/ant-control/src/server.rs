@@ -25,6 +25,12 @@ const FAST_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 /// timeout plus per-attempt overhead, without hanging the socket forever
 /// if the node loop wedges.
 const NETWORK_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
+/// Cap for commands that walk a chunk tree (joiner / mantaray): every
+/// node and every leaf is one round-trip. A 1 MB file is ~256 leaves +
+/// 2-3 intermediates; a manifest with one fork adds one more fetch on
+/// top. Real-world chunk fetches usually complete in <1 s, but pad for
+/// the unlucky path.
+const TREE_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A mutating or network-touching command issued by a client and forwarded
 /// to the node loop.
@@ -45,16 +51,42 @@ pub enum ControlCommand {
         reference: [u8; 32],
         ack: oneshot::Sender<ControlAck>,
     },
+    /// Walk the manifest at `reference`, resolve `path`, then join the
+    /// resulting chunk tree into a single `Vec<u8>`. Acks with
+    /// [`ControlAck::BzzBytes`] including any `Content-Type` metadata
+    /// recovered from the manifest.
+    GetBzz {
+        reference: [u8; 32],
+        path: String,
+        ack: oneshot::Sender<ControlAck>,
+    },
+    /// Join the multi-chunk tree rooted at `reference` (a `/bytes/` ref,
+    /// no manifest) and ack with the joined file bytes.
+    GetBytes {
+        reference: [u8; 32],
+        ack: oneshot::Sender<ControlAck>,
+    },
 }
 
 /// Node-loop reply to a [`ControlCommand`]. Serialized back to the client as
-/// `Response::Ok`, `Response::Bytes`, or `Response::Error` depending on the
-/// variant.
+/// `Response::Ok`, `Response::Bytes`, `Response::BzzBytes`, or
+/// `Response::Error` depending on the variant.
 #[derive(Debug, Clone)]
 pub enum ControlAck {
-    Ok { message: String },
-    Bytes { data: Vec<u8> },
-    Error { message: String },
+    Ok {
+        message: String,
+    },
+    Bytes {
+        data: Vec<u8>,
+    },
+    BzzBytes {
+        data: Vec<u8>,
+        content_type: Option<String>,
+        filename: Option<String>,
+    },
+    Error {
+        message: String,
+    },
 }
 
 /// Serve control requests on `socket_path` until the task is cancelled.
@@ -153,6 +185,39 @@ async fn handle_connection(
                 message: format!("bad reference: {e}"),
             },
         },
+        Ok(Request::GetBzz { reference, path }) => match parse_reference(&reference) {
+            Ok(addr) => {
+                dispatch_command(
+                    command_tx.as_ref(),
+                    TREE_COMMAND_TIMEOUT,
+                    |ack| ControlCommand::GetBzz {
+                        reference: addr,
+                        path,
+                        ack,
+                    },
+                )
+                .await
+            }
+            Err(e) => Response::Error {
+                message: format!("bad reference: {e}"),
+            },
+        },
+        Ok(Request::GetBytes { reference }) => match parse_reference(&reference) {
+            Ok(addr) => {
+                dispatch_command(
+                    command_tx.as_ref(),
+                    TREE_COMMAND_TIMEOUT,
+                    |ack| ControlCommand::GetBytes {
+                        reference: addr,
+                        ack,
+                    },
+                )
+                .await
+            }
+            Err(e) => Response::Error {
+                message: format!("bad reference: {e}"),
+            },
+        },
         Err(e) => Response::Error {
             message: format!("bad request: {e}"),
         },
@@ -192,6 +257,15 @@ where
         Ok(Ok(ControlAck::Ok { message })) => Response::Ok { message },
         Ok(Ok(ControlAck::Bytes { data })) => Response::Bytes {
             hex: format!("0x{}", hex::encode(data)),
+        },
+        Ok(Ok(ControlAck::BzzBytes {
+            data,
+            content_type,
+            filename,
+        })) => Response::BzzBytes {
+            hex: format!("0x{}", hex::encode(data)),
+            content_type,
+            filename,
         },
         Ok(Ok(ControlAck::Error { message })) => Response::Error { message },
         Ok(Err(_)) => Response::Error {

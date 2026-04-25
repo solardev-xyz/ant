@@ -68,18 +68,37 @@ enum Command {
         #[command(subcommand)]
         command: PeersCommand,
     },
-    /// Retrieve a single chunk by 32-byte reference and write it out.
+    /// Retrieve content from Swarm.
     ///
-    /// Today this only handles raw content-addressed chunks (the data
-    /// returned by bee's `/bytes/<ref>` endpoint). Multi-chunk files and
-    /// `/bzz/` mantaray manifests need the joiner / mantaray decoder
-    /// landing in a follow-up.
+    /// The reference may be one of:
+    ///
+    /// - `<hex>`: a 32-byte chunk address, returned as a single
+    ///   content-addressed chunk (the data behind bee's `/bytes/<ref>`
+    ///   for short files <= 4 KiB).
+    /// - `bytes://<hex>`: walk a multi-chunk byte tree rooted at `<hex>`
+    ///   (bee's `/bytes/<ref>` for longer files). Equivalent to `--bytes`.
+    /// - `bzz://<hex>[/path]`: walk the mantaray manifest at `<hex>`,
+    ///   resolve `path` (or the `website-index-document`), then join the
+    ///   resulting chunk tree. Equivalent to `--bzz` with `--bzz-path`.
     Get {
-        /// Hex-encoded 32-byte chunk reference; with or without a `0x` prefix.
+        /// Reference. See above for accepted forms.
         reference: String,
-        /// Path to write the chunk bytes to. Defaults to stdout.
+        /// Path to write the bytes to. Defaults to stdout.
         #[arg(long, short = 'o')]
         out: Option<PathBuf>,
+        /// Force `bytes` (multi-chunk join) mode regardless of the
+        /// reference's URL scheme.
+        #[arg(long, conflicts_with = "bzz")]
+        bytes: bool,
+        /// Force `bzz` (manifest walk + join) mode regardless of the
+        /// reference's URL scheme. Pair with `--bzz-path` to pick a
+        /// non-default file inside a directory manifest.
+        #[arg(long, conflicts_with = "bytes")]
+        bzz: bool,
+        /// Path component of a bzz reference, e.g. `index.html` or
+        /// `images/logo.png`. Empty triggers `website-index-document`.
+        #[arg(long, requires = "bzz")]
+        bzz_path: Option<String>,
     },
 }
 
@@ -147,63 +166,178 @@ fn main() -> Result<()> {
                 other => bail!("unexpected response: {other:?}"),
             }
         }
-        Command::Get { reference, out } => {
-            run_get(&socket, &reference, out.as_deref(), opt.json)?;
+        Command::Get {
+            reference,
+            out,
+            bytes,
+            bzz,
+            bzz_path,
+        } => {
+            run_get(
+                &socket,
+                &reference,
+                out.as_deref(),
+                opt.json,
+                FetchMode::from_flags(bytes, bzz, bzz_path.as_deref()),
+            )?;
         }
     }
     Ok(())
 }
 
-/// Fetch a chunk and write it to `out` (or stdout). With `--json`, prints
-/// a `{ ok, reference, bytes }` envelope to stdout instead of the raw
-/// payload, since shells generally won't render binary cleanly.
-fn run_get(socket: &Path, reference: &str, out: Option<&Path>, json: bool) -> Result<()> {
-    let resp = request_sync(
-        socket,
-        &Request::Get {
+/// One of the three retrieval shapes `antctl get` knows how to dispatch.
+/// Computed once from the command-line flags / URL scheme so the
+/// downstream logic can stay flat.
+#[derive(Debug, Clone)]
+enum FetchMode {
+    /// Single content-addressed chunk; daemon answers `Response::Bytes`.
+    Chunk,
+    /// Multi-chunk join; daemon answers `Response::Bytes` with the
+    /// joined file body.
+    Bytes,
+    /// Manifest walk + join; daemon answers `Response::BzzBytes` with
+    /// the joined body plus optional content-type / filename.
+    Bzz { path: String },
+}
+
+impl FetchMode {
+    /// Resolve a fetch mode from CLI flags. The reference itself is
+    /// inspected separately by [`parse_reference_with_mode`] so a URL
+    /// scheme on the reference can override these defaults.
+    fn from_flags(bytes: bool, bzz: bool, bzz_path: Option<&str>) -> Self {
+        if bzz {
+            FetchMode::Bzz {
+                path: bzz_path.unwrap_or("").to_string(),
+            }
+        } else if bytes {
+            FetchMode::Bytes
+        } else {
+            FetchMode::Chunk
+        }
+    }
+}
+
+/// Final destination for the bytes pulled back from the daemon. Stdout
+/// for raw bytes, optionally `--out` for a fixed path, or — if the
+/// daemon hands us a `Filename` from manifest metadata and the user
+/// passed `--out <dir>` rather than a file — `<dir>/<Filename>`.
+fn write_output(
+    out: Option<&Path>,
+    filename_hint: Option<&str>,
+    data: &[u8],
+) -> Result<Option<PathBuf>> {
+    use std::io::Write;
+    if let Some(p) = out {
+        // If `out` is an existing directory, append the manifest filename
+        // (or fall back to "data.bin" if there isn't one). This lets
+        // callers do `antctl get bzz://<ref>/ -o ./` and end up with
+        // `./index.html` automatically.
+        let target = if p.is_dir() {
+            let name = filename_hint.unwrap_or("data.bin");
+            p.join(name)
+        } else {
+            p.to_path_buf()
+        };
+        std::fs::write(&target, data)
+            .with_context(|| format!("write to {}", target.display()))?;
+        return Ok(Some(target));
+    }
+    io::stdout().lock().write_all(data)?;
+    Ok(None)
+}
+
+/// Resolve a CLI reference + mode into the daemon-side `Request`. URL
+/// schemes (`bzz://…`, `bytes://…`) on the reference take precedence
+/// over the explicit `--bzz` / `--bytes` flags; the flags fill in the
+/// gap when the user hands over a bare hex reference.
+fn parse_reference_with_mode(reference: &str, mode: FetchMode) -> Result<Request> {
+    if let Some(rest) = reference.strip_prefix("bzz://") {
+        // Split optional path (after first '/').
+        let (hex_part, path_part) = match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i + 1..]),
+            None => (rest, ""),
+        };
+        return Ok(Request::GetBzz {
+            reference: hex_part.to_string(),
+            path: path_part.to_string(),
+        });
+    }
+    if let Some(rest) = reference.strip_prefix("bytes://") {
+        return Ok(Request::GetBytes {
+            reference: rest.to_string(),
+        });
+    }
+    Ok(match mode {
+        FetchMode::Chunk => Request::Get {
             reference: reference.to_string(),
         },
-    )
-    .with_context(|| format!("talk to antd at {}", socket.display()))?;
-    let data = match resp {
-        Response::Bytes { hex } => decode_hex_payload(&hex)?,
+        FetchMode::Bytes => Request::GetBytes {
+            reference: reference.to_string(),
+        },
+        FetchMode::Bzz { path } => Request::GetBzz {
+            reference: reference.to_string(),
+            path,
+        },
+    })
+}
+
+/// Fetch a chunk / file and write it to `out` (or stdout). With `--json`,
+/// prints a structured envelope on stdout regardless of mode, since
+/// shells generally won't render binary cleanly.
+fn run_get(
+    socket: &Path,
+    reference: &str,
+    out: Option<&Path>,
+    json: bool,
+    mode: FetchMode,
+) -> Result<()> {
+    let req = parse_reference_with_mode(reference, mode)?;
+    let resp = request_sync(socket, &req)
+        .with_context(|| format!("talk to antd at {}", socket.display()))?;
+
+    // Unify the three shapes into (data, content_type, filename).
+    let (data, content_type, filename) = match resp {
+        Response::Bytes { hex } => (decode_hex_payload(&hex)?, None, None),
+        Response::BzzBytes {
+            hex,
+            content_type,
+            filename,
+        } => (decode_hex_payload(&hex)?, content_type, filename),
         Response::Error { message } => bail!("antd: {message}"),
         other => bail!("unexpected response: {other:?}"),
     };
 
-    if let Some(path) = out {
-        std::fs::write(path, &data)
-            .with_context(|| format!("write chunk to {}", path.display()))?;
-        if json {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "ok": true,
-                    "reference": reference,
-                    "bytes": data.len(),
-                    "out": path.display().to_string(),
-                })
-            );
-        } else {
-            eprintln!("wrote {} bytes to {}", data.len(), path.display());
+    let written = write_output(out, filename.as_deref(), &data)?;
+
+    if json {
+        let mut payload = serde_json::json!({
+            "ok": true,
+            "reference": reference,
+            "bytes": data.len(),
+        });
+        if let Some(ct) = &content_type {
+            payload["content_type"] = serde_json::Value::String(ct.clone());
         }
-    } else if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "ok": true,
-                "reference": reference,
-                "bytes": data.len(),
-                "hex": format!("0x{}", hex::encode(&data)),
-            })
-        );
-    } else {
-        use std::io::Write;
-        // Write to stdout. We never decode the payload as text — bee
-        // chunks are arbitrary binary; the caller is responsible for
-        // piping into something that handles bytes (e.g.
-        // `antctl get … | xxd | head`).
-        io::stdout().lock().write_all(&data)?;
+        if let Some(fname) = &filename {
+            payload["filename"] = serde_json::Value::String(fname.clone());
+        }
+        if let Some(p) = &written {
+            payload["out"] = serde_json::Value::String(p.display().to_string());
+        } else {
+            payload["hex"] = serde_json::Value::String(format!("0x{}", hex::encode(&data)));
+        }
+        println!("{payload}");
+    } else if let Some(p) = written {
+        let mut msg = format!("wrote {} bytes to {}", data.len(), p.display());
+        if let Some(ct) = &content_type {
+            msg.push_str(&format!(" ({ct})"));
+        }
+        eprintln!("{msg}");
+    } else if let Some(ct) = &content_type {
+        // Stdout got the body; surface the content type on stderr so
+        // shell pipelines like `antctl get bzz://<ref>/ | head` still
+        // know what they got without polluting stdout.
+        eprintln!("Content-Type: {ct}");
     }
     Ok(())
 }

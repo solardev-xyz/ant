@@ -167,6 +167,7 @@ name = "ant-retrieval"
 version = "0.1.0"
 dependencies = [
  "ant-crypto",
+ "async-trait",
  "futures",
  "hex",
  "libp2p",

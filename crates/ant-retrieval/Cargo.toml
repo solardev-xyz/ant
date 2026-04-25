@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 ant-crypto = { path = "../ant-crypto" }
+async-trait = "0.1.89"
 libp2p.workspace = true
 libp2p-stream = "0.4.0-alpha"
 tokio.workspace = true

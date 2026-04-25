@@ -168,6 +168,16 @@ impl RoutingTable {
     /// fall back to "the closest connected peer, even if we're closer than
     /// it" — bee's retrieval handler will then either serve from cache or
     /// itself forward toward the chunk.
+    /// Snapshot all current `(peer, overlay)` entries. Used by the node
+    /// loop to hand a stable peer list to a spawned fetch task without
+    /// holding a borrow of the live table for the whole tree walk.
+    pub fn snapshot(&self) -> Vec<(PeerId, Overlay)> {
+        self.entries
+            .iter()
+            .map(|(p, e)| (*p, e.overlay))
+            .collect()
+    }
+
     pub fn closest_peer(&self, target: &Overlay, skip: &[PeerId]) -> Option<(PeerId, Overlay)> {
         let mut best: Option<(PeerId, Overlay)> = None;
         for (peer, entry) in &self.entries {

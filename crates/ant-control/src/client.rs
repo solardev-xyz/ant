@@ -24,6 +24,17 @@ pub enum ClientError {
 }
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Tree-walking requests (`GetBytes`, `GetBzz`) can require many serial
+/// chunk fetches; mirror the daemon-side `TREE_COMMAND_TIMEOUT` plus a
+/// little headroom so the client doesn't bail before the daemon does.
+const TREE_TIMEOUT: Duration = Duration::from_secs(75);
+
+fn timeout_for(request: &Request) -> Duration {
+    match request {
+        Request::GetBytes { .. } | Request::GetBzz { .. } => TREE_TIMEOUT,
+        _ => DEFAULT_TIMEOUT,
+    }
+}
 
 /// Round-trip one request to the daemon and return its response.
 pub fn request_sync(socket_path: &Path, request: &Request) -> Result<Response, ClientError> {
@@ -31,8 +42,9 @@ pub fn request_sync(socket_path: &Path, request: &Request) -> Result<Response, C
         path: socket_path.display().to_string(),
         source: e,
     })?;
-    stream.set_read_timeout(Some(DEFAULT_TIMEOUT))?;
-    stream.set_write_timeout(Some(DEFAULT_TIMEOUT))?;
+    let timeout = timeout_for(request);
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
 
     let mut line = serde_json::to_vec(request)?;
     line.push(b'\n');

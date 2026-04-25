@@ -29,6 +29,20 @@ pub enum Request {
     /// [`Response::Bytes`] carrying the verified chunk payload (without
     /// the span prefix).
     Get { reference: String },
+    /// Retrieve a file via the bzz read-path: walks the manifest at
+    /// `reference`, resolves `path` (empty triggers `website-index-document`),
+    /// then joins the resulting chunk tree into the file's raw bytes.
+    /// Daemon answers with [`Response::BzzBytes`].
+    GetBzz {
+        reference: String,
+        #[serde(default)]
+        path: String,
+    },
+    /// Retrieve a multi-chunk raw byte tree by joining its chunk tree.
+    /// `reference` points at the root chunk of a `/bytes/` tree. Daemon
+    /// answers with [`Response::Bytes`] (no content-type, no manifest
+    /// metadata).
+    GetBytes { reference: String },
 }
 
 /// Daemon → client response.
@@ -43,12 +57,25 @@ pub enum Response {
     Ok {
         message: String,
     },
-    /// Hex-encoded chunk payload returned by [`Request::Get`]. Hex (rather
-    /// than base64 or raw binary) keeps the wire format newline-delimited
-    /// JSON for now; we'll revisit when multi-chunk fetches need streaming.
+    /// Hex-encoded chunk payload returned by [`Request::Get`] /
+    /// [`Request::GetBytes`]. Hex (rather than base64 or raw binary) keeps
+    /// the wire format newline-delimited JSON for now; we'll revisit when
+    /// multi-chunk fetches need streaming.
     Bytes {
         /// `0x`-prefixed lowercase hex of the payload bytes.
         hex: String,
+    },
+    /// Hex-encoded file payload returned by [`Request::GetBzz`], plus the
+    /// `Content-Type` metadata read from the matching mantaray value
+    /// node (when the manifest carried one).
+    BzzBytes {
+        hex: String,
+        #[serde(default)]
+        content_type: Option<String>,
+        /// Best-effort filename derived from the resolved path or
+        /// manifest metadata; useful for `antctl get -o`.
+        #[serde(default)]
+        filename: Option<String>,
     },
     Error {
         message: String,

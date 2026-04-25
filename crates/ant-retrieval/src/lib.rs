@@ -42,14 +42,46 @@
 //! sustained reader would need to honor SWAP debits (M3 territory); we
 //! deliberately don't here.
 
+pub mod fetcher;
+pub mod joiner;
+pub mod mantaray;
+
+pub use fetcher::{Overlay, RoutingFetcher};
+pub use joiner::{join, JoinError, DEFAULT_MAX_FILE_BYTES};
+pub use mantaray::{
+    lookup_path, LookupResult, ManifestError, MANTARAY_CONTENT_TYPE_KEY,
+    MANTARAY_ERROR_DOC_KEY, MANTARAY_INDEX_DOC_KEY,
+};
+
 use ant_crypto::{cac_valid, CHUNK_SIZE, SPAN_SIZE};
+use async_trait::async_trait;
 use futures::io::{AsyncReadExt, AsyncWriteExt};
 use libp2p::{PeerId, StreamProtocol};
 use libp2p_stream::Control;
 use prost::Message;
+use std::error::Error as StdError;
 use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, trace};
+
+/// Abstract chunk store used by [`join`] and [`lookup_path`].
+///
+/// Production callers wrap a `libp2p_stream::Control` with a routing-table
+/// lookup so each `fetch` resolves to "ask the closest peer over
+/// `/swarm/retrieval/1.4.0`" via [`retrieve_chunk`]. Tests can supply a
+/// `HashMap` and exercise the joiner / mantaray decoder offline.
+///
+/// `&mut self` is taken to allow stateful implementations (e.g. a per-call
+/// skip-set of peers we've already failed against) without forcing an
+/// internal `Mutex`.
+#[async_trait]
+pub trait ChunkFetcher: Send {
+    /// Fetch the wire bytes (`span (8 LE) || payload`) of the chunk at
+    /// `addr`, validating its CAC. Implementations should retry across
+    /// peers if needed; the joiner / mantaray code treats a single
+    /// failure here as a fatal error for the file.
+    async fn fetch(&mut self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>>;
+}
 
 /// Bee `pkg/retrieval` protocol id; pinned to bee 2.7.x.
 pub const PROTOCOL_RETRIEVAL: &str = "/swarm/retrieval/1.4.0/retrieval";
@@ -151,6 +183,15 @@ impl RetrievedChunk {
     pub fn payload(&self) -> &[u8] {
         &self.data[SPAN_SIZE..]
     }
+
+    /// Raw little-endian span bytes (the first 8 bytes of the wire chunk).
+    /// Useful when feeding the chunk back into the joiner, which expects
+    /// `span || payload`.
+    pub fn span_bytes(&self) -> [u8; SPAN_SIZE] {
+        let mut out = [0u8; SPAN_SIZE];
+        out.copy_from_slice(&self.data[..SPAN_SIZE]);
+        out
+    }
 }
 
 /// Retrieve `address` from a single peer over a libp2p stream.
@@ -218,6 +259,21 @@ async fn retrieve_chunk_inner(
     }
     if !cac_valid(&address, &delivery.data) {
         return Err(RetrievalError::InvalidChunk);
+    }
+
+    // Bee's `pb.Delivery` reserves a `stamp` field, but the live
+    // `/swarm/retrieval/1.4.0` handler never populates it (see
+    // `pkg/retrieval/retrieval.go::handler`). Stamps travel with
+    // pushsync, not retrieval. We surface what we got so a caller
+    // running with `RUST_LOG=ant_retrieval=debug` can spot the rare
+    // peer that does attach one.
+    if !delivery.stamp.is_empty() {
+        debug!(
+            target: "ant_retrieval",
+            chunk = %hex::encode(address),
+            stamp_len = delivery.stamp.len(),
+            "retrieval delivery carried a postage stamp (uncommon)",
+        );
     }
 
     Ok(RetrievedChunk {
