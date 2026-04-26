@@ -35,6 +35,13 @@ pub struct NodeConfig {
     pub commands: Option<mpsc::Receiver<ControlCommand>>,
     /// Baseline for `PeerInfo` cold-start timings (`antctl top` milestones).
     pub process_start: Instant,
+    /// Scope the in-memory chunk cache to a single request. Default
+    /// (`false`) keeps one process-wide cache so consecutive
+    /// `antctl get` calls share fetched chunks; setting this makes
+    /// every command start with an empty cache, which is the right
+    /// shape for reproducing transient retrieval failures or for
+    /// timing the cold path.
+    pub per_request_chunk_cache: bool,
 }
 
 impl NodeConfig {
@@ -55,6 +62,7 @@ impl NodeConfig {
             peerstore_path: None,
             commands: None,
             process_start: Instant::now(),
+            per_request_chunk_cache: false,
         }
     }
 
@@ -82,6 +90,11 @@ impl NodeConfig {
         self.process_start = t;
         self
     }
+
+    pub fn with_per_request_chunk_cache(mut self, per_request: bool) -> Self {
+        self.per_request_chunk_cache = per_request;
+        self
+    }
 }
 
 /// Run the M1.0 node loop until the process is interrupted.
@@ -98,6 +111,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<(), NodeError> {
         peerstore_path: cfg.peerstore_path,
         commands: cfg.commands,
         process_start: cfg.process_start,
+        per_request_chunk_cache: cfg.per_request_chunk_cache,
     })
     .await?;
     Ok(())

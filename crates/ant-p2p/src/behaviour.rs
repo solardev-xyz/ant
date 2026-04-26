@@ -73,6 +73,14 @@ pub struct RunConfig {
     pub commands: Option<mpsc::Receiver<ControlCommand>>,
     /// Baseline for cold-start elapsed metrics (`time_to_first_peer_s`, etc.).
     pub process_start: std::time::Instant,
+    /// When true, scope the in-memory chunk cache to a single
+    /// `antctl get` invocation: a fresh `InMemoryChunkCache` is built
+    /// for each request and dropped when the request finishes. Intra-
+    /// request retries still benefit from the cache (they share the
+    /// per-request `Arc`), but a second `antctl get` starts cold.
+    /// Useful for reproducing transient retrieval failures and
+    /// timing the cold path; off in production.
+    pub per_request_chunk_cache: bool,
 }
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
@@ -238,16 +246,25 @@ struct SwarmState {
     /// every rebuild so it can't grow unbounded across long sessions.
     peer_order: HashMap<PeerId, u64>,
     next_peer_order: u64,
-    /// Process-wide chunk cache. Shared (by `Arc::clone`) into every
-    /// `RoutingFetcher` we build for `GetBytes` / `GetBzz`, so every
-    /// chunk we fetch from the network is reusable for the rest of
-    /// the daemon's lifetime — across retry attempts within one
-    /// command, and across consecutive `antctl get` invocations.
-    chunk_cache: Arc<ant_retrieval::InMemoryChunkCache>,
+    /// Process-wide chunk cache, when enabled. `Some(cache)` means
+    /// every `GetBytes` / `GetBzz` clones this single `Arc`, so chunks
+    /// fetched on request N are reusable for request N+1. `None`
+    /// means each request builds its own fresh `InMemoryChunkCache`
+    /// (intra-request retries still cache-hit; consecutive
+    /// `antctl get` calls start cold). Toggled by
+    /// `RunConfig::per_request_chunk_cache`.
+    chunk_cache: Option<Arc<ant_retrieval::InMemoryChunkCache>>,
 }
 
 impl SwarmState {
-    fn new(target_peers: usize, base_overlay: Overlay) -> Self {
+    fn new(target_peers: usize, base_overlay: Overlay, per_request_chunk_cache: bool) -> Self {
+        let chunk_cache = if per_request_chunk_cache {
+            None
+        } else {
+            Some(Arc::new(
+                ant_retrieval::InMemoryChunkCache::with_default_capacity(),
+            ))
+        };
         Self {
             dialing: HashSet::new(),
             dial_started: HashMap::new(),
@@ -262,7 +279,20 @@ impl SwarmState {
             target_peers,
             peer_order: HashMap::new(),
             next_peer_order: 0,
-            chunk_cache: Arc::new(ant_retrieval::InMemoryChunkCache::with_default_capacity()),
+            chunk_cache,
+        }
+    }
+
+    /// Resolve the chunk cache for one user-visible `GetBytes` / `GetBzz`
+    /// command: clone the shared daemon cache if it's enabled, or
+    /// mint a brand-new cache for this request only. Either way the
+    /// returned `Arc` is what the request's retry loop hands to every
+    /// `RoutingFetcher` it builds, so intra-request retries always
+    /// share a cache and only inter-request reuse depends on the flag.
+    fn cache_for_request(&self) -> Arc<ant_retrieval::InMemoryChunkCache> {
+        match &self.chunk_cache {
+            Some(c) => c.clone(),
+            None => Arc::new(ant_retrieval::InMemoryChunkCache::with_default_capacity()),
         }
     }
 
@@ -516,7 +546,7 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
         &cfg.overlay_nonce,
         cfg.network_id,
     );
-    let mut state = SwarmState::new(target_peers, base_overlay);
+    let mut state = SwarmState::new(target_peers, base_overlay, cfg.per_request_chunk_cache);
     let mut peerstore = match cfg.peerstore_path.clone() {
         Some(p) => PeerStore::load(p),
         None => PeerStore::disabled(),
@@ -702,7 +732,7 @@ fn handle_control_command(
                 return;
             }
             let control = control.clone();
-            let cache = state.chunk_cache.clone();
+            let cache = state.cache_for_request();
             tokio::spawn(async move {
                 let reply = run_get_bytes(control, peers, cache, reference).await;
                 let _ = ack.send(reply);
@@ -721,7 +751,7 @@ fn handle_control_command(
                 return;
             }
             let control = control.clone();
-            let cache = state.chunk_cache.clone();
+            let cache = state.cache_for_request();
             tokio::spawn(async move {
                 let reply = run_get_bzz(control, peers, cache, reference, path).await;
                 let _ = ack.send(reply);

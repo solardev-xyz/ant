@@ -75,6 +75,15 @@ struct Opt {
     /// running yet.
     #[arg(long, default_value_t = false)]
     reset_peerstore: bool,
+
+    /// Scope the in-memory chunk cache to a single `antctl get` invocation
+    /// instead of sharing it across the daemon's lifetime. Each request
+    /// still gets a cache (so retries within the same request skip the
+    /// network for chunks already pulled), but a second request for the
+    /// same reference starts cold. Useful for reproducing transient
+    /// retrieval failures and benchmarking cold-path latency.
+    #[arg(long, default_value_t = false)]
+    per_request_chunk_cache: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -220,13 +229,21 @@ async fn main() -> Result<()> {
     // perpetual `recv().await`.
     let (cmd_tx, cmd_rx) = mpsc::channel::<ControlCommand>(32);
 
+    if opt.per_request_chunk_cache {
+        tracing::info!(
+            target: "antd",
+            "chunk cache scoped to per-request (--per-request-chunk-cache)",
+        );
+    }
+
     let node_fut = run_node(
         NodeConfig::mainnet_default(signing_secret, overlay_nonce, bootnodes, libp2p_keypair)
             .with_status(status_tx)
             .with_process_start(process_start)
             .with_external_addrs(external_addrs)
             .with_peerstore_path(peerstore_path)
-            .with_commands(cmd_rx),
+            .with_commands(cmd_rx)
+            .with_per_request_chunk_cache(opt.per_request_chunk_cache),
     );
 
     if opt.no_control_socket {
