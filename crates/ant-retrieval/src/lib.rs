@@ -71,16 +71,18 @@ use tracing::{debug, trace};
 /// `/swarm/retrieval/1.4.0`" via [`retrieve_chunk`]. Tests can supply a
 /// `HashMap` and exercise the joiner / mantaray decoder offline.
 ///
-/// `&mut self` is taken to allow stateful implementations (e.g. a per-call
-/// skip-set of peers we've already failed against) without forcing an
-/// internal `Mutex`.
+/// `&self` (rather than `&mut self`) lets the joiner fan out concurrent
+/// fetches against the same fetcher: sibling chunks of an intermediate
+/// node can be retrieved in parallel without contention. Implementations
+/// that need to mutate per-call state (e.g. a peer blacklist) wrap it in
+/// interior mutability.
 #[async_trait]
-pub trait ChunkFetcher: Send {
+pub trait ChunkFetcher: Send + Sync {
     /// Fetch the wire bytes (`span (8 LE) || payload`) of the chunk at
     /// `addr`, validating its CAC. Implementations should retry across
     /// peers if needed; the joiner / mantaray code treats a single
     /// failure here as a fatal error for the file.
-    async fn fetch(&mut self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>>;
+    async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>>;
 }
 
 /// Bee `pkg/retrieval` protocol id; pinned to bee 2.7.x.

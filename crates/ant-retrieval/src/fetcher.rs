@@ -24,6 +24,7 @@ use libp2p::PeerId;
 use libp2p_stream::Control;
 use std::cmp::Ordering;
 use std::error::Error as StdError;
+use std::sync::Mutex;
 use tracing::debug;
 
 /// 32-byte Swarm overlay. Duplicated locally rather than re-exported from
@@ -37,16 +38,18 @@ pub type Overlay = [u8; 32];
 const FALLBACK_PEERS: usize = 6;
 
 /// Stateful per-call fetcher. Owns a clone of `Control` and the peer
-/// snapshot; `&mut self` lets us memoise across the call (e.g. blacklist
-/// peers that have already failed), even though right now we just track a
-/// per-call skip list.
+/// snapshot. The blacklist is behind a `Mutex` because the joiner now
+/// fans out sibling fetches concurrently against the same `&self`
+/// fetcher, so two failing fetches can race to record the same bad peer.
+/// We never hold the lock across an `.await`, so a `std::sync::Mutex` is
+/// fine and avoids the `tokio::sync::Mutex` overhead.
 pub struct RoutingFetcher {
     control: Control,
     peers: Vec<(PeerId, Overlay)>,
     /// Peers that have failed at least once during this fetch. Used to
     /// rotate through candidates on retry without picking the same dud
     /// peer twice.
-    blacklist: Vec<PeerId>,
+    blacklist: Mutex<Vec<PeerId>>,
 }
 
 impl RoutingFetcher {
@@ -59,19 +62,22 @@ impl RoutingFetcher {
         Self {
             control,
             peers,
-            blacklist: Vec::new(),
+            blacklist: Mutex::new(Vec::new()),
         }
     }
 
     /// `(peer, overlay)` ordered by ascending XOR distance to `target`,
-    /// excluding any peer in [`Self::blacklist`].
+    /// excluding any peer currently in the blacklist. The blacklist is
+    /// snapshotted under the lock and dropped before we await anything.
     fn ranked(&self, target: &Overlay) -> Vec<(PeerId, Overlay)> {
+        let blacklist = self.blacklist.lock().expect("blacklist mutex poisoned");
         let mut ranked: Vec<(PeerId, Overlay)> = self
             .peers
             .iter()
-            .filter(|(p, _)| !self.blacklist.contains(p))
+            .filter(|(p, _)| !blacklist.contains(p))
             .copied()
             .collect();
+        drop(blacklist);
         ranked.sort_by(|(_, a), (_, b)| {
             for i in 0..32 {
                 let da = a[i] ^ target[i];
@@ -85,18 +91,31 @@ impl RoutingFetcher {
         });
         ranked
     }
+
+    fn blacklist_peer(&self, peer: PeerId) {
+        self.blacklist
+            .lock()
+            .expect("blacklist mutex poisoned")
+            .push(peer);
+    }
 }
 
 #[async_trait]
 impl ChunkFetcher for RoutingFetcher {
-    async fn fetch(&mut self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
+    async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
         let candidates = self.ranked(&addr);
         if candidates.is_empty() {
             return Err("no BZZ peers available".into());
         }
         let mut last_err: Option<RetrievalError> = None;
         for (peer, _overlay) in candidates.into_iter().take(FALLBACK_PEERS) {
-            match retrieve_chunk(&mut self.control, peer, addr).await {
+            // Each in-flight fetch gets its own `Control` clone; libp2p's
+            // stream control multiplexes over the existing yamux session
+            // so this is cheap (no transport-level handshake), and lets
+            // sibling fetches truly run in parallel rather than queuing
+            // behind a single shared `&mut Control`.
+            let mut control = self.control.clone();
+            match retrieve_chunk(&mut control, peer, addr).await {
                 Ok(chunk) => {
                     // Caller wants `span (8 LE) || payload`, exactly what
                     // arrives on the wire. `retrieve_chunk` already
@@ -114,7 +133,7 @@ impl ChunkFetcher for RoutingFetcher {
                         chunk = %hex::encode(addr),
                         "fetch failed, blacklisting peer: {e}",
                     );
-                    self.blacklist.push(peer);
+                    self.blacklist_peer(peer);
                     last_err = Some(e);
                 }
             }

@@ -730,7 +730,7 @@ async fn run_get_bytes(
     reference: [u8; 32],
 ) -> ControlAck {
     use ant_retrieval::{join, ChunkFetcher, RoutingFetcher, DEFAULT_MAX_FILE_BYTES};
-    let mut fetcher = RoutingFetcher::new(control, peers);
+    let fetcher = RoutingFetcher::new(control, peers);
     let root = match fetcher.fetch(reference).await {
         Ok(b) => b,
         Err(e) => {
@@ -739,7 +739,7 @@ async fn run_get_bytes(
             }
         }
     };
-    match join(&mut fetcher, &root, DEFAULT_MAX_FILE_BYTES).await {
+    match join(&fetcher, &root, DEFAULT_MAX_FILE_BYTES).await {
         Ok(data) => {
             debug!(
                 target: "ant_p2p",
@@ -768,8 +768,8 @@ async fn run_get_bzz(
         join, lookup_path, ChunkFetcher, ManifestError, RoutingFetcher, DEFAULT_MAX_FILE_BYTES,
     };
 
-    let mut fetcher = RoutingFetcher::new(control, peers);
-    let lookup = match lookup_path(&mut fetcher, reference, &path).await {
+    let fetcher = RoutingFetcher::new(control, peers);
+    let lookup = match lookup_path(&fetcher, reference, &path).await {
         Ok(r) => r,
         Err(ManifestError::NotAManifest) => {
             return ControlAck::Error {
@@ -805,7 +805,7 @@ async fn run_get_bzz(
             }
         }
     };
-    let data = match join(&mut fetcher, &root, DEFAULT_MAX_FILE_BYTES).await {
+    let data = match join(&fetcher, &root, DEFAULT_MAX_FILE_BYTES).await {
         Ok(d) => d,
         Err(e) => {
             return ControlAck::Error {

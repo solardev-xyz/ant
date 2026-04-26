@@ -138,7 +138,7 @@ pub struct LookupResult {
 /// produces and what bee's `bzzDownloadHandler` looks up; see
 /// `bee/pkg/api/bzz.go`).
 pub async fn lookup_path(
-    fetcher: &mut dyn ChunkFetcher,
+    fetcher: &dyn ChunkFetcher,
     root_addr: [u8; 32],
     path: &str,
 ) -> Result<LookupResult, ManifestError> {
@@ -196,7 +196,7 @@ pub async fn lookup_path(
 /// entry, …)` ultimately marshals the child) and merges fork-level
 /// metadata (Content-Type, Filename) onto that result.
 fn walk<'a>(
-    fetcher: &'a mut dyn ChunkFetcher,
+    fetcher: &'a dyn ChunkFetcher,
     node: Node,
     remaining: &'a [u8],
     full_path: &'a str,
@@ -272,7 +272,7 @@ fn walk<'a>(
 
 /// Fetch a manifest node by reference and unmarshal it.
 async fn load_node(
-    fetcher: &mut dyn ChunkFetcher,
+    fetcher: &dyn ChunkFetcher,
     addr: [u8; 32],
 ) -> Result<Node, ManifestError> {
     // The node is itself a Swarm file: fetch the root chunk, then join.
@@ -683,7 +683,7 @@ mod tests {
     #[async_trait]
     impl ChunkFetcher for MapFetcher {
         async fn fetch(
-            &mut self,
+            &self,
             addr: [u8; 32],
         ) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
             self.chunks
@@ -743,9 +743,9 @@ mod tests {
     /// file's data ref + Content-Type.
     #[tokio::test]
     async fn lookup_empty_path_uses_index_document() {
-        let mut fetcher = gateway_fetcher();
+        let fetcher = gateway_fetcher();
         let root = decode_addr(ROOT_ADDR_HEX);
-        let res = lookup_path(&mut fetcher, root, "").await.unwrap();
+        let res = lookup_path(&fetcher, root, "").await.unwrap();
         assert_eq!(hex::encode(res.data_ref), FILE_DATA_REF_HEX);
         assert_eq!(
             res.content_type.as_deref(),
@@ -757,9 +757,9 @@ mod tests {
     /// Explicit path matches the same file via the `h` fork.
     #[tokio::test]
     async fn lookup_explicit_path() {
-        let mut fetcher = gateway_fetcher();
+        let fetcher = gateway_fetcher();
         let root = decode_addr(ROOT_ADDR_HEX);
-        let res = lookup_path(&mut fetcher, root, "hello.txt").await.unwrap();
+        let res = lookup_path(&fetcher, root, "hello.txt").await.unwrap();
         assert_eq!(hex::encode(res.data_ref), FILE_DATA_REF_HEX);
         assert_eq!(
             res.content_type.as_deref(),
@@ -770,9 +770,9 @@ mod tests {
     /// Non-existent path returns a clear `NotFound`.
     #[tokio::test]
     async fn lookup_unknown_path_not_found() {
-        let mut fetcher = gateway_fetcher();
+        let fetcher = gateway_fetcher();
         let root = decode_addr(ROOT_ADDR_HEX);
-        let err = lookup_path(&mut fetcher, root, "missing.txt")
+        let err = lookup_path(&fetcher, root, "missing.txt")
             .await
             .unwrap_err();
         assert!(matches!(err, ManifestError::NotFound { .. }));
@@ -789,7 +789,7 @@ mod tests {
         let (addr, wire) = ant_crypto::cac_new(&payload).unwrap();
         let mut fetcher = MapFetcher::new();
         fetcher.insert(addr, wire);
-        let err = lookup_path(&mut fetcher, addr, "anything").await.unwrap_err();
+        let err = lookup_path(&fetcher, addr, "anything").await.unwrap_err();
         assert!(
             matches!(err, ManifestError::NotAManifest),
             "expected NotAManifest, got {err:?}",

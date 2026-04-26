@@ -36,6 +36,7 @@
 
 use crate::ChunkFetcher;
 use ant_crypto::CHUNK_SIZE;
+use futures::stream::{self, StreamExt};
 use thiserror::Error;
 use tracing::trace;
 
@@ -47,6 +48,16 @@ use tracing::trace;
 pub const DEFAULT_MAX_FILE_BYTES: usize = 32 * 1024 * 1024;
 /// Hard ceiling on intermediate-chunk fan-out. `swarm.Branches`.
 const MAX_BRANCHES: usize = CHUNK_SIZE / 32;
+
+/// Maximum number of sibling chunk fetches in flight at once during a
+/// single intermediate node's expansion. Each in-flight fetch costs one
+/// libp2p stream multiplexed over the existing yamux session and ~4 KiB
+/// of buffer; well under the per-peer flow-control window. Tuned for a
+/// small file (single intermediate root, < 128 leaves) to complete in
+/// roughly two retrieval-RTTs end-to-end. For very deep trees the
+/// effective fan-out is still per-level, so larger files benefit
+/// proportionally without unbounded concurrency.
+const FETCH_FANOUT: usize = 16;
 
 /// Reason a join failed. Distinct variants so the caller can decide
 /// whether to retry, fall back, or surface a clean error to the user.
@@ -93,7 +104,7 @@ pub enum JoinError {
 /// this keeps the multi-chunk reconstruction logic pure and unit-testable
 /// against a `HashMap` mock.
 pub async fn join(
-    fetcher: &mut dyn ChunkFetcher,
+    fetcher: &dyn ChunkFetcher,
     root_chunk_data: &[u8],
     max_bytes: usize,
 ) -> Result<Vec<u8>, JoinError> {
@@ -117,8 +128,17 @@ pub async fn join(
 /// Recursive joiner core. Appends `subtree_span` bytes worth of file data
 /// to `out`, given an intermediate or leaf chunk's *payload* (post-span)
 /// and the declared span of the subtree it roots.
+///
+/// At each intermediate level we fan out up to [`FETCH_FANOUT`] sibling
+/// fetches in parallel via `Stream::buffered`, which preserves input
+/// order. Once the fetched chunks come back we walk them sequentially:
+/// for leaves that's just an append, for sub-intermediates we recurse
+/// (and the next level fans out independently). This turns a chain of
+/// `N` sequential RTTs into roughly `ceil(N / FETCH_FANOUT)` per
+/// intermediate, which is the dominant cost for typical small files
+/// where the root has all leaves as direct children.
 fn join_subtree<'a>(
-    fetcher: &'a mut dyn ChunkFetcher,
+    fetcher: &'a dyn ChunkFetcher,
     chunk_payload: &'a [u8],
     subtree_span: u64,
     out: &'a mut Vec<u8>,
@@ -156,9 +176,14 @@ fn join_subtree<'a>(
             refs,
             subtree_span,
             branch_size,
+            fanout = FETCH_FANOUT.min(refs).max(1),
             "intermediate chunk",
         );
 
+        // Pre-compute (child_addr, child_span) for every sibling so the
+        // parallel fetch can run without touching the parent payload
+        // again, and so the order is fixed before we kick off any I/O.
+        let mut specs: Vec<([u8; 32], u64)> = Vec::with_capacity(refs);
         let mut remaining = subtree_span;
         for i in 0..refs {
             let mut child_addr = [0u8; 32];
@@ -170,16 +195,32 @@ fn join_subtree<'a>(
             } else {
                 branch_size.min(remaining)
             };
-            let child_chunk = fetcher
-                .fetch(child_addr)
-                .await
-                .map_err(|e| JoinError::FetchChunk {
-                    addr: hex::encode(child_addr),
-                    source: e,
-                })?;
+            specs.push((child_addr, child_span));
+            remaining = remaining.saturating_sub(child_span);
+        }
+
+        // Fan out the per-sibling fetches. `buffered` keeps results in
+        // input order so the byte stream we splice into `out` matches
+        // the file's logical layout. We collect into a Vec rather than
+        // streaming into the recursion because `out: &mut Vec<u8>` can
+        // only be borrowed by one in-flight future at a time — the
+        // fetches run in parallel, the assembly is sequential.
+        let fanout = FETCH_FANOUT.min(refs).max(1);
+        let results: Vec<Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>> =
+            stream::iter(specs.iter().copied().map(|(addr, _span)| async move {
+                fetcher.fetch(addr).await
+            }))
+            .buffered(fanout)
+            .collect()
+            .await;
+
+        for ((addr, child_span), result) in specs.into_iter().zip(results) {
+            let child_chunk = result.map_err(|e| JoinError::FetchChunk {
+                addr: hex::encode(addr),
+                source: e,
+            })?;
             let (_, child_payload) = split_chunk(&child_chunk, out.len() as u64)?;
             join_subtree(fetcher, child_payload, child_span, out).await?;
-            remaining = remaining.saturating_sub(child_span);
         }
         Ok(())
     })
@@ -262,7 +303,7 @@ mod tests {
     #[async_trait::async_trait]
     impl crate::ChunkFetcher for MapFetcher {
         async fn fetch(
-            &mut self,
+            &self,
             addr: [u8; 32],
         ) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
             self.chunks
@@ -280,8 +321,8 @@ mod tests {
     async fn joins_single_chunk_file() {
         let payload = b"hello swarm".to_vec();
         let (_, wire) = cac_new(&payload).unwrap();
-        let mut fetcher = MapFetcher::new();
-        let out = join(&mut fetcher, &wire, DEFAULT_MAX_FILE_BYTES).await.unwrap();
+        let fetcher = MapFetcher::new();
+        let out = join(&fetcher, &wire, DEFAULT_MAX_FILE_BYTES).await.unwrap();
         assert_eq!(out, payload);
     }
 
@@ -308,7 +349,7 @@ mod tests {
         fetcher.insert(addr_a, wire_a);
         fetcher.insert(addr_b, wire_b);
 
-        let out = join(&mut fetcher, &root_wire, DEFAULT_MAX_FILE_BYTES).await.unwrap();
+        let out = join(&fetcher, &root_wire, DEFAULT_MAX_FILE_BYTES).await.unwrap();
         assert_eq!(out.len(), span as usize);
         assert!(out[..CHUNK_SIZE].iter().all(|&b| b == 0xaa));
         assert!(out[CHUNK_SIZE..].iter().all(|&b| b == 0xbb));
@@ -364,7 +405,7 @@ mod tests {
         root_wire.extend_from_slice(&total_span.to_le_bytes());
         root_wire.extend_from_slice(&root_payload);
 
-        let out = join(&mut fetcher, &root_wire, DEFAULT_MAX_FILE_BYTES).await.unwrap();
+        let out = join(&fetcher, &root_wire, DEFAULT_MAX_FILE_BYTES).await.unwrap();
         assert_eq!(out.len(), expected.len());
         assert_eq!(&out[..256], &expected[..256], "leading prefix");
         assert_eq!(&out[out.len() - 256..], &expected[expected.len() - 256..], "trailing");
@@ -385,8 +426,8 @@ mod tests {
         wire.extend_from_slice(&span.to_le_bytes());
         wire.extend_from_slice(&bogus_payload);
 
-        let mut fetcher = MapFetcher::new();
-        let err = join(&mut fetcher, &wire, DEFAULT_MAX_FILE_BYTES).await.unwrap_err();
+        let fetcher = MapFetcher::new();
+        let err = join(&fetcher, &wire, DEFAULT_MAX_FILE_BYTES).await.unwrap_err();
         assert!(matches!(err, JoinError::TooLarge { .. }));
     }
 
@@ -400,8 +441,8 @@ mod tests {
         let mut wire = Vec::new();
         wire.extend_from_slice(&span);
         wire.extend_from_slice(&payload);
-        let mut fetcher = MapFetcher::new();
-        let err = join(&mut fetcher, &wire, DEFAULT_MAX_FILE_BYTES).await.unwrap_err();
+        let fetcher = MapFetcher::new();
+        let err = join(&fetcher, &wire, DEFAULT_MAX_FILE_BYTES).await.unwrap_err();
         assert!(matches!(err, JoinError::UnsupportedRedundancy));
     }
 
