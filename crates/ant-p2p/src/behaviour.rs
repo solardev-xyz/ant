@@ -27,6 +27,7 @@ use libp2p::{dns, noise, tcp, yamux, PeerId, StreamProtocol, Swarm, SwarmBuilder
 use libp2p_stream::Control;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -237,6 +238,12 @@ struct SwarmState {
     /// every rebuild so it can't grow unbounded across long sessions.
     peer_order: HashMap<PeerId, u64>,
     next_peer_order: u64,
+    /// Process-wide chunk cache. Shared (by `Arc::clone`) into every
+    /// `RoutingFetcher` we build for `GetBytes` / `GetBzz`, so every
+    /// chunk we fetch from the network is reusable for the rest of
+    /// the daemon's lifetime — across retry attempts within one
+    /// command, and across consecutive `antctl get` invocations.
+    chunk_cache: Arc<ant_retrieval::InMemoryChunkCache>,
 }
 
 impl SwarmState {
@@ -255,6 +262,7 @@ impl SwarmState {
             target_peers,
             peer_order: HashMap::new(),
             next_peer_order: 0,
+            chunk_cache: Arc::new(ant_retrieval::InMemoryChunkCache::with_default_capacity()),
         }
     }
 
@@ -694,8 +702,9 @@ fn handle_control_command(
                 return;
             }
             let control = control.clone();
+            let cache = state.chunk_cache.clone();
             tokio::spawn(async move {
-                let reply = run_get_bytes(control, peers, reference).await;
+                let reply = run_get_bytes(control, peers, cache, reference).await;
                 let _ = ack.send(reply);
             });
         }
@@ -712,77 +721,214 @@ fn handle_control_command(
                 return;
             }
             let control = control.clone();
+            let cache = state.chunk_cache.clone();
             tokio::spawn(async move {
-                let reply = run_get_bzz(control, peers, reference, path).await;
+                let reply = run_get_bzz(control, peers, cache, reference, path).await;
                 let _ = ack.send(reply);
             });
         }
     }
 }
 
+/// Max number of full pipeline attempts (lookup_path + fetch + join)
+/// per user-visible `get` command. Three is enough to absorb the kind
+/// of one-off bee peer disconnects we see in practice; more than that
+/// usually means the chunk genuinely isn't reachable from our slice
+/// of the network and waiting won't fix it.
+const MAX_FETCH_ATTEMPTS: usize = 3;
+
+/// Multiplier base for inter-attempt backoff. Attempt N waits
+/// `RETRY_BACKOFF_BASE * N` before retrying — small enough not to
+/// noticeably stretch the user's wait, large enough that we don't
+/// re-flood the same overloaded forwarders the moment they shed us.
+const RETRY_BACKOFF_BASE: Duration = Duration::from_millis(500);
+
+/// One pipeline attempt's outcome on failure. `Transient` failures
+/// (chunk fetch errors from peer / network flakes) should trigger a
+/// retry; `Permanent` failures (corrupt data, "not a manifest", path
+/// not found, file-too-large, …) won't get better with another try
+/// and surface to the user immediately.
+enum AttemptError {
+    Transient(String),
+    Permanent(String),
+}
+
+/// Did this `JoinError` come from a chunk-fetch failure? The other
+/// variants (oversize span, malformed intermediate, RS / encryption)
+/// describe data-shape problems that would re-fail identically on a
+/// retry, so we mark them permanent.
+fn is_join_transient(e: &ant_retrieval::JoinError) -> bool {
+    matches!(e, ant_retrieval::JoinError::FetchChunk { .. })
+}
+
+/// Did this `ManifestError` ultimately come from a chunk-fetch failure
+/// during the trie walk? The wire/encoding variants (bad version hash,
+/// invalid metadata, descend-past-leaf, …) and the lookup-miss are all
+/// terminal.
+fn is_manifest_transient(e: &ant_retrieval::ManifestError) -> bool {
+    matches!(
+        e,
+        ant_retrieval::ManifestError::Fetch(inner) if is_join_transient(inner)
+    )
+}
+
 /// Spawned task body for `Request::GetBytes`. Fetches the root chunk via
 /// `RoutingFetcher`, then hands it to `ant_retrieval::join`. Pulled out
 /// of `handle_control_command` so the latter stays small and the async
 /// pieces are exercise-able without spinning up a swarm.
+///
+/// Wraps the actual pipeline in a retry loop: a fresh `RoutingFetcher`
+/// per attempt (so the blacklist resets, peer ordering can shift on
+/// any new BZZ handshakes that landed in between, and we get a clean
+/// race against the network state at the moment of the retry).
 async fn run_get_bytes(
     control: Control,
     peers: Vec<(libp2p::PeerId, [u8; 32])>,
+    cache: Arc<ant_retrieval::InMemoryChunkCache>,
     reference: [u8; 32],
 ) -> ControlAck {
-    use ant_retrieval::{join, ChunkFetcher, RoutingFetcher, DEFAULT_MAX_FILE_BYTES};
-    let fetcher = RoutingFetcher::new(control, peers);
-    let root = match fetcher.fetch(reference).await {
-        Ok(b) => b,
-        Err(e) => {
-            return ControlAck::Error {
-                message: format!("fetch root chunk {}: {e}", hex::encode(reference)),
+    let mut blacklist: Vec<libp2p::PeerId> = Vec::new();
+    for attempt in 1..=MAX_FETCH_ATTEMPTS {
+        let fetcher = ant_retrieval::RoutingFetcher::with_blacklist(
+            control.clone(),
+            peers.clone(),
+            blacklist.clone(),
+        )
+        .with_cache(cache.clone());
+        match try_get_bytes(&fetcher, reference).await {
+            Ok(data) => {
+                debug!(
+                    target: "ant_p2p",
+                    root = %hex::encode(reference),
+                    bytes = data.len(),
+                    attempt,
+                    "joiner produced file",
+                );
+                return ControlAck::Bytes { data };
+            }
+            Err(AttemptError::Permanent(message)) => {
+                return ControlAck::Error { message };
+            }
+            Err(AttemptError::Transient(message)) if attempt < MAX_FETCH_ATTEMPTS => {
+                // Carry forward every peer this attempt has marked bad
+                // so the next attempt skips past them in the ranked
+                // list rather than re-asking the same losers.
+                blacklist = fetcher.blacklist_snapshot();
+                let backoff = RETRY_BACKOFF_BASE * attempt as u32;
+                warn!(
+                    target: "ant_p2p",
+                    attempt,
+                    skipped_peers = blacklist.len(),
+                    next_in_ms = backoff.as_millis() as u64,
+                    "get_bytes failed, retrying: {message}",
+                );
+                tokio::time::sleep(backoff).await;
+            }
+            Err(AttemptError::Transient(message)) => {
+                return ControlAck::Error { message };
             }
         }
-    };
-    match join(&fetcher, &root, DEFAULT_MAX_FILE_BYTES).await {
-        Ok(data) => {
-            debug!(
-                target: "ant_p2p",
-                root = %hex::encode(reference),
-                bytes = data.len(),
-                "joiner produced file",
-            );
-            ControlAck::Bytes { data }
-        }
-        Err(e) => ControlAck::Error {
-            message: format!("join {}: {e}", hex::encode(reference)),
-        },
     }
+    unreachable!("retry loop exits via return on the final attempt");
+}
+
+/// One attempt at the get-bytes pipeline. Splits per-error-site
+/// classification away from the retry policy in `run_get_bytes`.
+async fn try_get_bytes(
+    fetcher: &ant_retrieval::RoutingFetcher,
+    reference: [u8; 32],
+) -> Result<Vec<u8>, AttemptError> {
+    use ant_retrieval::{join, ChunkFetcher, DEFAULT_MAX_FILE_BYTES};
+
+    let root = fetcher.fetch(reference).await.map_err(|e| {
+        AttemptError::Transient(format!("fetch root chunk {}: {e}", hex::encode(reference)))
+    })?;
+    join(fetcher, &root, DEFAULT_MAX_FILE_BYTES)
+        .await
+        .map_err(|e| {
+            let message = format!("join {}: {e}", hex::encode(reference));
+            if is_join_transient(&e) {
+                AttemptError::Transient(message)
+            } else {
+                AttemptError::Permanent(message)
+            }
+        })
 }
 
 /// Spawned task body for `Request::GetBzz`. Walks the manifest at
 /// `reference`, resolves `path`, then runs the joiner against the
-/// resolved data ref.
+/// resolved data ref. Wrapped in the same retry loop as
+/// [`run_get_bytes`].
 async fn run_get_bzz(
     control: Control,
     peers: Vec<(libp2p::PeerId, [u8; 32])>,
+    cache: Arc<ant_retrieval::InMemoryChunkCache>,
     reference: [u8; 32],
     path: String,
 ) -> ControlAck {
-    use ant_retrieval::{
-        join, lookup_path, ChunkFetcher, ManifestError, RoutingFetcher, DEFAULT_MAX_FILE_BYTES,
-    };
-
-    let fetcher = RoutingFetcher::new(control, peers);
-    let lookup = match lookup_path(&fetcher, reference, &path).await {
-        Ok(r) => r,
-        Err(ManifestError::NotAManifest) => {
-            return ControlAck::Error {
-                message: format!(
-                    "{} is not a mantaray manifest; try `antctl get` (raw chunk) or fetch via /bytes",
-                    hex::encode(reference)
-                ),
+    let mut blacklist: Vec<libp2p::PeerId> = Vec::new();
+    for attempt in 1..=MAX_FETCH_ATTEMPTS {
+        let fetcher = ant_retrieval::RoutingFetcher::with_blacklist(
+            control.clone(),
+            peers.clone(),
+            blacklist.clone(),
+        )
+        .with_cache(cache.clone());
+        match try_get_bzz(&fetcher, reference, &path).await {
+            Ok((data, content_type, filename)) => {
+                return ControlAck::BzzBytes {
+                    data,
+                    content_type,
+                    filename,
+                };
+            }
+            Err(AttemptError::Permanent(message)) => {
+                return ControlAck::Error { message };
+            }
+            Err(AttemptError::Transient(message)) if attempt < MAX_FETCH_ATTEMPTS => {
+                blacklist = fetcher.blacklist_snapshot();
+                let backoff = RETRY_BACKOFF_BASE * attempt as u32;
+                warn!(
+                    target: "ant_p2p",
+                    attempt,
+                    skipped_peers = blacklist.len(),
+                    next_in_ms = backoff.as_millis() as u64,
+                    "get_bzz failed, retrying: {message}",
+                );
+                tokio::time::sleep(backoff).await;
+            }
+            Err(AttemptError::Transient(message)) => {
+                return ControlAck::Error { message };
             }
         }
+    }
+    unreachable!("retry loop exits via return on the final attempt");
+}
+
+/// One attempt at the get-bzz pipeline. Returns the resolved
+/// `(data, content_type, filename)` tuple on success.
+async fn try_get_bzz(
+    fetcher: &ant_retrieval::RoutingFetcher,
+    reference: [u8; 32],
+    path: &str,
+) -> Result<(Vec<u8>, Option<String>, Option<String>), AttemptError> {
+    use ant_retrieval::{join, lookup_path, ChunkFetcher, ManifestError, DEFAULT_MAX_FILE_BYTES};
+
+    let lookup = match lookup_path(fetcher, reference, path).await {
+        Ok(r) => r,
+        Err(ManifestError::NotAManifest) => {
+            return Err(AttemptError::Permanent(format!(
+                "{} is not a mantaray manifest; try `antctl get` (raw chunk) or fetch via /bytes",
+                hex::encode(reference)
+            )));
+        }
         Err(e) => {
-            return ControlAck::Error {
-                message: format!("manifest lookup '{path}': {e}"),
-            }
+            let message = format!("manifest lookup '{path}': {e}");
+            return Err(if is_manifest_transient(&e) {
+                AttemptError::Transient(message)
+            } else {
+                AttemptError::Permanent(message)
+            });
         }
     };
     let data_ref = lookup.data_ref;
@@ -795,34 +941,28 @@ async fn run_get_bzz(
         "manifest resolved",
     );
 
-    // Now fetch the file body itself. Reuse the same fetcher so the
-    // blacklist / peer ordering carries over from the manifest walk.
-    let root = match fetcher.fetch(data_ref).await {
-        Ok(b) => b,
-        Err(e) => {
-            return ControlAck::Error {
-                message: format!("fetch data root {}: {e}", hex::encode(data_ref)),
+    // Reuse the same fetcher so the blacklist / peer ordering carries
+    // over from the manifest walk into the file-body fetch.
+    let root = fetcher.fetch(data_ref).await.map_err(|e| {
+        AttemptError::Transient(format!("fetch data root {}: {e}", hex::encode(data_ref)))
+    })?;
+    let data = join(fetcher, &root, DEFAULT_MAX_FILE_BYTES)
+        .await
+        .map_err(|e| {
+            let message = format!("join data {}: {e}", hex::encode(data_ref));
+            if is_join_transient(&e) {
+                AttemptError::Transient(message)
+            } else {
+                AttemptError::Permanent(message)
             }
-        }
-    };
-    let data = match join(&fetcher, &root, DEFAULT_MAX_FILE_BYTES).await {
-        Ok(d) => d,
-        Err(e) => {
-            return ControlAck::Error {
-                message: format!("join data {}: {e}", hex::encode(data_ref)),
-            }
-        }
-    };
+        })?;
+
     let filename = lookup
         .metadata
         .get("Filename")
         .cloned()
-        .or_else(|| derive_filename_from_path(&path));
-    ControlAck::BzzBytes {
-        data,
-        content_type: lookup.content_type,
-        filename,
-    }
+        .or_else(|| derive_filename_from_path(path));
+    Ok((data, lookup.content_type, filename))
 }
 
 /// Heuristic fallback: if mantaray didn't carry a `Filename` metadata

@@ -18,24 +18,46 @@
 //! manifest walk is so long-lived that it matters in practice. Re-issuing
 //! the command is cheap.
 
-use crate::{retrieve_chunk, ChunkFetcher, RetrievalError};
+use crate::{retrieve_chunk, ChunkFetcher, InMemoryChunkCache, RetrievalError};
 use async_trait::async_trait;
+use futures::stream::{FuturesUnordered, StreamExt};
 use libp2p::PeerId;
 use libp2p_stream::Control;
 use std::cmp::Ordering;
 use std::error::Error as StdError;
-use std::sync::Mutex;
-use tracing::debug;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tracing::{debug, trace};
 
 /// 32-byte Swarm overlay. Duplicated locally rather than re-exported from
 /// `ant_p2p::routing` to keep `ant-retrieval` free of a circular dep.
 pub type Overlay = [u8; 32];
 
 /// Per-fetch retry budget. With 100 BZZ peers in the table the closest
-/// 8 will, on average, all be willing to forward — so 6 attempts is
-/// plenty before declaring the chunk unavailable. Keep small to avoid
-/// runaway latency on a manifest walk.
-const FALLBACK_PEERS: usize = 6;
+/// dozen or so will, on average, all be willing to forward, so a
+/// budget of 8 distinct peer attempts is comfortable headroom for one
+/// chunk before we declare it unavailable for this attempt. The outer
+/// retry wrapper in `ant-p2p` carries the resulting blacklist forward
+/// so subsequent attempts genuinely start at a different slice of
+/// peers (rather than re-hammering the same closest 8).
+const FALLBACK_PEERS: usize = 8;
+
+/// Hedging width. We may have at most this many in-flight retrieval
+/// streams for a single chunk at once; whichever returns a valid
+/// delivery first wins, the rest get cancelled. K=2 hits the sweet
+/// spot between tail-latency reduction and wasted bandwidth on
+/// duplicated chunks.
+const HEDGE_FANOUT: usize = 2;
+
+/// How long we wait on the first peer before firing a hedge. Most
+/// chunks resolve in well under this on the happy path (typical fast
+/// peer is 100–300 ms end-to-end), so the second request is only
+/// fired when the first peer is genuinely tail-slow. This avoids
+/// hammering bee peers — and getting disconnected for it — on every
+/// fetch, while still capping tail latency at roughly
+/// `HEDGE_DELAY + min_hedge_response`. If the first peer *errors*
+/// before the timer fires we hedge immediately rather than waiting.
+const HEDGE_DELAY: Duration = Duration::from_millis(250);
 
 /// Stateful per-call fetcher. Owns a clone of `Control` and the peer
 /// snapshot. The blacklist is behind a `Mutex` because the joiner now
@@ -50,6 +72,12 @@ pub struct RoutingFetcher {
     /// rotate through candidates on retry without picking the same dud
     /// peer twice.
     blacklist: Mutex<Vec<PeerId>>,
+    /// Optional shared chunk cache. When set, every `fetch` consults
+    /// the cache before going to the network and writes back on
+    /// success. The daemon holds one cache shared across requests so
+    /// re-fetches (within a retry attempt or across `antctl get`
+    /// invocations) skip the network entirely.
+    cache: Option<Arc<InMemoryChunkCache>>,
 }
 
 impl RoutingFetcher {
@@ -59,11 +87,51 @@ impl RoutingFetcher {
     /// matches what bee does (it freezes a peer set per request to avoid
     /// surprising re-routing mid-walk).
     pub fn new(control: Control, peers: Vec<(PeerId, Overlay)>) -> Self {
+        Self::with_blacklist(control, peers, Vec::new())
+    }
+
+    /// Build a fetcher pre-populated with peers we already know are
+    /// hopeless for this request. Used by the daemon's outer retry
+    /// loop to *carry the blacklist forward* across attempts: peers
+    /// that failed to deliver chunk(s) on attempt N get skipped on
+    /// attempt N+1, so each retry genuinely explores a fresh slice
+    /// of the ranked candidate list rather than re-asking the same
+    /// closest peers.
+    pub fn with_blacklist(
+        control: Control,
+        peers: Vec<(PeerId, Overlay)>,
+        blacklist: Vec<PeerId>,
+    ) -> Self {
         Self {
             control,
             peers,
-            blacklist: Mutex::new(Vec::new()),
+            blacklist: Mutex::new(blacklist),
+            cache: None,
         }
+    }
+
+    /// Attach a shared chunk cache to this fetcher. Chainable so call
+    /// sites can write
+    /// `RoutingFetcher::with_blacklist(..).with_cache(cache.clone())`
+    /// without juggling a third constructor variant. Passing the same
+    /// `Arc<InMemoryChunkCache>` to every fetcher built for the same
+    /// daemon process is what makes the cache persist across retry
+    /// attempts and across `antctl get` invocations.
+    pub fn with_cache(mut self, cache: Arc<InMemoryChunkCache>) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    /// Snapshot of the peers this fetcher has marked as failed during
+    /// its lifetime. Cheap clone (the blacklist is `Vec<PeerId>` and
+    /// `PeerId` is `Copy`-cheap). Caller hands this into
+    /// [`RoutingFetcher::with_blacklist`] when constructing the next
+    /// attempt's fetcher.
+    pub fn blacklist_snapshot(&self) -> Vec<PeerId> {
+        self.blacklist
+            .lock()
+            .expect("blacklist mutex poisoned")
+            .clone()
     }
 
     /// `(peer, overlay)` ordered by ascending XOR distance to `target`,
@@ -103,41 +171,123 @@ impl RoutingFetcher {
 #[async_trait]
 impl ChunkFetcher for RoutingFetcher {
     async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
+        // Cache hit short-circuits the entire network path. `retrieve_chunk`
+        // CAC-validates before we ever cache, so cached entries are trusted
+        // without re-hashing.
+        if let Some(cache) = self.cache.as_ref() {
+            if let Some(bytes) = cache.get(&addr) {
+                trace!(
+                    target: "ant_retrieval::fetcher",
+                    chunk = %hex::encode(addr),
+                    "cache hit",
+                );
+                return Ok(bytes);
+            }
+        }
+
         let candidates = self.ranked(&addr);
         if candidates.is_empty() {
             return Err("no BZZ peers available".into());
         }
+
+        // Hedged retrieval with a delay. We walk the ranked candidate
+        // list (capped at `FALLBACK_PEERS`) and keep up to
+        // `HEDGE_FANOUT` requests in flight at once. The first request
+        // is fired immediately. If it hasn't completed within
+        // `HEDGE_DELAY`, we add a hedge request to the next-closest
+        // peer. If a request errors, we backfill with the next peer
+        // straight away (don't wait on the timer — keep race breadth).
+        // The first peer to return a valid chunk wins; the rest get
+        // dropped, which cancels their libp2p streams.
+        let mut iter = candidates.into_iter().take(FALLBACK_PEERS);
+        let mut in_flight = FuturesUnordered::new();
+        // The initial `None` is observably dead — the only path that
+        // reads it goes through the `Err` arm below, which always
+        // overwrites it — but the type annotation on first use needs a
+        // value here.
+        #[allow(unused_assignments)]
         let mut last_err: Option<RetrievalError> = None;
-        for (peer, _overlay) in candidates.into_iter().take(FALLBACK_PEERS) {
-            // Each in-flight fetch gets its own `Control` clone; libp2p's
-            // stream control multiplexes over the existing yamux session
-            // so this is cheap (no transport-level handshake), and lets
-            // sibling fetches truly run in parallel rather than queuing
-            // behind a single shared `&mut Control`.
+
+        // Each in-flight fetch gets its own `Control` clone; libp2p's
+        // stream control multiplexes over the existing yamux session
+        // so this is cheap (no transport-level handshake), and lets
+        // hedge attempts truly run in parallel rather than queuing
+        // behind a single shared `&mut Control`.
+        let make_fut = |peer: PeerId| {
             let mut control = self.control.clone();
-            match retrieve_chunk(&mut control, peer, addr).await {
-                Ok(chunk) => {
-                    // Caller wants `span (8 LE) || payload`, exactly what
-                    // arrives on the wire. `retrieve_chunk` already
-                    // CAC-validates so we can hand bytes back without a
-                    // re-check.
-                    let mut wire = Vec::with_capacity(8 + chunk.payload().len());
-                    wire.extend_from_slice(&chunk.span_bytes());
-                    wire.extend_from_slice(chunk.payload());
-                    return Ok(wire);
+            async move {
+                let r = retrieve_chunk(&mut control, peer, addr).await;
+                (peer, r)
+            }
+        };
+
+        match iter.next() {
+            Some((peer, _)) => in_flight.push(make_fut(peer)),
+            None => return Err("no BZZ peers available".into()),
+        }
+
+        let mut hedge_timer = Box::pin(tokio::time::sleep(HEDGE_DELAY));
+
+        loop {
+            tokio::select! {
+                Some((peer, result)) = in_flight.next() => {
+                    match result {
+                        Ok(chunk) => {
+                            // Drop the rest — `FuturesUnordered`'s drop
+                            // runs each remaining future's destructor,
+                            // which cancels its libp2p stream. Bee on
+                            // the other side just sees a stream reset.
+                            drop(in_flight);
+                            // Caller wants `span (8 LE) || payload`,
+                            // exactly what arrives on the wire.
+                            // `retrieve_chunk` already CAC-validates so
+                            // we can hand bytes back without a re-check.
+                            let mut wire = Vec::with_capacity(8 + chunk.payload().len());
+                            wire.extend_from_slice(&chunk.span_bytes());
+                            wire.extend_from_slice(chunk.payload());
+                            // Write-through to the cache so the next
+                            // fetcher (next retry attempt, or a future
+                            // `antctl get` of the same reference)
+                            // skips the network for this chunk. The
+                            // clone is one 4 KiB memcpy per success.
+                            if let Some(cache) = self.cache.as_ref() {
+                                cache.put(addr, wire.clone());
+                            }
+                            return Ok(wire);
+                        }
+                        Err(e) => {
+                            debug!(
+                                target: "ant_retrieval::fetcher",
+                                %peer,
+                                chunk = %hex::encode(addr),
+                                "fetch failed, blacklisting peer: {e}",
+                            );
+                            self.blacklist_peer(peer);
+                            last_err = Some(e);
+                            // Eagerly backfill with the next candidate
+                            // so the race stays alive. Reset the hedge
+                            // timer so the new request gets a fair shot
+                            // before we layer another hedge on top.
+                            if let Some((peer, _)) = iter.next() {
+                                in_flight.push(make_fut(peer));
+                                hedge_timer = Box::pin(tokio::time::sleep(HEDGE_DELAY));
+                            } else if in_flight.is_empty() {
+                                break;
+                            }
+                        }
+                    }
                 }
-                Err(e) => {
-                    debug!(
-                        target: "ant_retrieval::fetcher",
-                        %peer,
-                        chunk = %hex::encode(addr),
-                        "fetch failed, blacklisting peer: {e}",
-                    );
-                    self.blacklist_peer(peer);
-                    last_err = Some(e);
+                _ = &mut hedge_timer, if in_flight.len() < HEDGE_FANOUT => {
+                    // First peer is taking a while; fire a hedge to the
+                    // next-closest candidate, if any.
+                    if let Some((peer, _)) = iter.next() {
+                        in_flight.push(make_fut(peer));
+                    }
+                    hedge_timer = Box::pin(tokio::time::sleep(HEDGE_DELAY));
                 }
             }
         }
+
         Err(format!(
             "all peers failed for chunk {} (last: {})",
             hex::encode(addr),

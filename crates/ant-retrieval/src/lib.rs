@@ -42,10 +42,12 @@
 //! sustained reader would need to honor SWAP debits (M3 territory); we
 //! deliberately don't here.
 
+pub mod cache;
 pub mod fetcher;
 pub mod joiner;
 pub mod mantaray;
 
+pub use cache::{InMemoryChunkCache, DEFAULT_CAPACITY as DEFAULT_CACHE_CAPACITY};
 pub use fetcher::{Overlay, RoutingFetcher};
 pub use joiner::{join, JoinError, DEFAULT_MAX_FILE_BYTES};
 pub use mantaray::{
