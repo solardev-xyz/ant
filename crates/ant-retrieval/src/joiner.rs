@@ -52,12 +52,18 @@ const MAX_BRANCHES: usize = CHUNK_SIZE / 32;
 /// Maximum number of sibling chunk fetches in flight at once during a
 /// single intermediate node's expansion. Each in-flight fetch costs one
 /// libp2p stream multiplexed over the existing yamux session and ~4 KiB
-/// of buffer; well under the per-peer flow-control window. Tuned for a
-/// small file (single intermediate root, < 128 leaves) to complete in
-/// roughly two retrieval-RTTs end-to-end. For very deep trees the
-/// effective fan-out is still per-level, so larger files benefit
-/// proportionally without unbounded concurrency.
-const FETCH_FANOUT: usize = 16;
+/// of buffer; well under the per-peer flow-control window. We previously
+/// ran this at 16, which raced ~32 streams in flight at the joiner level
+/// (16 chunks × hedge width 2). Bee peers reacted by churning their
+/// libp2p connection to us (visible in our log as a continuous
+/// connect/disconnect storm during a multi-MiB fetch) — observed effect:
+/// every multi-MiB media file took ~30 s per attempt and failed on a
+/// stream-open error before the joiner could finish. Cutting to 8
+/// halves the steady-state stream pressure on bee while keeping a deep
+/// tree's cumulative RTT bounded (a 36 MiB / 9000-leaf file at 8-wide
+/// goes through ~1100 round-trips, comfortably inside the gateway's
+/// 240 s envelope at typical 100–300 ms-per-chunk RTTs).
+const FETCH_FANOUT: usize = 8;
 
 /// Knobs that aren't span/payload-defined. Pass [`JoinOptions::default`]
 /// for the strict joiner; flip flags on for explicit, narrowly-scoped

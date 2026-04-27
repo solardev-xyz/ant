@@ -96,11 +96,15 @@ pub const PROTOCOL_RETRIEVAL: &str = "/swarm/retrieval/1.4.0/retrieval";
 pub type ChunkAddr = [u8; 32];
 
 /// Total wall-clock cap on a single retrieve attempt: open stream, headers
-/// roundtrip, request, delivery. Bee uses 30 s for `RetrieveChunkTimeout`,
-/// but for the origin path a peer that hasn't shipped a 4 KiB delivery in
-/// 10 s is almost certainly forwarding to a stuck downstream and we'd
-/// rather fail-fast and try a different peer.
-const RETRIEVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// roundtrip, request, delivery. Bee's own `RetrieveChunkTimeout` is 30 s
+/// because a peer typically has to forward our request a few hops deeper
+/// into the neighbourhood before someone with the chunk actually answers.
+/// Our previous 10 s cap was aggressive enough that we routinely cancelled
+/// peers mid-forward — bee logged the chunk as unretrievable even though
+/// the same chunk fetched fine via a longer-running client. 20 s splits
+/// the difference: enough headroom for a forwarded chunk to come back,
+/// short enough that a genuinely stuck peer doesn't block our retry loop.
+const RETRIEVE_TIMEOUT: Duration = Duration::from_secs(20);
 /// Max bytes for the bee-headers preamble. Bee tags retrieval streams
 /// with at most a couple of small tracing headers (current default is
 /// none); 8 KiB is more than enough and matches our existing cap on the

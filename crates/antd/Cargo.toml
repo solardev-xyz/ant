@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 ant-control = { path = "../ant-control" }
 ant-crypto = { path = "../ant-crypto" }
+ant-gateway = { path = "../ant-gateway" }
 ant-node = { path = "../ant-node" }
 ant-p2p = { path = "../ant-p2p" }
 k256.workspace = true

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/ant-control",
     "crates/ant-crypto",
+    "crates/ant-gateway",
     "crates/ant-p2p",
     "crates/ant-retrieval",
     "crates/ant-node",
@@ -40,3 +41,6 @@ libp2p = { version = "0.56.0", features = [
     "tokio",
 ] }
 anyhow = "1.0.98"
+async-trait = "0.1.89"
+axum = "0.8.9"
+hyper = "1.9.0"

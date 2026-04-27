@@ -10,13 +10,13 @@ use ant_control::{
     ControlAck, ControlCommand, GetProgress, HandshakeReport, PeerConnectionInfo,
     PeerConnectionState, PeerPipelineEntry, RoutingInfo, StatusSnapshot,
 };
-use ant_retrieval::ProgressTracker;
 use ant_crypto::{
     ethereum_address_from_public_key, overlay_from_ethereum_address, OVERLAY_NONCE_LEN,
     SECP256K1_SECRET_LEN,
 };
-use k256::ecdsa::{SigningKey, VerifyingKey};
+use ant_retrieval::ProgressTracker;
 use futures::StreamExt;
+use k256::ecdsa::{SigningKey, VerifyingKey};
 use libp2p::core::connection::ConnectedPoint;
 use libp2p::identify;
 use libp2p::identity::Keypair;
@@ -31,7 +31,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 use tracing::{debug, info, trace, warn};
 
 const LISTEN: &str = "/ip4/0.0.0.0/tcp/0";
@@ -276,6 +276,34 @@ struct SwarmState {
     /// so each chunk fetched (or served from the cache) gets dumped
     /// to disk. Set from `RunConfig::chunk_record_dir`.
     chunk_record_dir: Option<PathBuf>,
+    /// Live `(PeerId, Overlay)` snapshot of the routing table, refreshed
+    /// every time we admit or forget a peer. Spawned `GetBytes` /
+    /// `GetBzz` tasks subscribe to this watch and re-read it at the
+    /// start of every retry attempt — that's how we avoid pinning a
+    /// minute-stale peer list across a 3+ minute multi-chunk fetch.
+    /// Bee peers churn aggressively (libp2p connections regularly
+    /// open and close within a few seconds during normal swarm
+    /// activity), and a snapshot frozen at command time would leave
+    /// the fetcher trying to open streams on long-dead connections —
+    /// which surfaces in the logs as `io: <peer>/N: connection is closed`
+    /// or `oneshot canceled` from the libp2p stream-open path. The
+    /// retry loop's whole point is to re-roll against the *current*
+    /// network state, not the network state from before the fetch
+    /// started.
+    peers_watch: watch::Sender<Vec<(PeerId, Overlay)>>,
+    /// Process-wide cap on concurrent `retrieve_chunk` calls. Cloned
+    /// into every `RoutingFetcher` we build for any `GetBytes` /
+    /// `GetBzz` request, so the cap applies across concurrent
+    /// requests rather than per-request. Sized to roughly one
+    /// joiner's worth of fan-out (`FETCH_FANOUT × HEDGE_FANOUT` =
+    /// 8 × 2 = 16): enough for a single retrieval pipeline to run
+    /// unblocked, small enough that a stampede from concurrent
+    /// browser fetches gets serialised at the chunk level instead of
+    /// flooding bee with ~64 simultaneous streams. Without this cap,
+    /// concurrently-fetched media files turn into self-DoS — chunks
+    /// that respond in 90–200 ms when probed individually time out
+    /// at 20 s when racing against ~60 sibling streams.
+    retrieval_inflight: Arc<Semaphore>,
 }
 
 impl SwarmState {
@@ -309,7 +337,21 @@ impl SwarmState {
             next_peer_order: 0,
             chunk_cache,
             chunk_record_dir,
+            peers_watch: watch::channel(Vec::new()).0,
+            retrieval_inflight: Arc::new(Semaphore::new(RETRIEVAL_INFLIGHT_CAP)),
         }
+    }
+
+    /// Republish the current routing-table snapshot on `peers_watch`.
+    /// Call after every `routing.admit` / `routing.forget`. Cheap: the
+    /// snapshot is at most a few hundred `(PeerId, [u8; 32])` pairs and
+    /// `watch::Sender::send_replace` does a single move + wake of any
+    /// borrow-blocked readers (there aren't any during normal operation
+    /// — the spawned retry tasks read on attempt boundaries, not
+    /// continuously).
+    fn publish_peers(&self) {
+        let snapshot = self.routing.snapshot();
+        self.peers_watch.send_replace(snapshot);
     }
 
     /// Resolve the chunk cache for one user-visible `GetBytes` / `GetBzz`
@@ -579,11 +621,8 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     if let Some(s) = &cfg.status {
         s.send_modify(|st| st.peers.node_limit = target_peers as u32);
     }
-    let base_overlay = local_overlay_from_secret(
-        &cfg.signing_secret,
-        &cfg.overlay_nonce,
-        cfg.network_id,
-    );
+    let base_overlay =
+        local_overlay_from_secret(&cfg.signing_secret, &cfg.overlay_nonce, cfg.network_id);
     let mut state = SwarmState::new(
         target_peers,
         base_overlay,
@@ -762,18 +801,59 @@ fn handle_control_command(
                 let _ = ack.send(reply);
             });
         }
+        ControlCommand::GetChunkRaw { reference, ack } => {
+            // Same routing / fetch path as `GetChunk`, but ack carries
+            // the wire bytes (`span || payload`) so `ant-gateway` can
+            // serve `/chunks/{addr}` byte-for-byte the way bee does.
+            let candidate = state.routing.closest_peer(&reference, &[]);
+            let Some((peer, _overlay)) = candidate else {
+                let _ = ack.send(ControlAck::Error {
+                    message: "no peers available; wait for handshakes to complete".to_string(),
+                });
+                return;
+            };
+            let mut control = control.clone();
+            tokio::spawn(async move {
+                let res = ant_retrieval::retrieve_chunk(&mut control, peer, reference).await;
+                let reply = match res {
+                    Ok(chunk) => {
+                        debug!(
+                            target: "ant_p2p",
+                            %peer,
+                            wire_bytes = chunk.data.len(),
+                            "retrieval ok (raw)",
+                        );
+                        ControlAck::Bytes { data: chunk.data }
+                    }
+                    Err(e) => {
+                        debug!(target: "ant_p2p", %peer, "retrieval failed: {e}");
+                        ControlAck::Error {
+                            message: format!("retrieval from {peer}: {e}"),
+                        }
+                    }
+                };
+                let _ = ack.send(reply);
+            });
+        }
         ControlCommand::GetBytes {
             reference,
             bypass_cache,
             progress,
+            max_bytes,
             ack,
         } => {
-            // Multi-chunk raw bytes: snapshot peers, build a routing-aware
-            // fetcher, and drive the joiner inside a spawned task. The
-            // joiner does its own per-chunk fetch + CAC verify; we only
-            // need to feed it the root chunk.
-            let peers = state.routing.snapshot();
-            if peers.is_empty() {
+            // Multi-chunk raw bytes: subscribe to the live peer-snapshot
+            // watch, build a routing-aware fetcher per attempt against
+            // the *current* set of BZZ peers, and drive the joiner
+            // inside a spawned task. The joiner does its own per-chunk
+            // fetch + CAC verify; we only need to feed it the root
+            // chunk. Subscribing (rather than snapshotting at command
+            // time) is what keeps the retry loop honest across long
+            // multi-MiB fetches: by attempt N our original peer list
+            // would be 30+ seconds stale and full of disconnected
+            // peers.
+            let peers_rx = state.peers_watch.subscribe();
+            if peers_rx.borrow().is_empty() {
                 send_terminal_ack(
                     &ack,
                     ControlAck::Error {
@@ -785,6 +865,7 @@ fn handle_control_command(
             let control = control.clone();
             let cache = state.cache_for_request(bypass_cache);
             let record_dir = state.chunk_record_dir.clone();
+            let inflight_limit = state.retrieval_inflight.clone();
             let tracker = Arc::new(ProgressTracker::new(bypass_cache));
             let started = Instant::now();
             let emitter = if progress {
@@ -800,11 +881,13 @@ fn handle_control_command(
             tokio::spawn(async move {
                 let reply = run_get_bytes(
                     control,
-                    peers,
+                    peers_rx,
                     cache,
                     record_dir,
+                    inflight_limit,
                     tracker_for_run,
                     reference,
+                    max_bytes,
                 )
                 .await;
                 if let Some(handle) = emitter {
@@ -819,10 +902,12 @@ fn handle_control_command(
             allow_degraded_redundancy,
             bypass_cache,
             progress,
+            max_bytes,
             ack,
         } => {
-            let peers = state.routing.snapshot();
-            if peers.is_empty() {
+            // Same live-snapshot reasoning as `GetBytes` above.
+            let peers_rx = state.peers_watch.subscribe();
+            if peers_rx.borrow().is_empty() {
                 send_terminal_ack(
                     &ack,
                     ControlAck::Error {
@@ -834,6 +919,7 @@ fn handle_control_command(
             let control = control.clone();
             let cache = state.cache_for_request(bypass_cache);
             let record_dir = state.chunk_record_dir.clone();
+            let inflight_limit = state.retrieval_inflight.clone();
             let tracker = Arc::new(ProgressTracker::new(bypass_cache));
             let started = Instant::now();
             let emitter = if progress {
@@ -849,13 +935,15 @@ fn handle_control_command(
             tokio::spawn(async move {
                 let reply = run_get_bzz(
                     control,
-                    peers,
+                    peers_rx,
                     cache,
                     record_dir,
+                    inflight_limit,
                     tracker_for_run,
                     reference,
                     path,
                     allow_degraded_redundancy,
+                    max_bytes,
                 )
                 .await;
                 if let Some(handle) = emitter {
@@ -929,11 +1017,32 @@ fn send_terminal_ack(ack: &mpsc::Sender<ControlAck>, reply: ControlAck) {
 }
 
 /// Max number of full pipeline attempts (lookup_path + fetch + join)
-/// per user-visible `get` command. Three is enough to absorb the kind
-/// of one-off bee peer disconnects we see in practice; more than that
-/// usually means the chunk genuinely isn't reachable from our slice
-/// of the network and waiting won't fix it.
-const MAX_FETCH_ATTEMPTS: usize = 3;
+/// per user-visible `get` command. We saw real-world cases where a
+/// large file's tail leaves needed up to four full retries to find a
+/// bee peer in a different neighbourhood that actually had the chunk —
+/// chunk locality on mainnet is sparse enough that the closest 16
+/// peers (per-attempt budget in `ant-retrieval::FALLBACK_PEERS`)
+/// occasionally all return `storage: not found` even though the chunk
+/// is retrievable from a wider scan. Five attempts gives us up to ~80
+/// distinct candidate peers per chunk across attempts (with the
+/// blacklist carried forward), at the cost of an extra ~7.5 s of
+/// backoff in the worst case (0.5 + 1 + 1.5 + 2 + 2.5 s); the gateway
+/// request timeout absorbs this comfortably.
+const MAX_FETCH_ATTEMPTS: usize = 5;
+
+/// Process-wide cap on concurrent `retrieve_chunk` calls (see
+/// `SwarmState::retrieval_inflight`). Sized to one joiner pipeline
+/// (`ant_retrieval::FETCH_FANOUT × HEDGE_FANOUT` = 8 × 2 = 16) so a
+/// single fetch runs unbounded but a stampede from concurrent
+/// browser fetches gets serialised at the chunk level. We saw, with
+/// no cap at all, four parallel `bzz://` fetches turn into ~60
+/// simultaneous retrieval streams — chunks that responded to
+/// `/chunks/<addr>` in 90–200 ms in isolation timed out at our 20 s
+/// envelope under that load, even though the *same chunks* fetched
+/// fine moments later. 16 closes that hole. Tuning higher trades
+/// per-request latency for stampede risk; tuning lower starves the
+/// joiner.
+const RETRIEVAL_INFLIGHT_CAP: usize = 16;
 
 /// Multiplier base for inter-attempt backoff. Attempt N waits
 /// `RETRY_BACKOFF_BASE * N` before retrying — small enough not to
@@ -976,28 +1085,53 @@ fn is_manifest_transient(e: &ant_retrieval::ManifestError) -> bool {
 /// pieces are exercise-able without spinning up a swarm.
 ///
 /// Wraps the actual pipeline in a retry loop: a fresh `RoutingFetcher`
-/// per attempt (so the blacklist resets, peer ordering can shift on
-/// any new BZZ handshakes that landed in between, and we get a clean
-/// race against the network state at the moment of the retry).
+/// per attempt with a **clean blacklist** *and* a fresh peer snapshot
+/// pulled from `peers_rx` at attempt-start. So peers that were
+/// transiently unreachable on attempt N (dropped libp2p connection,
+/// tail-slow forward, momentarily no dial address) drop out of the
+/// candidate list automatically once `ConnectionClosed` fires —
+/// instead of sitting in a frozen list and giving us "connection is
+/// closed" / "oneshot canceled" errors over and over until we exhaust
+/// `MAX_FETCH_ATTEMPTS`. Bee's retrieval works the same way: skip-lists
+/// are scoped to a single retrieval, never to the whole client session,
+/// and the candidate set comes from the live forwarding-Kademlia table.
+///
+/// This is the core of the fix for "browser stalls on a multi-MiB media
+/// file": both the blacklist carry-forward *and* the frozen peer snapshot
+/// pushed us into "no BZZ peers available" or "connection is closed"
+/// by attempt 2 — every peer we'd ever flubbed got banned permanently
+/// for the rest of the request, and even un-flubbed-but-disconnected
+/// peers stayed in the rotation forever.
+// Eight args is over clippy's preferred ceiling, but bundling shared
+// retrieval plumbing with request-scoped knobs into a struct just for
+// one call site hides more than it helps.
+#[allow(clippy::too_many_arguments)]
 async fn run_get_bytes(
     control: Control,
-    peers: Vec<(libp2p::PeerId, [u8; 32])>,
+    peers_rx: watch::Receiver<Vec<(libp2p::PeerId, [u8; 32])>>,
     cache: Arc<ant_retrieval::InMemoryChunkCache>,
     record_dir: Option<PathBuf>,
+    inflight_limit: Arc<Semaphore>,
     tracker: Arc<ProgressTracker>,
     reference: [u8; 32],
+    max_bytes: Option<u64>,
 ) -> ControlAck {
-    let mut blacklist: Vec<libp2p::PeerId> = Vec::new();
     for attempt in 1..=MAX_FETCH_ATTEMPTS {
-        let fetcher = ant_retrieval::RoutingFetcher::with_blacklist(
-            control.clone(),
-            peers.clone(),
-            blacklist.clone(),
-        )
-        .with_cache(cache.clone())
-        .with_record_dir(record_dir.clone())
-        .with_progress(tracker.clone());
-        match try_get_bytes(&fetcher, &tracker, reference).await {
+        if peers_rx.borrow().is_empty() {
+            return ControlAck::Error {
+                message: "no peers available; wait for handshakes to complete".to_string(),
+            };
+        }
+        // Pass the watch receiver itself, not a snapshot: the fetcher's
+        // per-chunk `ranked()` call rereads it so peers that disconnect
+        // during the attempt drop out of subsequent chunks' candidate
+        // pools immediately.
+        let fetcher = ant_retrieval::RoutingFetcher::new(control.clone(), peers_rx.clone())
+            .with_cache(cache.clone())
+            .with_record_dir(record_dir.clone())
+            .with_progress(tracker.clone())
+            .with_inflight_limit(inflight_limit.clone());
+        match try_get_bytes(&fetcher, &tracker, reference, max_bytes).await {
             Ok(data) => {
                 debug!(
                     target: "ant_p2p",
@@ -1012,15 +1146,10 @@ async fn run_get_bytes(
                 return ControlAck::Error { message };
             }
             Err(AttemptError::Transient(message)) if attempt < MAX_FETCH_ATTEMPTS => {
-                // Carry forward every peer this attempt has marked bad
-                // so the next attempt skips past them in the ranked
-                // list rather than re-asking the same losers.
-                blacklist = fetcher.blacklist_snapshot();
                 let backoff = RETRY_BACKOFF_BASE * attempt as u32;
                 warn!(
                     target: "ant_p2p",
                     attempt,
-                    skipped_peers = blacklist.len(),
                     next_in_ms = backoff.as_millis() as u64,
                     "get_bytes failed, retrying: {message}",
                 );
@@ -1040,8 +1169,9 @@ async fn try_get_bytes(
     fetcher: &ant_retrieval::RoutingFetcher,
     tracker: &ProgressTracker,
     reference: [u8; 32],
+    max_bytes: Option<u64>,
 ) -> Result<Vec<u8>, AttemptError> {
-    use ant_retrieval::{join, ChunkFetcher, DEFAULT_MAX_FILE_BYTES};
+    use ant_retrieval::{join, ChunkFetcher};
 
     let root = fetcher.fetch(reference).await.map_err(|e| {
         AttemptError::Transient(format!("fetch root chunk {}: {e}", hex::encode(reference)))
@@ -1053,16 +1183,15 @@ async fn try_get_bytes(
     if let Some(total) = root_span_to_u64(&root) {
         tracker.set_total_bytes(total);
     }
-    join(fetcher, &root, DEFAULT_MAX_FILE_BYTES)
-        .await
-        .map_err(|e| {
-            let message = format!("join {}: {e}", hex::encode(reference));
-            if is_join_transient(&e) {
-                AttemptError::Transient(message)
-            } else {
-                AttemptError::Permanent(message)
-            }
-        })
+    let cap = clamp_max_bytes(max_bytes);
+    join(fetcher, &root, cap).await.map_err(|e| {
+        let message = format!("join {}: {e}", hex::encode(reference));
+        if is_join_transient(&e) {
+            AttemptError::Transient(message)
+        } else {
+            AttemptError::Permanent(message)
+        }
+    })
 }
 
 /// Decode the 8-byte little-endian BMT span prefix from a wire-format
@@ -1076,35 +1205,64 @@ fn root_span_to_u64(wire: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(span))
 }
 
+/// Resolve the optional per-request `max_bytes` override into the
+/// `usize` the joiner expects. `None` falls back to the conservative
+/// `DEFAULT_MAX_FILE_BYTES` (32 MiB), keeping `antctl get` safe by
+/// default. The HTTP gateway raises this so real bzz sites with media
+/// payloads don't 502 at the joiner step. Saturating cast keeps a
+/// hypothetical `u64` value larger than `usize::MAX` — only possible on
+/// 32-bit targets — from wrapping to a tiny cap silently.
+fn clamp_max_bytes(max_bytes: Option<u64>) -> usize {
+    use ant_retrieval::DEFAULT_MAX_FILE_BYTES;
+    match max_bytes {
+        Some(n) => usize::try_from(n).unwrap_or(usize::MAX),
+        None => DEFAULT_MAX_FILE_BYTES,
+    }
+}
+
 /// Spawned task body for `Request::GetBzz`. Walks the manifest at
 /// `reference`, resolves `path`, then runs the joiner against the
 /// resolved data ref. Wrapped in the same retry loop as
 /// [`run_get_bytes`].
-// Eight args one over clippy's preferred ceiling, but the alternative
+// Nine args is over clippy's preferred ceiling, but the alternative
 // (bundling shared retrieval plumbing with request-scoped knobs into a
 // struct just for one call site) hides more than it helps.
 #[allow(clippy::too_many_arguments)]
 async fn run_get_bzz(
     control: Control,
-    peers: Vec<(libp2p::PeerId, [u8; 32])>,
+    peers_rx: watch::Receiver<Vec<(libp2p::PeerId, [u8; 32])>>,
     cache: Arc<ant_retrieval::InMemoryChunkCache>,
     record_dir: Option<PathBuf>,
+    inflight_limit: Arc<Semaphore>,
     tracker: Arc<ProgressTracker>,
     reference: [u8; 32],
     path: String,
     allow_degraded_redundancy: bool,
+    max_bytes: Option<u64>,
 ) -> ControlAck {
-    let mut blacklist: Vec<libp2p::PeerId> = Vec::new();
     for attempt in 1..=MAX_FETCH_ATTEMPTS {
-        let fetcher = ant_retrieval::RoutingFetcher::with_blacklist(
-            control.clone(),
-            peers.clone(),
-            blacklist.clone(),
+        if peers_rx.borrow().is_empty() {
+            return ControlAck::Error {
+                message: "no peers available; wait for handshakes to complete".to_string(),
+            };
+        }
+        // Pass the watch receiver itself: see `run_get_bytes` for
+        // rationale on per-chunk peer freshness.
+        let fetcher = ant_retrieval::RoutingFetcher::new(control.clone(), peers_rx.clone())
+            .with_cache(cache.clone())
+            .with_record_dir(record_dir.clone())
+            .with_progress(tracker.clone())
+            .with_inflight_limit(inflight_limit.clone());
+        match try_get_bzz(
+            &fetcher,
+            &tracker,
+            reference,
+            &path,
+            allow_degraded_redundancy,
+            max_bytes,
         )
-        .with_cache(cache.clone())
-        .with_record_dir(record_dir.clone())
-        .with_progress(tracker.clone());
-        match try_get_bzz(&fetcher, &tracker, reference, &path, allow_degraded_redundancy).await {
+        .await
+        {
             Ok((data, content_type, filename)) => {
                 return ControlAck::BzzBytes {
                     data,
@@ -1116,12 +1274,10 @@ async fn run_get_bzz(
                 return ControlAck::Error { message };
             }
             Err(AttemptError::Transient(message)) if attempt < MAX_FETCH_ATTEMPTS => {
-                blacklist = fetcher.blacklist_snapshot();
                 let backoff = RETRY_BACKOFF_BASE * attempt as u32;
                 warn!(
                     target: "ant_p2p",
                     attempt,
-                    skipped_peers = blacklist.len(),
                     next_in_ms = backoff.as_millis() as u64,
                     "get_bzz failed, retrying: {message}",
                 );
@@ -1137,17 +1293,16 @@ async fn run_get_bzz(
 
 /// One attempt at the get-bzz pipeline. Returns the resolved
 /// `(data, content_type, filename)` tuple on success.
+#[allow(clippy::too_many_arguments)]
 async fn try_get_bzz(
     fetcher: &ant_retrieval::RoutingFetcher,
     tracker: &ProgressTracker,
     reference: [u8; 32],
     path: &str,
     allow_degraded_redundancy: bool,
+    max_bytes: Option<u64>,
 ) -> Result<(Vec<u8>, Option<String>, Option<String>), AttemptError> {
-    use ant_retrieval::{
-        join_with_options, lookup_path, ChunkFetcher, JoinOptions, ManifestError,
-        DEFAULT_MAX_FILE_BYTES,
-    };
+    use ant_retrieval::{join_with_options, lookup_path, ChunkFetcher, JoinOptions, ManifestError};
 
     let lookup = match lookup_path(fetcher, reference, path).await {
         Ok(r) => r,
@@ -1191,7 +1346,8 @@ async fn try_get_bzz(
     let join_options = JoinOptions {
         allow_degraded_redundancy,
     };
-    let data = join_with_options(fetcher, &root, DEFAULT_MAX_FILE_BYTES, join_options)
+    let cap = clamp_max_bytes(max_bytes);
+    let data = join_with_options(fetcher, &root, cap, join_options)
         .await
         .map_err(|e| {
             let message = format!("join data {}: {e}", hex::encode(data_ref));
@@ -1412,6 +1568,7 @@ fn handle_swarm_event(
             // forwarder would keep picking a peer we have no live
             // connection to.
             state.routing.forget(&peer_id);
+            state.publish_peers();
             if was_bzz {
                 info!(
                     target: "ant_p2p",
@@ -1508,6 +1665,7 @@ fn handle_drive_outcome(
             // (signature recovers to an Ethereum address whose overlay
             // matches the declared one), so admitting it is safe.
             state.routing.admit(peer, info.remote_overlay);
+            state.publish_peers();
             let peer_set_size = state.peer_set_size();
             state.failed.retain(|f| f.peer != peer);
             *backoff = MIN_BACKOFF;
@@ -1955,4 +2113,52 @@ fn build_swarm(keypair: Keypair) -> Result<Swarm<AntBehaviour>, RunError> {
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(u64::MAX)))
         .build();
     Ok(swarm)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libp2p::identity::Keypair;
+
+    fn pid() -> PeerId {
+        Keypair::generate_ed25519().public().to_peer_id()
+    }
+
+    /// Pin the contract that `publish_peers` actually republishes the
+    /// current routing-table snapshot on `peers_watch`. The retry loop
+    /// in `run_get_bytes` / `run_get_bzz` reads from this watch on every
+    /// attempt, so silently breaking publication (e.g. by forgetting to
+    /// call it after an admit / forget) reverts us to the frozen-snapshot
+    /// regression that produced the "io: <peer>/N: connection is closed"
+    /// 502s on multi-MiB media files.
+    #[test]
+    fn publish_peers_reflects_admit_and_forget() {
+        let mut state = SwarmState::new(32, [0u8; 32], false, None);
+        let mut rx = state.peers_watch.subscribe();
+        // Initial state: empty.
+        assert!(rx.borrow_and_update().is_empty());
+
+        let p1 = pid();
+        let o1 = [1u8; 32];
+        state.routing.admit(p1, o1);
+        state.publish_peers();
+        let v = rx.borrow_and_update().clone();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0], (p1, o1));
+
+        let p2 = pid();
+        let o2 = [2u8; 32];
+        state.routing.admit(p2, o2);
+        state.publish_peers();
+        let v = rx.borrow_and_update().clone();
+        assert_eq!(v.len(), 2, "two peers visible after second admit");
+        assert!(v.contains(&(p1, o1)));
+        assert!(v.contains(&(p2, o2)));
+
+        state.routing.forget(&p1);
+        state.publish_peers();
+        let v = rx.borrow_and_update().clone();
+        assert_eq!(v.len(), 1, "only the un-forgotten peer remains");
+        assert_eq!(v[0], (p2, o2));
+    }
 }

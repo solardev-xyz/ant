@@ -5,6 +5,7 @@ use ant_crypto::{
     ethereum_address_from_public_key, overlay_from_ethereum_address, random_overlay_nonce,
     random_secp256k1_secret, SECP256K1_SECRET_LEN,
 };
+use ant_gateway::{Gateway, GatewayHandle, GatewayIdentity};
 use ant_node::{run_node, NodeConfig};
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
@@ -14,12 +15,19 @@ use libp2p::identity::{self, Keypair};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
 use tracing_subscriber::EnvFilter;
 
 const AGENT: &str = concat!("antd/", env!("CARGO_PKG_VERSION"));
+/// Pinned bee API version this build advertises via `/health.apiVersion`.
+/// Bumped per Ant release per PLAN.md §C.5; the constant lives in the
+/// binary (not in `ant-gateway`) so the gateway crate stays bee-version
+/// agnostic and can be reused in other embedders.
+const BEE_API_VERSION: &str = "7.2.0";
 
 #[derive(Parser, Debug)]
 #[command(name = "antd", version, about = "Ant Swarm light node (M1.0)")]
@@ -51,6 +59,18 @@ struct Opt {
     /// Disable the `antctl` control socket entirely.
     #[arg(long, default_value_t = false)]
     no_control_socket: bool,
+
+    /// Address `ant-gateway` listens on for the bee-shaped HTTP API.
+    /// Default mirrors bee's own default (`127.0.0.1:1633`) so unmodified
+    /// `bee-js` clients work against `antd` without configuration.
+    #[arg(long, default_value = "127.0.0.1:1633")]
+    api_addr: SocketAddr,
+
+    /// Disable the bee-shaped HTTP API entirely. Useful for headless
+    /// deployments that only need `antctl` access via the control
+    /// socket.
+    #[arg(long, default_value_t = false)]
+    no_http_api: bool,
 
     /// Externally reachable multiaddrs to advertise via libp2p-identify.
     /// Bee bootnodes stall our handshake by 10 s when their peerstore lacks a
@@ -138,6 +158,7 @@ async fn main() -> Result<()> {
         .verifying_key());
     let eth = ethereum_address_from_public_key(&vk);
     let overlay = overlay_from_ethereum_address(&eth, opt.network_id, &overlay_nonce);
+    let public_key_compressed = vk.to_encoded_point(true).as_bytes().to_vec();
     tracing::info!(
         target: "antd",
         "loaded identity eth=0x{} overlay=0x{}",
@@ -262,25 +283,62 @@ async fn main() -> Result<()> {
             .with_chunk_record_dir(chunk_record_dir),
     );
 
-    if opt.no_control_socket {
+    let gateway_handle = if opt.no_http_api {
+        None
+    } else {
+        Some(GatewayHandle {
+            agent: Arc::new(AGENT.to_string()),
+            api_version: Arc::new(BEE_API_VERSION.to_string()),
+            identity: Arc::new(GatewayIdentity {
+                overlay_hex: hex::encode(overlay),
+                ethereum_hex: format!("0x{}", hex::encode(eth)),
+                public_key_hex: hex::encode(&public_key_compressed),
+                peer_id: peer_id.to_string(),
+            }),
+            status: status_rx.clone(),
+            commands: cmd_tx.clone(),
+        })
+    };
+
+    if opt.no_control_socket && gateway_handle.is_none() {
         drop(cmd_tx);
         return node_fut.await.map_err(|e| anyhow::anyhow!("{e}"));
     }
 
-    let control_path = control_socket.clone();
-    let control_fut = ant_control::serve(control_path, AGENT.to_string(), status_rx, Some(cmd_tx));
-    tracing::info!(
-        target: "antd",
-        "control socket at {}",
-        control_socket.display(),
-    );
+    let api_addr = opt.api_addr;
+    let gateway_fut = async move {
+        match gateway_handle {
+            Some(handle) => Gateway::serve(handle, api_addr)
+                .await
+                .map_err(|e| anyhow::anyhow!("gateway: {e}")),
+            None => std::future::pending::<Result<()>>().await,
+        }
+    };
 
-    tokio::select! {
-        res = node_fut => res.map_err(|e| anyhow::anyhow!("{e}")),
-        res = control_fut => match res {
-            Ok(()) => Ok(()),
-            Err(e) => Err(anyhow::anyhow!("control socket: {e}")),
-        },
+    if opt.no_control_socket {
+        drop(cmd_tx);
+        tokio::select! {
+            res = node_fut => res.map_err(|e| anyhow::anyhow!("{e}")),
+            res = gateway_fut => res,
+        }
+    } else {
+        let control_path = control_socket.clone();
+        let control_fut =
+            ant_control::serve(control_path, AGENT.to_string(), status_rx, Some(cmd_tx));
+        tracing::info!(
+            target: "antd",
+            "control socket at {}",
+            control_socket.display(),
+        );
+
+        tokio::select! {
+            res = node_fut => res.map_err(|e| anyhow::anyhow!("{e}")),
+            res = control_fut => match res {
+                Ok(()) => Ok(()),
+                Err(e) => Err(anyhow::anyhow!("control socket: {e}")),
+            },
+            res = gateway_fut => res,
+        }
     }
 }
 

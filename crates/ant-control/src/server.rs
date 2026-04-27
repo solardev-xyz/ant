@@ -71,6 +71,17 @@ pub enum ControlCommand {
         reference: [u8; 32],
         ack: oneshot::Sender<ControlAck>,
     },
+    /// Like `GetChunk`, but the ack carries the chunk's full **wire
+    /// bytes** (`span (8 LE) || payload`) instead of just the payload.
+    /// Used by `ant-gateway` to serve `/chunks/{addr}` in a bee-shaped
+    /// way (bee's `chunkstore.Get` returns `Chunk.Data()` which is the
+    /// wire form). Routing / peer-pick / CAC verification logic is
+    /// identical to `GetChunk`; the only difference is what the node
+    /// loop puts in `ControlAck::Bytes::data`.
+    GetChunkRaw {
+        reference: [u8; 32],
+        ack: oneshot::Sender<ControlAck>,
+    },
     /// Walk the manifest at `reference`, resolve `path`, then join the
     /// resulting chunk tree into a single `Vec<u8>`. Acks with
     /// [`ControlAck::BzzBytes`] including any `Content-Type` metadata
@@ -80,22 +91,30 @@ pub enum ControlCommand {
     /// `bypass_cache` swaps the daemon's shared chunk cache for a
     /// fresh per-request one (intra-request retries still benefit
     /// from caching). `progress` opts the request into streaming
-    /// [`ControlAck::Progress`] emissions.
+    /// [`ControlAck::Progress`] emissions. `max_bytes` overrides the
+    /// joiner's per-request size cap; `None` means "use the joiner's
+    /// `DEFAULT_MAX_FILE_BYTES` (32 MiB)" — appropriate for `antctl get`
+    /// where allocating gigabytes from a malformed root chunk would be
+    /// a footgun. The HTTP gateway raises this so real bzz sites with
+    /// videos / archives don't 502 at the joiner step.
     GetBzz {
         reference: [u8; 32],
         path: String,
         allow_degraded_redundancy: bool,
         bypass_cache: bool,
         progress: bool,
+        max_bytes: Option<u64>,
         ack: mpsc::Sender<ControlAck>,
     },
     /// Join the multi-chunk tree rooted at `reference` (a `/bytes/` ref,
     /// no manifest) and ack with the joined file bytes. See
-    /// [`ControlCommand::GetBzz`] for `bypass_cache` and `progress`.
+    /// [`ControlCommand::GetBzz`] for `bypass_cache`, `progress`, and
+    /// `max_bytes`.
     GetBytes {
         reference: [u8; 32],
         bypass_cache: bool,
         progress: bool,
+        max_bytes: Option<u64>,
         ack: mpsc::Sender<ControlAck>,
     },
 }
@@ -218,11 +237,9 @@ async fn handle_connection(
             .await?;
         }
         Ok(Request::PeersReset) => {
-            let response = dispatch_oneshot(
-                command_tx.as_ref(),
-                FAST_COMMAND_TIMEOUT,
-                |ack| ControlCommand::ResetPeerstore { ack },
-            )
+            let response = dispatch_oneshot(command_tx.as_ref(), FAST_COMMAND_TIMEOUT, |ack| {
+                ControlCommand::ResetPeerstore { ack }
+            })
             .await;
             write_response(&mut write_half, &response).await?;
         }
@@ -232,15 +249,14 @@ async fn handle_connection(
             progress: _,
         }) => match parse_reference(&reference) {
             Ok(addr) => {
-                let response = dispatch_oneshot(
-                    command_tx.as_ref(),
-                    NETWORK_COMMAND_TIMEOUT,
-                    |ack| ControlCommand::GetChunk {
-                        reference: addr,
-                        ack,
-                    },
-                )
-                .await;
+                let response =
+                    dispatch_oneshot(command_tx.as_ref(), NETWORK_COMMAND_TIMEOUT, |ack| {
+                        ControlCommand::GetChunk {
+                            reference: addr,
+                            ack,
+                        }
+                    })
+                    .await;
                 write_response(&mut write_half, &response).await?;
             }
             Err(e) => {
@@ -271,6 +287,10 @@ async fn handle_connection(
                         allow_degraded_redundancy,
                         bypass_cache,
                         progress,
+                        // CLI keeps the conservative joiner default; the
+                        // HTTP gateway opts in to a higher ceiling for
+                        // real-site downloads.
+                        max_bytes: None,
                         ack,
                     },
                 )
@@ -300,6 +320,7 @@ async fn handle_connection(
                         reference: addr,
                         bypass_cache,
                         progress,
+                        max_bytes: None,
                         ack,
                     },
                 )
@@ -455,7 +476,10 @@ fn ack_to_response(ack: ControlAck) -> Response {
 /// Lower- or upper-case is fine. Anything else is rejected before the
 /// command hits the node loop so the caller gets a tidy error.
 fn parse_reference(s: &str) -> Result<[u8; 32], String> {
-    let stripped = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    let stripped = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     if stripped.len() != 64 {
         return Err(format!(
             "reference must be 32 bytes (64 hex chars); got {}",

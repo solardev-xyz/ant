@@ -20,4 +20,4 @@ pub use protocol::{
 #[cfg(unix)]
 pub use client::{request_streaming, request_sync, ClientError, StreamEvent};
 #[cfg(unix)]
-pub use server::{serve, ControlAck, ControlCommand, ServerError};
+pub use server::{serve, streaming_ack_channel, ControlAck, ControlCommand, ServerError};

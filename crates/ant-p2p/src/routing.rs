@@ -172,10 +172,7 @@ impl RoutingTable {
     /// loop to hand a stable peer list to a spawned fetch task without
     /// holding a borrow of the live table for the whole tree walk.
     pub fn snapshot(&self) -> Vec<(PeerId, Overlay)> {
-        self.entries
-            .iter()
-            .map(|(p, e)| (*p, e.overlay))
-            .collect()
+        self.entries.iter().map(|(p, e)| (*p, e.overlay)).collect()
     }
 
     pub fn closest_peer(&self, target: &Overlay, skip: &[PeerId]) -> Option<(PeerId, Overlay)> {
