@@ -42,6 +42,13 @@ pub struct NodeConfig {
     /// shape for reproducing transient retrieval failures or for
     /// timing the cold path.
     pub per_request_chunk_cache: bool,
+    /// When set, every chunk fetched by a `GetBytes` / `GetBzz`
+    /// request is dumped to `<dir>/<hex_addr>.bin` (raw wire bytes:
+    /// 8-byte LE span || payload). Used by `antd --record-chunks`
+    /// (debug builds only) to capture an offline fixture of every
+    /// chunk a successful `antctl get` touched. The directory must
+    /// already exist; `None` (the default) disables recording.
+    pub chunk_record_dir: Option<PathBuf>,
 }
 
 impl NodeConfig {
@@ -63,6 +70,7 @@ impl NodeConfig {
             commands: None,
             process_start: Instant::now(),
             per_request_chunk_cache: false,
+            chunk_record_dir: None,
         }
     }
 
@@ -95,6 +103,11 @@ impl NodeConfig {
         self.per_request_chunk_cache = per_request;
         self
     }
+
+    pub fn with_chunk_record_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.chunk_record_dir = dir;
+        self
+    }
 }
 
 /// Run the M1.0 node loop until the process is interrupted.
@@ -112,6 +125,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<(), NodeError> {
         commands: cfg.commands,
         process_start: cfg.process_start,
         per_request_chunk_cache: cfg.per_request_chunk_cache,
+        chunk_record_dir: cfg.chunk_record_dir,
     })
     .await?;
     Ok(())

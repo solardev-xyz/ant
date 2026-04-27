@@ -84,6 +84,16 @@ struct Opt {
     /// retrieval failures and benchmarking cold-path latency.
     #[arg(long, default_value_t = false)]
     per_request_chunk_cache: bool,
+
+    /// Dump every chunk fetched during a `GetBytes` / `GetBzz` request
+    /// to `<DIR>/<hex_addr>.bin` (raw wire bytes: 8-byte LE span ||
+    /// payload). Combined with the `MapFetcher::from_dir` helper this
+    /// lets the integration tests in `ant-retrieval` replay a real
+    /// `antctl get` offline. Debug builds only; release `antd` does not
+    /// expose the flag. The directory is created if missing.
+    #[cfg(debug_assertions)]
+    #[arg(long, value_name = "DIR")]
+    record_chunks: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -236,6 +246,11 @@ async fn main() -> Result<()> {
         );
     }
 
+    let chunk_record_dir = resolve_chunk_record_dir(
+        #[cfg(debug_assertions)]
+        opt.record_chunks.as_deref(),
+    )?;
+
     let node_fut = run_node(
         NodeConfig::mainnet_default(signing_secret, overlay_nonce, bootnodes, libp2p_keypair)
             .with_status(status_tx)
@@ -243,7 +258,8 @@ async fn main() -> Result<()> {
             .with_external_addrs(external_addrs)
             .with_peerstore_path(peerstore_path)
             .with_commands(cmd_rx)
-            .with_per_request_chunk_cache(opt.per_request_chunk_cache),
+            .with_per_request_chunk_cache(opt.per_request_chunk_cache)
+            .with_chunk_record_dir(chunk_record_dir),
     );
 
     if opt.no_control_socket {
@@ -266,6 +282,32 @@ async fn main() -> Result<()> {
             Err(e) => Err(anyhow::anyhow!("control socket: {e}")),
         },
     }
+}
+
+/// Resolve the optional `--record-chunks <DIR>` value to an absolute path
+/// (with `~` expanded) and ensure the directory exists, so the
+/// `RoutingFetcher` write path can drop a chunk into it without first
+/// stat-ing the parent. Returns `Ok(None)` in release builds (the flag
+/// is hidden from clap there) and when the operator didn't pass the
+/// flag in debug builds; `Err` if `mkdir -p` failed.
+fn resolve_chunk_record_dir(
+    #[cfg(debug_assertions)] record_chunks: Option<&Path>,
+) -> Result<Option<PathBuf>> {
+    #[cfg(debug_assertions)]
+    {
+        if let Some(p) = record_chunks {
+            let dir = expand_tilde(p);
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("create --record-chunks dir {dir:?}"))?;
+            tracing::info!(
+                target: "antd",
+                "recording every fetched chunk to {} (--record-chunks)",
+                dir.display(),
+            );
+            return Ok(Some(dir));
+        }
+    }
+    Ok(None)
 }
 
 /// Take an exclusive advisory lock on `<data-dir>/antd.lock` so a second

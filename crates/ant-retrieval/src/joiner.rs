@@ -59,6 +59,22 @@ const MAX_BRANCHES: usize = CHUNK_SIZE / 32;
 /// proportionally without unbounded concurrency.
 const FETCH_FANOUT: usize = 16;
 
+/// Knobs that aren't span/payload-defined. Pass [`JoinOptions::default`]
+/// for the strict joiner; flip flags on for explicit, narrowly-scoped
+/// fallbacks.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JoinOptions {
+    /// Accept files whose root span carries a non-zero
+    /// redundancy/erasure-coding level byte. The joiner masks the level
+    /// byte off and walks the chunk tree as if it were level NONE,
+    /// which yields the correct bytes whenever every data chunk is
+    /// reachable. Reed-Solomon recovery itself is not implemented;
+    /// missing chunks remain fatal. Off by default — set explicitly via
+    /// `antctl get --allow-degraded-redundancy` so the user opts in to
+    /// "best-effort decode without the redundancy benefit".
+    pub allow_degraded_redundancy: bool,
+}
+
 /// Reason a join failed. Distinct variants so the caller can decide
 /// whether to retry, fall back, or surface a clean error to the user.
 #[derive(Debug, Error)]
@@ -71,9 +87,11 @@ pub enum JoinError {
     #[error("malformed intermediate chunk at offset {offset}: {detail}")]
     MalformedChunk { offset: u64, detail: String },
     /// The chunk's span carries non-zero high bits, indicating
-    /// Reed-Solomon redundancy. We don't implement RS today.
-    #[error("redundancy / erasure coding not supported")]
-    UnsupportedRedundancy,
+    /// Reed-Solomon redundancy. We don't implement RS today; pass
+    /// [`JoinOptions::allow_degraded_redundancy`] to decode anyway
+    /// without the redundancy safety net.
+    #[error("redundancy / erasure coding not supported (level {level}); pass --allow-degraded-redundancy to decode without RS recovery")]
+    UnsupportedRedundancy { level: u8 },
     /// Encrypted chunks (64-byte refs) aren't supported. Only triggered
     /// if the *caller* passes a 64-byte root reference; for the
     /// 32-byte path we never decode a 64-byte ref-length intermediate.
@@ -108,10 +126,38 @@ pub async fn join(
     root_chunk_data: &[u8],
     max_bytes: usize,
 ) -> Result<Vec<u8>, JoinError> {
+    join_with_options(fetcher, root_chunk_data, max_bytes, JoinOptions::default()).await
+}
+
+/// Like [`join`], but with explicit knobs (currently just
+/// `allow_degraded_redundancy`). Kept as a separate entry point so the
+/// strict default has the simplest possible signature for the test
+/// suite and the unit-tested mantaray internals; production callers
+/// that need to flip flags use this variant.
+pub async fn join_with_options(
+    fetcher: &dyn ChunkFetcher,
+    root_chunk_data: &[u8],
+    max_bytes: usize,
+    options: JoinOptions,
+) -> Result<Vec<u8>, JoinError> {
     let (span_raw, payload) = split_chunk(root_chunk_data, 0)?;
-    if !is_redundancy_none(span_raw) {
-        return Err(JoinError::UnsupportedRedundancy);
-    }
+    let span_raw = if is_redundancy_none(span_raw) {
+        span_raw
+    } else if options.allow_degraded_redundancy {
+        let level = span_raw[7];
+        tracing::warn!(
+            target: "ant_retrieval::joiner",
+            level,
+            "root span carries redundancy level {level}; decoding without RS recovery (--allow-degraded-redundancy)",
+        );
+        let mut masked = span_raw;
+        masked[7] = 0;
+        masked
+    } else {
+        return Err(JoinError::UnsupportedRedundancy {
+            level: span_raw[7],
+        });
+    };
     let span = u64::from_le_bytes(span_raw);
     if span > max_bytes as u64 {
         return Err(JoinError::TooLarge {
@@ -431,8 +477,9 @@ mod tests {
         assert!(matches!(err, JoinError::TooLarge { .. }));
     }
 
-    /// Spans with the redundancy bits set are rejected — silently
-    /// mis-decoding a redundant file would produce garbled output.
+    /// Spans with the redundancy bits set are rejected by default —
+    /// silently mis-decoding a redundant file would produce garbled
+    /// output.
     #[tokio::test]
     async fn rejects_redundancy_span() {
         let payload = vec![0u8; 32];
@@ -443,7 +490,28 @@ mod tests {
         wire.extend_from_slice(&payload);
         let fetcher = MapFetcher::new();
         let err = join(&fetcher, &wire, DEFAULT_MAX_FILE_BYTES).await.unwrap_err();
-        assert!(matches!(err, JoinError::UnsupportedRedundancy));
+        assert!(matches!(err, JoinError::UnsupportedRedundancy { level: 1 }));
+    }
+
+    /// `--allow-degraded-redundancy` masks the level byte and decodes
+    /// the file as if it were level NONE. Verified end-to-end on a
+    /// single-leaf root: the joiner trusts the masked span and returns
+    /// the payload bytes truncated to that length.
+    #[tokio::test]
+    async fn allow_degraded_redundancy_masks_level_byte() {
+        let payload = b"hello swarm".to_vec();
+        let (_, mut wire) = cac_new(&payload).unwrap();
+        // Splice a level into the root span. The CAC address mismatch
+        // doesn't matter here — we feed the wire bytes straight into
+        // `join_with_options`, bypassing the per-chunk verifier.
+        wire[7] = 3; // INSANE
+        let fetcher = MapFetcher::new();
+        let opts = JoinOptions {
+            allow_degraded_redundancy: true,
+        };
+        let out =
+            join_with_options(&fetcher, &wire, DEFAULT_MAX_FILE_BYTES, opts).await.unwrap();
+        assert_eq!(out, payload);
     }
 
     /// Compute the CAC address of a constructed intermediate chunk for

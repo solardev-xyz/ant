@@ -25,9 +25,10 @@ use libp2p::PeerId;
 use libp2p_stream::Control;
 use std::cmp::Ordering;
 use std::error::Error as StdError;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 /// 32-byte Swarm overlay. Duplicated locally rather than re-exported from
 /// `ant_p2p::routing` to keep `ant-retrieval` free of a circular dep.
@@ -78,6 +79,13 @@ pub struct RoutingFetcher {
     /// re-fetches (within a retry attempt or across `antctl get`
     /// invocations) skip the network entirely.
     cache: Option<Arc<InMemoryChunkCache>>,
+    /// When set, every CAC-validated chunk is dumped to
+    /// `<dir>/<hex_addr>.bin` (wire bytes: `span || payload`) just
+    /// before being returned to the caller. Used by `antd
+    /// --record-chunks <dir>` to capture an offline fixture of the
+    /// chunks involved in a successful `antctl get`. Best-effort: a
+    /// failed write logs a warning but does not break the fetch.
+    record_dir: Option<PathBuf>,
 }
 
 impl RoutingFetcher {
@@ -107,6 +115,7 @@ impl RoutingFetcher {
             peers,
             blacklist: Mutex::new(blacklist),
             cache: None,
+            record_dir: None,
         }
     }
 
@@ -119,6 +128,18 @@ impl RoutingFetcher {
     /// attempts and across `antctl get` invocations.
     pub fn with_cache(mut self, cache: Arc<InMemoryChunkCache>) -> Self {
         self.cache = Some(cache);
+        self
+    }
+
+    /// Dump every successfully-fetched chunk to `dir` as
+    /// `<dir>/<hex_addr>.bin` (raw wire bytes: 8-byte LE span ||
+    /// payload). Combined with `MapFetcher::from_dir` this lets the
+    /// caller replay a real `antctl get` offline. Set by `antd
+    /// --record-chunks <dir>` (debug builds only); a `None` value (the
+    /// default) is a no-op. The directory is *not* created here — the
+    /// caller is responsible for that.
+    pub fn with_record_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.record_dir = dir;
         self
     }
 
@@ -181,6 +202,9 @@ impl ChunkFetcher for RoutingFetcher {
                     chunk = %hex::encode(addr),
                     "cache hit",
                 );
+                if let Some(dir) = self.record_dir.as_ref() {
+                    record_chunk(dir, &addr, &bytes);
+                }
                 return Ok(bytes);
             }
         }
@@ -253,6 +277,9 @@ impl ChunkFetcher for RoutingFetcher {
                             if let Some(cache) = self.cache.as_ref() {
                                 cache.put(addr, wire.clone());
                             }
+                            if let Some(dir) = self.record_dir.as_ref() {
+                                record_chunk(dir, &addr, &wire);
+                            }
                             return Ok(wire);
                         }
                         Err(e) => {
@@ -296,5 +323,35 @@ impl ChunkFetcher for RoutingFetcher {
                 .unwrap_or_else(|| "no candidates".into())
         )
         .into())
+    }
+}
+
+/// Best-effort dump of a CAC-validated chunk's wire bytes to
+/// `<dir>/<hex_addr>.bin`. Used by the daemon's `--record-chunks`
+/// flag to capture a fixture of every chunk a successful `antctl
+/// get` touched. Skips if the file already exists (chunks are
+/// content-addressed, so the bytes can't differ); a write error
+/// only logs a warning so a full disk doesn't poison a live
+/// retrieval.
+fn record_chunk(dir: &std::path::Path, addr: &[u8; 32], wire: &[u8]) {
+    let path = dir.join(format!("{}.bin", hex::encode(addr)));
+    if path.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::write(&path, wire) {
+        warn!(
+            target: "ant_retrieval::fetcher",
+            chunk = %hex::encode(addr),
+            error = %e,
+            path = %path.display(),
+            "record-chunks write failed",
+        );
+    } else {
+        trace!(
+            target: "ant_retrieval::fetcher",
+            chunk = %hex::encode(addr),
+            bytes = wire.len(),
+            "recorded chunk",
+        );
     }
 }

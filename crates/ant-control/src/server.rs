@@ -54,10 +54,13 @@ pub enum ControlCommand {
     /// Walk the manifest at `reference`, resolve `path`, then join the
     /// resulting chunk tree into a single `Vec<u8>`. Acks with
     /// [`ControlAck::BzzBytes`] including any `Content-Type` metadata
-    /// recovered from the manifest.
+    /// recovered from the manifest. When `allow_degraded_redundancy`
+    /// is set the joiner masks any non-zero RS level byte off the
+    /// file's root span and decodes without RS recovery.
     GetBzz {
         reference: [u8; 32],
         path: String,
+        allow_degraded_redundancy: bool,
         ack: oneshot::Sender<ControlAck>,
     },
     /// Join the multi-chunk tree rooted at `reference` (a `/bytes/` ref,
@@ -185,7 +188,11 @@ async fn handle_connection(
                 message: format!("bad reference: {e}"),
             },
         },
-        Ok(Request::GetBzz { reference, path }) => match parse_reference(&reference) {
+        Ok(Request::GetBzz {
+            reference,
+            path,
+            allow_degraded_redundancy,
+        }) => match parse_reference(&reference) {
             Ok(addr) => {
                 dispatch_command(
                     command_tx.as_ref(),
@@ -193,6 +200,7 @@ async fn handle_connection(
                     |ack| ControlCommand::GetBzz {
                         reference: addr,
                         path,
+                        allow_degraded_redundancy,
                         ack,
                     },
                 )

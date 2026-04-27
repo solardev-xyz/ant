@@ -69,17 +69,30 @@ enum Command {
         command: PeersCommand,
     },
     /// Retrieve content from Swarm.
-    ///
-    /// The reference may be one of:
-    ///
-    /// - `<hex>`: a 32-byte chunk address, returned as a single
-    ///   content-addressed chunk (the data behind bee's `/bytes/<ref>`
-    ///   for short files <= 4 KiB).
-    /// - `bytes://<hex>`: walk a multi-chunk byte tree rooted at `<hex>`
-    ///   (bee's `/bytes/<ref>` for longer files). Equivalent to `--bytes`.
-    /// - `bzz://<hex>[/path]`: walk the mantaray manifest at `<hex>`,
-    ///   resolve `path` (or the `website-index-document`), then join the
-    ///   resulting chunk tree. Equivalent to `--bzz` with `--bzz-path`.
+    #[command(
+        long_about = "\
+Retrieve content from Swarm.
+
+The reference may be one of:
+
+  <hex>                  Single 32-byte content-addressed chunk
+                         (bee's /bytes/<ref> for short files <= 4 KiB).
+  bytes://<hex>          Walk a multi-chunk byte tree rooted at <hex>
+                         (bee's /bytes/<ref> for longer files). Same
+                         shape as --bytes.
+  bzz://<hex>[/path]     Walk the mantaray manifest at <hex>, resolve
+                         <path> (or the website-index-document), then
+                         join the resulting chunk tree. Same shape as
+                         --bzz [--bzz-path]. Path may be multi-segment.
+
+Examples:
+
+  antctl get <chunk-hex>                      # raw 4 KiB chunk
+  antctl get bytes://<file-hex> -o blob.bin   # multi-chunk file
+  antctl get bzz://<root>/index.html          # website index
+  antctl get bzz://<root>/images/logo.png     # nested file
+  antctl get bzz://<root>/13/4358/2645.png    # tile pyramid leaf"
+    )]
     Get {
         /// Reference. See above for accepted forms.
         reference: String,
@@ -96,9 +109,32 @@ enum Command {
         #[arg(long, conflicts_with = "bytes")]
         bzz: bool,
         /// Path component of a bzz reference, e.g. `index.html` or
-        /// `images/logo.png`. Empty triggers `website-index-document`.
+        /// `images/logo.png` or `13/4358/2645.png`. Empty triggers
+        /// `website-index-document`.
         #[arg(long, requires = "bzz")]
         bzz_path: Option<String>,
+        /// Decode bzz files whose root span carries a non-zero
+        /// Reed-Solomon redundancy level. The daemon masks the level
+        /// byte off and walks the chunk tree without RS recovery, so
+        /// every data chunk must still be reachable. Default: off
+        /// (the daemon errors with `redundancy / erasure coding not
+        /// supported`).
+        #[arg(long)]
+        allow_degraded_redundancy: bool,
+        /// Before issuing the request, poll `antctl status` until the
+        /// daemon has a completed BZZ handshake AND at least N libp2p
+        /// peers connected. Avoids the `no peers available; wait for
+        /// handshakes to complete` error when the user fires `get`
+        /// against a freshly-started daemon. `0` disables the wait
+        /// (request goes out immediately).
+        #[arg(long, default_value_t = 4)]
+        wait_peers: u32,
+        /// Maximum time to spend waiting for `--wait-peers` before
+        /// giving up and issuing the request anyway. The daemon will
+        /// then return its own error if peers really are zero. In
+        /// seconds.
+        #[arg(long, default_value_t = 30)]
+        wait_timeout: u64,
     },
 }
 
@@ -172,13 +208,20 @@ fn main() -> Result<()> {
             bytes,
             bzz,
             bzz_path,
+            allow_degraded_redundancy,
+            wait_peers,
+            wait_timeout,
         } => {
+            if wait_peers > 0 {
+                wait_for_peers(&socket, wait_peers, Duration::from_secs(wait_timeout));
+            }
             run_get(
                 &socket,
                 &reference,
                 out.as_deref(),
                 opt.json,
                 FetchMode::from_flags(bytes, bzz, bzz_path.as_deref()),
+                allow_degraded_redundancy,
             )?;
         }
     }
@@ -250,7 +293,11 @@ fn write_output(
 /// schemes (`bzz://…`, `bytes://…`) on the reference take precedence
 /// over the explicit `--bzz` / `--bytes` flags; the flags fill in the
 /// gap when the user hands over a bare hex reference.
-fn parse_reference_with_mode(reference: &str, mode: FetchMode) -> Result<Request> {
+fn parse_reference_with_mode(
+    reference: &str,
+    mode: FetchMode,
+    allow_degraded_redundancy: bool,
+) -> Result<Request> {
     if let Some(rest) = reference.strip_prefix("bzz://") {
         // Split optional path (after first '/').
         let (hex_part, path_part) = match rest.find('/') {
@@ -260,6 +307,7 @@ fn parse_reference_with_mode(reference: &str, mode: FetchMode) -> Result<Request
         return Ok(Request::GetBzz {
             reference: hex_part.to_string(),
             path: path_part.to_string(),
+            allow_degraded_redundancy,
         });
     }
     if let Some(rest) = reference.strip_prefix("bytes://") {
@@ -277,6 +325,7 @@ fn parse_reference_with_mode(reference: &str, mode: FetchMode) -> Result<Request
         FetchMode::Bzz { path } => Request::GetBzz {
             reference: reference.to_string(),
             path,
+            allow_degraded_redundancy,
         },
     })
 }
@@ -290,8 +339,9 @@ fn run_get(
     out: Option<&Path>,
     json: bool,
     mode: FetchMode,
+    allow_degraded_redundancy: bool,
 ) -> Result<()> {
-    let req = parse_reference_with_mode(reference, mode)?;
+    let req = parse_reference_with_mode(reference, mode, allow_degraded_redundancy)?;
     let resp = request_sync(socket, &req)
         .with_context(|| format!("talk to antd at {}", socket.display()))?;
 
@@ -357,6 +407,54 @@ fn fetch_status(socket: &Path) -> Result<StatusSnapshot> {
         Response::Status(snap) => Ok(*snap),
         Response::Error { message } => bail!("antd: {message}"),
         other => bail!("unexpected response: {other:?}"),
+    }
+}
+
+/// Block until the daemon reports `min_peers` libp2p peers AND at least
+/// one completed BZZ handshake, or `timeout` elapses. Best-effort: any
+/// transport hiccup is logged and ignored — the actual `Get` request
+/// will surface a real error if the daemon stays unreachable.
+///
+/// Distinct from `peers.routing.size` (BZZ-handshaked peers in the
+/// forwarding-Kademlia table): `connected + last_handshake.is_some()`
+/// matches the matrix the daemon's `run_get_*` paths actually trip on
+/// (`peers.is_empty()` from `routing.snapshot()`), so the bar is set
+/// where the daemon needs it, not higher.
+fn wait_for_peers(socket: &Path, min_peers: u32, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    let mut printed_waiting = false;
+    loop {
+        match fetch_status(socket) {
+            Ok(snap) => {
+                if snap.peers.last_handshake.is_some() && snap.peers.connected >= min_peers {
+                    if printed_waiting {
+                        eprintln!(
+                            "antctl: routing ready ({} peers, {} connected)",
+                            snap.peers.routing.size, snap.peers.connected,
+                        );
+                    }
+                    return;
+                }
+                if !printed_waiting {
+                    eprintln!(
+                        "antctl: waiting for {} peers (currently {}, routing={})",
+                        min_peers, snap.peers.connected, snap.peers.routing.size,
+                    );
+                    printed_waiting = true;
+                }
+            }
+            Err(e) => {
+                eprintln!("antctl: status poll failed (will retry): {e:#}");
+            }
+        }
+        if Instant::now() >= deadline {
+            eprintln!(
+                "antctl: --wait-peers={} not reached in {:?}; issuing request anyway",
+                min_peers, timeout,
+            );
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(500));
     }
 }
 

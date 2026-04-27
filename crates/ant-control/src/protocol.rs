@@ -33,10 +33,19 @@ pub enum Request {
     /// `reference`, resolves `path` (empty triggers `website-index-document`),
     /// then joins the resulting chunk tree into the file's raw bytes.
     /// Daemon answers with [`Response::BzzBytes`].
+    ///
+    /// `allow_degraded_redundancy`: opt in to decoding files whose root
+    /// chunk carries a non-zero Reed-Solomon redundancy level. The
+    /// daemon masks the level byte and walks the chunk tree without
+    /// running RS recovery — bytes come back if every data chunk is
+    /// reachable, otherwise the request fails as it would today.
+    /// Defaults to `false` so the normal path remains strict.
     GetBzz {
         reference: String,
         #[serde(default)]
         path: String,
+        #[serde(default)]
+        allow_degraded_redundancy: bool,
     },
     /// Retrieve a multi-chunk raw byte tree by joining its chunk tree.
     /// `reference` points at the root chunk of a `/bytes/` tree. Daemon

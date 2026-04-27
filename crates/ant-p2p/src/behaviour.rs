@@ -81,6 +81,15 @@ pub struct RunConfig {
     /// Useful for reproducing transient retrieval failures and
     /// timing the cold path; off in production.
     pub per_request_chunk_cache: bool,
+    /// When set, every chunk fetched by a `GetBytes` / `GetBzz`
+    /// request is dumped to `<dir>/<hex_addr>.bin` (raw wire bytes:
+    /// 8-byte LE span || payload). Combined with the integration-test
+    /// helper that loads a directory of such chunks into a
+    /// `MapFetcher`, this lets us snapshot a successful mainnet
+    /// retrieval and replay it offline as a regression fixture. The
+    /// daemon only honours the flag in debug builds (the `antd` CLI
+    /// hides it otherwise); the directory must already exist.
+    pub chunk_record_dir: Option<PathBuf>,
 }
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
@@ -254,10 +263,20 @@ struct SwarmState {
     /// `antctl get` calls start cold). Toggled by
     /// `RunConfig::per_request_chunk_cache`.
     chunk_cache: Option<Arc<ant_retrieval::InMemoryChunkCache>>,
+    /// Optional fixture-capture directory; cloned into every
+    /// `RoutingFetcher` we build for a `GetBytes` / `GetBzz` request,
+    /// so each chunk fetched (or served from the cache) gets dumped
+    /// to disk. Set from `RunConfig::chunk_record_dir`.
+    chunk_record_dir: Option<PathBuf>,
 }
 
 impl SwarmState {
-    fn new(target_peers: usize, base_overlay: Overlay, per_request_chunk_cache: bool) -> Self {
+    fn new(
+        target_peers: usize,
+        base_overlay: Overlay,
+        per_request_chunk_cache: bool,
+        chunk_record_dir: Option<PathBuf>,
+    ) -> Self {
         let chunk_cache = if per_request_chunk_cache {
             None
         } else {
@@ -280,6 +299,7 @@ impl SwarmState {
             peer_order: HashMap::new(),
             next_peer_order: 0,
             chunk_cache,
+            chunk_record_dir,
         }
     }
 
@@ -546,7 +566,12 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
         &cfg.overlay_nonce,
         cfg.network_id,
     );
-    let mut state = SwarmState::new(target_peers, base_overlay, cfg.per_request_chunk_cache);
+    let mut state = SwarmState::new(
+        target_peers,
+        base_overlay,
+        cfg.per_request_chunk_cache,
+        cfg.chunk_record_dir.clone(),
+    );
     let mut peerstore = match cfg.peerstore_path.clone() {
         Some(p) => PeerStore::load(p),
         None => PeerStore::disabled(),
@@ -733,14 +758,16 @@ fn handle_control_command(
             }
             let control = control.clone();
             let cache = state.cache_for_request();
+            let record_dir = state.chunk_record_dir.clone();
             tokio::spawn(async move {
-                let reply = run_get_bytes(control, peers, cache, reference).await;
+                let reply = run_get_bytes(control, peers, cache, record_dir, reference).await;
                 let _ = ack.send(reply);
             });
         }
         ControlCommand::GetBzz {
             reference,
             path,
+            allow_degraded_redundancy,
             ack,
         } => {
             let peers = state.routing.snapshot();
@@ -752,8 +779,18 @@ fn handle_control_command(
             }
             let control = control.clone();
             let cache = state.cache_for_request();
+            let record_dir = state.chunk_record_dir.clone();
             tokio::spawn(async move {
-                let reply = run_get_bzz(control, peers, cache, reference, path).await;
+                let reply = run_get_bzz(
+                    control,
+                    peers,
+                    cache,
+                    record_dir,
+                    reference,
+                    path,
+                    allow_degraded_redundancy,
+                )
+                .await;
                 let _ = ack.send(reply);
             });
         }
@@ -815,6 +852,7 @@ async fn run_get_bytes(
     control: Control,
     peers: Vec<(libp2p::PeerId, [u8; 32])>,
     cache: Arc<ant_retrieval::InMemoryChunkCache>,
+    record_dir: Option<PathBuf>,
     reference: [u8; 32],
 ) -> ControlAck {
     let mut blacklist: Vec<libp2p::PeerId> = Vec::new();
@@ -824,7 +862,8 @@ async fn run_get_bytes(
             peers.clone(),
             blacklist.clone(),
         )
-        .with_cache(cache.clone());
+        .with_cache(cache.clone())
+        .with_record_dir(record_dir.clone());
         match try_get_bytes(&fetcher, reference).await {
             Ok(data) => {
                 debug!(
@@ -893,8 +932,10 @@ async fn run_get_bzz(
     control: Control,
     peers: Vec<(libp2p::PeerId, [u8; 32])>,
     cache: Arc<ant_retrieval::InMemoryChunkCache>,
+    record_dir: Option<PathBuf>,
     reference: [u8; 32],
     path: String,
+    allow_degraded_redundancy: bool,
 ) -> ControlAck {
     let mut blacklist: Vec<libp2p::PeerId> = Vec::new();
     for attempt in 1..=MAX_FETCH_ATTEMPTS {
@@ -903,8 +944,9 @@ async fn run_get_bzz(
             peers.clone(),
             blacklist.clone(),
         )
-        .with_cache(cache.clone());
-        match try_get_bzz(&fetcher, reference, &path).await {
+        .with_cache(cache.clone())
+        .with_record_dir(record_dir.clone());
+        match try_get_bzz(&fetcher, reference, &path, allow_degraded_redundancy).await {
             Ok((data, content_type, filename)) => {
                 return ControlAck::BzzBytes {
                     data,
@@ -941,8 +983,12 @@ async fn try_get_bzz(
     fetcher: &ant_retrieval::RoutingFetcher,
     reference: [u8; 32],
     path: &str,
+    allow_degraded_redundancy: bool,
 ) -> Result<(Vec<u8>, Option<String>, Option<String>), AttemptError> {
-    use ant_retrieval::{join, lookup_path, ChunkFetcher, ManifestError, DEFAULT_MAX_FILE_BYTES};
+    use ant_retrieval::{
+        join_with_options, lookup_path, ChunkFetcher, JoinOptions, ManifestError,
+        DEFAULT_MAX_FILE_BYTES,
+    };
 
     let lookup = match lookup_path(fetcher, reference, path).await {
         Ok(r) => r,
@@ -976,7 +1022,10 @@ async fn try_get_bzz(
     let root = fetcher.fetch(data_ref).await.map_err(|e| {
         AttemptError::Transient(format!("fetch data root {}: {e}", hex::encode(data_ref)))
     })?;
-    let data = join(fetcher, &root, DEFAULT_MAX_FILE_BYTES)
+    let join_options = JoinOptions {
+        allow_degraded_redundancy,
+    };
+    let data = join_with_options(fetcher, &root, DEFAULT_MAX_FILE_BYTES, join_options)
         .await
         .map_err(|e| {
             let message = format!("join data {}: {e}", hex::encode(data_ref));

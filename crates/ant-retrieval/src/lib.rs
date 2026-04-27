@@ -49,7 +49,7 @@ pub mod mantaray;
 
 pub use cache::{InMemoryChunkCache, DEFAULT_CAPACITY as DEFAULT_CACHE_CAPACITY};
 pub use fetcher::{Overlay, RoutingFetcher};
-pub use joiner::{join, JoinError, DEFAULT_MAX_FILE_BYTES};
+pub use joiner::{join, join_with_options, JoinError, JoinOptions, DEFAULT_MAX_FILE_BYTES};
 pub use mantaray::{
     lookup_path, LookupResult, ManifestError, MANTARAY_CONTENT_TYPE_KEY,
     MANTARAY_ERROR_DOC_KEY, MANTARAY_INDEX_DOC_KEY,
