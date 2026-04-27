@@ -1,6 +1,16 @@
-//! Tokio-based UDS server. Reads one NDJSON request, writes one NDJSON response, closes.
+//! Tokio-based UDS server. Reads one NDJSON request, writes one or more
+//! NDJSON responses, closes.
+//!
+//! The wire is single-shot for almost every request: one [`Request`] line
+//! in, one [`Response`] line out, EOF. The exception is a `Get*` request
+//! with `progress: true` — the daemon may emit zero or more
+//! [`Response::Progress`] lines before the terminal response, all on the
+//! same connection. Old clients that don't ask for progress only ever
+//! see the terminal line, so the v1 single-shot framing is preserved.
 
-use crate::protocol::{Request, Response, StatusSnapshot, VersionInfo, PROTOCOL_VERSION};
+use crate::protocol::{
+    GetProgress, Request, Response, StatusSnapshot, VersionInfo, PROTOCOL_VERSION,
+};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
@@ -31,14 +41,24 @@ const NETWORK_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 /// top. Real-world chunk fetches usually complete in <1 s, but pad for
 /// the unlucky path.
 const TREE_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+/// Buffer depth for the streaming ack channel. Sized big enough to
+/// hold a couple of progress emissions plus the terminal ack without
+/// the producer ever blocking, and small enough that a stalled writer
+/// is observable in memory pressure rather than runaway buffering.
+const STREAM_ACK_CAPACITY: usize = 16;
 
 /// A mutating or network-touching command issued by a client and forwarded
 /// to the node loop.
 ///
 /// The node loop owns state that needs a single-writer path (the peerstore,
 /// the swarm), so `serve()` does not touch it directly; instead it relays a
-/// `ControlCommand` through an `mpsc::Sender` and awaits an ack on the
-/// embedded `oneshot`.
+/// `ControlCommand` through an `mpsc::Sender` and awaits the ack(s) on the
+/// embedded reply channel. Non-streaming commands (peerstore reset, single-
+/// chunk retrieve) carry a `oneshot` — exactly one ack lands and the
+/// channel closes. Streaming-capable commands (`GetBytes`, `GetBzz`)
+/// carry an `mpsc::Sender` that produces zero or more
+/// [`ControlAck::Progress`] samples followed by exactly one terminal
+/// variant (`Bytes` / `BzzBytes` / `Error`).
 #[derive(Debug)]
 pub enum ControlCommand {
     /// Drop the on-disk peerstore snapshot and clear the in-memory dedup
@@ -57,23 +77,32 @@ pub enum ControlCommand {
     /// recovered from the manifest. When `allow_degraded_redundancy`
     /// is set the joiner masks any non-zero RS level byte off the
     /// file's root span and decodes without RS recovery.
+    /// `bypass_cache` swaps the daemon's shared chunk cache for a
+    /// fresh per-request one (intra-request retries still benefit
+    /// from caching). `progress` opts the request into streaming
+    /// [`ControlAck::Progress`] emissions.
     GetBzz {
         reference: [u8; 32],
         path: String,
         allow_degraded_redundancy: bool,
-        ack: oneshot::Sender<ControlAck>,
+        bypass_cache: bool,
+        progress: bool,
+        ack: mpsc::Sender<ControlAck>,
     },
     /// Join the multi-chunk tree rooted at `reference` (a `/bytes/` ref,
-    /// no manifest) and ack with the joined file bytes.
+    /// no manifest) and ack with the joined file bytes. See
+    /// [`ControlCommand::GetBzz`] for `bypass_cache` and `progress`.
     GetBytes {
         reference: [u8; 32],
-        ack: oneshot::Sender<ControlAck>,
+        bypass_cache: bool,
+        progress: bool,
+        ack: mpsc::Sender<ControlAck>,
     },
 }
 
 /// Node-loop reply to a [`ControlCommand`]. Serialized back to the client as
-/// `Response::Ok`, `Response::Bytes`, `Response::BzzBytes`, or
-/// `Response::Error` depending on the variant.
+/// `Response::Ok`, `Response::Bytes`, `Response::BzzBytes`,
+/// `Response::Progress`, or `Response::Error` depending on the variant.
 #[derive(Debug, Clone)]
 pub enum ControlAck {
     Ok {
@@ -87,9 +116,27 @@ pub enum ControlAck {
         content_type: Option<String>,
         filename: Option<String>,
     },
+    /// Streaming progress sample for a `GetBytes` / `GetBzz` request.
+    /// Producer can fire as many of these as it likes; the dispatcher
+    /// keeps writing them until a terminal variant arrives or the
+    /// channel closes.
+    Progress(GetProgress),
     Error {
         message: String,
     },
+}
+
+impl ControlAck {
+    fn is_terminal(&self) -> bool {
+        !matches!(self, ControlAck::Progress(_))
+    }
+}
+
+/// Build the `mpsc` ack channel handed to streaming-capable
+/// `ControlCommand`s. Public so the node loop's tests can wire one up
+/// without reaching into the server module's internals.
+pub fn streaming_ack_channel() -> (mpsc::Sender<ControlAck>, mpsc::Receiver<ControlAck>) {
+    mpsc::channel(STREAM_ACK_CAPACITY)
 }
 
 /// Serve control requests on `socket_path` until the task is cancelled.
@@ -155,26 +202,37 @@ async fn handle_connection(
     }
     let trimmed = line.trim_end_matches(['\r', '\n']);
 
-    let response = match serde_json::from_str::<Request>(trimmed) {
+    match serde_json::from_str::<Request>(trimmed) {
         Ok(Request::Status) => {
             let snap = status_rx.borrow().clone();
-            Response::Status(Box::new(snap))
+            write_response(&mut write_half, &Response::Status(Box::new(snap))).await?;
         }
-        Ok(Request::Version) => Response::Version(VersionInfo {
-            agent,
-            protocol_version: PROTOCOL_VERSION,
-        }),
+        Ok(Request::Version) => {
+            write_response(
+                &mut write_half,
+                &Response::Version(VersionInfo {
+                    agent,
+                    protocol_version: PROTOCOL_VERSION,
+                }),
+            )
+            .await?;
+        }
         Ok(Request::PeersReset) => {
-            dispatch_command(
+            let response = dispatch_oneshot(
                 command_tx.as_ref(),
                 FAST_COMMAND_TIMEOUT,
                 |ack| ControlCommand::ResetPeerstore { ack },
             )
-            .await
+            .await;
+            write_response(&mut write_half, &response).await?;
         }
-        Ok(Request::Get { reference }) => match parse_reference(&reference) {
+        Ok(Request::Get {
+            reference,
+            bypass_cache: _,
+            progress: _,
+        }) => match parse_reference(&reference) {
             Ok(addr) => {
-                dispatch_command(
+                let response = dispatch_oneshot(
                     command_tx.as_ref(),
                     NETWORK_COMMAND_TIMEOUT,
                     |ack| ControlCommand::GetChunk {
@@ -182,67 +240,111 @@ async fn handle_connection(
                         ack,
                     },
                 )
-                .await
+                .await;
+                write_response(&mut write_half, &response).await?;
             }
-            Err(e) => Response::Error {
-                message: format!("bad reference: {e}"),
-            },
+            Err(e) => {
+                write_response(
+                    &mut write_half,
+                    &Response::Error {
+                        message: format!("bad reference: {e}"),
+                    },
+                )
+                .await?;
+            }
         },
         Ok(Request::GetBzz {
             reference,
             path,
             allow_degraded_redundancy,
+            bypass_cache,
+            progress,
         }) => match parse_reference(&reference) {
             Ok(addr) => {
-                dispatch_command(
+                dispatch_streaming(
+                    &mut write_half,
                     command_tx.as_ref(),
                     TREE_COMMAND_TIMEOUT,
                     |ack| ControlCommand::GetBzz {
                         reference: addr,
                         path,
                         allow_degraded_redundancy,
+                        bypass_cache,
+                        progress,
                         ack,
                     },
                 )
-                .await
+                .await?;
             }
-            Err(e) => Response::Error {
-                message: format!("bad reference: {e}"),
-            },
+            Err(e) => {
+                write_response(
+                    &mut write_half,
+                    &Response::Error {
+                        message: format!("bad reference: {e}"),
+                    },
+                )
+                .await?;
+            }
         },
-        Ok(Request::GetBytes { reference }) => match parse_reference(&reference) {
+        Ok(Request::GetBytes {
+            reference,
+            bypass_cache,
+            progress,
+        }) => match parse_reference(&reference) {
             Ok(addr) => {
-                dispatch_command(
+                dispatch_streaming(
+                    &mut write_half,
                     command_tx.as_ref(),
                     TREE_COMMAND_TIMEOUT,
                     |ack| ControlCommand::GetBytes {
                         reference: addr,
+                        bypass_cache,
+                        progress,
                         ack,
                     },
                 )
-                .await
+                .await?;
             }
-            Err(e) => Response::Error {
-                message: format!("bad reference: {e}"),
-            },
+            Err(e) => {
+                write_response(
+                    &mut write_half,
+                    &Response::Error {
+                        message: format!("bad reference: {e}"),
+                    },
+                )
+                .await?;
+            }
         },
-        Err(e) => Response::Error {
-            message: format!("bad request: {e}"),
-        },
-    };
+        Err(e) => {
+            write_response(
+                &mut write_half,
+                &Response::Error {
+                    message: format!("bad request: {e}"),
+                },
+            )
+            .await?;
+        }
+    }
 
-    let mut out = serde_json::to_vec(&response).expect("serialize Response");
-    out.push(b'\n');
-    write_half.write_all(&out).await?;
     write_half.flush().await?;
     write_half.shutdown().await?;
     Ok(())
 }
 
-/// Forward a mutating command to the node loop and block until it acks (or
-/// the timeout fires). Returns a `Response` ready to serialize back to the
-/// client.
-async fn dispatch_command<F>(
+async fn write_response<W>(write_half: &mut W, response: &Response) -> Result<(), ServerError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let mut out = serde_json::to_vec(response).expect("serialize Response");
+    out.push(b'\n');
+    write_half.write_all(&out).await?;
+    Ok(())
+}
+
+/// Forward a non-streaming command to the node loop and block until it
+/// acks (or the timeout fires). Returns a `Response` ready to serialize
+/// back to the client.
+async fn dispatch_oneshot<F>(
     command_tx: Option<&mpsc::Sender<ControlCommand>>,
     timeout: Duration,
     build: F,
@@ -262,26 +364,90 @@ where
         };
     }
     match tokio::time::timeout(timeout, ack_rx).await {
-        Ok(Ok(ControlAck::Ok { message })) => Response::Ok { message },
-        Ok(Ok(ControlAck::Bytes { data })) => Response::Bytes {
-            hex: format!("0x{}", hex::encode(data)),
-        },
-        Ok(Ok(ControlAck::BzzBytes {
-            data,
-            content_type,
-            filename,
-        })) => Response::BzzBytes {
-            hex: format!("0x{}", hex::encode(data)),
-            content_type,
-            filename,
-        },
-        Ok(Ok(ControlAck::Error { message })) => Response::Error { message },
+        Ok(Ok(ack)) => ack_to_response(ack),
         Ok(Err(_)) => Response::Error {
             message: "daemon dropped the command without replying".to_string(),
         },
         Err(_) => Response::Error {
             message: format!("daemon did not ack within {} seconds", timeout.as_secs()),
         },
+    }
+}
+
+/// Forward a streaming-capable command to the node loop, write each
+/// non-terminal `Progress` ack as its own NDJSON line, and finish with
+/// the terminal response. The `timeout` resets every time a fresh ack
+/// lands so a long-but-progressing fetch isn't killed for taking longer
+/// than the per-message bound.
+async fn dispatch_streaming<W, F>(
+    write_half: &mut W,
+    command_tx: Option<&mpsc::Sender<ControlCommand>>,
+    timeout: Duration,
+    build: F,
+) -> Result<(), ServerError>
+where
+    W: AsyncWriteExt + Unpin,
+    F: FnOnce(mpsc::Sender<ControlAck>) -> ControlCommand,
+{
+    let Some(tx) = command_tx else {
+        let response = Response::Error {
+            message: "daemon has no control-command channel wired up".to_string(),
+        };
+        return write_response(write_half, &response).await;
+    };
+    let (ack_tx, mut ack_rx) = streaming_ack_channel();
+    if tx.send(build(ack_tx)).await.is_err() {
+        let response = Response::Error {
+            message: "daemon node loop is no longer accepting commands".to_string(),
+        };
+        return write_response(write_half, &response).await;
+    }
+    loop {
+        match tokio::time::timeout(timeout, ack_rx.recv()).await {
+            Ok(Some(ack)) => {
+                let is_terminal = ack.is_terminal();
+                let response = ack_to_response(ack);
+                write_response(write_half, &response).await?;
+                if is_terminal {
+                    return Ok(());
+                }
+            }
+            Ok(None) => {
+                let response = Response::Error {
+                    message: "daemon dropped the command without replying".to_string(),
+                };
+                return write_response(write_half, &response).await;
+            }
+            Err(_) => {
+                let response = Response::Error {
+                    message: format!(
+                        "daemon went silent for more than {} seconds",
+                        timeout.as_secs()
+                    ),
+                };
+                return write_response(write_half, &response).await;
+            }
+        }
+    }
+}
+
+fn ack_to_response(ack: ControlAck) -> Response {
+    match ack {
+        ControlAck::Ok { message } => Response::Ok { message },
+        ControlAck::Bytes { data } => Response::Bytes {
+            hex: format!("0x{}", hex::encode(data)),
+        },
+        ControlAck::BzzBytes {
+            data,
+            content_type,
+            filename,
+        } => Response::BzzBytes {
+            hex: format!("0x{}", hex::encode(data)),
+            content_type,
+            filename,
+        },
+        ControlAck::Progress(p) => Response::Progress(p),
+        ControlAck::Error { message } => Response::Error { message },
     }
 }
 

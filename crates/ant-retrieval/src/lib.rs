@@ -46,6 +46,7 @@ pub mod cache;
 pub mod fetcher;
 pub mod joiner;
 pub mod mantaray;
+pub mod progress;
 
 pub use cache::{InMemoryChunkCache, DEFAULT_CAPACITY as DEFAULT_CACHE_CAPACITY};
 pub use fetcher::{Overlay, RoutingFetcher};
@@ -54,6 +55,7 @@ pub use mantaray::{
     lookup_path, LookupResult, ManifestError, MANTARAY_CONTENT_TYPE_KEY,
     MANTARAY_ERROR_DOC_KEY, MANTARAY_INDEX_DOC_KEY,
 };
+pub use progress::{estimate_total_chunks, ProgressSample, ProgressTracker};
 
 use ant_crypto::{cac_valid, CHUNK_SIZE, SPAN_SIZE};
 use async_trait::async_trait;

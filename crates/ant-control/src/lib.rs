@@ -12,12 +12,12 @@ mod client;
 mod server;
 
 pub use protocol::{
-    HandshakeReport, IdentityInfo, PeerConnectionInfo, PeerConnectionState, PeerInfo,
+    GetProgress, HandshakeReport, IdentityInfo, PeerConnectionInfo, PeerConnectionState, PeerInfo,
     PeerPipelineEntry, ProtocolError, Request, Response, RoutingInfo, StatusSnapshot, VersionInfo,
     PROTOCOL_VERSION,
 };
 
 #[cfg(unix)]
-pub use client::{request_sync, ClientError};
+pub use client::{request_streaming, request_sync, ClientError, StreamEvent};
 #[cfg(unix)]
 pub use server::{serve, ControlAck, ControlCommand, ServerError};

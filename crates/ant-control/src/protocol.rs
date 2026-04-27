@@ -4,7 +4,15 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Bumped whenever the wire format changes in a non-additive way.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// v2 introduced streaming progress on `Get`/`GetBytes`/`GetBzz`: when the
+/// client sends `progress: true`, the daemon may emit zero or more
+/// [`Response::Progress`] messages on the same connection before the
+/// terminal response. Older clients leave `progress` at its default
+/// (`false`) and continue to see exactly one response, preserving the
+/// v1 single-shot behaviour. The new `bypass_cache` request flag is
+/// equally additive — old daemons simply ignore the field.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Error)]
 pub enum ProtocolError {
@@ -28,7 +36,22 @@ pub enum Request {
     /// reference is a `0x`-prefixed hex string. The daemon answers with
     /// [`Response::Bytes`] carrying the verified chunk payload (without
     /// the span prefix).
-    Get { reference: String },
+    ///
+    /// `bypass_cache` skips the daemon's shared in-memory chunk cache
+    /// for this request only: the daemon mints a fresh per-request
+    /// cache so intra-request retries still benefit from caching, but
+    /// no chunk hits or writes touch the long-lived cache. Useful for
+    /// timing the cold path or reproducing a transient retrieval.
+    /// `progress` opts the request into streaming
+    /// [`Response::Progress`] updates emitted at a regular cadence
+    /// while the chunk tree is fetched.
+    Get {
+        reference: String,
+        #[serde(default)]
+        bypass_cache: bool,
+        #[serde(default)]
+        progress: bool,
+    },
     /// Retrieve a file via the bzz read-path: walks the manifest at
     /// `reference`, resolves `path` (empty triggers `website-index-document`),
     /// then joins the resulting chunk tree into the file's raw bytes.
@@ -40,18 +63,29 @@ pub enum Request {
     /// running RS recovery — bytes come back if every data chunk is
     /// reachable, otherwise the request fails as it would today.
     /// Defaults to `false` so the normal path remains strict.
+    /// See [`Request::Get`] for `bypass_cache` and `progress`.
     GetBzz {
         reference: String,
         #[serde(default)]
         path: String,
         #[serde(default)]
         allow_degraded_redundancy: bool,
+        #[serde(default)]
+        bypass_cache: bool,
+        #[serde(default)]
+        progress: bool,
     },
     /// Retrieve a multi-chunk raw byte tree by joining its chunk tree.
     /// `reference` points at the root chunk of a `/bytes/` tree. Daemon
     /// answers with [`Response::Bytes`] (no content-type, no manifest
-    /// metadata).
-    GetBytes { reference: String },
+    /// metadata). See [`Request::Get`] for `bypass_cache` and `progress`.
+    GetBytes {
+        reference: String,
+        #[serde(default)]
+        bypass_cache: bool,
+        #[serde(default)]
+        progress: bool,
+    },
 }
 
 /// Daemon → client response.
@@ -86,9 +120,57 @@ pub enum Response {
         #[serde(default)]
         filename: Option<String>,
     },
+    /// Streaming progress emitted by `Get` / `GetBytes` / `GetBzz`
+    /// when the client opted in via `progress: true`. May be sent
+    /// zero or more times before a terminal `Bytes` / `BzzBytes` /
+    /// `Error` reply on the same connection. Clients that didn't ask
+    /// for progress will never receive this variant; old clients can
+    /// ignore it.
+    Progress(GetProgress),
     Error {
         message: String,
     },
+}
+
+/// One streaming progress sample for an in-flight `Get*` request.
+///
+/// All counters are cumulative since the request started. Spans of `0`
+/// for `total_*_estimate` mean "not yet known" — the daemon doesn't
+/// learn the file size until it has fetched the data root chunk and
+/// inspected its 8-byte span prefix, so the first few samples on a
+/// large file may report only `chunks_done` / `bytes_done`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GetProgress {
+    /// Wall-clock milliseconds since the daemon accepted the request.
+    pub elapsed_ms: u64,
+    /// Number of chunks delivered to the joiner so far (cache hits +
+    /// successful network fetches).
+    pub chunks_done: u64,
+    /// Best-effort estimate of total chunks for the request, derived
+    /// from the data root's span. `0` until the data root has been
+    /// fetched (and for single-chunk files where the root *is* the
+    /// data, the first sample carries `chunks_done == 1` and
+    /// `total_chunks_estimate == 1`).
+    pub total_chunks_estimate: u64,
+    /// Bytes of chunk wire data fetched so far (`span (8) || payload`
+    /// for each delivered chunk).
+    pub bytes_done: u64,
+    /// File-body byte count reported by the data root's span. `0`
+    /// until known. For `Get` and `GetBytes` this is the file size;
+    /// for `GetBzz` it's the size of the resolved file body, not the
+    /// manifest.
+    pub total_bytes_estimate: u64,
+    /// Cache hits served without going to the network. Useful for
+    /// distinguishing "fast retrieval from a warm cache" from "fast
+    /// retrieval from a single very-close peer".
+    pub cache_hits: u64,
+    /// Distinct peers we successfully retrieved at least one chunk
+    /// from during this request. `0` means everything seen so far
+    /// came from cache.
+    pub peers_used: u32,
+    /// Echoes the request's `bypass_cache` flag so a client that
+    /// forgot which mode it asked for can reconcile when rendering.
+    pub bypass_cache: bool,
 }
 
 /// Everything `antctl status` wants to show.

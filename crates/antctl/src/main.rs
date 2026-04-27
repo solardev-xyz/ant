@@ -4,7 +4,8 @@
 //! `ant-control::Request` / `Response`).
 
 use ant_control::{
-    request_sync, PeerConnectionInfo, PeerConnectionState, Request, Response, StatusSnapshot,
+    request_streaming, request_sync, GetProgress, PeerConnectionInfo, PeerConnectionState,
+    Request, Response, StatusSnapshot,
 };
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -135,6 +136,22 @@ Examples:
         /// seconds.
         #[arg(long, default_value_t = 30)]
         wait_timeout: u64,
+        /// Skip the daemon's shared in-memory chunk cache for this
+        /// request only. The daemon mints a fresh per-request cache,
+        /// so intra-request retries still benefit from caching but no
+        /// chunk hits or writes touch the long-lived cache. Useful
+        /// for timing the cold path or reproducing a transient
+        /// retrieval issue.
+        #[arg(long)]
+        bypass_cache: bool,
+        /// Suppress the in-place progress line on stderr. By default
+        /// `antctl get` renders a one-line status (chunks, bytes,
+        /// rate, peer count) that updates every ~150 ms while the
+        /// daemon walks the chunk tree. The line is also auto-hidden
+        /// for non-TTY stderr, when `--json` is set, and for
+        /// single-chunk fetches where there's nothing to track.
+        #[arg(long)]
+        no_progress: bool,
     },
 }
 
@@ -211,17 +228,38 @@ fn main() -> Result<()> {
             allow_degraded_redundancy,
             wait_peers,
             wait_timeout,
+            bypass_cache,
+            no_progress,
         } => {
             if wait_peers > 0 {
                 wait_for_peers(&socket, wait_peers, Duration::from_secs(wait_timeout));
             }
+            let mode = FetchMode::from_flags(bytes, bzz, bzz_path.as_deref());
+            // Single-chunk fetches return a single line; there's
+            // nothing to stream, so don't bother asking the daemon.
+            // For multi-chunk fetches, render a status line on stderr
+            // unless the user opted out, the user wants JSON, or
+            // stderr isn't a TTY (we'd otherwise mangle log capture).
+            // URL schemes on the reference (`bzz://`, `bytes://`)
+            // override the explicit flags, so peek at the reference
+            // too — otherwise `antctl get bzz://...` would silently
+            // skip progress because `mode` is `Chunk`.
+            let multi_chunk = !matches!(mode, FetchMode::Chunk)
+                || reference.starts_with("bzz://")
+                || reference.starts_with("bytes://");
+            let show_progress = !no_progress
+                && !opt.json
+                && multi_chunk
+                && std::io::IsTerminal::is_terminal(&std::io::stderr());
             run_get(
                 &socket,
                 &reference,
                 out.as_deref(),
                 opt.json,
-                FetchMode::from_flags(bytes, bzz, bzz_path.as_deref()),
+                mode,
                 allow_degraded_redundancy,
+                bypass_cache,
+                show_progress,
             )?;
         }
     }
@@ -297,6 +335,8 @@ fn parse_reference_with_mode(
     reference: &str,
     mode: FetchMode,
     allow_degraded_redundancy: bool,
+    bypass_cache: bool,
+    progress: bool,
 ) -> Result<Request> {
     if let Some(rest) = reference.strip_prefix("bzz://") {
         // Split optional path (after first '/').
@@ -308,24 +348,34 @@ fn parse_reference_with_mode(
             reference: hex_part.to_string(),
             path: path_part.to_string(),
             allow_degraded_redundancy,
+            bypass_cache,
+            progress,
         });
     }
     if let Some(rest) = reference.strip_prefix("bytes://") {
         return Ok(Request::GetBytes {
             reference: rest.to_string(),
+            bypass_cache,
+            progress,
         });
     }
     Ok(match mode {
         FetchMode::Chunk => Request::Get {
             reference: reference.to_string(),
+            bypass_cache,
+            progress,
         },
         FetchMode::Bytes => Request::GetBytes {
             reference: reference.to_string(),
+            bypass_cache,
+            progress,
         },
         FetchMode::Bzz { path } => Request::GetBzz {
             reference: reference.to_string(),
             path,
             allow_degraded_redundancy,
+            bypass_cache,
+            progress,
         },
     })
 }
@@ -333,6 +383,16 @@ fn parse_reference_with_mode(
 /// Fetch a chunk / file and write it to `out` (or stdout). With `--json`,
 /// prints a structured envelope on stdout regardless of mode, since
 /// shells generally won't render binary cleanly.
+///
+/// `show_progress` opts the request into streaming
+/// `Response::Progress` updates and renders an in-place stderr status
+/// line. The caller decides whether progress makes sense (TTY check,
+/// `--json`, single-chunk fetches, etc.) so this function can stay
+/// focused on plumbing.
+// Eight args is one over clippy's preferred ceiling, but every one of
+// them is a CLI-driven knob with a distinct meaning, and bundling them
+// into a struct just for clippy would obscure the call site below.
+#[allow(clippy::too_many_arguments)]
 fn run_get(
     socket: &Path,
     reference: &str,
@@ -340,10 +400,30 @@ fn run_get(
     json: bool,
     mode: FetchMode,
     allow_degraded_redundancy: bool,
+    bypass_cache: bool,
+    show_progress: bool,
 ) -> Result<()> {
-    let req = parse_reference_with_mode(reference, mode, allow_degraded_redundancy)?;
-    let resp = request_sync(socket, &req)
-        .with_context(|| format!("talk to antd at {}", socket.display()))?;
+    let req = parse_reference_with_mode(
+        reference,
+        mode,
+        allow_degraded_redundancy,
+        bypass_cache,
+        show_progress,
+    )?;
+
+    let (resp, last_progress) = if show_progress {
+        let mut renderer = ProgressRenderer::new(bypass_cache);
+        let resp = request_streaming(socket, &req, |p| renderer.render(p))
+            .with_context(|| format!("talk to antd at {}", socket.display()))?;
+        let last = renderer.finish();
+        (resp, last)
+    } else {
+        (
+            request_sync(socket, &req)
+                .with_context(|| format!("talk to antd at {}", socket.display()))?,
+            None,
+        )
+    };
 
     // Unify the three shapes into (data, content_type, filename).
     let (data, content_type, filename) = match resp {
@@ -389,7 +469,237 @@ fn run_get(
         // know what they got without polluting stdout.
         eprintln!("Content-Type: {ct}");
     }
+
+    // Post-download stats summary. Only meaningful when streaming
+    // progress was active (multi-chunk fetch on a TTY without
+    // `--json` / `--no-progress`); otherwise we have nothing to
+    // report and the existing one-line `wrote N bytes …` carries
+    // its own narrative.
+    if !json {
+        if let Some(sample) = last_progress {
+            eprintln!("{}", format_stats_summary(&sample, bypass_cache));
+        }
+    }
     Ok(())
+}
+
+/// EMA smoothing factor for the per-second download-rate readout.
+/// 0.30 is a middle ground: visibly responsive when the rate jumps but
+/// not so jumpy that a single fast/slow sample dominates the line.
+const PROGRESS_EMA_ALPHA: f64 = 0.30;
+
+/// Stateful renderer for `antctl get`'s per-line stderr progress
+/// output. Holds the last sample we showed so we can compute an
+/// instantaneous rate (with EMA smoothing) between consecutive
+/// `GetProgress` events, plus the column count of the last line so
+/// [`finish`](Self::finish) can erase it cleanly with `\r` + spaces.
+struct ProgressRenderer {
+    /// Smoothed bytes/sec across the request. `None` until we have
+    /// at least two samples to interpolate between.
+    ema_bps: Option<f64>,
+    /// Width of the most recently printed line, in display columns,
+    /// so `finish` can wipe it with the right number of spaces.
+    last_line_width: usize,
+    /// Most recent sample received, so [`finish`](Self::finish) can
+    /// hand it back to the caller for a post-download summary line.
+    /// `None` if no progress event ever landed (single-chunk fetch
+    /// or a request that errored before the first emitter tick).
+    last_sample: Option<GetProgress>,
+    /// Cached `bypass_cache` so we can prefix `[no-cache] ` even on
+    /// the very first sample (where the in-flight `GetProgress` may
+    /// still echo `false` if the daemon hasn't initialised the
+    /// tracker yet — shouldn't happen in practice but guards us).
+    bypass_cache_hint: bool,
+}
+
+impl ProgressRenderer {
+    fn new(bypass_cache: bool) -> Self {
+        Self {
+            ema_bps: None,
+            last_line_width: 0,
+            last_sample: None,
+            bypass_cache_hint: bypass_cache,
+        }
+    }
+
+    /// Update the rate EMA and re-render the in-place status line.
+    /// Called once per `Response::Progress` from the streaming client.
+    fn render(&mut self, p: &GetProgress) {
+        if let Some(prev) = &self.last_sample {
+            let dt_ms = p.elapsed_ms.saturating_sub(prev.elapsed_ms);
+            let dbytes = p.bytes_done.saturating_sub(prev.bytes_done);
+            // Skip the EMA update for samples that produced no
+            // progress (e.g. emitter ticked while the joiner was
+            // stuck on a slow peer). Keeping the EMA stable is
+            // friendlier than letting it trend toward zero on every
+            // stalled tick.
+            if dt_ms > 0 && dbytes > 0 {
+                let bps = (dbytes as f64) * 1000.0 / dt_ms as f64;
+                self.ema_bps = Some(match self.ema_bps {
+                    Some(prev) => prev * (1.0 - PROGRESS_EMA_ALPHA) + bps * PROGRESS_EMA_ALPHA,
+                    None => bps,
+                });
+            }
+        }
+        self.last_sample = Some(p.clone());
+
+        let line = format_progress_line(p, self.ema_bps, self.bypass_cache_hint);
+        // `\r` returns to column 0; pad with spaces to overwrite any
+        // trailing characters from the previous (longer) line, then
+        // write the new content. Flush so the user sees updates even
+        // when stderr is line-buffered.
+        use std::io::Write as _;
+        let mut err = std::io::stderr().lock();
+        let new_width = display_width(&line);
+        let padding = self.last_line_width.saturating_sub(new_width);
+        let _ = write!(err, "\r{line}{}", " ".repeat(padding));
+        let _ = err.flush();
+        self.last_line_width = new_width;
+    }
+
+    /// Erase the in-place status line so subsequent stderr output
+    /// (e.g. `wrote N bytes to <path>`) starts on a fresh column,
+    /// and hand the most recent sample back to the caller for the
+    /// post-download stats summary.
+    fn finish(self) -> Option<GetProgress> {
+        if self.last_sample.is_some() {
+            use std::io::Write as _;
+            let mut err = std::io::stderr().lock();
+            let _ = write!(err, "\r{}\r", " ".repeat(self.last_line_width));
+            let _ = err.flush();
+        }
+        self.last_sample
+    }
+}
+
+/// Render one `GetProgress` sample as a one-line stderr status. The
+/// renderer trims to a "best summary" view rather than dumping every
+/// counter; users wanting a structured feed can always re-run with
+/// `--json` (which doesn't take this path).
+fn format_progress_line(p: &GetProgress, ema_bps: Option<f64>, bypass_cache: bool) -> String {
+    let chunks = if p.total_chunks_estimate > 0 {
+        format!("{}/{}", p.chunks_done, p.total_chunks_estimate)
+    } else {
+        format!("{}/?", p.chunks_done)
+    };
+    let bytes = if p.total_bytes_estimate > 0 {
+        format!(
+            "{}/{}",
+            format_bytes(p.bytes_done),
+            format_bytes(p.total_bytes_estimate),
+        )
+    } else {
+        format!("{}/?", format_bytes(p.bytes_done))
+    };
+    let rate = match ema_bps {
+        Some(bps) if bps > 0.0 => format!("{}/s", format_bytes(bps as u64)),
+        _ => "—/s".to_string(),
+    };
+    let elapsed = format_progress_elapsed(p.elapsed_ms);
+    // Show the source mix even when the user didn't pass
+    // `--bypass-cache`, so a populated cache doesn't "look slow"
+    // simply because the joiner is hitting it instead of peers.
+    let sources = format!(
+        "{} peer{}{}",
+        p.peers_used,
+        if p.peers_used == 1 { "" } else { "s" },
+        if p.cache_hits > 0 {
+            format!(", {} cache", p.cache_hits)
+        } else {
+            String::new()
+        },
+    );
+    let cache_tag = if bypass_cache { "[no-cache] " } else { "" };
+    format!(
+        "{cache_tag}↓ {chunks} chunks  {bytes}  {rate}  {sources}  {elapsed}",
+    )
+}
+
+/// Single-line post-download summary printed once the in-place
+/// progress line has been wiped. Pulls every interesting counter out
+/// of the final `GetProgress` so the user can see, at a glance, how
+/// the fetch went without scrolling back through live frames.
+///
+/// Format: `stats: 5 chunks (18.2KiB) in 312ms · avg 58.4KiB/s · 3 peers · 2 cache · cold`.
+/// `cold` / `warm` is dropped when the daemon's cache wasn't
+/// involved either way (no peers and no hits — should only happen on
+/// a no-op fetch).
+fn format_stats_summary(p: &GetProgress, bypass_cache_hint: bool) -> String {
+    let chunks = if p.total_chunks_estimate > 0 && p.total_chunks_estimate != p.chunks_done {
+        format!("{}/{} chunks", p.chunks_done, p.total_chunks_estimate)
+    } else {
+        format!(
+            "{} chunk{}",
+            p.chunks_done,
+            if p.chunks_done == 1 { "" } else { "s" },
+        )
+    };
+    let bytes = format_bytes(p.bytes_done);
+    let elapsed = format_progress_elapsed(p.elapsed_ms);
+    // Use cumulative average rather than the live EMA: the EMA was
+    // useful while the user could read it, but the post-download
+    // summary wants the deterministic "this is what just happened"
+    // number — total bytes ÷ total seconds.
+    let avg = if p.elapsed_ms > 0 {
+        let bps = (p.bytes_done as f64) * 1000.0 / p.elapsed_ms as f64;
+        format!("avg {}/s", format_bytes(bps as u64))
+    } else {
+        "avg —/s".to_string()
+    };
+    let peers = format!(
+        "{} peer{}",
+        p.peers_used,
+        if p.peers_used == 1 { "" } else { "s" },
+    );
+    let cache = format!("{} cache", p.cache_hits);
+    // Trust `bypass_cache` from the sample; fall back to the caller's
+    // hint in case an old daemon ever lands a sample with the field
+    // unset (defensive — shouldn't happen on v2).
+    let mode = if p.bypass_cache || bypass_cache_hint {
+        " · cold"
+    } else if p.cache_hits > 0 || p.peers_used > 0 {
+        " · warm"
+    } else {
+        ""
+    };
+    format!("stats: {chunks} ({bytes}) in {elapsed} · {avg} · {peers} · {cache}{mode}")
+}
+
+fn format_progress_elapsed(ms: u64) -> String {
+    let secs = ms / 1000;
+    let tenths = (ms % 1000) / 100;
+    if secs >= 60 {
+        let m = secs / 60;
+        let s = secs % 60;
+        format!("{m}m{s:02}s")
+    } else {
+        format!("{secs}.{tenths}s")
+    }
+}
+
+/// Human-readable byte size: SI-ish powers of 1024 with a single decimal
+/// for non-byte units. Kept inline to avoid a `humansize`-style dep just
+/// for one stderr line.
+fn format_bytes(n: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    if n >= GIB {
+        format!("{:.1}GiB", n as f64 / GIB as f64)
+    } else if n >= MIB {
+        format!("{:.1}MiB", n as f64 / MIB as f64)
+    } else if n >= KIB {
+        format!("{:.1}KiB", n as f64 / KIB as f64)
+    } else {
+        format!("{n}B")
+    }
+}
+
+/// Approximate display width in columns. Good enough for the progress
+/// line, which is plain ASCII plus a couple of well-known glyphs (the
+/// `↓` arrow and the em-dash); we treat each `char` as one column.
+fn display_width(s: &str) -> usize {
+    s.chars().count()
 }
 
 /// Decode a `0x`-prefixed (or bare) hex string from the daemon's
@@ -1612,5 +1922,60 @@ fn format_duration(secs: u64) -> String {
         format!("{m}m {s}s")
     } else {
         format!("{s}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(chunks: u64, total_chunks: u64, bytes: u64, total_bytes: u64) -> GetProgress {
+        GetProgress {
+            elapsed_ms: 250,
+            chunks_done: chunks,
+            total_chunks_estimate: total_chunks,
+            bytes_done: bytes,
+            total_bytes_estimate: total_bytes,
+            cache_hits: 0,
+            peers_used: 0,
+            bypass_cache: false,
+        }
+    }
+
+    #[test]
+    fn stats_summary_formats_completed_cold_fetch() {
+        let mut s = sample(5, 5, 18 * 1024, 18 * 1024);
+        s.peers_used = 3;
+        s.bypass_cache = true;
+        let line = format_stats_summary(&s, true);
+        assert_eq!(
+            line,
+            "stats: 5 chunks (18.0KiB) in 0.2s · avg 72.0KiB/s · 3 peers · 0 cache · cold",
+        );
+    }
+
+    #[test]
+    fn stats_summary_formats_warm_cache_hit() {
+        let mut s = sample(3, 3, 12 * 1024, 12 * 1024);
+        s.cache_hits = 3;
+        let line = format_stats_summary(&s, false);
+        assert!(line.contains("0 peers"), "got: {line}");
+        assert!(line.contains("3 cache"), "got: {line}");
+        assert!(line.ends_with("warm"), "got: {line}");
+    }
+
+    #[test]
+    fn stats_summary_renders_partial_progress_on_error() {
+        let s = sample(2, 9, 8 * 1024, 36 * 1024);
+        let line = format_stats_summary(&s, false);
+        assert!(line.starts_with("stats: 2/9 chunks"), "got: {line}");
+    }
+
+    #[test]
+    fn progress_line_marks_unknown_total_with_question_mark() {
+        let s = sample(1, 0, 4 * 1024, 0);
+        let line = format_progress_line(&s, None, false);
+        assert!(line.contains("1/?"), "got: {line}");
+        assert!(line.contains("4.0KiB/?"), "got: {line}");
     }
 }

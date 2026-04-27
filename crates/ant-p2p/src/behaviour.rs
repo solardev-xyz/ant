@@ -7,9 +7,10 @@ use crate::peerstore::PeerStore;
 use crate::routing::{Overlay, RoutingTable};
 use crate::sinks;
 use ant_control::{
-    ControlAck, ControlCommand, HandshakeReport, PeerConnectionInfo, PeerConnectionState,
-    PeerPipelineEntry, RoutingInfo, StatusSnapshot,
+    ControlAck, ControlCommand, GetProgress, HandshakeReport, PeerConnectionInfo,
+    PeerConnectionState, PeerPipelineEntry, RoutingInfo, StatusSnapshot,
 };
+use ant_retrieval::ProgressTracker;
 use ant_crypto::{
     ethereum_address_from_public_key, overlay_from_ethereum_address, OVERLAY_NONCE_LEN,
     SECP256K1_SECRET_LEN,
@@ -309,7 +310,14 @@ impl SwarmState {
     /// returned `Arc` is what the request's retry loop hands to every
     /// `RoutingFetcher` it builds, so intra-request retries always
     /// share a cache and only inter-request reuse depends on the flag.
-    fn cache_for_request(&self) -> Arc<ant_retrieval::InMemoryChunkCache> {
+    ///
+    /// `bypass_cache` overrides the daemon-wide setting for this one
+    /// request: a fresh `InMemoryChunkCache` is always returned, so
+    /// no chunk hits or writes touch the long-lived cache.
+    fn cache_for_request(&self, bypass_cache: bool) -> Arc<ant_retrieval::InMemoryChunkCache> {
+        if bypass_cache {
+            return Arc::new(ant_retrieval::InMemoryChunkCache::with_default_capacity());
+        }
         match &self.chunk_cache {
             Some(c) => c.clone(),
             None => Arc::new(ant_retrieval::InMemoryChunkCache::with_default_capacity()),
@@ -744,57 +752,170 @@ fn handle_control_command(
                 let _ = ack.send(reply);
             });
         }
-        ControlCommand::GetBytes { reference, ack } => {
+        ControlCommand::GetBytes {
+            reference,
+            bypass_cache,
+            progress,
+            ack,
+        } => {
             // Multi-chunk raw bytes: snapshot peers, build a routing-aware
             // fetcher, and drive the joiner inside a spawned task. The
             // joiner does its own per-chunk fetch + CAC verify; we only
             // need to feed it the root chunk.
             let peers = state.routing.snapshot();
             if peers.is_empty() {
-                let _ = ack.send(ControlAck::Error {
-                    message: "no peers available; wait for handshakes to complete".to_string(),
-                });
+                send_terminal_ack(
+                    &ack,
+                    ControlAck::Error {
+                        message: "no peers available; wait for handshakes to complete".to_string(),
+                    },
+                );
                 return;
             }
             let control = control.clone();
-            let cache = state.cache_for_request();
+            let cache = state.cache_for_request(bypass_cache);
             let record_dir = state.chunk_record_dir.clone();
+            let tracker = Arc::new(ProgressTracker::new(bypass_cache));
+            let started = Instant::now();
+            let emitter = if progress {
+                Some(spawn_progress_emitter(
+                    tracker.clone(),
+                    ack.clone(),
+                    started,
+                ))
+            } else {
+                None
+            };
+            let tracker_for_run = tracker.clone();
             tokio::spawn(async move {
-                let reply = run_get_bytes(control, peers, cache, record_dir, reference).await;
-                let _ = ack.send(reply);
+                let reply = run_get_bytes(
+                    control,
+                    peers,
+                    cache,
+                    record_dir,
+                    tracker_for_run,
+                    reference,
+                )
+                .await;
+                if let Some(handle) = emitter {
+                    handle.abort();
+                }
+                let _ = ack.send(reply).await;
             });
         }
         ControlCommand::GetBzz {
             reference,
             path,
             allow_degraded_redundancy,
+            bypass_cache,
+            progress,
             ack,
         } => {
             let peers = state.routing.snapshot();
             if peers.is_empty() {
-                let _ = ack.send(ControlAck::Error {
-                    message: "no peers available; wait for handshakes to complete".to_string(),
-                });
+                send_terminal_ack(
+                    &ack,
+                    ControlAck::Error {
+                        message: "no peers available; wait for handshakes to complete".to_string(),
+                    },
+                );
                 return;
             }
             let control = control.clone();
-            let cache = state.cache_for_request();
+            let cache = state.cache_for_request(bypass_cache);
             let record_dir = state.chunk_record_dir.clone();
+            let tracker = Arc::new(ProgressTracker::new(bypass_cache));
+            let started = Instant::now();
+            let emitter = if progress {
+                Some(spawn_progress_emitter(
+                    tracker.clone(),
+                    ack.clone(),
+                    started,
+                ))
+            } else {
+                None
+            };
+            let tracker_for_run = tracker.clone();
             tokio::spawn(async move {
                 let reply = run_get_bzz(
                     control,
                     peers,
                     cache,
                     record_dir,
+                    tracker_for_run,
                     reference,
                     path,
                     allow_degraded_redundancy,
                 )
                 .await;
-                let _ = ack.send(reply);
+                if let Some(handle) = emitter {
+                    handle.abort();
+                }
+                let _ = ack.send(reply).await;
             });
         }
     }
+}
+
+/// How often the progress emitter wakes up and pushes a sample over
+/// the ack channel. 150 ms is fast enough to drive a smoothly-updating
+/// stderr status line on the client without flooding the wire (or
+/// blocking the joiner on a stalled writer).
+const PROGRESS_TICK: Duration = Duration::from_millis(150);
+
+/// Convert a tracker snapshot + the request's start instant into the
+/// wire-shape `GetProgress`. The tracker itself doesn't track
+/// elapsed time (it's a pure counter struct), so we mix it in here.
+fn build_progress(tracker: &ProgressTracker, started: Instant) -> GetProgress {
+    let sample = tracker.snapshot();
+    GetProgress {
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        chunks_done: sample.chunks_done,
+        total_chunks_estimate: sample.total_chunks_estimate,
+        bytes_done: sample.bytes_done,
+        total_bytes_estimate: sample.total_bytes_estimate,
+        cache_hits: sample.cache_hits,
+        peers_used: sample.peers_used,
+        bypass_cache: sample.bypass_cache,
+    }
+}
+
+/// Spawn a background ticker that emits one `ControlAck::Progress`
+/// per `PROGRESS_TICK` until either the ack channel closes (the
+/// connection went away) or the parent task aborts the handle. The
+/// emitter exits on the first failed send so a disconnected client
+/// doesn't keep us spinning forever.
+fn spawn_progress_emitter(
+    tracker: Arc<ProgressTracker>,
+    ack: mpsc::Sender<ControlAck>,
+    started: Instant,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(PROGRESS_TICK);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Skip the immediate first fire — counters are all zero so
+        // there's nothing useful to send before the first chunk lands.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let progress = build_progress(&tracker, started);
+            if ack.send(ControlAck::Progress(progress)).await.is_err() {
+                return;
+            }
+        }
+    })
+}
+
+/// Best-effort terminal ack send for the rare cases where we know
+/// we're going to error out before spawning the worker task (e.g.
+/// no peers available). The mpsc channel was minted with capacity
+/// 16 so this never actually blocks; spawning a tiny task keeps
+/// `handle_control_command` itself synchronous.
+fn send_terminal_ack(ack: &mpsc::Sender<ControlAck>, reply: ControlAck) {
+    let ack = ack.clone();
+    tokio::spawn(async move {
+        let _ = ack.send(reply).await;
+    });
 }
 
 /// Max number of full pipeline attempts (lookup_path + fetch + join)
@@ -853,6 +974,7 @@ async fn run_get_bytes(
     peers: Vec<(libp2p::PeerId, [u8; 32])>,
     cache: Arc<ant_retrieval::InMemoryChunkCache>,
     record_dir: Option<PathBuf>,
+    tracker: Arc<ProgressTracker>,
     reference: [u8; 32],
 ) -> ControlAck {
     let mut blacklist: Vec<libp2p::PeerId> = Vec::new();
@@ -863,8 +985,9 @@ async fn run_get_bytes(
             blacklist.clone(),
         )
         .with_cache(cache.clone())
-        .with_record_dir(record_dir.clone());
-        match try_get_bytes(&fetcher, reference).await {
+        .with_record_dir(record_dir.clone())
+        .with_progress(tracker.clone());
+        match try_get_bytes(&fetcher, &tracker, reference).await {
             Ok(data) => {
                 debug!(
                     target: "ant_p2p",
@@ -905,6 +1028,7 @@ async fn run_get_bytes(
 /// classification away from the retry policy in `run_get_bytes`.
 async fn try_get_bytes(
     fetcher: &ant_retrieval::RoutingFetcher,
+    tracker: &ProgressTracker,
     reference: [u8; 32],
 ) -> Result<Vec<u8>, AttemptError> {
     use ant_retrieval::{join, ChunkFetcher, DEFAULT_MAX_FILE_BYTES};
@@ -912,6 +1036,13 @@ async fn try_get_bytes(
     let root = fetcher.fetch(reference).await.map_err(|e| {
         AttemptError::Transient(format!("fetch root chunk {}: {e}", hex::encode(reference)))
     })?;
+    // The root chunk's span is the total file size (in bytes) of the
+    // BMT-built tree below it, so we can finalize the progress totals
+    // as soon as the root lands and the rest of the joiner can drive
+    // the chunks_done counter against a real denominator.
+    if let Some(total) = root_span_to_u64(&root) {
+        tracker.set_total_bytes(total);
+    }
     join(fetcher, &root, DEFAULT_MAX_FILE_BYTES)
         .await
         .map_err(|e| {
@@ -924,15 +1055,31 @@ async fn try_get_bytes(
         })
 }
 
+/// Decode the 8-byte little-endian BMT span prefix from a wire-format
+/// CAC chunk (`span || payload`) into a `u64` byte length. For an
+/// intermediate chunk this is the total span its subtree covers; for
+/// the root it's the final file size. Returns `None` if `wire` is
+/// somehow shorter than the span prefix (shouldn't happen with
+/// CAC-verified output, but cheap to guard).
+fn root_span_to_u64(wire: &[u8]) -> Option<u64> {
+    let span: [u8; 8] = wire.get(..8)?.try_into().ok()?;
+    Some(u64::from_le_bytes(span))
+}
+
 /// Spawned task body for `Request::GetBzz`. Walks the manifest at
 /// `reference`, resolves `path`, then runs the joiner against the
 /// resolved data ref. Wrapped in the same retry loop as
 /// [`run_get_bytes`].
+// Eight args one over clippy's preferred ceiling, but the alternative
+// (bundling shared retrieval plumbing with request-scoped knobs into a
+// struct just for one call site) hides more than it helps.
+#[allow(clippy::too_many_arguments)]
 async fn run_get_bzz(
     control: Control,
     peers: Vec<(libp2p::PeerId, [u8; 32])>,
     cache: Arc<ant_retrieval::InMemoryChunkCache>,
     record_dir: Option<PathBuf>,
+    tracker: Arc<ProgressTracker>,
     reference: [u8; 32],
     path: String,
     allow_degraded_redundancy: bool,
@@ -945,8 +1092,9 @@ async fn run_get_bzz(
             blacklist.clone(),
         )
         .with_cache(cache.clone())
-        .with_record_dir(record_dir.clone());
-        match try_get_bzz(&fetcher, reference, &path, allow_degraded_redundancy).await {
+        .with_record_dir(record_dir.clone())
+        .with_progress(tracker.clone());
+        match try_get_bzz(&fetcher, &tracker, reference, &path, allow_degraded_redundancy).await {
             Ok((data, content_type, filename)) => {
                 return ControlAck::BzzBytes {
                     data,
@@ -981,6 +1129,7 @@ async fn run_get_bzz(
 /// `(data, content_type, filename)` tuple on success.
 async fn try_get_bzz(
     fetcher: &ant_retrieval::RoutingFetcher,
+    tracker: &ProgressTracker,
     reference: [u8; 32],
     path: &str,
     allow_degraded_redundancy: bool,
@@ -1022,6 +1171,13 @@ async fn try_get_bzz(
     let root = fetcher.fetch(data_ref).await.map_err(|e| {
         AttemptError::Transient(format!("fetch data root {}: {e}", hex::encode(data_ref)))
     })?;
+    // Manifest chunks already showed up in the tracker as raw bytes;
+    // we only learn the *file*'s size once the data root lands. Set
+    // it now so the client's progress bar gets a real denominator
+    // for the second half of the request.
+    if let Some(total) = root_span_to_u64(&root) {
+        tracker.set_total_bytes(total);
+    }
     let join_options = JoinOptions {
         allow_degraded_redundancy,
     };

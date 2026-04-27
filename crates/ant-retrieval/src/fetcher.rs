@@ -18,6 +18,7 @@
 //! manifest walk is so long-lived that it matters in practice. Re-issuing
 //! the command is cheap.
 
+use crate::progress::ProgressTracker;
 use crate::{retrieve_chunk, ChunkFetcher, InMemoryChunkCache, RetrievalError};
 use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -86,6 +87,12 @@ pub struct RoutingFetcher {
     /// chunks involved in a successful `antctl get`. Best-effort: a
     /// failed write logs a warning but does not break the fetch.
     record_dir: Option<PathBuf>,
+    /// Optional shared progress counters. When set, every chunk
+    /// returned from this fetcher (network or cache) increments
+    /// `chunks_done` / `bytes_done` and — for network fetches —
+    /// adds the source peer to the unique-peer set. The daemon
+    /// reads from it on a timer to emit `Response::Progress` lines.
+    progress: Option<Arc<ProgressTracker>>,
 }
 
 impl RoutingFetcher {
@@ -116,6 +123,7 @@ impl RoutingFetcher {
             blacklist: Mutex::new(blacklist),
             cache: None,
             record_dir: None,
+            progress: None,
         }
     }
 
@@ -140,6 +148,17 @@ impl RoutingFetcher {
     /// caller is responsible for that.
     pub fn with_record_dir(mut self, dir: Option<PathBuf>) -> Self {
         self.record_dir = dir;
+        self
+    }
+
+    /// Hook a [`ProgressTracker`] into this fetcher. Every chunk the
+    /// fetcher hands back (cache hit or network success) updates the
+    /// tracker; the daemon's progress emitter reads it on a timer.
+    /// Pass the same `Arc<ProgressTracker>` to every fetcher built
+    /// for the same `Get*` request — the retry-loop wrapper in
+    /// `ant-p2p` already does this.
+    pub fn with_progress(mut self, tracker: Arc<ProgressTracker>) -> Self {
+        self.progress = Some(tracker);
         self
     }
 
@@ -204,6 +223,9 @@ impl ChunkFetcher for RoutingFetcher {
                 );
                 if let Some(dir) = self.record_dir.as_ref() {
                     record_chunk(dir, &addr, &bytes);
+                }
+                if let Some(tracker) = self.progress.as_ref() {
+                    tracker.record_chunk(None, bytes.len() as u64);
                 }
                 return Ok(bytes);
             }
@@ -279,6 +301,9 @@ impl ChunkFetcher for RoutingFetcher {
                             }
                             if let Some(dir) = self.record_dir.as_ref() {
                                 record_chunk(dir, &addr, &wire);
+                            }
+                            if let Some(tracker) = self.progress.as_ref() {
+                                tracker.record_chunk(Some(peer), wire.len() as u64);
                             }
                             return Ok(wire);
                         }
