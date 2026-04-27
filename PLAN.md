@@ -239,6 +239,7 @@ ant/
 │   ├── ant-chain/              # Gnosis RPC, ABIs, tx signing, nonce mgmt
 │   ├── ant-stamps/             # Batch state, per-chunk signing, bucket tracking
 │   ├── ant-swap/               # Chequebook deploy, cheque issuance, EIP-712 signing
+│   ├── ant-gateway/            # Bee-shaped HTTP API (feature-gated, antd only — see Appendix C)
 │   └── ant-ffi/                # UniFFI bindings: public API surface, error mapping
 ├── uniffi/
 │   └── ant.udl                 # Interface definition consumed by ant-ffi
@@ -532,6 +533,7 @@ Goal: the node retrieves any reference from mainnet, including multi-chunk files
 - Size budget enforcement in CI (fail PRs that push `.xcframework` / `.aar` past the M2 budget).
 - Foreground + background suspend/resume for reads.
 - Observability bridges (OSLog / logcat).
+- Tier-A `ant-gateway` shipped with `antd` (Appendix C): bee-shaped read endpoints, stub wallet/stamps/chequebook, `beeMode = "ultra-light"`. Mobile artifact unchanged (gateway is feature-gated off in `ant-ffi`).
 - Internal beta of the download-only build.
 
 **Exit (M2):** Independently shippable ultra-light library. Per-platform artifact ≤ ~5 MB stripped (lighter than the full M3 target because no chain / SWAP / stamps code).
@@ -580,6 +582,7 @@ Goal: everything in M2, plus honest on-device uploading with on-chain postage-st
 - Streaming chunker with on-the-fly BMT tree construction.
 - `ant-mantaray` construction path (previously we only traversed).
 - `upload_manifest` API for multi-file directory uploads.
+- Tier-B `ant-gateway` endpoints (Appendix C) come online incrementally with the underlying capability: `/wallet`, `/chequebook/*` real after Phase 7; `/stamps` writes after Phase 8; `/bzz` POST, `/bytes` POST, `/chunks*`, `/tags*`, `/feeds/*`, `/soc/*`, `/stewardship/*`, `/envelope/*` after Phase 9. `beeMode` flips to `"light"` once `swap-enable` is honored end-to-end.
 
 **Exit (M3):** Upload a multi-file directory as a single mantaray manifest and retrieve files by path — full read/write parity with a `bee` light node for the supported protocol subset.
 
@@ -715,6 +718,7 @@ Tracked as a CI check that fails the build if `.xcframework` or `.aar` grows pas
 | xBZZ / xDAI acquisition blocks new users | High | High | Relayer-sponsored onboarding; clear "bring your own" path for power users. |
 | Artifact size creeps past budget | Medium | Low | CI gate; per-crate size regression dashboard. |
 | Libp2p API churn | Medium | Low | Continuous upgrade policy (§3); dedicated upgrade PRs for breaking changes; interop smoke tests gate the merge. |
+| Bee HTTP API drifts faster than we track | Medium | Medium | Pinned reference bee version per release (§C.5); golden-response CI corpus (§C.6); 501-stub policy (§C.1) keeps consumers from silently degrading. |
 
 ---
 
@@ -734,6 +738,7 @@ Tracked as a CI check that fails the build if `.xcframework` or `.aar` grows pas
 3. **Does the app always run its own node, or can it fall back to a gateway?** Fallback is nice but doubles the retrieval code path. Recommend: node-only, ship the smallest node possible.
 4. **xBZZ on-ramp inside the app or external?** External first to avoid regulatory overhead; revisit in v2.
 5. **Windows / desktop ports?** Not in v1 scope but keep FFI clean so it's trivial later.
+6. **Do we expose `ant-gateway` on a Unix domain socket as well as TCP?** Lets local consumers avoid binding the loopback port and dovetails with the existing `ant-control` socket transport. Recommend: yes, behind a `--api-socket <path>` flag, off by default.
 
 ---
 
@@ -781,3 +786,254 @@ Tracked as a CI check that fails the build if `.xcframework` or `.aar` grows pas
 - Trojan chunks
 - Cheque cashing
 - Advanced redundancy (erasure-coded uploads) — parked for v2
+
+---
+
+## Appendix C — Bee compatibility surface
+
+Independently of any specific downstream, we want **`antd` to be a drop-in replacement for `bee` for the protocol subset Ant implements.** Tools written against `bee` — `bee-js` clients, `curl` / `xh` scripts, custom protocol handlers, monitoring dashboards, ENS-resolving gateways — must work unmodified against `antd` for any feature Ant supports, and must fail cleanly (not mysteriously) for any feature Ant does not.
+
+This appendix is the contract for that compatibility. It is intentionally strict on shapes and intentionally narrow on scope: every endpoint listed is either implemented, will be implemented in a stated milestone, or is a permanent stub that returns a structured 501 so consumers can feature-detect.
+
+### C.1 Compatibility tiers
+
+Tied directly to the milestones in §9.
+
+| Tier | Capability | Lands in | What it unlocks |
+|---|---|---|---|
+| **A — Read-only / ultra-light** | Read endpoints (`/bzz`, `/bytes`, `/chunks`, status, peers, topology, addresses); stub wallet/stamps/chequebook returning empty/zero in a bee-shaped way; `beeMode = "ultra-light"`. | End of **M2** | Any bee-shaped read client (browsers, gateway proxies, scripts that only download) works against `antd` with zero changes. |
+| **B — Read + write / light** | All Tier A endpoints + uploads, tags, stamps (buy/topup/dilute), feeds/SOCs, chequebook deposit, wallet balances; `beeMode = "light"`. | End of **M3** | Full `bee-js` API surface for the protocol subset Ant supports; uploaders, publishing tools, and feed-driven apps work unchanged. |
+| **Permanently absent** | Anything in Appendix B (PSS, GSOC, pullsync, transactions, staking, ACT, restricted/admin API). | Never | Endpoints return `501 Not Implemented` with `{code:501, message:"not implemented in ant"}` so consumers can branch. |
+
+### C.2 Process & configuration compatibility
+
+- **Binary entry points.** `antd` accepts the same subcommand vocabulary `bee` does for the operations downstreams script against:
+  - `antd init [--config <path>]` — generates `keys/swarm.key` (see §C.3) using the password from config; idempotent if a keystore already exists.
+  - `antd start [--config <path>]` — runs the daemon.
+  - Existing `antd` flags remain authoritative; the subcommands accept the bee-shaped YAML config below in addition to native flags.
+- **Config schema.** `--config <file.yaml>` parses the bee YAML. Recognized keys, all optional, with the same semantics bee gives them:
+
+  ```
+  api-addr                       # default 127.0.0.1:1633
+  data-dir
+  password                       # decrypts keys/swarm.key
+  mainnet                        # default true
+  full-node                      # ant always reports false
+  swap-enable                    # M3+; ignored on Tier A
+  blockchain-rpc-endpoint        # required when swap-enable=true
+  cors-allowed-origins           # default "" (no CORS)
+  resolver-options               # ENS RPC URL(s)
+  skip-postage-snapshot          # accepted as no-op (we never run the snapshot)
+  storage-incentives-enable      # ignored (Appendix B)
+  network-id                     # default 1 (mainnet)
+  bootnodes                      # additive to dnsaddr defaults
+  ```
+
+  Unknown keys are logged at `warn` and ignored. Conflicting native CLI flags win.
+- **Daemon lifecycle.** Default `api-addr` is `127.0.0.1:1633` to match bee. `GET /health` answers within 50 ms of socket bind so external supervisors can poll aggressively. `SIGTERM` triggers graceful shutdown; we guarantee exit within 5 s of receiving it.
+- **Process identity.** `antd` may be invoked through a `bee` symlink or wrapper script without behavior change; we never branch on `argv[0]`.
+
+### C.3 Identity & on-disk format
+
+- Bee's `keys/swarm.key` is the canonical identity contract: a **Web3 v3 JSON keystore** encrypted with the operator-supplied `password`. Ant adopts this format as its **only** on-disk node-key format from M1.1 onward — the existing `signing.key` / `identity.json` pair is migrated to `keys/swarm.key` on first launch when a password is available, and the legacy files are removed once migration succeeds.
+- `keys/` is the only subdirectory of `data-dir` we promise to keep bee-shaped. `statestore/`, `localstore/`, etc. remain Ant-internal; we do not promise byte-level compatibility there, and bee's data-dir is **not** a valid Ant data-dir (and vice versa).
+- Externally-injected identities are a first-class flow: an embedder may write `keys/swarm.key` itself (e.g. derived from a vault) and start `antd` without running `antd init`. We detect the existing keystore and skip generation.
+- The Web3 v3 implementation lives in `ant-crypto` and is exercised by both `antd` (file-backed) and the desktop `keyring` backend (used as opaque blob storage on Windows / Linux headless).
+
+### C.4 HTTP gateway crate
+
+- New crate **`ant-gateway`** in the workspace, slotted into the "planned after M1.1" group in §4. Depends on `ant-node`; nothing else depends on it.
+- Cargo feature `http-api`, **enabled by default for `antd`, disabled for `ant-ffi`** so the mobile artifact never carries the HTTP server (the size budget in §12 is unaffected).
+- Built on `axum` + `hyper`, single `tokio` runtime shared with the node core. No second listener, no debug port — bee unified its API in 2.0+ and we follow that convention.
+- All response bodies follow bee's `jsonhttp` shape:
+  - Success: bee field names, exact casing, no wrapper envelope.
+  - Error: `{code: <http-status>, message: <human-readable>, reasons?: [...]}` with the same `code`/`message` field names bee uses.
+- Streaming: `/bzz/...` and `/bytes/...` stream the body as chunks are joined; `Content-Length` set when known, `Transfer-Encoding: chunked` otherwise. `Range` is honored against the joiner.
+- CORS: off by default; the `cors-allowed-origins` config value, when non-empty, drives an `Access-Control-Allow-Origin` allowlist.
+
+#### C.4.1 Request headers honored
+
+When acting as the bee-shaped server, `ant-gateway` recognizes:
+
+| Header | Direction | Semantics |
+|---|---|---|
+| `Range` | request | Standard byte ranges on `/bzz`, `/bytes`, `/chunks/<addr>`. |
+| `If-None-Match` | request | ETag match against root reference; `304` on hit. |
+| `Swarm-Chunk-Retrieval-Timeout` | request | Per-chunk fetch timeout cap for this request. |
+| `Swarm-Redundancy-Strategy` | request | Plumbed to `ant-retrieval` redundancy selection. |
+| `Swarm-Redundancy-Fallback-Mode` | request | As above. |
+| `Swarm-Encrypt` | request (M3) | Encrypted upload toggle (deferred per §16; rejected with 501 until v1.1). |
+| `Swarm-Pin` | request (M3) | Pin uploaded references locally. |
+| `Swarm-Tag` | request (M3) | Attach upload to existing tag. |
+| `Swarm-Postage-Batch-Id` | request (M3) | Batch to stamp the upload with. |
+| `Swarm-Collection` | request (M3) | Treat body as tar collection → mantaray. |
+| `Swarm-Index-Document` / `Swarm-Error-Document` | request (M3) | Mantaray root metadata. |
+| `Swarm-Deferred-Upload` | request (M3) | Async upload; client polls tag for status. |
+| `Content-Type`, `Content-Length` | request | Standard. |
+| `ETag`, `Swarm-Tag-Uid`, `Swarm-Feed-Index`, `Swarm-Feed-Index-Next` | response | Set where bee sets them. |
+
+#### C.4.2 Endpoint matrix
+
+Methods listed are the ones we serve; bee's other methods on the same path return `405`. "Tier" gives the milestone the endpoint becomes real; rows marked **501** are permanently stubbed.
+
+| Path | Methods | Tier | Notes |
+|---|---|---|---|
+| `/health` | GET | A | `{status:"ok", version, apiVersion}`. |
+| `/readiness` | GET | A | `200` once routing table has ≥1 BZZ-handshaked peer; else `503`. |
+| `/node` | GET | A | `{beeMode}`: `"ultra-light"` until SWAP lights up, then `"light"`. |
+| `/addresses` | GET | A | `{ethereum, overlay, public_key, pss_public_key:null, underlay:[...]}`. |
+| `/peers` | GET | A | `{peers: [...]}` from `ant-p2p` snapshot. |
+| `/peers/{addr}` | DELETE | A | Disconnect; matches bee shape. |
+| `/topology` | GET | A | `{baseAddr, population, connected, timestamp, nnLowWatermark, depth, reachability, networkAvailability, bins}`. |
+| `/blocklist` | GET | A | `{peers: []}` (we don't ban yet); writeable post-M3. |
+| `/connect/{multi-address:.+}` | POST | A | Manual dial; useful for tests. |
+| `/pingpong/{address}` | POST | A | Round-trip latency. |
+| `/bzz/{addr}` | GET, HEAD | A | Mantaray traversal via `ant-retrieval::lookup_path`. |
+| `/bzz/{addr}/{path:.*}` | GET, HEAD | A | As above. |
+| `/bytes/{addr}` | GET, HEAD | A | Joined byte stream via `ant-retrieval::join`. |
+| `/chunks/{addr}` | GET, HEAD | A | Single-chunk fetch. |
+| `/wallet` | GET | A→B | Tier A: zero balances, no chain; Tier B: real balances via `ant-chain`. |
+| `/stamps` | GET | A→B | Tier A: `{stamps: []}`; Tier B: real batches from `ant-stamps`. |
+| `/stamps/{batch-id}` | GET | B | |
+| `/stamps/{amount}/{depth}` | POST | B | Buy batch. |
+| `/stamps/topup/{batch-id}/{amount}` | PATCH | B | |
+| `/stamps/dilute/{batch-id}/{depth}` | PATCH | B | |
+| `/chequebook/address` | GET | A→B | Tier A: zero address (consumers treat as not-deployed); Tier B: real address. |
+| `/chequebook/balance` | GET | A→B | Tier A: zero; Tier B: real. |
+| `/chequebook/deposit/{amount}` | POST | B | |
+| `/chequebook/withdraw/{amount}` | POST | B | |
+| `/chequebook/cashout/{peer}` | GET, POST | — | **501** — we don't cash cheques (§5.8). |
+| `/bytes` | POST | B | Raw byte upload via `ant-pushsync`. |
+| `/bzz` | POST | B | File / collection upload (with `Swarm-Collection: true`). |
+| `/chunks` | POST | B | Direct chunk upload. |
+| `/chunks/stream` | GET (WebSocket) | B | bee-js streams chunks here for high-throughput pushers. |
+| `/tags` | GET, POST | B | |
+| `/tags/{id}` | GET, DELETE, PATCH | B | Status fields bee-js reads: `split, seen, stored, sent, synced, uid, address, startedAt`. |
+| `/feeds/{owner}/{topic}` | GET, POST | B | |
+| `/soc/{owner}/{id}` | POST | B | |
+| `/pins`, `/pins/check`, `/pins/{ref}` | GET, POST, DELETE | B | Local pin set. |
+| `/stewardship/{address}` | GET, PUT | B | Reupload helper; uses `ant-pushsync`. |
+| `/envelope/{address}` | POST | B | Stamp envelope for already-existing chunks. |
+| `/grantee`, `/grantee/{address}` | * | — | **501** — ACT (Appendix B). |
+| `/pss/*`, `/gsoc/*` | * | — | **501** — Appendix B. |
+| `/transactions`, `/transactions/{hash}` | * | — | **501** — admin/restricted API. |
+| `/reservestate`, `/chainstate`, `/redistributionstate`, `/stake/*` | * | — | **501** — full-node only (Appendix B). |
+| `/auth`, `/refresh` | * | — | **501** — restricted-API auth. |
+
+Endpoints not listed here are unknown to bee in the same versions we target, or are intentionally outside our scope; they 404.
+
+### C.5 Pinned bee API version
+
+We pick **one bee minor version per Ant release** as our "reference shape" and document it. Tier A ships against the latest stable bee at the time M2 lands; Tier B is re-snapped to whatever's latest at M3. Compatibility past that is best-effort and tracked in §15. The reference version is recorded in `ant-gateway/COMPAT.md` and exposed at runtime via `/health.apiVersion`.
+
+### C.6 Conformance testing
+
+In addition to the strategy in §10:
+
+- **Golden response corpus.** A vendored set of recorded bee HTTP responses (one file per endpoint per scenario) lives in `crates/ant-gateway/tests/golden/`. CI replays each scenario against `antd` and `bee` side-by-side in containers and asserts JSON-shape equivalence (field names, types, presence — not values).
+- **`bee-js` smoke suite.** A subset of the upstream `@ethersphere/bee-js` integration tests is run from a Node test harness against `antd`. We track which suites pass per release.
+- **Header-handling tests.** Hyper-level tests that fire each header in §C.4.1 at the gateway and verify the documented behavior.
+- **501 regression test.** Every endpoint in §C.4.2 marked permanently absent is asserted to return `501` with the agreed body — this prevents accidental partial implementations.
+
+### C.7 Out of scope by design
+
+- Anything in Appendix B (Pullsync, storage incentives, staking, PSS / GSOC, ACT, cheque cashing, advanced redundancy).
+- Restricted / admin API behind bee's `restricted: true` mode; `/auth` and `/refresh` are 501.
+- Multi-instance configurations (`bee` running with separate API + debug API ports). We only expose the unified API surface bee added in 2.0+.
+- Byte-level compatibility of `data-dir/statestore` and `data-dir/localstore`. Migrating an existing bee data directory into Ant is **not** supported; only the `keys/swarm.key` file carries over.
+
+---
+
+## Appendix D — Tier-A drop-in checklist
+
+Concrete work breakdown for the **first Tier-A drop-in** from Appendix C — the smallest cut of `ant-gateway` that makes a generic bee HTTP consumer behave correctly against `antd`. This is the work that lands inside §9 Phase 4.
+
+### D.1 Goal and scope
+
+Single capability: a bee-shaped read-only HTTP surface on `127.0.0.1:1633`, sufficient for an unmodified `bee-js` client (or any other bee HTTP consumer) to:
+
+- Probe health and version.
+- Read peer / topology / address state.
+- Resolve and stream `bzz://` content with mantaray path lookup.
+- Receive zeroed bee-shaped responses on wallet / stamps / chequebook so consumer UIs degrade gracefully.
+
+**Out of scope for this checklist** (deferred to later M3 phases or the optional follow-ons below): writes, real wallet / stamps / SWAP, ENS resolution, encrypted uploads.
+
+### D.2 Work items
+
+#### D.2.1 Gateway crate scaffold
+
+- New `crates/ant-gateway/` with `axum` + `hyper`. Entry: `Gateway::serve(node, addr)`.
+- Cargo feature `http-api`, default-on for `antd`, off elsewhere.
+- New flag `--api-addr` on `antd`; default `127.0.0.1:1633`. Gateway started after `Node` is up.
+- Bee `jsonhttp` error helper (`{code, message}`).
+- `tracing` span per request.
+
+**Done when:** `curl http://127.0.0.1:1633/health` returns `{"status":"ok","version":"...","apiVersion":"..."}` within 50 ms of socket bind.
+
+#### D.2.2 Status endpoints (no retrieval)
+
+| Endpoint | Source |
+|---|---|
+| `GET /health` | static — version from `env!("CARGO_PKG_VERSION")` |
+| `GET /readiness` | `ant-p2p` peer snapshot ≥ 1 BZZ-handshaked peer |
+| `GET /node` | hardcoded `{beeMode:"ultra-light", chequebookEnabled:false, swapEnabled:false}` |
+| `GET /addresses` | existing identity in `antd::main` (overlay, ethereum, libp2p public key) |
+| `GET /peers` | `ant-p2p` peer snapshot |
+| `GET /topology` | `ant-p2p` routing table; first cut may flatten all peers into a single bin |
+
+**Done when:** consumers polling these endpoints render version, peer count, and topology total without errors.
+
+#### D.2.3 Retrieval endpoints
+
+- `GET/HEAD /bytes/{addr}` — `ant_retrieval::join`, streamed body.
+- `GET/HEAD /chunks/{addr}` — `ant_retrieval::ChunkFetcher`.
+- `GET/HEAD /bzz/{addr}` — mantaray root metadata; honor `index-document`, fall back to `lookup_path` with empty path.
+- `GET/HEAD /bzz/{addr}/{path:.*}` — `ant_retrieval::lookup_path` + joiner. `Content-Type` from manifest entry metadata; default `application/octet-stream`.
+- `Range` (single-range) on `/bytes` and `/bzz`; reject multi-range with `416`.
+- Honor `Swarm-Chunk-Retrieval-Timeout`. Accept and ignore `Swarm-Redundancy-Strategy`, `Swarm-Redundancy-Fallback-Mode` for the first cut.
+- Stream chunked via `Body::from_stream` so large files don't materialize.
+
+**Done when:** `curl -o out.html http://127.0.0.1:1633/bzz/<known-root>/index.html` produces the same bytes as `antctl get bzz://<known-root>/index.html`.
+
+#### D.2.4 Stub the wallet / stamps / chequebook trio
+
+These exist solely so bee consumers don't see undefined fields. Field names verbatim — `bee-js` indexes by them.
+
+| Endpoint | Body |
+|---|---|
+| `GET /wallet` | `{bzzBalance:"0", nativeTokenBalance:"0", chainID:100}` |
+| `GET /stamps` | `{stamps:[]}` |
+| `GET /chequebook/address` | `{chequebookAddress:"0x0000000000000000000000000000000000000000"}` |
+| `GET /chequebook/balance` | `{totalBalance:"0", availableBalance:"0"}` |
+
+#### D.2.5 Catch-all 501
+
+Single `fallback` handler returning `501 {code:501, message:"not implemented in ant"}`. Anything outside the Tier-A column of §C.4.2 lands here. Future-proofs feature detection without us having to ship the rest of the matrix this week.
+
+### D.3 Optional follow-ons
+
+Not blockers for the smoke test, but unlock the next layer of integrations cheaply.
+
+- **D.3.1 Bee YAML config + subcommand shim.** `antd init --config <yaml>` and `antd start --config <yaml>` parsing the §C.2 schema. Lets embedders that hand bee a YAML keep doing so unmodified. Roughly half a day; do it right after the smoke test.
+- **D.3.2 Web3 v3 keystore.** `keys/swarm.key` read/write per §C.3, with migration from the legacy `signing.key` / `identity.json`. Required as soon as an embedder wants to inject identity (e.g. derived from a vault). Plan to land before any "real" embedder integration goes beyond a smoke test.
+
+### D.4 Acceptance
+
+Two automatable gates plus one manual:
+
+1. **`bee-js` smoke.** Stand up `antd`, point `new Bee("http://127.0.0.1:1633")` at it, exercise `bee.getHealth()`, `bee.getNodeAddresses()`, `bee.getPeers()`, `bee.getTopology()`, `bee.downloadFile(<known-root>, "index.html")`. All succeed without retries beyond the cold-start window.
+2. **Curl conformance.** Per §C.6 golden corpus: shape-equivalent to a bee container for every Tier-A endpoint.
+3. **Manual browse.** Any bee-shaped browser proxy (custom protocol handler proxying to `127.0.0.1:1633`) navigating to `bzz://<known-root>/` resolves and renders.
+
+This is the exit gate for the Tier-A column of §C.4.2. After it passes, M3 work proceeds against a known-good HTTP surface.
+
+### D.5 Suggested order
+
+Roughly one engineering week if D.3.1 ships with it; three to four days without.
+
+1. D.2.1 + D.2.2 — half a day; verifiable with `curl`.
+2. D.2.3 — one to two days; the real work, mostly wiring existing `ant-retrieval` to axum.
+3. D.2.4 + D.2.5 — an hour.
+4. D.3.1 — half a day, optional but high-leverage.
+5. D.4 acceptance.
