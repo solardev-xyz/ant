@@ -238,6 +238,13 @@ struct SwarmState {
     failed: Vec<PeerFailure>,
     pending: HashMap<PeerId, PendingPhase>,
     bzz_peers: HashSet<PeerId>,
+    /// Total cold-start time (dial + identify + handshake, in ms) for each
+    /// peer that has reached `Ready`. Surfaced as `ready_in_ms` on the
+    /// pipeline rows so `antctl top` can show the column and rank slow
+    /// peers. Reset on `ConnectionClosed` together with `bzz_peers`, so a
+    /// reconnect always reports the new pipeline's timing rather than a
+    /// stale one.
+    ready_in_ms: HashMap<PeerId, u64>,
     /// Forwarding-Kademlia routing table populated as each outbound BZZ
     /// handshake completes; consumed by the retrieval client to pick which
     /// peer to ask for a given chunk. Mirrors `bzz_peers` but carries the
@@ -293,6 +300,7 @@ impl SwarmState {
             failed: Vec::new(),
             pending: HashMap::new(),
             bzz_peers: HashSet::new(),
+            ready_in_ms: HashMap::new(),
             routing: RoutingTable::new(base_overlay),
             seen_hints: HashSet::new(),
             hint_queue: VecDeque::new(),
@@ -461,12 +469,14 @@ fn build_peer_pipeline_entries(
         let conn = by_id.get(&peer).copied();
         let st = classify_pipeline_state(peer, state, conn);
         let ip = ip_for_pipeline_row(peer, state, conn);
+        let ready_in_ms = state.ready_in_ms.get(&peer).copied();
         rows.push((
             order,
             PeerPipelineEntry {
                 peer_id: peer.to_string(),
                 state: st,
                 ip,
+                ready_in_ms,
             },
         ));
     }
@@ -1397,6 +1407,7 @@ fn handle_swarm_event(
             state.dial_hint_addr.remove(&peer_id);
             let was_pending = state.pending.remove(&peer_id).is_some();
             let was_bzz = state.bzz_peers.remove(&peer_id);
+            state.ready_in_ms.remove(&peer_id);
             // Drop the routing entry alongside `bzz_peers`; otherwise the
             // forwarder would keep picking a peer we have no live
             // connection to.
@@ -1489,6 +1500,10 @@ fn handle_drive_outcome(
         DriveOutcome::Ok(info) => {
             let first_bzz_in_session = state.bzz_peers.is_empty();
             state.bzz_peers.insert(peer);
+            if let Some(p) = pipeline_ms.as_ref() {
+                let total = p.dial_ms.unwrap_or(0) + p.identifying_ms + p.handshake_ms;
+                state.ready_in_ms.insert(peer, total);
+            }
             // The remote_overlay was just verified by `handshake_outbound`
             // (signature recovers to an Ethereum address whose overlay
             // matches the declared one), so admitting it is safe.

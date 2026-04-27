@@ -919,6 +919,42 @@ fn pipeline_state_label(st: PeerConnectionState) -> &'static str {
     }
 }
 
+/// Format a `ready_in_ms` value for the Nodes table. `<1 s` is shown
+/// in milliseconds (`312 ms`), `<100 s` in tenths of a second
+/// (`3.4 s`), and longer durations in whole seconds (`120 s`). The
+/// resulting strings are at most 7 characters, so they fit the
+/// 8-column `ready in` field with breathing room.
+fn format_ready_in_ms(ms: u64) -> String {
+    if ms < 1_000 {
+        format!("{ms} ms")
+    } else if ms < 100_000 {
+        let secs = ms as f64 / 1_000.0;
+        format!("{secs:.1} s")
+    } else {
+        format!("{} s", ms / 1_000)
+    }
+}
+
+/// Sort key for `antctl top`'s Nodes table: slowest `ready_in_ms` first,
+/// peers that haven't reached `Ready` yet pushed to the bottom in the
+/// daemon's existing arrival order. Returns indices into
+/// `s.peers.peer_pipeline`; both the table and the detail panel must
+/// route through this so the cursor row and the details stay in sync.
+fn pipeline_view_order(s: &StatusSnapshot) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..s.peers.peer_pipeline.len()).collect();
+    order.sort_by(|&a, &b| {
+        let pa = &s.peers.peer_pipeline[a];
+        let pb = &s.peers.peer_pipeline[b];
+        match (pa.ready_in_ms, pb.ready_in_ms) {
+            (Some(x), Some(y)) => y.cmp(&x).then(a.cmp(&b)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.cmp(&b),
+        }
+    });
+    order
+}
+
 fn ready_count_for_gauge(s: &StatusSnapshot) -> u32 {
     if !s.peers.peer_pipeline.is_empty() {
         s.peers
@@ -1542,7 +1578,9 @@ fn draw_disconnected_nodes_page(frame: &mut Frame, area: TuiRect, error: &str) {
     draw_panel(frame, detail_area, "Details", &rows);
 }
 
-const NODES_HEADER: [&str; 6] = ["peer id", "state", "ip", "type", "agent", "version"];
+const NODES_HEADER: [&str; 7] = [
+    "peer id", "state", "ready in", "ip", "type", "agent", "version",
+];
 /// Gap between adjacent columns; `column_spacing(2)` so each column gets
 /// exactly two spaces of breathing room before the next one starts.
 const NODES_COLUMN_SPACING: u16 = 2;
@@ -1554,11 +1592,14 @@ const NODES_COLUMN_SPACING: u16 = 2;
 ///   leaves room for the `(none yet)` placeholder when the daemon has no
 ///   peers yet.
 /// * `status` — longest pipeline label is `Identifying`/`Handshaking` (11).
+/// * `ready in` — `format_ready_in_ms` emits `<999 ms` (3 ascii digits +
+///   space + unit) or `<99.9 s` (4 ascii chars + space + unit), so 8
+///   covers both plus the header.
 /// * `ip` — fits IPv4 `255.255.255.255` (15); rarer IPv6 / DNS values clip.
 /// * `type` — `light` is the longest of `full` / `light` / `-` (5).
 /// * `agent` — `bee` is 3; allow up to 8 for future clients without reflow.
 /// * `version` — `10.20.30` (8) covers any plausible semver core.
-const NODES_COLUMN_WIDTHS: [u16; 6] = [10, 11, 15, 5, 8, 8];
+const NODES_COLUMN_WIDTHS: [u16; 7] = [10, 11, 8, 15, 5, 8, 8];
 
 fn nodes_table_block() -> Block<'static> {
     Block::default()
@@ -1625,7 +1666,7 @@ fn dash_if_empty(s: &str) -> String {
     }
 }
 
-fn nodes_constraints() -> [Constraint; 6] {
+fn nodes_constraints() -> [Constraint; 7] {
     [
         Constraint::Length(NODES_COLUMN_WIDTHS[0]),
         Constraint::Length(NODES_COLUMN_WIDTHS[1]),
@@ -1633,12 +1674,14 @@ fn nodes_constraints() -> [Constraint; 6] {
         Constraint::Length(NODES_COLUMN_WIDTHS[3]),
         Constraint::Length(NODES_COLUMN_WIDTHS[4]),
         Constraint::Length(NODES_COLUMN_WIDTHS[5]),
+        Constraint::Length(NODES_COLUMN_WIDTHS[6]),
     ]
 }
 
 fn draw_empty_nodes_table(frame: &mut Frame, area: TuiRect) {
     let rows = vec![Row::new(vec![
         "(waiting…)".to_string(),
+        "-".to_string(),
         "-".to_string(),
         "-".to_string(),
         "-".to_string(),
@@ -1683,17 +1726,24 @@ fn draw_nodes_table(frame: &mut Frame, area: TuiRect, s: &StatusSnapshot, select
             "-".to_string(),
             "-".to_string(),
             "-".to_string(),
+            "-".to_string(),
         ]]
     } else if !s.peers.peer_pipeline.is_empty() {
+        let order = pipeline_view_order(s);
         (start..end)
             .map(|idx| {
-                let p = &s.peers.peer_pipeline[idx];
+                let p = &s.peers.peer_pipeline[order[idx]];
                 let conn = by_id.get(p.peer_id.as_str()).copied();
                 let (agent, version) =
                     parse_agent_version(conn.map(|c| c.agent_version.as_str()).unwrap_or(""));
+                let ready_in = match p.ready_in_ms {
+                    Some(ms) => format_ready_in_ms(ms),
+                    None => "-".to_string(),
+                };
                 vec![
                     short_peer_id(&p.peer_id),
                     pipeline_state_label(p.state).to_string(),
+                    ready_in,
                     dash_if_empty(&p.ip),
                     node_kind_label(conn.and_then(|c| c.full_node)).to_string(),
                     dash_if_empty(&agent),
@@ -1714,6 +1764,7 @@ fn draw_nodes_table(frame: &mut Frame, area: TuiRect, s: &StatusSnapshot, select
                 vec![
                     short_peer_id(&peer.peer_id),
                     status.to_string(),
+                    "-".to_string(),
                     status_addr_ip(peer),
                     node_kind_label(peer.full_node).to_string(),
                     dash_if_empty(&agent),
@@ -1764,7 +1815,9 @@ fn draw_node_details(
     let rows: Vec<PanelRow> = if n == 0 {
         vec![kv("node", "(none selected)")]
     } else if !s.peers.peer_pipeline.is_empty() {
-        match s.peers.peer_pipeline.get(selected) {
+        let order = pipeline_view_order(s);
+        let row_idx = order.get(selected).copied();
+        match row_idx.and_then(|i| s.peers.peer_pipeline.get(i)) {
             Some(row) => {
                 let full = s
                     .peers
@@ -1774,6 +1827,10 @@ fn draw_node_details(
                 let mut rows = vec![
                     kv("peer_id", &row.peer_id),
                     kv("state", pipeline_state_label(row.state)),
+                    kv(
+                        "ready in",
+                        &row.ready_in_ms.map(format_ready_in_ms).unwrap_or_else(|| "-".to_string()),
+                    ),
                     kv(
                         "ip",
                         if row.ip.is_empty() {

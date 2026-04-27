@@ -256,6 +256,14 @@ pub struct PeerPipelineEntry {
     /// Best-effort remote endpoint for UI (e.g. `192.0.2.1` or a DNS name).
     #[serde(default)]
     pub ip: String,
+    /// Wall-clock milliseconds from the first dial attempt (or, for inbound
+    /// peers, from `ConnectionEstablished`) to the moment the BZZ handshake
+    /// completed and the peer entered `Ready`. `None` for peers that
+    /// haven't reached `Ready` yet, and for peers tracked by older
+    /// daemons that didn't record this. Reset on disconnect, so a
+    /// reconnect produces a fresh measurement.
+    #[serde(default)]
+    pub ready_in_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
