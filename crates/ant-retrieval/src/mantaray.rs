@@ -243,8 +243,7 @@ fn walk<'a>(
         };
 
         // The fork's prefix must be a prefix of `remaining`.
-        if remaining.len() < fork.prefix.len()
-            || remaining[..fork.prefix.len()] != fork.prefix[..]
+        if remaining.len() < fork.prefix.len() || remaining[..fork.prefix.len()] != fork.prefix[..]
         {
             return Err(ManifestError::NotFound {
                 path: full_path.to_string(),
@@ -271,20 +270,16 @@ fn walk<'a>(
 }
 
 /// Fetch a manifest node by reference and unmarshal it.
-async fn load_node(
-    fetcher: &dyn ChunkFetcher,
-    addr: [u8; 32],
-) -> Result<Node, ManifestError> {
+async fn load_node(fetcher: &dyn ChunkFetcher, addr: [u8; 32]) -> Result<Node, ManifestError> {
     // The node is itself a Swarm file: fetch the root chunk, then join.
     // For tiny manifests (< 4 KiB) the root chunk's payload is already
     // the entire serialised node.
-    let root_chunk = fetcher
-        .fetch(addr)
-        .await
-        .map_err(|e| ManifestError::Fetch(JoinError::FetchChunk {
+    let root_chunk = fetcher.fetch(addr).await.map_err(|e| {
+        ManifestError::Fetch(JoinError::FetchChunk {
             addr: hex::encode(addr),
             source: e,
-        }))?;
+        })
+    })?;
     // Defensive: cac_valid should already have run inside `fetch`, but
     // re-check so a buggy custom fetcher can't hand us garbage.
     if !cac_valid(&addr, &root_chunk) {
@@ -487,7 +482,8 @@ impl Node {
                 );
                 let mut fork_meta = HashMap::new();
                 if has_meta && meta_size > 0 {
-                    let meta_start = offset + FORK_PRE_REF_SIZE + ref_size + FORK_METADATA_SIZE_BYTES;
+                    let meta_start =
+                        offset + FORK_PRE_REF_SIZE + ref_size + FORK_METADATA_SIZE_BYTES;
                     let meta_bytes = &data[meta_start..meta_start + meta_size];
                     fork_meta = parse_metadata(meta_bytes)?;
                     // Forks set with-metadata flag on themselves; some of
@@ -682,10 +678,7 @@ mod tests {
 
     #[async_trait]
     impl ChunkFetcher for MapFetcher {
-        async fn fetch(
-            &self,
-            addr: [u8; 32],
-        ) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+        async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
             self.chunks
                 .get(&addr)
                 .cloned()
@@ -703,8 +696,7 @@ mod tests {
     const ROOT_HEX: &str = "a00100000000000000000000000000000000000000000000000000000000000000000000000000005768b3b6a7db56d21d1abff40d41cebfc83448fed8d7e9b06ec0d3b073f28f200000000000000000000000000000000000000000000000000000000000000000000000000080000000000000000100000000000000000000000000000000000012012f00000000000000000000000000000000000000000000000000000000000cc878d32c96126d47f63fbe391114ee1438cd521146fc975dea1546d302b6c0003e7b22776562736974652d696e6465782d646f63756d656e74223a2268656c6c6f2e747874227d0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a120968656c6c6f2e7478740000000000000000000000000000000000000000000ad6c856f417b0805250d41a46559c9402a9251f8bc6acd65540fe0e68b45d41005e7b22436f6e74656e742d54797065223a22746578742f706c61696e3b20636861727365743d7574662d38222c2246696c656e616d65223a2268656c6c6f2e747874227d0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a";
     const CHILD_SLASH_HEX: &str = "600000000000000000000000000000000000000000000000000000000000000000000000000000005768b3b6a7db56d21d1abff40d41cebfc83448fed8d7e9b06ec0d3b073f28f000000000000000000000000000000000000000000000000000000000000000000";
     const CHILD_H_HEX: &str = "800000000000000000000000000000000000000000000000000000000000000000000000000000005768b3b6a7db56d21d1abff40d41cebfc83448fed8d7e9b06ec0d3b073f28f202f63d85b71d63176df24ea98df065d4de18163fcbc9f75e6d23f4327f33bca820000000000000000000000000000000000000000000000000000000000000000";
-    const ROOT_ADDR_HEX: &str =
-        "b6c8b1b632dac74382f7f0fb9ac44d4885b4b894d2b794e57fd1c43f773f78a2";
+    const ROOT_ADDR_HEX: &str = "b6c8b1b632dac74382f7f0fb9ac44d4885b4b894d2b794e57fd1c43f773f78a2";
     const CHILD_SLASH_ADDR_HEX: &str =
         "0cc878d32c96126d47f63fbe391114ee1438cd521146fc975dea1546d302b6c0";
     const CHILD_H_ADDR_HEX: &str =
@@ -717,10 +709,7 @@ mod tests {
     /// if `antd` had fetched these chunks itself.
     fn gateway_fetcher() -> MapFetcher {
         let mut f = MapFetcher::new();
-        f.insert(
-            decode_addr(ROOT_ADDR_HEX),
-            hex::decode(ROOT_HEX).unwrap(),
-        );
+        f.insert(decode_addr(ROOT_ADDR_HEX), hex::decode(ROOT_HEX).unwrap());
         f.insert(
             decode_addr(CHILD_SLASH_ADDR_HEX),
             hex::decode(CHILD_SLASH_HEX).unwrap(),
@@ -751,7 +740,10 @@ mod tests {
             res.content_type.as_deref(),
             Some("text/plain; charset=utf-8")
         );
-        assert_eq!(res.metadata.get("Filename").map(|s| s.as_str()), Some("hello.txt"));
+        assert_eq!(
+            res.metadata.get("Filename").map(|s| s.as_str()),
+            Some("hello.txt")
+        );
     }
 
     /// Explicit path matches the same file via the `h` fork.
@@ -813,7 +805,10 @@ mod tests {
     /// (Content-Type strings, filenames with spaces).
     #[test]
     fn flat_json_object_basic() {
-        let m = parse_flat_json_object("{\"Content-Type\":\"text/plain; charset=utf-8\",\"Filename\":\"hello.txt\"}").unwrap();
+        let m = parse_flat_json_object(
+            "{\"Content-Type\":\"text/plain; charset=utf-8\",\"Filename\":\"hello.txt\"}",
+        )
+        .unwrap();
         assert_eq!(m.get("Content-Type").unwrap(), "text/plain; charset=utf-8");
         assert_eq!(m.get("Filename").unwrap(), "hello.txt");
         assert_eq!(m.len(), 2);

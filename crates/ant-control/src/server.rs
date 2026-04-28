@@ -117,6 +117,18 @@ pub enum ControlCommand {
         max_bytes: Option<u64>,
         ack: mpsc::Sender<ControlAck>,
     },
+    /// Gateway-only streaming `/bytes/{ref}` path. Sends
+    /// [`ControlAck::BytesStreamStart`], zero or more
+    /// [`ControlAck::BytesChunk`] messages, then [`ControlAck::StreamDone`]
+    /// or [`ControlAck::Error`]. The JSON control socket does not expose
+    /// this command; it exists so `ant-gateway` can behave like Bee and
+    /// write the HTTP body while the joiner is still retrieving.
+    StreamBytes {
+        reference: [u8; 32],
+        bypass_cache: bool,
+        max_bytes: Option<u64>,
+        ack: mpsc::Sender<ControlAck>,
+    },
 }
 
 /// Node-loop reply to a [`ControlCommand`]. Serialized back to the client as
@@ -140,6 +152,13 @@ pub enum ControlAck {
     /// keeps writing them until a terminal variant arrives or the
     /// channel closes.
     Progress(GetProgress),
+    BytesStreamStart {
+        total_bytes: u64,
+    },
+    BytesChunk {
+        data: Vec<u8>,
+    },
+    StreamDone,
     Error {
         message: String,
     },
@@ -147,7 +166,12 @@ pub enum ControlAck {
 
 impl ControlAck {
     fn is_terminal(&self) -> bool {
-        !matches!(self, ControlAck::Progress(_))
+        !matches!(
+            self,
+            ControlAck::Progress(_)
+                | ControlAck::BytesStreamStart { .. }
+                | ControlAck::BytesChunk { .. }
+        )
     }
 }
 
@@ -468,6 +492,12 @@ fn ack_to_response(ack: ControlAck) -> Response {
             filename,
         },
         ControlAck::Progress(p) => Response::Progress(p),
+        ControlAck::BytesStreamStart { .. } | ControlAck::BytesChunk { .. } => Response::Error {
+            message: "streaming byte bodies are only supported by ant-gateway".to_string(),
+        },
+        ControlAck::StreamDone => Response::Ok {
+            message: "stream complete".to_string(),
+        },
         ControlAck::Error { message } => Response::Error { message },
     }
 }

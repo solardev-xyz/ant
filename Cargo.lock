@@ -104,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "ant-control"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "serde",
@@ -116,7 +116,7 @@ dependencies = [
 
 [[package]]
 name = "ant-crypto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "getrandom 0.3.4",
  "hex",
@@ -127,7 +127,7 @@ dependencies = [
 
 [[package]]
 name = "ant-gateway"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ant-control",
  "ant-crypto",
@@ -136,6 +136,7 @@ dependencies = [
  "async-trait",
  "axum",
  "bytes",
+ "futures",
  "hex",
  "http-body-util",
  "hyper",
@@ -150,7 +151,7 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ant-control",
  "ant-crypto",
@@ -163,7 +164,7 @@ dependencies = [
 
 [[package]]
 name = "ant-p2p"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ant-control",
  "ant-crypto",
@@ -187,7 +188,7 @@ dependencies = [
 
 [[package]]
 name = "ant-retrieval"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ant-crypto",
  "async-trait",
@@ -206,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "antctl"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ant-control",
  "anyhow",
@@ -220,7 +221,7 @@ dependencies = [
 
 [[package]]
 name = "antd"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ant-control",
  "ant-crypto",

@@ -47,8 +47,7 @@ impl InMemoryChunkCache {
     /// least 1 — `LruCache::new` panics on zero, but a daemon misconfig
     /// shouldn't take the process down.
     pub fn new(capacity: usize) -> Self {
-        let cap = NonZeroUsize::new(capacity.max(1))
-            .expect("capacity clamped to >= 1 above");
+        let cap = NonZeroUsize::new(capacity.max(1)).expect("capacity clamped to >= 1 above");
         Self {
             inner: Mutex::new(LruCache::new(cap)),
         }

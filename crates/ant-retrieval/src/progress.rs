@@ -82,7 +82,10 @@ impl ProgressTracker {
         self.bytes_done.fetch_add(bytes, Ordering::Relaxed);
         match peer {
             Some(p) => {
-                self.peers.lock().expect("progress mutex poisoned").insert(p);
+                self.peers
+                    .lock()
+                    .expect("progress mutex poisoned")
+                    .insert(p);
             }
             None => {
                 self.cache_hits.fetch_add(1, Ordering::Relaxed);

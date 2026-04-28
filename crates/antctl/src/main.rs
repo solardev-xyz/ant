@@ -4,8 +4,8 @@
 //! `ant-control::Request` / `Response`).
 
 use ant_control::{
-    request_streaming, request_sync, GetProgress, PeerConnectionInfo, PeerConnectionState,
-    Request, Response, StatusSnapshot,
+    request_streaming, request_sync, GetProgress, PeerConnectionInfo, PeerConnectionState, Request,
+    Response, StatusSnapshot,
 };
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -70,8 +70,7 @@ enum Command {
         command: PeersCommand,
     },
     /// Retrieve content from Swarm.
-    #[command(
-        long_about = "\
+    #[command(long_about = "\
 Retrieve content from Swarm.
 
 The reference may be one of:
@@ -92,8 +91,7 @@ Examples:
   antctl get bytes://<file-hex> -o blob.bin   # multi-chunk file
   antctl get bzz://<root>/index.html          # website index
   antctl get bzz://<root>/images/logo.png     # nested file
-  antctl get bzz://<root>/13/4358/2645.png    # tile pyramid leaf"
-    )]
+  antctl get bzz://<root>/13/4358/2645.png    # tile pyramid leaf")]
     Get {
         /// Reference. See above for accepted forms.
         reference: String,
@@ -319,8 +317,7 @@ fn write_output(
         } else {
             p.to_path_buf()
         };
-        std::fs::write(&target, data)
-            .with_context(|| format!("write to {}", target.display()))?;
+        std::fs::write(&target, data).with_context(|| format!("write to {}", target.display()))?;
         return Ok(Some(target));
     }
     io::stdout().lock().write_all(data)?;
@@ -610,9 +607,7 @@ fn format_progress_line(p: &GetProgress, ema_bps: Option<f64>, bypass_cache: boo
         },
     );
     let cache_tag = if bypass_cache { "[no-cache] " } else { "" };
-    format!(
-        "{cache_tag}↓ {chunks} chunks  {bytes}  {rate}  {sources}  {elapsed}",
-    )
+    format!("{cache_tag}↓ {chunks} chunks  {bytes}  {rate}  {sources}  {elapsed}",)
 }
 
 /// Single-line post-download summary printed once the in-place
@@ -706,7 +701,10 @@ fn display_width(s: &str) -> usize {
 /// `Response::Bytes`. The daemon controls the format; we still validate
 /// because a corrupted socket would otherwise silently drop bytes.
 fn decode_hex_payload(s: &str) -> Result<Vec<u8>> {
-    let stripped = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    let stripped = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     hex::decode(stripped).context("decode response hex")
 }
 
@@ -1829,7 +1827,9 @@ fn draw_node_details(
                     kv("state", pipeline_state_label(row.state)),
                     kv(
                         "ready in",
-                        &row.ready_in_ms.map(format_ready_in_ms).unwrap_or_else(|| "-".to_string()),
+                        &row.ready_in_ms
+                            .map(format_ready_in_ms)
+                            .unwrap_or_else(|| "-".to_string()),
                     ),
                     kv(
                         "ip",

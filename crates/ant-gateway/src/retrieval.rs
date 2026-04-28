@@ -23,9 +23,12 @@ use std::time::Duration;
 
 use ant_control::{ControlAck, ControlCommand};
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
+use bytes::Bytes;
+use futures::stream;
+use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
@@ -45,17 +48,10 @@ const SWARM_CHUNK_RETRIEVAL_TIMEOUT: HeaderName =
 /// completes a *single* fetch in ~165 s at our `FETCH_FANOUT=8` joiner
 /// width and ~150 ms per-chunk RTT. Concurrent `bzz://` fetches
 /// (browsers happily issue 4–6 at once for media galleries) share the
-/// process-wide retrieval semaphore (`RETRIEVAL_INFLIGHT_CAP=16` in
-/// ant-p2p), so each one's effective fanout drops in proportion: 4
-/// in-flight files at FETCH_FANOUT=8 split 16 permits four ways and
-/// each ends up running ~4-wide instead of 8-wide, doubling per-file
-/// wall time. 600 s comfortably covers that worst case while still
-/// being short enough that a wedged handler doesn't pin a hyper task
-/// indefinitely; browsers typically tolerate 5–10 minute responses
-/// for media downloads. Higher in-flight counts (semaphore pressure
-/// > 4) start to flake at the *connection* level — see
-/// `ant_retrieval::is_peer_fatal` for why we no longer turn that into
-/// a request-killing peer blacklist.
+/// process-wide retrieval semaphore (`RETRIEVAL_INFLIGHT_CAP=32` in
+/// ant-p2p). 600 s is still a large envelope, but it keeps a wedged
+/// handler from pinning a hyper task indefinitely while allowing the
+/// concurrent media path to complete under normal mainnet latency.
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 /// Single-chunk fetches are bounded by `ant-retrieval`'s internal
 /// timeout (20 s) plus the outer retry loop. 60 s leaves room for
@@ -133,6 +129,7 @@ pub async fn chunk(
 pub async fn bytes(
     State(handle): State<GatewayHandle>,
     Path(addr): Path<String>,
+    Query(query): Query<BytesQuery>,
     method: Method,
     headers: HeaderMap,
 ) -> Response {
@@ -141,18 +138,36 @@ pub async fn bytes(
         Err(e) => return json_error(StatusCode::BAD_REQUEST, e),
     };
 
+    let range_header = headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
     let timeout = request_timeout(&headers, DEFAULT_REQUEST_TIMEOUT);
+
+    if method == Method::GET && range_header.is_none() {
+        return match dispatch_stream_bytes(&handle, reference, timeout).await {
+            Ok(streamed) => {
+                let content_type = sniff_content_type(&streamed.first_bytes, query.filename());
+                let filename = raw_bytes_filename(&addr, query.filename(), content_type);
+                streaming_response(
+                    streamed.total_bytes,
+                    streamed.body,
+                    content_type,
+                    Some(&filename),
+                )
+            }
+            Err(e) => e,
+        };
+    }
 
     let body = match dispatch_get_bytes(&handle, reference, timeout).await {
         Ok(b) => b,
         Err(e) => return e,
     };
 
-    let range_header = headers
-        .get(header::RANGE)
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
-    finalize_with_range(method, body, "application/octet-stream", None, range_header)
+    let content_type = sniff_content_type(&body, query.filename());
+    let filename = raw_bytes_filename(&addr, query.filename(), content_type);
+    finalize_with_range(method, body, content_type, Some(&filename), range_header)
 }
 
 /// `GET /bzz/{addr}` and `HEAD /bzz/{addr}`. Empty path resolves to
@@ -223,6 +238,27 @@ struct BzzOutcome {
     filename: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct BytesQuery {
+    #[serde(default, alias = "name")]
+    filename: Option<String>,
+}
+
+impl BytesQuery {
+    fn filename(&self) -> Option<&str> {
+        self.filename
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+}
+
+struct StreamedBytes {
+    total_bytes: u64,
+    first_bytes: Vec<u8>,
+    body: Body,
+}
+
 // `Err(Response)` is the routine "early-return an error response" path —
 // boxing it would add a heap alloc to the failure case for no benefit.
 #[allow(clippy::result_large_err)]
@@ -235,7 +271,12 @@ async fn dispatch_get_bytes(
     let cmd = ControlCommand::GetBytes {
         reference,
         bypass_cache: false,
-        progress: false,
+        // Keep the control ack channel active while large joins are
+        // making progress; `drain_terminal` drops these samples but each
+        // one proves the node task is alive, so the gateway timeout acts
+        // as an idle timeout instead of a hard wall for multi-minute media
+        // downloads.
+        progress: true,
         max_bytes: Some(GATEWAY_MAX_FILE_BYTES),
         ack: ack_tx,
     };
@@ -258,6 +299,114 @@ async fn dispatch_get_bytes(
 }
 
 #[allow(clippy::result_large_err)]
+async fn dispatch_stream_bytes(
+    handle: &GatewayHandle,
+    reference: [u8; 32],
+    timeout: Duration,
+) -> Result<StreamedBytes, Response> {
+    let (ack_tx, mut ack_rx) = ant_control::streaming_ack_channel();
+    let cmd = ControlCommand::StreamBytes {
+        reference,
+        bypass_cache: false,
+        max_bytes: Some(GATEWAY_MAX_FILE_BYTES),
+        ack: ack_tx,
+    };
+    if handle.commands.send(cmd).await.is_err() {
+        return Err(node_unavailable());
+    }
+
+    let total_bytes = loop {
+        match tokio::time::timeout(timeout, ack_rx.recv()).await {
+            Ok(Some(ControlAck::BytesStreamStart { total_bytes })) => break total_bytes,
+            Ok(Some(ControlAck::Progress(_))) => continue,
+            Ok(Some(ControlAck::Error { message })) => {
+                return Err(json_error(StatusCode::NOT_FOUND, message));
+            }
+            Ok(Some(other)) => {
+                warn!(target: "ant_gateway", ?other, "unexpected ack before StreamBytes start");
+                return Err(json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "unexpected node ack",
+                ));
+            }
+            Ok(None) => return Err(node_unavailable()),
+            Err(_) => {
+                return Err(json_error(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    format!("retrieval timed out after {}s", timeout.as_secs()),
+                ));
+            }
+        }
+    };
+
+    let first_chunk = loop {
+        match tokio::time::timeout(timeout, ack_rx.recv()).await {
+            Ok(Some(ControlAck::BytesChunk { data })) => break Some(data),
+            Ok(Some(ControlAck::StreamDone)) => break None,
+            Ok(Some(ControlAck::Progress(_))) => continue,
+            Ok(Some(ControlAck::Error { message })) => {
+                return Err(json_error(StatusCode::NOT_FOUND, message));
+            }
+            Ok(Some(other)) => {
+                warn!(target: "ant_gateway", ?other, "unexpected ack before first StreamBytes chunk");
+                return Err(json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "unexpected node ack",
+                ));
+            }
+            Ok(None) => return Err(node_unavailable()),
+            Err(_) => {
+                return Err(json_error(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    format!("retrieval timed out after {}s", timeout.as_secs()),
+                ));
+            }
+        }
+    };
+    let first_bytes = first_chunk
+        .as_ref()
+        .map(|b| b[..b.len().min(512)].to_vec())
+        .unwrap_or_default();
+
+    let body_stream = stream::unfold((first_chunk, ack_rx), |(mut first, mut rx)| async move {
+        if let Some(data) = first.take() {
+            return Some((Ok::<Bytes, std::io::Error>(Bytes::from(data)), (None, rx)));
+        }
+        loop {
+            match rx.recv().await {
+                Some(ControlAck::BytesChunk { data }) => {
+                    return Some((Ok::<Bytes, std::io::Error>(Bytes::from(data)), (None, rx)));
+                }
+                Some(ControlAck::StreamDone) | None => return None,
+                Some(ControlAck::Progress(_)) => continue,
+                Some(ControlAck::Error { message }) => {
+                    return Some((
+                        Err(std::io::Error::new(std::io::ErrorKind::Other, message)),
+                        (None, rx),
+                    ));
+                }
+                Some(other) => {
+                    warn!(target: "ant_gateway", ?other, "unexpected ack during StreamBytes body");
+                    return Some((
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "unexpected node ack",
+                        )),
+                        (None, rx),
+                    ));
+                }
+            }
+        }
+    });
+
+    Ok(StreamedBytes {
+        total_bytes,
+        first_bytes,
+        body: Body::from_stream(body_stream),
+    })
+}
+
+#[allow(clippy::result_large_err)]
 async fn dispatch_get_bzz(
     handle: &GatewayHandle,
     reference: [u8; 32],
@@ -274,7 +423,7 @@ async fn dispatch_get_bzz(
         // still fails fast if a data chunk is actually missing.
         allow_degraded_redundancy: true,
         bypass_cache: false,
-        progress: false,
+        progress: true,
         max_bytes: Some(GATEWAY_MAX_FILE_BYTES),
         ack: ack_tx,
     };
@@ -384,11 +533,155 @@ fn write_response(
         .headers_mut()
         .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     if let Some(name) = filename {
-        if let Ok(v) = HeaderValue::from_str(&format!("inline; filename=\"{name}\"")) {
+        if let Some(v) = content_disposition(name) {
             resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
         }
     }
     resp
+}
+
+fn streaming_response(
+    total_bytes: u64,
+    body: Body,
+    content_type: &str,
+    filename: Option<&str>,
+) -> Response {
+    let mut resp = Response::new(body);
+    let _ = resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(content_type)
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+    );
+    let _ = resp
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, HeaderValue::from(total_bytes));
+    let _ = resp
+        .headers_mut()
+        .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    if let Some(name) = filename {
+        if let Some(v) = content_disposition(name) {
+            resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
+        }
+    }
+    resp
+}
+
+fn content_disposition(filename: &str) -> Option<HeaderValue> {
+    let filename = sanitize_filename(filename);
+    HeaderValue::from_str(&format!("inline; filename=\"{filename}\"")).ok()
+}
+
+fn sanitize_filename(filename: &str) -> String {
+    let mut out = String::with_capacity(filename.len().min(128));
+    for ch in filename.chars() {
+        let safe = match ch {
+            '"' | '\'' | '\\' | '/' | ':' | '<' | '>' | '|' | '?' | '*' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        };
+        out.push(safe);
+        if out.len() >= 128 {
+            break;
+        }
+    }
+    let trimmed = out.trim_matches([' ', '.']).trim();
+    if trimmed.is_empty() {
+        "download.bin".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn raw_bytes_filename(hash: &str, requested: Option<&str>, content_type: &str) -> String {
+    if let Some(name) = requested {
+        return sanitize_filename(name);
+    }
+    let hash = hash
+        .strip_prefix("0x")
+        .or_else(|| hash.strip_prefix("0X"))
+        .unwrap_or(hash);
+    let ext = extension_for_content_type(content_type).unwrap_or("bin");
+    format!("{hash}.{ext}")
+}
+
+fn sniff_content_type(bytes: &[u8], filename: Option<&str>) -> &'static str {
+    if let Some(name) = filename {
+        if let Some(content_type) = content_type_from_extension(name) {
+            return content_type;
+        }
+    }
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return "image/png";
+    }
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return "image/jpeg";
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return "image/gif";
+    }
+    if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
+        return "audio/wav";
+    }
+    if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return "image/webp";
+    }
+    if bytes.starts_with(b"%PDF-") {
+        return "application/pdf";
+    }
+    if bytes.starts_with(b"ID3")
+        || bytes.starts_with(&[0xff, 0xfb])
+        || bytes.starts_with(&[0xff, 0xf3])
+    {
+        return "audio/mpeg";
+    }
+    if bytes.starts_with(b"OggS") {
+        return "application/ogg";
+    }
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        return "video/mp4";
+    }
+    "application/octet-stream"
+}
+
+fn content_type_from_extension(filename: &str) -> Option<&'static str> {
+    let ext = filename.rsplit('.').next()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "svg" => Some("image/svg+xml"),
+        "wav" => Some("audio/wav"),
+        "mp3" => Some("audio/mpeg"),
+        "ogg" | "oga" => Some("audio/ogg"),
+        "mp4" | "m4v" => Some("video/mp4"),
+        "webm" => Some("video/webm"),
+        "pdf" => Some("application/pdf"),
+        "txt" => Some("text/plain; charset=utf-8"),
+        "html" | "htm" => Some("text/html; charset=utf-8"),
+        "json" => Some("application/json"),
+        _ => None,
+    }
+}
+
+fn extension_for_content_type(content_type: &str) -> Option<&'static str> {
+    match content_type.split(';').next().unwrap_or(content_type) {
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpg"),
+        "image/gif" => Some("gif"),
+        "image/webp" => Some("webp"),
+        "image/svg+xml" => Some("svg"),
+        "audio/wav" => Some("wav"),
+        "audio/mpeg" => Some("mp3"),
+        "audio/ogg" => Some("ogg"),
+        "video/mp4" => Some("mp4"),
+        "video/webm" => Some("webm"),
+        "application/pdf" => Some("pdf"),
+        "text/plain" => Some("txt"),
+        "text/html" => Some("html"),
+        "application/json" => Some("json"),
+        _ => None,
+    }
 }
 
 /// Apply a single-range `Range` header against the joined body if the
@@ -432,6 +725,11 @@ fn finalize_with_range(
             let cr = format!("bytes {start}-{end}/{total}");
             if let Ok(v) = HeaderValue::from_str(&cr) {
                 resp.headers_mut().insert(header::CONTENT_RANGE, v);
+            }
+            if let Some(name) = filename {
+                if let Some(v) = content_disposition(name) {
+                    resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
+                }
             }
             resp
         }

@@ -30,7 +30,8 @@ use ant_control::{
 use ant_gateway::testkit::build_router;
 use ant_gateway::{GatewayHandle, GatewayIdentity};
 use ant_retrieval::{
-    join_with_options, lookup_path, ChunkFetcher, JoinOptions, DEFAULT_MAX_FILE_BYTES,
+    join_to_sender, join_with_options, lookup_path, ChunkFetcher, JoinOptions,
+    DEFAULT_MAX_FILE_BYTES,
 };
 use async_trait::async_trait;
 use axum::body::Body;
@@ -282,6 +283,56 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
                 Err(e) => ControlAck::Error { message: e },
             };
             let _ = ack.send(reply).await;
+        }
+        ControlCommand::StreamBytes {
+            reference,
+            bypass_cache: _,
+            max_bytes,
+            ack,
+        } => {
+            let result = async {
+                let root = fetcher.fetch(reference).await.map_err(|e| e.to_string())?;
+                let total = root
+                    .get(..8)
+                    .and_then(|s| s.try_into().ok())
+                    .map(u64::from_le_bytes)
+                    .ok_or_else(|| "root shorter than span".to_string())?;
+                ack.send(ControlAck::BytesStreamStart { total_bytes: total })
+                    .await
+                    .map_err(|_| "stream closed".to_string())?;
+                let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel(8);
+                let opts = JoinOptions {
+                    allow_degraded_redundancy: true,
+                };
+                let cap = max_bytes
+                    .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
+                    .unwrap_or(DEFAULT_MAX_FILE_BYTES);
+                let mut join_fut = Box::pin(join_to_sender(fetcher, &root, cap, opts, chunk_tx));
+                let mut join_result = None;
+                loop {
+                    tokio::select! {
+                        result = &mut join_fut, if join_result.is_none() => {
+                            join_result = Some(result.map_err(|e| e.to_string()));
+                        }
+                        maybe_chunk = chunk_rx.recv() => {
+                            match maybe_chunk {
+                                Some(data) => {
+                                    ack.send(ControlAck::BytesChunk { data })
+                                        .await
+                                        .map_err(|_| "stream closed".to_string())?;
+                                }
+                                None => return join_result.unwrap_or(Ok(())),
+                            }
+                        }
+                    }
+                }
+            }
+            .await;
+            let terminal = match result {
+                Ok(()) => ControlAck::StreamDone,
+                Err(e) => ControlAck::Error { message: e },
+            };
+            let _ = ack.send(terminal).await;
         }
         ControlCommand::GetBzz {
             reference,

@@ -131,13 +131,17 @@ async fn gateway_raises_joiner_max_bytes_above_cli_default() {
         let captured = captured_for_dispatch.clone();
         async move {
             match cmd {
-                ControlCommand::GetBytes { max_bytes, ack, .. } => {
+                ControlCommand::StreamBytes { max_bytes, ack, .. } => {
                     captured.lock().await.push(max_bytes);
                     let _ = ack
-                        .send(ControlAck::Bytes {
+                        .send(ControlAck::BytesStreamStart { total_bytes: 4 })
+                        .await;
+                    let _ = ack
+                        .send(ControlAck::BytesChunk {
                             data: b"stub".to_vec(),
                         })
                         .await;
+                    let _ = ack.send(ControlAck::StreamDone).await;
                 }
                 ControlCommand::GetBzz { max_bytes, ack, .. } => {
                     captured.lock().await.push(max_bytes);
@@ -253,11 +257,41 @@ async fn bytes_returns_fixture_payload() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
         resp.headers().get(header::CONTENT_TYPE).unwrap(),
-        "application/octet-stream",
+        "image/png"
+    );
+    assert_eq!(
+        resp.headers().get(header::CONTENT_DISPOSITION).unwrap(),
+        format!("inline; filename=\"{DATA_REF}.png\"").as_str(),
     );
     let bytes = body_bytes(resp).await;
     assert_eq!(bytes.len(), BODY_LEN);
     assert_eq!(sha256_hex(&bytes), BODY_SHA256);
+}
+
+#[tokio::test]
+async fn bytes_filename_query_sets_content_headers() {
+    let router = handle_with_fixture_node();
+    let uri = format!("/bytes/{DATA_REF}?filename=tile.wav");
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::GET)
+            .uri(&uri)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get(header::CONTENT_TYPE).unwrap(),
+        "audio/wav"
+    );
+    assert_eq!(
+        resp.headers().get(header::CONTENT_DISPOSITION).unwrap(),
+        "inline; filename=\"tile.wav\"",
+    );
+    let bytes = body_bytes(resp).await;
+    assert_eq!(bytes.len(), BODY_LEN);
 }
 
 /// `GET /chunks/{addr}` returns the **wire bytes** (`span (8 LE) || payload`),

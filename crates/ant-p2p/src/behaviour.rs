@@ -294,15 +294,10 @@ struct SwarmState {
     /// Process-wide cap on concurrent `retrieve_chunk` calls. Cloned
     /// into every `RoutingFetcher` we build for any `GetBytes` /
     /// `GetBzz` request, so the cap applies across concurrent
-    /// requests rather than per-request. Sized to roughly one
-    /// joiner's worth of fan-out (`FETCH_FANOUT × HEDGE_FANOUT` =
-    /// 8 × 2 = 16): enough for a single retrieval pipeline to run
-    /// unblocked, small enough that a stampede from concurrent
-    /// browser fetches gets serialised at the chunk level instead of
-    /// flooding bee with ~64 simultaneous streams. Without this cap,
-    /// concurrently-fetched media files turn into self-DoS — chunks
-    /// that respond in 90–200 ms when probed individually time out
-    /// at 20 s when racing against ~60 sibling streams.
+    /// requests rather than per-request. The cap is deliberately below
+    /// the unbounded browser stampede (~60 simultaneous retrieval
+    /// streams in the four-WAV repro), but high enough that several
+    /// large gateway downloads can make progress at once.
     retrieval_inflight: Arc<Semaphore>,
 }
 
@@ -896,6 +891,42 @@ fn handle_control_command(
                 let _ = ack.send(reply).await;
             });
         }
+        ControlCommand::StreamBytes {
+            reference,
+            bypass_cache,
+            max_bytes,
+            ack,
+        } => {
+            let peers_rx = state.peers_watch.subscribe();
+            if peers_rx.borrow().is_empty() {
+                send_terminal_ack(
+                    &ack,
+                    ControlAck::Error {
+                        message: "no peers available; wait for handshakes to complete".to_string(),
+                    },
+                );
+                return;
+            }
+            let control = control.clone();
+            let cache = state.cache_for_request(bypass_cache);
+            let record_dir = state.chunk_record_dir.clone();
+            let inflight_limit = state.retrieval_inflight.clone();
+            let tracker = Arc::new(ProgressTracker::new(bypass_cache));
+            tokio::spawn(async move {
+                run_stream_bytes(
+                    control,
+                    peers_rx,
+                    cache,
+                    record_dir,
+                    inflight_limit,
+                    tracker,
+                    reference,
+                    max_bytes,
+                    ack,
+                )
+                .await;
+            });
+        }
         ControlCommand::GetBzz {
             reference,
             path,
@@ -951,6 +982,99 @@ fn handle_control_command(
                 }
                 let _ = ack.send(reply).await;
             });
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_stream_bytes(
+    control: Control,
+    peers_rx: watch::Receiver<Vec<(libp2p::PeerId, [u8; 32])>>,
+    cache: Arc<ant_retrieval::InMemoryChunkCache>,
+    record_dir: Option<PathBuf>,
+    inflight_limit: Arc<Semaphore>,
+    tracker: Arc<ProgressTracker>,
+    reference: [u8; 32],
+    max_bytes: Option<u64>,
+    ack: mpsc::Sender<ControlAck>,
+) {
+    use ant_retrieval::ChunkFetcher;
+
+    let fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx)
+        .with_cache(cache)
+        .with_record_dir(record_dir)
+        .with_progress(tracker.clone())
+        .with_inflight_limit(inflight_limit)
+        .with_request_inflight_limit(RETRIEVAL_REQUEST_INFLIGHT_CAP);
+
+    let root = match fetcher.fetch(reference).await {
+        Ok(root) => root,
+        Err(e) => {
+            let _ = ack
+                .send(ControlAck::Error {
+                    message: format!("fetch root chunk {}: {e}", hex::encode(reference)),
+                })
+                .await;
+            return;
+        }
+    };
+    let Some(total_bytes) = root_span_to_u64(&root) else {
+        let _ = ack
+            .send(ControlAck::Error {
+                message: format!("root chunk {} shorter than span", hex::encode(reference)),
+            })
+            .await;
+        return;
+    };
+    tracker.set_total_bytes(total_bytes);
+    if ack
+        .send(ControlAck::BytesStreamStart { total_bytes })
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    let (chunk_tx, mut chunk_rx) = mpsc::channel::<Vec<u8>>(16);
+    let cap = clamp_max_bytes(max_bytes);
+    let mut join_fut = Box::pin(ant_retrieval::join_to_sender(
+        &fetcher,
+        &root,
+        cap,
+        ant_retrieval::JoinOptions::default(),
+        chunk_tx,
+    ));
+    let mut join_result = None;
+
+    loop {
+        tokio::select! {
+            result = &mut join_fut, if join_result.is_none() => {
+                join_result = Some(result);
+            }
+            maybe_chunk = chunk_rx.recv() => {
+                match maybe_chunk {
+                    Some(data) => {
+                        if ack.send(ControlAck::BytesChunk { data }).await.is_err() {
+                            return;
+                        }
+                    }
+                    None => {
+                        match join_result.unwrap_or(Ok(())) {
+                            Ok(()) => {
+                                let _ = ack.send(ControlAck::StreamDone).await;
+                            }
+                            Err(e) => {
+                                let _ = ack
+                                    .send(ControlAck::Error {
+                                        message: format!("join {}: {e}", hex::encode(reference)),
+                                    })
+                                    .await;
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
         }
     }
 }
@@ -1017,32 +1141,30 @@ fn send_terminal_ack(ack: &mpsc::Sender<ControlAck>, reply: ControlAck) {
 }
 
 /// Max number of full pipeline attempts (lookup_path + fetch + join)
-/// per user-visible `get` command. We saw real-world cases where a
-/// large file's tail leaves needed up to four full retries to find a
-/// bee peer in a different neighbourhood that actually had the chunk —
-/// chunk locality on mainnet is sparse enough that the closest 16
-/// peers (per-attempt budget in `ant-retrieval::FALLBACK_PEERS`)
-/// occasionally all return `storage: not found` even though the chunk
-/// is retrievable from a wider scan. Five attempts gives us up to ~80
-/// distinct candidate peers per chunk across attempts (with the
-/// blacklist carried forward), at the cost of an extra ~7.5 s of
-/// backoff in the worst case (0.5 + 1 + 1.5 + 2 + 2.5 s); the gateway
-/// request timeout absorbs this comfortably.
-const MAX_FETCH_ATTEMPTS: usize = 5;
+/// per user-visible `get` command. Successful chunks are written through
+/// to the daemon cache, so later attempts usually skip straight to the
+/// sparse tail chunks that still need a working peer. Live gateway
+/// verification against four concurrent 44 MiB WAVs still saw late
+/// single-chunk misses after five attempts; ten attempts gives those
+/// tail chunks more peer-set churn windows without re-downloading the
+/// already joined prefix.
+const MAX_FETCH_ATTEMPTS: usize = 10;
 
 /// Process-wide cap on concurrent `retrieve_chunk` calls (see
-/// `SwarmState::retrieval_inflight`). Sized to one joiner pipeline
-/// (`ant_retrieval::FETCH_FANOUT × HEDGE_FANOUT` = 8 × 2 = 16) so a
-/// single fetch runs unbounded but a stampede from concurrent
-/// browser fetches gets serialised at the chunk level. We saw, with
-/// no cap at all, four parallel `bzz://` fetches turn into ~60
-/// simultaneous retrieval streams — chunks that responded to
-/// `/chunks/<addr>` in 90–200 ms in isolation timed out at our 20 s
-/// envelope under that load, even though the *same chunks* fetched
-/// fine moments later. 16 closes that hole. Tuning higher trades
-/// per-request latency for stampede risk; tuning lower starves the
-/// joiner.
-const RETRIEVAL_INFLIGHT_CAP: usize = 16;
+/// `SwarmState::retrieval_inflight`). Unbounded four-file gateway
+/// fetches stampede bee with ~60 streams and trigger chunk timeouts;
+/// 16 avoids the stampede but leaves four 44 MiB WAVs short of the
+/// gateway's 600 s envelope. With per-request fairness in front of this
+/// global queue we can safely let the daemon use more aggregate network
+/// parallelism without one request monopolising all permits.
+const RETRIEVAL_INFLIGHT_CAP: usize = 64;
+
+/// Per-user-request cap layered in front of the process-wide semaphore.
+/// This keeps four concurrent large media downloads fair: no single
+/// joiner can queue every global permit with descendant leaf fetches
+/// while another request is still waiting on its root or first ordered
+/// subtree.
+const RETRIEVAL_REQUEST_INFLIGHT_CAP: usize = 16;
 
 /// Multiplier base for inter-attempt backoff. Attempt N waits
 /// `RETRY_BACKOFF_BASE * N` before retrying — small enough not to
@@ -1130,7 +1252,8 @@ async fn run_get_bytes(
             .with_cache(cache.clone())
             .with_record_dir(record_dir.clone())
             .with_progress(tracker.clone())
-            .with_inflight_limit(inflight_limit.clone());
+            .with_inflight_limit(inflight_limit.clone())
+            .with_request_inflight_limit(RETRIEVAL_REQUEST_INFLIGHT_CAP);
         match try_get_bytes(&fetcher, &tracker, reference, max_bytes).await {
             Ok(data) => {
                 debug!(
@@ -1252,7 +1375,8 @@ async fn run_get_bzz(
             .with_cache(cache.clone())
             .with_record_dir(record_dir.clone())
             .with_progress(tracker.clone())
-            .with_inflight_limit(inflight_limit.clone());
+            .with_inflight_limit(inflight_limit.clone())
+            .with_request_inflight_limit(RETRIEVAL_REQUEST_INFLIGHT_CAP);
         match try_get_bzz(
             &fetcher,
             &tracker,

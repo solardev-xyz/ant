@@ -36,24 +36,23 @@ use tracing::{debug, trace, warn};
 /// `ant_p2p::routing` to keep `ant-retrieval` free of a circular dep.
 pub type Overlay = [u8; 32];
 
-/// Per-fetch retry budget. We empirically saw chunks for which 16 of
-/// the closest peers either responded `storage: not found` or had
-/// just dropped their libp2p connection (giving us "no addresses for
-/// peer" before bee even saw the request) — yet the chunk fetched
-/// fine via a longer-running client. 32 buys roughly half a typical
-/// `~70` BZZ-connected peer set per chunk, which is the budget bee
-/// itself uses for its `kademlia.ClosestPeer` retry loop. With
-/// hedging width 2 we never have more than 2 streams in flight, so
-/// the wider candidate list only matters on the failure path: most
-/// happy-path fetches still resolve at the first or second peer.
-const FALLBACK_PEERS: usize = 32;
+/// Per-fetch retry budget. Multi-MiB files under browser-style
+/// concurrency routinely hit chunks where dozens of close peers either
+/// answer `storage: not found` or have already disappeared from the
+/// address book (`no addresses for peer`) by the time we ask them. A
+/// budget of 32 was enough for isolated single-file fetches, but live
+/// four-WAV gateway verification still exhausted it on rare chunks
+/// while the daemon had ~100 warm BZZ peers. Search nearly the whole
+/// warm set on the failure path; hedging width and the process-wide
+/// semaphore still cap actual in-flight retrieval streams.
+const FALLBACK_PEERS: usize = 96;
 
 /// Hedging width. We may have at most this many in-flight retrieval
 /// streams for a single chunk at once; whichever returns a valid
-/// delivery first wins, the rest get cancelled. K=2 hits the sweet
-/// spot between tail-latency reduction and wasted bandwidth on
-/// duplicated chunks.
-const HEDGE_FANOUT: usize = 2;
+/// delivery first wins, the rest get cancelled. Bee origin retrieval can
+/// multiplex to the initial peer plus two forwards; keep the same
+/// effective breadth here.
+const HEDGE_FANOUT: usize = 3;
 
 /// How long we wait on the first peer before firing a hedge. Most
 /// chunks resolve in well under this on the happy path (typical fast
@@ -63,7 +62,7 @@ const HEDGE_FANOUT: usize = 2;
 /// fetch, while still capping tail latency at roughly
 /// `HEDGE_DELAY + min_hedge_response`. If the first peer *errors*
 /// before the timer fires we hedge immediately rather than waiting.
-const HEDGE_DELAY: Duration = Duration::from_millis(250);
+const HEDGE_DELAY: Duration = Duration::from_millis(500);
 
 /// Stateful per-call fetcher. Owns a clone of `Control` and a live
 /// peer-snapshot subscription via `tokio::sync::watch::Receiver`.
@@ -124,6 +123,12 @@ pub struct RoutingFetcher {
     /// (i.e. `None`), every fetch runs unbounded — appropriate for
     /// unit tests and the (single-request) `antctl get` path.
     inflight_limit: Option<Arc<Semaphore>>,
+    /// Per-request cap layered in front of `inflight_limit`. Futures
+    /// acquire this semaphore before they enter the process-wide queue,
+    /// which prevents one large joiner from filling the global FIFO with
+    /// hundreds of descendant chunk fetches while another HTTP request is
+    /// still trying to fetch its root or first ordered subtree.
+    request_inflight_limit: Option<Arc<Semaphore>>,
 }
 
 impl RoutingFetcher {
@@ -151,6 +156,7 @@ impl RoutingFetcher {
             record_dir: None,
             progress: None,
             inflight_limit: None,
+            request_inflight_limit: None,
         }
     }
 
@@ -206,6 +212,16 @@ impl RoutingFetcher {
     /// process — see `inflight_limit` on the struct for why.
     pub fn with_inflight_limit(mut self, sem: Arc<Semaphore>) -> Self {
         self.inflight_limit = Some(sem);
+        self
+    }
+
+    /// Cap concurrent in-flight `retrieve_chunk` calls for one
+    /// user-visible tree join. This is deliberately separate from the
+    /// process-wide cap: `ant-p2p` creates one fetcher per `GetBytes` /
+    /// `GetBzz` command, so this keeps concurrent browser downloads fair
+    /// while still allowing the daemon as a whole to use the network.
+    pub fn with_request_inflight_limit(mut self, limit: usize) -> Self {
+        self.request_inflight_limit = Some(Arc::new(Semaphore::new(limit.max(1))));
         self
     }
 
@@ -310,13 +326,18 @@ impl ChunkFetcher for RoutingFetcher {
         let make_fut = |peer: PeerId| {
             let mut control = self.control.clone();
             let sem = self.inflight_limit.clone();
+            let request_sem = self.request_inflight_limit.clone();
             async move {
-                let _permit = match sem {
+                let _request_permit = match request_sem {
                     Some(s) => Some(
                         s.acquire_owned()
                             .await
-                            .expect("retrieval semaphore closed"),
+                            .expect("request retrieval semaphore closed"),
                     ),
+                    None => None,
+                };
+                let _permit = match sem {
+                    Some(s) => Some(s.acquire_owned().await.expect("retrieval semaphore closed")),
                     None => None,
                 };
                 let r = retrieve_chunk(&mut control, peer, addr).await;
@@ -461,25 +482,27 @@ impl ChunkFetcher for RoutingFetcher {
 /// `peers_watch` removes them from the candidate pool — that's the
 /// proper signal, not an Io error from a single stream.
 ///
-/// We *do* blacklist on transport-level connect failures
-/// (`OpenStream`), framing errors (`MessageTooLarge`,
-/// `BadPayloadSize`, protobuf decode failures), and CAC mismatches:
-/// those say the peer is unreachable, misbehaving, or speaking a
-/// protocol we can't decode, and there's no reason to expect a
-/// different chunk fetch against the same peer to behave any
-/// differently. We measured the alternative (treating `OpenStream`
-/// as transient too) and a single 44 MiB `/bytes/` fetch slowed
-/// from 165 s to 456 s — peers that genuinely went away (libp2p
-/// purged their address book) stayed in the candidate pool and
-/// each sibling chunk wasted one `OpenStream` round-trip on them
-/// before failing to a working peer.
+/// `OpenStream(_)` is likewise kept per-chunk. Treating it as fatal was
+/// faster for isolated single-file fetches, but live gateway verification
+/// with four parallel WAVs showed the shared request blacklist poisoning
+/// otherwise healthy file attempts: enough sibling chunks raced through
+/// stale address-book entries that later chunks exhausted their candidate
+/// set and returned `all peers failed`. The `peers_watch` remains the
+/// source of truth for peer liveness; one stream-open failure is not
+/// enough to ban a peer for every other chunk in the file.
+///
+/// We still blacklist on framing errors (`MessageTooLarge`,
+/// `BadPayloadSize`, protobuf decode failures) and CAC mismatches: those
+/// say the peer is misbehaving or speaking a protocol we can't decode,
+/// and there's no reason to expect a different chunk fetch against the
+/// same peer to behave any differently.
 fn is_peer_fatal(err: &RetrievalError) -> bool {
     match err {
         RetrievalError::Remote(_) => false,
         RetrievalError::Timeout(_) => false,
         RetrievalError::Io(_) => false,
-        RetrievalError::OpenStream(_)
-        | RetrievalError::ProstEncode(_)
+        RetrievalError::OpenStream(_) => false,
+        RetrievalError::ProstEncode(_)
         | RetrievalError::ProstDecode(_)
         | RetrievalError::MessageTooLarge { .. }
         | RetrievalError::InvalidChunk
@@ -546,8 +569,8 @@ mod tests {
         );
 
         assert!(
-            is_peer_fatal(&RetrievalError::OpenStream("dial failed".into())),
-            "transport-level failure: peer is unreachable",
+            !is_peer_fatal(&RetrievalError::OpenStream("dial failed".into())),
+            "stream-open failure must NOT poison the peer for sibling chunks",
         );
         assert!(
             is_peer_fatal(&RetrievalError::InvalidChunk),

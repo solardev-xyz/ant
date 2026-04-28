@@ -50,10 +50,12 @@ pub mod progress;
 
 pub use cache::{InMemoryChunkCache, DEFAULT_CAPACITY as DEFAULT_CACHE_CAPACITY};
 pub use fetcher::{Overlay, RoutingFetcher};
-pub use joiner::{join, join_with_options, JoinError, JoinOptions, DEFAULT_MAX_FILE_BYTES};
+pub use joiner::{
+    join, join_to_sender, join_with_options, JoinError, JoinOptions, DEFAULT_MAX_FILE_BYTES,
+};
 pub use mantaray::{
-    lookup_path, LookupResult, ManifestError, MANTARAY_CONTENT_TYPE_KEY,
-    MANTARAY_ERROR_DOC_KEY, MANTARAY_INDEX_DOC_KEY,
+    lookup_path, LookupResult, ManifestError, MANTARAY_CONTENT_TYPE_KEY, MANTARAY_ERROR_DOC_KEY,
+    MANTARAY_INDEX_DOC_KEY,
 };
 pub use progress::{estimate_total_chunks, ProgressSample, ProgressTracker};
 
@@ -99,12 +101,12 @@ pub type ChunkAddr = [u8; 32];
 /// roundtrip, request, delivery. Bee's own `RetrieveChunkTimeout` is 30 s
 /// because a peer typically has to forward our request a few hops deeper
 /// into the neighbourhood before someone with the chunk actually answers.
-/// Our previous 10 s cap was aggressive enough that we routinely cancelled
-/// peers mid-forward — bee logged the chunk as unretrievable even though
-/// the same chunk fetched fine via a longer-running client. 20 s splits
-/// the difference: enough headroom for a forwarded chunk to come back,
-/// short enough that a genuinely stuck peer doesn't block our retry loop.
-const RETRIEVE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Our previous 10 s / 20 s caps were aggressive enough that we
+/// routinely cancelled peers mid-forward — bee logged the chunk as
+/// unretrievable even though the same chunk fetched fine via a
+/// longer-running client. Match Bee's origin retrieval timeout so
+/// forwarded neighbourhood lookups get the same chance to complete.
+const RETRIEVE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Max bytes for the bee-headers preamble. Bee tags retrieval streams
 /// with at most a couple of small tracing headers (current default is
 /// none); 8 KiB is more than enough and matches our existing cap on the

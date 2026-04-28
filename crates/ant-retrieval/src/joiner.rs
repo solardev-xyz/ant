@@ -36,8 +36,11 @@
 
 use crate::ChunkFetcher;
 use ant_crypto::CHUNK_SIZE;
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, StreamExt, TryStreamExt};
+use std::collections::BTreeMap;
+use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::mpsc;
 use tracing::trace;
 
 /// Default cap on a joined file's total size, in bytes. Sized to comfortably
@@ -49,21 +52,29 @@ pub const DEFAULT_MAX_FILE_BYTES: usize = 32 * 1024 * 1024;
 /// Hard ceiling on intermediate-chunk fan-out. `swarm.Branches`.
 const MAX_BRANCHES: usize = CHUNK_SIZE / 32;
 
-/// Maximum number of sibling chunk fetches in flight at once during a
-/// single intermediate node's expansion. Each in-flight fetch costs one
-/// libp2p stream multiplexed over the existing yamux session and ~4 KiB
-/// of buffer; well under the per-peer flow-control window. We previously
-/// ran this at 16, which raced ~32 streams in flight at the joiner level
-/// (16 chunks × hedge width 2). Bee peers reacted by churning their
-/// libp2p connection to us (visible in our log as a continuous
-/// connect/disconnect storm during a multi-MiB fetch) — observed effect:
-/// every multi-MiB media file took ~30 s per attempt and failed on a
-/// stream-open error before the joiner could finish. Cutting to 8
-/// halves the steady-state stream pressure on bee while keeping a deep
-/// tree's cumulative RTT bounded (a 36 MiB / 9000-leaf file at 8-wide
-/// goes through ~1100 round-trips, comfortably inside the gateway's
-/// 240 s envelope at typical 100–300 ms-per-chunk RTTs).
+/// Maximum number of sibling subtrees expanded at once from a single
+/// intermediate node. Each subtree may fetch its own descendants, so the
+/// daemon's process-wide retrieval semaphore remains the final cap on
+/// live libp2p streams; this fanout controls how much of a deep file can
+/// make progress instead of walking left-to-right one subtree at a time.
+/// Keep this close to Bee's worker-style prefetching while relying on
+/// `RoutingFetcher`'s per-request and process-wide semaphores to prevent
+/// concurrent media requests from stampeding the network.
 const FETCH_FANOUT: usize = 8;
+/// Retry a child subtree in place when it fails because one descendant
+/// chunk could not be fetched. This is the streaming equivalent of the
+/// old whole-file retry loop: once the gateway has emitted earlier bytes
+/// it cannot restart the response, so transient mainnet misses must be
+/// retried before the child subtree is handed to the caller. Successful
+/// descendant chunks are cached by `RoutingFetcher`, so retries normally
+/// jump straight to the missing tail.
+const SUBTREE_RETRY_ATTEMPTS: usize = 32;
+/// Above this span, the streaming joiner descends into a child subtree
+/// instead of materialising that whole child as one output buffer. This
+/// is what fixes Bee-shaped roots with only a couple of very large
+/// children: `/bytes` can emit the first 512 KiB-ish descendants instead
+/// of waiting for a 64 MiB subtree to finish.
+const STREAM_RECURSE_THRESHOLD: u64 = 1024 * 1024;
 
 /// Knobs that aren't span/payload-defined. Pass [`JoinOptions::default`]
 /// for the strict joiner; flip flags on for explicit, narrowly-scoped
@@ -112,6 +123,10 @@ pub enum JoinError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+    /// The downstream consumer went away while the joiner was streaming
+    /// output chunks.
+    #[error("output stream closed")]
+    OutputClosed,
 }
 
 /// Reconstruct a file from a Swarm reference using the chunk tree.
@@ -160,9 +175,7 @@ pub async fn join_with_options(
         masked[7] = 0;
         masked
     } else {
-        return Err(JoinError::UnsupportedRedundancy {
-            level: span_raw[7],
-        });
+        return Err(JoinError::UnsupportedRedundancy { level: span_raw[7] });
     };
     let span = u64::from_le_bytes(span_raw);
     if span > max_bytes as u64 {
@@ -172,43 +185,76 @@ pub async fn join_with_options(
         });
     }
 
-    let mut out = Vec::with_capacity(span as usize);
-    join_subtree(fetcher, payload, span, &mut out).await?;
-    Ok(out)
+    join_subtree(fetcher, payload, span, 0).await
 }
 
-/// Recursive joiner core. Appends `subtree_span` bytes worth of file data
-/// to `out`, given an intermediate or leaf chunk's *payload* (post-span)
-/// and the declared span of the subtree it roots.
+/// Stream a joined file in byte order without materialising the entire
+/// body in one `Vec<u8>`.
+///
+/// This mirrors Bee's HTTP path more closely than [`join`]: the caller
+/// fetches the root chunk once, learns the total span, and then receives
+/// ordered body chunks as the joiner resolves subtrees. The current
+/// implementation emits one buffer per completed child subtree at each
+/// intermediate level; that is intentionally coarser than Bee's
+/// `io.ReadSeeker`, but it lets the gateway send body bytes while the
+/// rest of the tree is still being retrieved.
+pub async fn join_to_sender(
+    fetcher: &dyn ChunkFetcher,
+    root_chunk_data: &[u8],
+    max_bytes: usize,
+    options: JoinOptions,
+    out: mpsc::Sender<Vec<u8>>,
+) -> Result<(), JoinError> {
+    let (span_raw, payload) = split_chunk(root_chunk_data, 0)?;
+    let span_raw = if is_redundancy_none(span_raw) {
+        span_raw
+    } else if options.allow_degraded_redundancy {
+        let mut masked = span_raw;
+        masked[7] = 0;
+        masked
+    } else {
+        return Err(JoinError::UnsupportedRedundancy { level: span_raw[7] });
+    };
+    let span = u64::from_le_bytes(span_raw);
+    if span > max_bytes as u64 {
+        return Err(JoinError::TooLarge {
+            span,
+            cap: max_bytes,
+        });
+    }
+
+    join_subtree_to_sender(fetcher, payload, span, 0, &out).await
+}
+
+/// Recursive joiner core. Returns `subtree_span` bytes worth of file data,
+/// given an intermediate or leaf chunk's *payload* (post-span) and the
+/// declared span of the subtree it roots.
 ///
 /// At each intermediate level we fan out up to [`FETCH_FANOUT`] sibling
-/// fetches in parallel via `Stream::buffered`, which preserves input
-/// order. Once the fetched chunks come back we walk them sequentially:
-/// for leaves that's just an append, for sub-intermediates we recurse
-/// (and the next level fans out independently). This turns a chain of
-/// `N` sequential RTTs into roughly `ceil(N / FETCH_FANOUT)` per
-/// intermediate, which is the dominant cost for typical small files
-/// where the root has all leaves as direct children.
+/// subtrees in parallel. Each sibling builds into its own `Vec<u8>`,
+/// then the parent concatenates completed subtrees in document order.
+/// That keeps output ordering deterministic without forcing the
+/// right-hand siblings to wait for every recursive fetch in the
+/// left-hand subtree.
 fn join_subtree<'a>(
     fetcher: &'a dyn ChunkFetcher,
     chunk_payload: &'a [u8],
     subtree_span: u64,
-    out: &'a mut Vec<u8>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), JoinError>> + Send + 'a>> {
+    offset: u64,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, JoinError>> + Send + 'a>> {
     Box::pin(async move {
         // Leaf: the chunk *is* the data. `subtree_span` was carried from
         // the parent ref so we don't even need to re-read this chunk's own
         // span; the payload bytes are already what we want.
         if subtree_span <= chunk_payload.len() as u64 {
-            out.extend_from_slice(&chunk_payload[..subtree_span as usize]);
-            return Ok(());
+            return Ok(chunk_payload[..subtree_span as usize].to_vec());
         }
 
         // Intermediate: payload must be `[ref32; N]`. We never accept
         // 64-byte (encrypted) refs in the joiner.
         if !chunk_payload.len().is_multiple_of(32) {
             return Err(JoinError::MalformedChunk {
-                offset: out.len() as u64,
+                offset,
                 detail: format!(
                     "intermediate payload len {} not a multiple of 32",
                     chunk_payload.len()
@@ -218,7 +264,7 @@ fn join_subtree<'a>(
         let refs = chunk_payload.len() / 32;
         if refs == 0 || refs > MAX_BRANCHES {
             return Err(JoinError::MalformedChunk {
-                offset: out.len() as u64,
+                offset,
                 detail: format!("intermediate ref count {refs} out of range"),
             });
         }
@@ -235,8 +281,9 @@ fn join_subtree<'a>(
         // Pre-compute (child_addr, child_span) for every sibling so the
         // parallel fetch can run without touching the parent payload
         // again, and so the order is fixed before we kick off any I/O.
-        let mut specs: Vec<([u8; 32], u64)> = Vec::with_capacity(refs);
+        let mut specs: Vec<(usize, [u8; 32], u64, u64)> = Vec::with_capacity(refs);
         let mut remaining = subtree_span;
+        let mut child_offset = offset;
         for i in 0..refs {
             let mut child_addr = [0u8; 32];
             child_addr.copy_from_slice(&chunk_payload[i * 32..(i + 1) * 32]);
@@ -247,35 +294,191 @@ fn join_subtree<'a>(
             } else {
                 branch_size.min(remaining)
             };
-            specs.push((child_addr, child_span));
+            specs.push((i, child_addr, child_span, child_offset));
             remaining = remaining.saturating_sub(child_span);
+            child_offset = child_offset.saturating_add(child_span);
         }
 
-        // Fan out the per-sibling fetches. `buffered` keeps results in
-        // input order so the byte stream we splice into `out` matches
-        // the file's logical layout. We collect into a Vec rather than
-        // streaming into the recursion because `out: &mut Vec<u8>` can
-        // only be borrowed by one in-flight future at a time — the
-        // fetches run in parallel, the assembly is sequential.
+        // Fan out whole subtrees, not just the immediate child chunk
+        // fetch. `buffer_unordered` avoids head-of-line blocking when an
+        // early sibling is tail-slow; the index lets us restore byte
+        // order before concatenating.
         let fanout = FETCH_FANOUT.min(refs).max(1);
-        let results: Vec<Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>> =
-            stream::iter(specs.iter().copied().map(|(addr, _span)| async move {
-                fetcher.fetch(addr).await
-            }))
-            .buffered(fanout)
-            .collect()
-            .await;
+        let mut children = stream::iter(specs.into_iter().map(
+            |(index, addr, child_span, child_offset)| async move {
+                let child =
+                    join_child_with_retries(fetcher, addr, child_span, child_offset).await?;
+                Ok((index, child))
+            },
+        ))
+        .buffer_unordered(fanout);
 
-        for ((addr, child_span), result) in specs.into_iter().zip(results) {
-            let child_chunk = result.map_err(|e| JoinError::FetchChunk {
-                addr: hex::encode(addr),
-                source: e,
-            })?;
-            let (_, child_payload) = split_chunk(&child_chunk, out.len() as u64)?;
-            join_subtree(fetcher, child_payload, child_span, out).await?;
+        let mut pending = BTreeMap::new();
+        let mut next_index = 0;
+        let mut out = Vec::with_capacity(subtree_span as usize);
+        while let Some((index, child)) = children.try_next().await? {
+            pending.insert(index, child);
+            while let Some(child) = pending.remove(&next_index) {
+                out.extend_from_slice(&child);
+                next_index += 1;
+            }
+        }
+        Ok(out)
+    })
+}
+
+fn join_subtree_to_sender<'a>(
+    fetcher: &'a dyn ChunkFetcher,
+    chunk_payload: &'a [u8],
+    subtree_span: u64,
+    offset: u64,
+    out: &'a mpsc::Sender<Vec<u8>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), JoinError>> + Send + 'a>> {
+    Box::pin(async move {
+        if subtree_span <= chunk_payload.len() as u64 {
+            out.send(chunk_payload[..subtree_span as usize].to_vec())
+                .await
+                .map_err(|_| JoinError::OutputClosed)?;
+            return Ok(());
+        }
+
+        if !chunk_payload.len().is_multiple_of(32) {
+            return Err(JoinError::MalformedChunk {
+                offset,
+                detail: format!(
+                    "intermediate payload len {} not a multiple of 32",
+                    chunk_payload.len()
+                ),
+            });
+        }
+        let refs = chunk_payload.len() / 32;
+        if refs == 0 || refs > MAX_BRANCHES {
+            return Err(JoinError::MalformedChunk {
+                offset,
+                detail: format!("intermediate ref count {refs} out of range"),
+            });
+        }
+
+        let branch_size = subtrie_section(refs, subtree_span);
+        let mut specs: Vec<(usize, [u8; 32], u64, u64)> = Vec::with_capacity(refs);
+        let mut remaining = subtree_span;
+        let mut child_offset = offset;
+        for i in 0..refs {
+            let mut child_addr = [0u8; 32];
+            child_addr.copy_from_slice(&chunk_payload[i * 32..(i + 1) * 32]);
+            let child_span = if i == refs - 1 {
+                remaining
+            } else {
+                branch_size.min(remaining)
+            };
+            specs.push((i, child_addr, child_span, child_offset));
+            remaining = remaining.saturating_sub(child_span);
+            child_offset = child_offset.saturating_add(child_span);
+        }
+
+        if specs
+            .iter()
+            .any(|(_, _, child_span, _)| *child_span > STREAM_RECURSE_THRESHOLD)
+        {
+            for (_, addr, child_span, child_offset) in specs {
+                join_child_to_sender(fetcher, addr, child_span, child_offset, out).await?;
+            }
+            return Ok(());
+        }
+
+        let fanout = FETCH_FANOUT.min(refs).max(1);
+        let mut children = stream::iter(specs.into_iter().map(
+            |(index, addr, child_span, child_offset)| async move {
+                let child =
+                    join_child_with_retries(fetcher, addr, child_span, child_offset).await?;
+                Ok((index, child))
+            },
+        ))
+        .buffer_unordered(fanout);
+
+        let mut pending = BTreeMap::new();
+        let mut next_index = 0;
+        while let Some((index, child)) = children.try_next().await? {
+            pending.insert(index, child);
+            while let Some(child) = pending.remove(&next_index) {
+                out.send(child).await.map_err(|_| JoinError::OutputClosed)?;
+                next_index += 1;
+            }
         }
         Ok(())
     })
+}
+
+async fn join_child_to_sender(
+    fetcher: &dyn ChunkFetcher,
+    addr: [u8; 32],
+    child_span: u64,
+    child_offset: u64,
+    out: &mpsc::Sender<Vec<u8>>,
+) -> Result<(), JoinError> {
+    let mut child_chunk = None;
+    for attempt in 1..=SUBTREE_RETRY_ATTEMPTS {
+        match fetcher.fetch(addr).await {
+            Ok(chunk) => {
+                child_chunk = Some(chunk);
+                break;
+            }
+            Err(e) if attempt < SUBTREE_RETRY_ATTEMPTS => {
+                tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
+                drop(e);
+            }
+            Err(e) => {
+                return Err(JoinError::FetchChunk {
+                    addr: hex::encode(addr),
+                    source: e,
+                });
+            }
+        }
+    }
+    let child_chunk = child_chunk.expect("retry loop always runs at least once");
+    let (_, child_payload) = split_chunk(&child_chunk, child_offset)?;
+    join_subtree_to_sender(fetcher, child_payload, child_span, child_offset, out).await
+}
+
+async fn join_child_with_retries(
+    fetcher: &dyn ChunkFetcher,
+    addr: [u8; 32],
+    child_span: u64,
+    child_offset: u64,
+) -> Result<Vec<u8>, JoinError> {
+    let mut last_err = None;
+    for attempt in 1..=SUBTREE_RETRY_ATTEMPTS {
+        match join_child_once(fetcher, addr, child_span, child_offset).await {
+            Ok(child) => return Ok(child),
+            Err(e) if is_transient_join_error(&e) && attempt < SUBTREE_RETRY_ATTEMPTS => {
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.expect("retry loop always runs at least once"))
+}
+
+async fn join_child_once(
+    fetcher: &dyn ChunkFetcher,
+    addr: [u8; 32],
+    child_span: u64,
+    child_offset: u64,
+) -> Result<Vec<u8>, JoinError> {
+    let child_chunk = fetcher
+        .fetch(addr)
+        .await
+        .map_err(|e| JoinError::FetchChunk {
+            addr: hex::encode(addr),
+            source: e,
+        })?;
+    let (_, child_payload) = split_chunk(&child_chunk, child_offset)?;
+    join_subtree(fetcher, child_payload, child_span, child_offset).await
+}
+
+fn is_transient_join_error(err: &JoinError) -> bool {
+    matches!(err, JoinError::FetchChunk { .. })
 }
 
 /// Split `[span (8 LE) || payload]` into its two parts, with a positional
@@ -332,8 +535,10 @@ fn subtrie_section(refs: usize, subtree_span: u64) -> u64 {
 mod tests {
     use super::*;
     use ant_crypto::cac_new;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::error::Error;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     /// HashMap-backed fetcher for tests. Pre-populated with whatever
     /// chunks the test wants the joiner to find.
@@ -354,10 +559,59 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::ChunkFetcher for MapFetcher {
-        async fn fetch(
-            &self,
-            addr: [u8; 32],
-        ) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+        async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+            self.chunks
+                .get(&addr)
+                .cloned()
+                .ok_or_else(|| -> Box<dyn Error + Send + Sync> {
+                    format!("missing chunk {}", hex::encode(addr)).into()
+                })
+        }
+    }
+
+    /// Fetcher that makes selected leaf chunks linger long enough for
+    /// the test to observe whether independent subtrees overlap.
+    struct ObservedFetcher {
+        chunks: HashMap<[u8; 32], Vec<u8>>,
+        delayed: HashSet<[u8; 32]>,
+        active_delayed: AtomicUsize,
+        max_active_delayed: AtomicUsize,
+    }
+
+    impl ObservedFetcher {
+        fn new() -> Self {
+            Self {
+                chunks: HashMap::new(),
+                delayed: HashSet::new(),
+                active_delayed: AtomicUsize::new(0),
+                max_active_delayed: AtomicUsize::new(0),
+            }
+        }
+
+        fn insert(&mut self, addr: [u8; 32], wire: Vec<u8>) {
+            self.chunks.insert(addr, wire);
+        }
+
+        fn insert_delayed(&mut self, addr: [u8; 32], wire: Vec<u8>) {
+            self.delayed.insert(addr);
+            self.insert(addr, wire);
+        }
+
+        fn max_active_delayed(&self) -> usize {
+            self.max_active_delayed.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ChunkFetcher for ObservedFetcher {
+        async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+            if self.delayed.contains(&addr) {
+                let active = self.active_delayed.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_active_delayed.fetch_max(active, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                self.active_delayed.fetch_sub(1, Ordering::SeqCst);
+            }
+
             self.chunks
                 .get(&addr)
                 .cloned()
@@ -401,7 +655,9 @@ mod tests {
         fetcher.insert(addr_a, wire_a);
         fetcher.insert(addr_b, wire_b);
 
-        let out = join(&fetcher, &root_wire, DEFAULT_MAX_FILE_BYTES).await.unwrap();
+        let out = join(&fetcher, &root_wire, DEFAULT_MAX_FILE_BYTES)
+            .await
+            .unwrap();
         assert_eq!(out.len(), span as usize);
         assert!(out[..CHUNK_SIZE].iter().all(|&b| b == 0xaa));
         assert!(out[CHUNK_SIZE..].iter().all(|&b| b == 0xbb));
@@ -457,10 +713,73 @@ mod tests {
         root_wire.extend_from_slice(&total_span.to_le_bytes());
         root_wire.extend_from_slice(&root_payload);
 
-        let out = join(&fetcher, &root_wire, DEFAULT_MAX_FILE_BYTES).await.unwrap();
+        let out = join(&fetcher, &root_wire, DEFAULT_MAX_FILE_BYTES)
+            .await
+            .unwrap();
         assert_eq!(out.len(), expected.len());
         assert_eq!(&out[..256], &expected[..256], "leading prefix");
-        assert_eq!(&out[out.len() - 256..], &expected[expected.len() - 256..], "trailing");
+        assert_eq!(
+            &out[out.len() - 256..],
+            &expected[expected.len() - 256..],
+            "trailing"
+        );
+    }
+
+    /// Two large L1 subtrees should overlap while joining. The previous
+    /// implementation fetched both L1 chunks in parallel, then recursively
+    /// joined the left L1 subtree to completion before starting the right
+    /// one, so delayed leaf fetch concurrency never exceeded
+    /// `FETCH_FANOUT`. The fixed joiner builds sibling subtrees in
+    /// parallel and restores byte order at the parent.
+    #[tokio::test]
+    async fn joins_sibling_subtrees_in_parallel() {
+        let mut fetcher = ObservedFetcher::new();
+        let mut intermediate_addrs = Vec::with_capacity(2);
+        let mut expected: Vec<u8> = Vec::with_capacity(256 * CHUNK_SIZE);
+
+        for group in 0..2u16 {
+            let mut intermediate_payload = Vec::with_capacity(128 * 32);
+            for leaf in 0..128u16 {
+                let byte = ((group * 128 + leaf) % 251) as u8;
+                let payload = vec![byte; CHUNK_SIZE];
+                let (addr, wire) = cac_new(&payload).unwrap();
+                fetcher.insert_delayed(addr, wire);
+                intermediate_payload.extend_from_slice(&addr);
+                expected.extend_from_slice(&payload);
+            }
+
+            let span = 128 * CHUNK_SIZE as u64;
+            let mut wire = Vec::new();
+            wire.extend_from_slice(&span.to_le_bytes());
+            wire.extend_from_slice(&intermediate_payload);
+            let addr = chunk_addr(&intermediate_payload, span);
+            fetcher.insert(addr, wire);
+            intermediate_addrs.push(addr);
+        }
+
+        let mut root_payload = Vec::with_capacity(2 * 32);
+        for addr in &intermediate_addrs {
+            root_payload.extend_from_slice(addr);
+        }
+        let total_span = expected.len() as u64;
+        let mut root_wire = Vec::new();
+        root_wire.extend_from_slice(&total_span.to_le_bytes());
+        root_wire.extend_from_slice(&root_payload);
+
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            join(&fetcher, &root_wire, DEFAULT_MAX_FILE_BYTES),
+        )
+        .await
+        .expect("join timed out")
+        .unwrap();
+
+        assert_eq!(out, expected);
+        assert!(
+            fetcher.max_active_delayed() > FETCH_FANOUT,
+            "expected delayed leaves from multiple L1 subtrees to overlap; max active was {}",
+            fetcher.max_active_delayed()
+        );
     }
 
     /// Cap is honored before any allocation happens. Even a manifestly
@@ -479,7 +798,9 @@ mod tests {
         wire.extend_from_slice(&bogus_payload);
 
         let fetcher = MapFetcher::new();
-        let err = join(&fetcher, &wire, DEFAULT_MAX_FILE_BYTES).await.unwrap_err();
+        let err = join(&fetcher, &wire, DEFAULT_MAX_FILE_BYTES)
+            .await
+            .unwrap_err();
         assert!(matches!(err, JoinError::TooLarge { .. }));
     }
 
@@ -495,7 +816,9 @@ mod tests {
         wire.extend_from_slice(&span);
         wire.extend_from_slice(&payload);
         let fetcher = MapFetcher::new();
-        let err = join(&fetcher, &wire, DEFAULT_MAX_FILE_BYTES).await.unwrap_err();
+        let err = join(&fetcher, &wire, DEFAULT_MAX_FILE_BYTES)
+            .await
+            .unwrap_err();
         assert!(matches!(err, JoinError::UnsupportedRedundancy { level: 1 }));
     }
 
@@ -515,8 +838,9 @@ mod tests {
         let opts = JoinOptions {
             allow_degraded_redundancy: true,
         };
-        let out =
-            join_with_options(&fetcher, &wire, DEFAULT_MAX_FILE_BYTES, opts).await.unwrap();
+        let out = join_with_options(&fetcher, &wire, DEFAULT_MAX_FILE_BYTES, opts)
+            .await
+            .unwrap();
         assert_eq!(out, payload);
     }
 
