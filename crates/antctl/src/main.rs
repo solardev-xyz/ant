@@ -8,7 +8,7 @@ use ant_control::{
     Response, StatusSnapshot,
 };
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::{
     cursor::{Hide, Show},
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -150,7 +150,18 @@ Examples:
         /// single-chunk fetches where there's nothing to track.
         #[arg(long)]
         no_progress: bool,
+        /// Progress renderer to use when stderr is a TTY. `line` is the
+        /// compact default; `visual` draws a retro block map from the
+        /// aggregate chunk counters the daemon streams today.
+        #[arg(long, value_enum, default_value = "line")]
+        progress_style: ProgressStyle,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ProgressStyle {
+    Line,
+    Visual,
 }
 
 #[derive(Subcommand, Debug)]
@@ -228,6 +239,7 @@ fn main() -> Result<()> {
             wait_timeout,
             bypass_cache,
             no_progress,
+            progress_style,
         } => {
             if wait_peers > 0 {
                 wait_for_peers(&socket, wait_peers, Duration::from_secs(wait_timeout));
@@ -258,6 +270,7 @@ fn main() -> Result<()> {
                 allow_degraded_redundancy,
                 bypass_cache,
                 show_progress,
+                progress_style,
             )?;
         }
     }
@@ -399,6 +412,7 @@ fn run_get(
     allow_degraded_redundancy: bool,
     bypass_cache: bool,
     show_progress: bool,
+    progress_style: ProgressStyle,
 ) -> Result<()> {
     let req = parse_reference_with_mode(
         reference,
@@ -409,7 +423,7 @@ fn run_get(
     )?;
 
     let (resp, last_progress) = if show_progress {
-        let mut renderer = ProgressRenderer::new(bypass_cache);
+        let mut renderer = ProgressRenderer::new(bypass_cache, progress_style);
         let resp = request_streaming(socket, &req, |p| renderer.render(p))
             .with_context(|| format!("talk to antd at {}", socket.display()))?;
         let last = renderer.finish();
@@ -491,6 +505,8 @@ const PROGRESS_EMA_ALPHA: f64 = 0.30;
 /// `GetProgress` events, plus the column count of the last line so
 /// [`finish`](Self::finish) can erase it cleanly with `\r` + spaces.
 struct ProgressRenderer {
+    /// Selected stderr renderer for this request.
+    style: ProgressStyle,
     /// Smoothed bytes/sec across the request. `None` until we have
     /// at least two samples to interpolate between.
     ema_bps: Option<f64>,
@@ -510,8 +526,9 @@ struct ProgressRenderer {
 }
 
 impl ProgressRenderer {
-    fn new(bypass_cache: bool) -> Self {
+    fn new(bypass_cache: bool, style: ProgressStyle) -> Self {
         Self {
+            style,
             ema_bps: None,
             last_line_width: 0,
             last_sample: None,
@@ -538,20 +555,35 @@ impl ProgressRenderer {
                 });
             }
         }
-        self.last_sample = Some(p.clone());
-
-        let line = format_progress_line(p, self.ema_bps, self.bypass_cache_hint);
+        let previous = self.last_sample.as_ref();
         // `\r` returns to column 0; pad with spaces to overwrite any
         // trailing characters from the previous (longer) line, then
         // write the new content. Flush so the user sees updates even
         // when stderr is line-buffered.
         use std::io::Write as _;
         let mut err = std::io::stderr().lock();
-        let new_width = display_width(&line);
-        let padding = self.last_line_width.saturating_sub(new_width);
-        let _ = write!(err, "\r{line}{}", " ".repeat(padding));
+        match self.style {
+            ProgressStyle::Line => {
+                let line = format_progress_line(p, self.ema_bps, self.bypass_cache_hint);
+                let new_width = display_width(&line);
+                let padding = self.last_line_width.saturating_sub(new_width);
+                let _ = write!(err, "\r\x1b[2K{line}{}", " ".repeat(padding));
+                self.last_line_width = new_width;
+            }
+            ProgressStyle::Visual => {
+                let (bar, stats) = format_visual_progress_lines_for_width(
+                    p,
+                    previous,
+                    self.ema_bps,
+                    self.bypass_cache_hint,
+                    terminal_width(),
+                );
+                let _ = write!(err, "\r\x1b[2K{bar}\n\r\x1b[2K{stats}\x1b[1A\r");
+                self.last_line_width = 0;
+            }
+        }
         let _ = err.flush();
-        self.last_line_width = new_width;
+        self.last_sample = Some(p.clone());
     }
 
     /// Erase the in-place status line so subsequent stderr output
@@ -562,7 +594,14 @@ impl ProgressRenderer {
         if self.last_sample.is_some() {
             use std::io::Write as _;
             let mut err = std::io::stderr().lock();
-            let _ = write!(err, "\r{}\r", " ".repeat(self.last_line_width));
+            match self.style {
+                ProgressStyle::Line => {
+                    let _ = write!(err, "\r\x1b[2K\r");
+                }
+                ProgressStyle::Visual => {
+                    let _ = write!(err, "\r\x1b[2K\n\r\x1b[2K\x1b[1A\r");
+                }
+            }
             let _ = err.flush();
         }
         self.last_sample
@@ -608,6 +647,100 @@ fn format_progress_line(p: &GetProgress, ema_bps: Option<f64>, bypass_cache: boo
     );
     let cache_tag = if bypass_cache { "[no-cache] " } else { "" };
     format!("{cache_tag}↓ {chunks} chunks  {bytes}  {rate}  {sources}  {elapsed}",)
+}
+
+/// Render a compact, defrag-style block map plus a separate stats line
+/// from aggregate progress counters. The current control protocol does
+/// not report exact chunk indexes, so the map visualizes
+/// completed-vs-pending volume rather than claiming a physical chunk
+/// layout.
+fn format_visual_progress_lines_for_width(
+    p: &GetProgress,
+    previous: Option<&GetProgress>,
+    ema_bps: Option<f64>,
+    bypass_cache: bool,
+    terminal_width: usize,
+) -> (String, String) {
+    const MAX_BLOCKS: usize = 72;
+    let percent = if p.total_chunks_estimate > 0 {
+        let capped = p.chunks_done.min(p.total_chunks_estimate);
+        format!(
+            "{:>5.1}%",
+            capped as f64 * 100.0 / p.total_chunks_estimate as f64
+        )
+    } else {
+        " ?.?%".to_string()
+    };
+    let chunks = if p.total_chunks_estimate > 0 {
+        format!("{}/{}", p.chunks_done, p.total_chunks_estimate)
+    } else {
+        format!("{}/?", p.chunks_done)
+    };
+    let rate = match ema_bps {
+        Some(bps) if bps > 0.0 => format!("{}/s", format_bytes(bps as u64)),
+        _ => "--/s".to_string(),
+    };
+    let cache_tag = if bypass_cache { "[no-cache] " } else { "" };
+    let stats = format!(
+        "{cache_tag}{percent}  {chunks}ch  {rate}  {}p/{}c  {}",
+        p.peers_used,
+        p.cache_hits,
+        format_progress_elapsed(p.elapsed_ms),
+    );
+    let blocks = terminal_width.saturating_sub(2).min(MAX_BLOCKS);
+
+    let total = visual_total_chunks(p);
+    let done_blocks = visual_done_blocks(p.chunks_done, total, blocks);
+    let previous_done_blocks = previous
+        .map(|prev| visual_done_blocks(prev.chunks_done, total, blocks))
+        .unwrap_or(0)
+        .min(done_blocks);
+    let cache_blocks =
+        visual_done_blocks(p.cache_hits.min(p.chunks_done), total, blocks).min(done_blocks);
+    let scan = if blocks > 0 {
+        ((p.elapsed_ms / 150) as usize) % blocks
+    } else {
+        0
+    };
+
+    let mut map = String::with_capacity(blocks);
+    for i in 0..blocks {
+        let ch = if i < done_blocks {
+            if i >= previous_done_blocks && previous.is_some() {
+                '▓'
+            } else if i < cache_blocks {
+                '▣'
+            } else {
+                '█'
+            }
+        } else if p.total_chunks_estimate == 0 && i == scan {
+            '▒'
+        } else {
+            '░'
+        };
+        map.push(ch);
+    }
+
+    (format!("[{map}]"), stats)
+}
+
+fn visual_total_chunks(p: &GetProgress) -> u64 {
+    if p.total_chunks_estimate > 0 {
+        p.total_chunks_estimate
+    } else {
+        // Before the root span is known, reserve some pending space so
+        // early samples still look like an in-flight map instead of a
+        // completed tiny file.
+        p.chunks_done.saturating_add(16).max(16)
+    }
+}
+
+fn visual_done_blocks(chunks_done: u64, total_chunks: u64, blocks: usize) -> usize {
+    if chunks_done == 0 || total_chunks == 0 || blocks == 0 {
+        return 0;
+    }
+    let capped = chunks_done.min(total_chunks);
+    ((capped * blocks as u64).div_ceil(total_chunks)) as usize
 }
 
 /// Single-line post-download summary printed once the in-place
@@ -691,10 +824,17 @@ fn format_bytes(n: u64) -> String {
 }
 
 /// Approximate display width in columns. Good enough for the progress
-/// line, which is plain ASCII plus a couple of well-known glyphs (the
-/// `↓` arrow and the em-dash); we treat each `char` as one column.
+/// line, which is plain ASCII plus a few well-known progress glyphs
+/// (`↓`, `█`, `░`); we treat each `char` as one column.
 fn display_width(s: &str) -> usize {
     s.chars().count()
+}
+
+fn terminal_width() -> usize {
+    terminal::size()
+        .map(|(width, _)| width as usize)
+        .unwrap_or(80)
+        .max(20)
 }
 
 /// Decode a `0x`-prefixed (or bare) hex string from the daemon's
@@ -2034,5 +2174,37 @@ mod tests {
         let line = format_progress_line(&s, None, false);
         assert!(line.contains("1/?"), "got: {line}");
         assert!(line.contains("4.0KiB/?"), "got: {line}");
+    }
+
+    #[test]
+    fn visual_progress_line_draws_block_map() {
+        let previous = sample(3, 10, 12 * 1024, 40 * 1024);
+        let mut current = sample(5, 10, 20 * 1024, 40 * 1024);
+        current.peers_used = 2;
+        current.cache_hits = 1;
+
+        let (bar, stats) = format_visual_progress_lines_for_width(
+            &current,
+            Some(&previous),
+            Some(8.0 * 1024.0),
+            false,
+            80,
+        );
+        assert!(bar.contains('▣'), "got: {bar}");
+        assert!(bar.contains('▓'), "got: {bar}");
+        assert!(bar.contains('░'), "got: {bar}");
+        assert!(stats.contains("50.0%"), "got: {stats}");
+        assert!(stats.contains("5/10ch"), "got: {stats}");
+        assert!(stats.contains("2p/1c"), "got: {stats}");
+    }
+
+    #[test]
+    fn visual_progress_line_handles_unknown_total() {
+        let s = sample(1, 0, 4 * 1024, 0);
+        let (bar, stats) = format_visual_progress_lines_for_width(&s, None, None, true, 80);
+        assert!(bar.starts_with('['), "got: {bar}");
+        assert!(stats.starts_with("[no-cache] "), "got: {stats}");
+        assert!(stats.contains("?.?%"), "got: {stats}");
+        assert!(stats.contains("1/?ch"), "got: {stats}");
     }
 }
