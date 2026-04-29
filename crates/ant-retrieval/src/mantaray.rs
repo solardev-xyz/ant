@@ -49,6 +49,7 @@
 //! `website-index-document`, we treat that as the path. This matches what
 //! `bee/pkg/api/bzz.go` does when serving `bzz://<ref>/`.
 
+use crate::feed::{feed_from_metadata, resolve_sequence_feed, FeedError, FeedType};
 use crate::ChunkFetcher;
 use crate::{cac_valid, join, JoinError, DEFAULT_MAX_FILE_BYTES};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -116,6 +117,11 @@ pub enum ManifestError {
     /// Underlying chunk-fetch failed while loading a node.
     #[error("fetch manifest node: {0}")]
     Fetch(#[from] JoinError),
+    /// The reference is a feed manifest but feed dereferencing failed —
+    /// either the feed has no updates, the SOC signature didn't match
+    /// the declared owner, or the metadata was malformed.
+    #[error("dereference feed: {0}")]
+    Feed(#[from] FeedError),
 }
 
 /// One match in the manifest trie.
@@ -144,6 +150,43 @@ pub struct ManifestEntry {
     pub metadata: BTreeMap<String, String>,
 }
 
+/// If `root_addr` points at a *feed manifest* — a mantaray manifest
+/// whose `/` fork carries `swarm-feed-{owner,topic,type}` metadata —
+/// dereference the feed and return the address of the current content
+/// root the feed points at. Otherwise return `root_addr` unchanged.
+///
+/// This is the mechanical equivalent of bee's `goto FETCH;` in
+/// `bee/pkg/api/bzz.go::serveReference`: feed-backed `.eth` sites
+/// publish a stable feed-manifest reference that resolves transparently
+/// to whichever rolling content root is current. Callers wrap their
+/// usual lookup against the returned address, so the rest of the
+/// manifest decoder doesn't need to know feeds exist.
+pub async fn resolve_feed_root(
+    fetcher: &dyn ChunkFetcher,
+    root_addr: [u8; 32],
+) -> Result<[u8; 32], ManifestError> {
+    let root_node = load_node(fetcher, root_addr).await?;
+    // The feed metadata lives on the `/` fork's metadata blob; on the
+    // root node itself there is none. Look there first; if it isn't
+    // present, this isn't a feed manifest.
+    let Some(slash_fork) = root_node.forks.get(&b'/') else {
+        return Ok(root_addr);
+    };
+    let feed = match feed_from_metadata(&slash_fork.metadata)? {
+        Some(f) => f,
+        None => return Ok(root_addr),
+    };
+    debug!(
+        target: "ant_retrieval::mantaray",
+        feed_owner = %hex::encode(feed.owner),
+        feed_topic = %hex::encode(feed.topic),
+        "feed manifest detected; dereferencing",
+    );
+    match feed.kind {
+        FeedType::Sequence => Ok(resolve_sequence_feed(fetcher, &feed).await?),
+    }
+}
+
 /// Walk a mantaray manifest and resolve `path` to the file it points at.
 ///
 /// `fetcher` is used to load every node in the trie. `root_addr` is the
@@ -153,6 +196,11 @@ pub struct ManifestEntry {
 /// stored on the manifest's "/" fork (this is what `swarm-cli upload <file>`
 /// produces and what bee's `bzzDownloadHandler` looks up; see
 /// `bee/pkg/api/bzz.go`).
+///
+/// If `root_addr` is a feed manifest, the lookup transparently
+/// dereferences it once before walking, exactly like bee's
+/// `bzzDownloadHandler` does — callers don't need to know whether
+/// they're looking at a static manifest or a feed.
 pub async fn lookup_path(
     fetcher: &dyn ChunkFetcher,
     root_addr: [u8; 32],
@@ -160,10 +208,12 @@ pub async fn lookup_path(
 ) -> Result<LookupResult, ManifestError> {
     let path = path.trim_start_matches('/');
 
-    let root_node = load_node(fetcher, root_addr).await?;
+    let effective_root = resolve_feed_root(fetcher, root_addr).await?;
+    let root_node = load_node(fetcher, effective_root).await?;
     debug!(
         target: "ant_retrieval::mantaray",
         root = %hex::encode(root_addr),
+        effective_root = %hex::encode(effective_root),
         forks = root_node.forks.len(),
         "loaded mantaray root",
     );
@@ -207,13 +257,19 @@ pub async fn lookup_path(
 }
 
 /// List paths and metadata stored in a mantaray manifest.
+///
+/// If `root_addr` is a feed manifest, the listing transparently
+/// dereferences it first and lists the *resolved* content root — this
+/// matches the behaviour callers expect from a "show me what's at this
+/// reference" API and what the gateway exposes at `/v0/manifest/<addr>`.
 pub async fn list_manifest(
     fetcher: &dyn ChunkFetcher,
     root_addr: [u8; 32],
 ) -> Result<Vec<ManifestEntry>, ManifestError> {
-    let root_node = load_node(fetcher, root_addr).await?;
+    let effective_root = resolve_feed_root(fetcher, root_addr).await?;
+    let root_node = load_node(fetcher, effective_root).await?;
     let mut entries = Vec::new();
-    let mut visited = HashSet::from([root_addr]);
+    let mut visited = HashSet::from([effective_root]);
     collect_entries(
         fetcher,
         root_node,
@@ -995,5 +1051,124 @@ mod tests {
         let raw = b"\n\n\n";
         let m = parse_metadata(raw).unwrap();
         assert!(m.is_empty());
+    }
+
+    /// End-to-end walk of the blog.swarm.eth content manifest for the
+    /// path `/search`. This was the request that timed out in
+    /// production with a flood of `chunk=00000000…` retrievals. With
+    /// the parser in good shape, walking should return a clean
+    /// `NotFound` (the `s` fork's child node has prefix
+    /// `earch/index.html` which doesn't match the user's `earch`),
+    /// **without** ever asking the fetcher for an all-zero address.
+    /// `MapFetcher` panics on an unknown chunk, so any spurious
+    /// fetch surfaces as a test failure.
+    #[tokio::test]
+    async fn walk_blog_swarm_eth_search_returns_not_found() {
+        const ROOT_PAYLOAD: &str = "00000000000000000000000000000000000000000000000000000000000000005768b3b6a7db56d21d1abff40d41cebfc83448fed8d7e9b06ec0d3b073f28f2000000000000000000000000000000000000000000000000000000000000000000000000000801000000000007a03a9040000000000000000000000000000000012012f00000000000000000000000000000000000000000000000000000000000cc878d32c96126d47f63fbe391114ee1438cd521146fc975dea1546d302b6c0003e7b22776562736974652d696e6465782d646f63756d656e74223a22696e6465782e68746d6c227d0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a12083430342e68746d6c000000000000000000000000000000000000000000009d2afcaf1de60508865777137fc2eafd61221b37101083a0b4847dc818d6b4e7005e7b22436f6e74656e742d54797065223a22746578742f68746d6c3b20636861727365743d7574662d38222c2246696c656e616d65223a223430342e68746d6c227d0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a1a1061646d696e2f2e67697469676e6f726500000000000000000000000000003891cf97520e77cc4b11d0606863f6d25b1476ee01e23eed4ec8196a74ac8fea005e7b22436f6e74656e742d54797065223a226170706c69636174696f6e2f6f637465742d73747265616d222c2246696c656e616d65223a222e67697469676e6f7265227d0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0401630000000000000000000000000000000000000000000000000000000000d7b04da63d26b8b8b40300102f810a7ca5247095d6c6a6d030d8d9f25e9dea71120b64656661756c742e706e6700000000000000000000000000000000000000e1eb16a43f2bd7d41cc476c129eace731e4c9f620b8d6241a6e3c051ba7b4bd7003e7b22436f6e74656e742d54797065223a22696d6167652f706e67222c2246696c656e616d65223a2264656661756c742e706e67227d0a0a0a0a0a0a0a0a0a0c03656e2f000000000000000000000000000000000000000000000000000000d30d9932f844f8aeeef19f8aa2a45fd90c83aba3afed92447ba0931b4cf29ddb0401660000000000000000000000000000000000000000000000000000000000348afc6f95e6dd6612631a66777352849add9f451f43490dd220f44a03ad548d0c05686976652f0000000000000000000000000000000000000000000000000094289260467f5cb1a285b1d6d772f585337e1202eacd148c0d2e95eca29206b1120a696e6465782e68746d6c0000000000000000000000000000000000000000ba2e49319f9718dedc1cebd3b3d1933c41b3212aa89677e2e5c5a1bae3518375005e7b22436f6e74656e742d54797065223a22746578742f68746d6c3b20636861727365743d7574662d38222c2246696c656e616d65223a22696e6465782e68746d6c227d0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0c097061676566696e642f00000000000000000000000000000000000000000031f2e6c0601ee97fd5127b3c00d4539b183b2dd8a4380f280b186f066bdfba7a0401730000000000000000000000000000000000000000000000000000000000e8aa9151a4c271bc7099cd1de086aa563b6b2e5ad8191e5208ad55fdaccb44840c0875706c6f6164732f000000000000000000000000000000000000000000002613920be866d1dc196a1ebe17bf89058d7f3236fbbb6b0206b286fab20d45eb0c0477616d2f0000000000000000000000000000000000000000000000000000fadf98f25eb13245da5a0ee52a9c899d964a5d8bd9b1716787a69779118c82df0c037a682f00000000000000000000000000000000000000000000000000000069892465cd55cbd6cce1e3fcca4b24566355dfa05fdbfadb80341181e60b640b";
+        const S_PAYLOAD: &str = "00000000000000000000000000000000000000000000000000000000000000005768b3b6a7db56d21d1abff40d41cebfc83448fed8d7e9b06ec0d3b073f28f20000000000000000000000000000000000000000000000000000000000000000000000000000000000000000020028000000000000000000000000000000000001a1065617263682f696e6465782e68746d6c000000000000000000000000000014c3a451758dcac5dc003b131c20df4d012898f304c492d0264db0d6d1552bcc005e7b22436f6e74656e742d54797065223a22746578742f68746d6c3b20636861727365743d7574662d38222c2246696c656e616d65223a22696e6465782e68746d6c227d0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a120a6974656d61702e786d6c0000000000000000000000000000000000000000d8de45fc0674d70a63a8f51378f6a714a9e5d288ec925accf8b65d13a701d939003e7b22436f6e74656e742d54797065223a226170706c69636174696f6e2f786d6c222c2246696c656e616d65223a22736974656d61702e786d6c227d0a0a0a04057761726d5f00000000000000000000000000000000000000000000000000ced34a771ed8377594ea6fca11c76ec22f61d4366882c658dcb9ae7dba644ae3";
+
+        // The chunks the fetcher needs are stored as `span (8 LE) ‖
+        // payload`. For these manifests the span byte width is the
+        // payload length itself (single-chunk node).
+        let root_payload = hex::decode(ROOT_PAYLOAD).unwrap();
+        let s_payload = hex::decode(S_PAYLOAD).unwrap();
+        let root_addr = decode_addr(
+            "567fbf0f92c09ad52afd736398deb3a674a6f8eca2495694292f42a859d9e60e",
+        );
+        let s_addr = decode_addr(
+            "e8aa9151a4c271bc7099cd1de086aa563b6b2e5ad8191e5208ad55fdaccb4484",
+        );
+        let mut root_wire = Vec::with_capacity(8 + root_payload.len());
+        root_wire.extend_from_slice(&(root_payload.len() as u64).to_le_bytes());
+        root_wire.extend_from_slice(&root_payload);
+        let mut s_wire = Vec::with_capacity(8 + s_payload.len());
+        s_wire.extend_from_slice(&(s_payload.len() as u64).to_le_bytes());
+        s_wire.extend_from_slice(&s_payload);
+
+        let mut fetcher = MapFetcher::new();
+        fetcher.insert(root_addr, root_wire);
+        fetcher.insert(s_addr, s_wire);
+
+        let err = lookup_path(&fetcher, root_addr, "search").await.unwrap_err();
+        assert!(
+            matches!(err, ManifestError::NotFound { .. }),
+            "expected NotFound, got {err:?}",
+        );
+    }
+
+    /// Real-world fixture: the `s` child node from blog.swarm.eth's
+    /// content manifest. This is the node `walk` descends into when
+    /// asked for `/search/...` — three forks (`e` for `earch/index.html`,
+    /// `i` for `itemap.xml`, `w` for `warm_`).
+    #[test]
+    fn unmarshal_real_blog_swarm_eth_s_child() {
+        const PAYLOAD_HEX: &str = "00000000000000000000000000000000000000000000000000000000000000005768b3b6a7db56d21d1abff40d41cebfc83448fed8d7e9b06ec0d3b073f28f20000000000000000000000000000000000000000000000000000000000000000000000000000000000000000020028000000000000000000000000000000000001a1065617263682f696e6465782e68746d6c000000000000000000000000000014c3a451758dcac5dc003b131c20df4d012898f304c492d0264db0d6d1552bcc005e7b22436f6e74656e742d54797065223a22746578742f68746d6c3b20636861727365743d7574662d38222c2246696c656e616d65223a22696e6465782e68746d6c227d0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a120a6974656d61702e786d6c0000000000000000000000000000000000000000d8de45fc0674d70a63a8f51378f6a714a9e5d288ec925accf8b65d13a701d939003e7b22436f6e74656e742d54797065223a226170706c69636174696f6e2f786d6c222c2246696c656e616d65223a22736974656d61702e786d6c227d0a0a0a04057761726d5f00000000000000000000000000000000000000000000000000ced34a771ed8377594ea6fca11c76ec22f61d4366882c658dcb9ae7dba644ae3";
+        let payload = hex::decode(PAYLOAD_HEX).expect("hex");
+        assert_eq!(payload.len(), 480);
+        let node = Node::unmarshal(&payload).expect("unmarshal");
+        let mut keys: Vec<u8> = node.forks.keys().copied().collect();
+        keys.sort();
+        assert_eq!(keys, b"eiw".to_vec());
+        let e = node.forks.get(&b'e').unwrap();
+        assert_eq!(e.prefix, b"earch/index.html");
+        assert_eq!(
+            hex::encode(e.child_ref),
+            "14c3a451758dcac5dc003b131c20df4d012898f304c492d0264db0d6d1552bcc"
+        );
+    }
+
+    /// Real-world fixture: the resolved content manifest of
+    /// `blog.swarm.eth` at feed index 47 (April 2026). Captured as the
+    /// raw 1440-byte node payload (post-span-strip). This is the
+    /// manifest `antd` was failing to walk after feed dereferencing —
+    /// the on-disk obfuscation key happens to be all zeros, so
+    /// XOR-decryption is a no-op and bee's parse can be exercised
+    /// directly. Pins the v0.2 fork header layout (type, prefix_len,
+    /// padded prefix, child_ref, optional metadata size + bytes) so
+    /// any drift between us and bee surfaces here rather than as a
+    /// silent all-zero `child_ref` request at runtime.
+    #[test]
+    fn unmarshal_real_blog_swarm_eth_root() {
+        // 1440 bytes = exactly the chunk payload (no outer span).
+        const PAYLOAD_HEX: &str = "00000000000000000000000000000000000000000000000000000000000000005768b3b6a7db56d21d1abff40d41cebfc83448fed8d7e9b06ec0d3b073f28f2000000000000000000000000000000000000000000000000000000000000000000000000000801000000000007a03a9040000000000000000000000000000000012012f00000000000000000000000000000000000000000000000000000000000cc878d32c96126d47f63fbe391114ee1438cd521146fc975dea1546d302b6c0003e7b22776562736974652d696e6465782d646f63756d656e74223a22696e6465782e68746d6c227d0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a12083430342e68746d6c000000000000000000000000000000000000000000009d2afcaf1de60508865777137fc2eafd61221b37101083a0b4847dc818d6b4e7005e7b22436f6e74656e742d54797065223a22746578742f68746d6c3b20636861727365743d7574662d38222c2246696c656e616d65223a223430342e68746d6c227d0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a1a1061646d696e2f2e67697469676e6f726500000000000000000000000000003891cf97520e77cc4b11d0606863f6d25b1476ee01e23eed4ec8196a74ac8fea005e7b22436f6e74656e742d54797065223a226170706c69636174696f6e2f6f637465742d73747265616d222c2246696c656e616d65223a222e67697469676e6f7265227d0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0401630000000000000000000000000000000000000000000000000000000000d7b04da63d26b8b8b40300102f810a7ca5247095d6c6a6d030d8d9f25e9dea71120b64656661756c742e706e6700000000000000000000000000000000000000e1eb16a43f2bd7d41cc476c129eace731e4c9f620b8d6241a6e3c051ba7b4bd7003e7b22436f6e74656e742d54797065223a22696d6167652f706e67222c2246696c656e616d65223a2264656661756c742e706e67227d0a0a0a0a0a0a0a0a0a0c03656e2f000000000000000000000000000000000000000000000000000000d30d9932f844f8aeeef19f8aa2a45fd90c83aba3afed92447ba0931b4cf29ddb0401660000000000000000000000000000000000000000000000000000000000348afc6f95e6dd6612631a66777352849add9f451f43490dd220f44a03ad548d0c05686976652f0000000000000000000000000000000000000000000000000094289260467f5cb1a285b1d6d772f585337e1202eacd148c0d2e95eca29206b1120a696e6465782e68746d6c0000000000000000000000000000000000000000ba2e49319f9718dedc1cebd3b3d1933c41b3212aa89677e2e5c5a1bae3518375005e7b22436f6e74656e742d54797065223a22746578742f68746d6c3b20636861727365743d7574662d38222c2246696c656e616d65223a22696e6465782e68746d6c227d0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0c097061676566696e642f00000000000000000000000000000000000000000031f2e6c0601ee97fd5127b3c00d4539b183b2dd8a4380f280b186f066bdfba7a0401730000000000000000000000000000000000000000000000000000000000e8aa9151a4c271bc7099cd1de086aa563b6b2e5ad8191e5208ad55fdaccb44840c0875706c6f6164732f000000000000000000000000000000000000000000002613920be866d1dc196a1ebe17bf89058d7f3236fbbb6b0206b286fab20d45eb0c0477616d2f0000000000000000000000000000000000000000000000000000fadf98f25eb13245da5a0ee52a9c899d964a5d8bd9b1716787a69779118c82df0c037a682f00000000000000000000000000000000000000000000000000000069892465cd55cbd6cce1e3fcca4b24566355dfa05fdbfadb80341181e60b640b";
+        let payload = hex::decode(PAYLOAD_HEX).expect("hex");
+        assert_eq!(payload.len(), 1440);
+        let node = Node::unmarshal(&payload).expect("unmarshal");
+
+        // 14 forks: '/', '4', 'a', 'c', 'd', 'e', 'f', 'h', 'i', 'p',
+        // 's', 'u', 'w', 'z'. (Verified against `swarm-cli` output.)
+        let want_keys: Vec<u8> = b"/4acdefhipsuwz".to_vec();
+        let mut got_keys: Vec<u8> = node.forks.keys().copied().collect();
+        got_keys.sort();
+        assert_eq!(got_keys, want_keys, "fork set mismatch");
+
+        // Spot-check three forks across the manifest to catch drift in
+        // either the meta-size handling (fork[/]: with-metadata, big
+        // meta) or the bare-edge case (fork[c]: edge, no meta).
+        let slash = node.forks.get(&b'/').expect("/ fork");
+        assert_eq!(slash.prefix, b"/");
+        assert_eq!(
+            hex::encode(slash.child_ref),
+            "0cc878d32c96126d47f63fbe391114ee1438cd521146fc975dea1546d302b6c0",
+        );
+        assert_eq!(
+            slash.metadata.get("website-index-document").map(String::as_str),
+            Some("index.html"),
+        );
+
+        let s_fork = node.forks.get(&b's').expect("s fork");
+        assert_eq!(s_fork.prefix, b"s");
+        assert_eq!(
+            hex::encode(s_fork.child_ref),
+            "e8aa9151a4c271bc7099cd1de086aa563b6b2e5ad8191e5208ad55fdaccb4484",
+        );
+        assert!(s_fork.metadata.is_empty());
+
+        let z_fork = node.forks.get(&b'z').expect("z fork");
+        assert_eq!(z_fork.prefix, b"zh/");
+        assert_eq!(
+            hex::encode(z_fork.child_ref),
+            "69892465cd55cbd6cce1e3fcca4b24566355dfa05fdbfadb80341181e60b640b",
+        );
     }
 }

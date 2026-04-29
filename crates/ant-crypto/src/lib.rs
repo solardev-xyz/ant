@@ -6,9 +6,11 @@
 
 pub mod bmt;
 mod error;
+pub mod soc;
 
 pub use bmt::{bmt_hash_with_span, bmt_root, cac_new, cac_valid, CHUNK_SIZE, SPAN_SIZE};
 pub use error::CryptoError;
+pub use soc::{soc_valid, SOC_HEADER_SIZE, SOC_ID_SIZE, SOC_MIN_CHUNK_SIZE, SOC_SIG_SIZE};
 
 use k256::ecdsa::{RecoveryId, Signature, SigningKey, VerifyingKey};
 use sha3::{Digest, Keccak256};
@@ -96,12 +98,46 @@ pub fn sign_handshake_data(
     Ok(out)
 }
 
+/// Sign a 32-byte prehash directly, **without** the EIP-191 wrapping
+/// `sign_handshake_data` adds. Used for Swarm SOC signing where the
+/// digest is the raw `keccak256(id ‖ cac_address)` — see
+/// `bee/pkg/soc/soc.go::Sign`.
+///
+/// Output format matches `sign_handshake_data`: `r ‖ s ‖ v` with `v`
+/// in `27..=30`, i.e. compatible with [`recover_public_key_from_prehash`].
+pub fn sign_prehash(
+    secret: &[u8; SECP256K1_SECRET_LEN],
+    digest: &[u8; 32],
+) -> Result<[u8; 65], CryptoError> {
+    let sk = SigningKey::from_bytes(secret.into())?;
+    let (sig, recid) = sk.sign_prehash_recoverable(digest)?;
+    let v = recid.to_byte().saturating_add(27);
+    let mut out = [0u8; 65];
+    out[..32].copy_from_slice(sig.r().to_bytes().as_slice());
+    out[32..64].copy_from_slice(sig.s().to_bytes().as_slice());
+    out[64] = v;
+    Ok(out)
+}
+
 /// Recover signer public key from a Bee / Ethereum 65-byte signature (`r‖s‖v` with `v` in 27..=30).
 pub fn recover_public_key(
     signature: &[u8; 65],
     sign_data: &[u8],
 ) -> Result<VerifyingKey, CryptoError> {
     let digest = ethereum_signed_message_hash(sign_data);
+    recover_public_key_from_prehash(signature, &digest)
+}
+
+/// Recover signer public key from a 65-byte signature over an
+/// already-computed 32-byte digest (no EIP-191 prefix wrapping).
+///
+/// Used by Swarm's single-owner-chunk verification, which signs
+/// `keccak256(id ‖ cac_address)` directly — see Bee
+/// `pkg/soc/soc.go::FromChunk`.
+pub fn recover_public_key_from_prehash(
+    signature: &[u8; 65],
+    digest: &[u8; 32],
+) -> Result<VerifyingKey, CryptoError> {
     let recid = RecoveryId::try_from(
         signature[64]
             .checked_sub(27)
@@ -109,7 +145,7 @@ pub fn recover_public_key(
     )
     .map_err(|_| CryptoError::BadSignature)?;
     let sig = Signature::from_slice(&signature[..64])?;
-    Ok(VerifyingKey::recover_from_prehash(&digest, &sig, recid)?)
+    Ok(VerifyingKey::recover_from_prehash(digest, &sig, recid)?)
 }
 
 /// Verify a BZZ handshake signature and optionally that overlay matches `nonce` + `network_id`.
