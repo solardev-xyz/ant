@@ -983,6 +983,38 @@ fn handle_control_command(
                 let _ = ack.send(reply).await;
             });
         }
+        ControlCommand::ListBzz {
+            reference,
+            bypass_cache,
+            ack,
+        } => {
+            let peers_rx = state.peers_watch.subscribe();
+            if peers_rx.borrow().is_empty() {
+                send_terminal_ack(
+                    &ack,
+                    ControlAck::Error {
+                        message: "no peers available; wait for handshakes to complete".to_string(),
+                    },
+                );
+                return;
+            }
+            let control = control.clone();
+            let cache = state.cache_for_request(bypass_cache);
+            let record_dir = state.chunk_record_dir.clone();
+            let inflight_limit = state.retrieval_inflight.clone();
+            tokio::spawn(async move {
+                let reply = run_list_bzz(
+                    control,
+                    peers_rx,
+                    cache,
+                    record_dir,
+                    inflight_limit,
+                    reference,
+                )
+                .await;
+                let _ = ack.send(reply).await;
+            });
+        }
     }
 }
 
@@ -1326,6 +1358,44 @@ async fn try_get_bytes(
 fn root_span_to_u64(wire: &[u8]) -> Option<u64> {
     let span: [u8; 8] = wire.get(..8)?.try_into().ok()?;
     Some(u64::from_le_bytes(span))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_list_bzz(
+    control: Control,
+    peers_rx: watch::Receiver<Vec<(libp2p::PeerId, [u8; 32])>>,
+    cache: Arc<ant_retrieval::InMemoryChunkCache>,
+    record_dir: Option<PathBuf>,
+    inflight_limit: Arc<Semaphore>,
+    reference: [u8; 32],
+) -> ControlAck {
+    if peers_rx.borrow().is_empty() {
+        return ControlAck::Error {
+            message: "no peers available; wait for handshakes to complete".to_string(),
+        };
+    }
+
+    let fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx)
+        .with_cache(cache)
+        .with_record_dir(record_dir)
+        .with_inflight_limit(inflight_limit)
+        .with_request_inflight_limit(RETRIEVAL_REQUEST_INFLIGHT_CAP);
+
+    match ant_retrieval::list_manifest(&fetcher, reference).await {
+        Ok(entries) => ControlAck::Manifest {
+            entries: entries
+                .into_iter()
+                .map(|entry| ant_control::ManifestEntryInfo {
+                    path: entry.path,
+                    reference: entry.reference.map(hex::encode),
+                    metadata: entry.metadata,
+                })
+                .collect(),
+        },
+        Err(e) => ControlAck::Error {
+            message: format!("list manifest {}: {e}", hex::encode(reference)),
+        },
+    }
 }
 
 /// Resolve the optional per-request `max_bytes` override into the

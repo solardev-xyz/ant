@@ -40,6 +40,11 @@ pub fn build(handle: GatewayHandle) -> Router {
         .route("/chequebook/balance", get(stubs::chequebook_balance))
         .route("/chunks/{addr}", get_or_head(retrieval::chunk))
         .route("/bytes/{addr}", get_or_head(retrieval::bytes))
+        // Ant-specific extension (not part of bee Tier-A): list paths in
+        // a mantaray manifest. Namespaced under `/v0/` so the bee compat
+        // surface stays clean and the demo UI at `vibing.at/ant/` can
+        // still introspect manifests.
+        .route("/v0/manifest/{addr}", get(retrieval::manifest))
         .route("/bzz/{addr}", get_or_head(retrieval::bzz_root))
         // Trailing-slash root: bee treats `/bzz/<addr>/` as equivalent to
         // `/bzz/<addr>` (both resolve to the manifest's

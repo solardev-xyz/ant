@@ -30,7 +30,7 @@ use ant_control::{
 use ant_gateway::testkit::build_router;
 use ant_gateway::{GatewayHandle, GatewayIdentity};
 use ant_retrieval::{
-    join_to_sender, join_with_options, lookup_path, ChunkFetcher, JoinOptions,
+    join_to_sender, join_with_options, list_manifest, lookup_path, ChunkFetcher, JoinOptions,
     DEFAULT_MAX_FILE_BYTES,
 };
 use async_trait::async_trait;
@@ -370,6 +370,28 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
                     filename: lookup.metadata.get("Filename").cloned(),
                 },
                 Err(e) => ControlAck::Error { message: e },
+            };
+            let _ = ack.send(reply).await;
+        }
+        ControlCommand::ListBzz {
+            reference,
+            bypass_cache: _,
+            ack,
+        } => {
+            let reply = match list_manifest(fetcher, reference).await {
+                Ok(entries) => ControlAck::Manifest {
+                    entries: entries
+                        .into_iter()
+                        .map(|entry| ant_control::ManifestEntryInfo {
+                            path: entry.path,
+                            reference: entry.reference.map(hex::encode),
+                            metadata: entry.metadata,
+                        })
+                        .collect(),
+                },
+                Err(e) => ControlAck::Error {
+                    message: e.to_string(),
+                },
             };
             let _ = ack.send(reply).await;
         }

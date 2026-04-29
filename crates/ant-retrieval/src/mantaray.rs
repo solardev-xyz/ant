@@ -51,7 +51,7 @@
 
 use crate::ChunkFetcher;
 use crate::{cac_valid, join, JoinError, DEFAULT_MAX_FILE_BYTES};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use thiserror::Error;
 use tracing::{debug, trace};
 
@@ -73,7 +73,10 @@ const FORK_PRE_REF_SIZE: usize = 32; // type(1) + prefixLen(1) + prefix(30)
 const FORK_METADATA_SIZE_BYTES: usize = 2;
 const NODE_TYPE_VALUE: u8 = 2;
 const NODE_TYPE_EDGE: u8 = 4;
+const NODE_TYPE_PATH_SEPARATOR: u8 = 8;
 const NODE_TYPE_WITH_METADATA: u8 = 16;
+const MANIFEST_LIST_MAX_DEPTH: usize = 6;
+const MANIFEST_LIST_MAX_ENTRIES: usize = 512;
 
 const VERSION_02_HASH_HEX: &str =
     "5768b3b6a7db56d21d1abff40d41cebfc83448fed8d7e9b06ec0d3b073f28f7b";
@@ -126,6 +129,19 @@ pub struct LookupResult {
     /// All metadata at the matched value node. Caller may inspect for
     /// `Filename` etc.
     pub metadata: HashMap<String, String>,
+}
+
+/// One path/value discovered while walking a mantaray manifest.
+#[derive(Debug, Clone)]
+pub struct ManifestEntry {
+    /// Path prefix represented by this manifest entry.
+    pub path: String,
+    /// File data reference for value entries. `None` means the entry only
+    /// carries metadata, e.g. the synthetic `/` fork with
+    /// `website-index-document`.
+    pub reference: Option<[u8; 32]>,
+    /// Metadata attached to this entry or fork.
+    pub metadata: BTreeMap<String, String>,
 }
 
 /// Walk a mantaray manifest and resolve `path` to the file it points at.
@@ -188,6 +204,27 @@ pub async fn lookup_path(
         &effective_path,
     )
     .await
+}
+
+/// List paths and metadata stored in a mantaray manifest.
+pub async fn list_manifest(
+    fetcher: &dyn ChunkFetcher,
+    root_addr: [u8; 32],
+) -> Result<Vec<ManifestEntry>, ManifestError> {
+    let root_node = load_node(fetcher, root_addr).await?;
+    let mut entries = Vec::new();
+    let mut visited = HashSet::from([root_addr]);
+    collect_entries(
+        fetcher,
+        root_node,
+        String::new(),
+        &mut entries,
+        &mut visited,
+        0,
+    )
+    .await?;
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(entries)
 }
 
 /// Recursive walker. Loads nodes lazily from `fetcher` as it descends.
@@ -269,6 +306,133 @@ fn walk<'a>(
     })
 }
 
+fn metadata_to_btree(metadata: HashMap<String, String>) -> BTreeMap<String, String> {
+    metadata.into_iter().collect()
+}
+
+fn collect_entries<'a>(
+    fetcher: &'a dyn ChunkFetcher,
+    node: Node,
+    path: String,
+    entries: &'a mut Vec<ManifestEntry>,
+    visited: &'a mut HashSet<[u8; 32]>,
+    depth: usize,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ManifestError>> + Send + 'a>> {
+    Box::pin(async move {
+        if entries.len() >= MANIFEST_LIST_MAX_ENTRIES {
+            return Ok(());
+        }
+
+        let node_has_value = node.entry.len() == 32 && node.entry.iter().any(|&b| b != 0);
+        let node_metadata = node.metadata.clone();
+        if node_has_value {
+            let mut reference = [0u8; 32];
+            reference.copy_from_slice(&node.entry);
+            entries.push(ManifestEntry {
+                path: if path.is_empty() {
+                    "/".to_string()
+                } else {
+                    path.clone()
+                },
+                reference: Some(reference),
+                metadata: metadata_to_btree(node_metadata),
+            });
+        } else if !node_metadata.is_empty() {
+            entries.push(ManifestEntry {
+                path: if path.is_empty() {
+                    "/".to_string()
+                } else {
+                    path.clone()
+                },
+                reference: None,
+                metadata: metadata_to_btree(node_metadata),
+            });
+        }
+
+        if depth >= MANIFEST_LIST_MAX_DEPTH {
+            return Ok(());
+        }
+
+        let mut forks: Vec<Fork> = node.forks.into_values().collect();
+        forks.sort_by(|a, b| a.prefix.cmp(&b.prefix));
+        for fork in forks {
+            if entries.len() >= MANIFEST_LIST_MAX_ENTRIES {
+                break;
+            }
+
+            let fork_path = format!("{path}{}", String::from_utf8_lossy(&fork.prefix));
+            if fork.child_ref == [0u8; 32] {
+                if !fork.metadata.is_empty() {
+                    entries.push(ManifestEntry {
+                        path: if fork_path.is_empty() {
+                            "/".to_string()
+                        } else {
+                            fork_path
+                        },
+                        reference: None,
+                        metadata: metadata_to_btree(fork.metadata),
+                    });
+                }
+                continue;
+            }
+
+            if !visited.insert(fork.child_ref) {
+                entries.push(ManifestEntry {
+                    path: if fork_path.is_empty() {
+                        "/".to_string()
+                    } else {
+                        fork_path
+                    },
+                    reference: Some(fork.child_ref),
+                    metadata: metadata_to_btree(fork.metadata),
+                });
+                continue;
+            }
+
+            match load_node(fetcher, fork.child_ref).await {
+                Ok(mut child_node) => {
+                    let child_path = child_listing_path(&fork_path, fork.node_type);
+                    for (k, v) in fork.metadata {
+                        child_node.metadata.entry(k).or_insert(v);
+                    }
+                    collect_entries(fetcher, child_node, child_path, entries, visited, depth + 1)
+                        .await?;
+                }
+                Err(ManifestError::NotAManifest) => {
+                    entries.push(ManifestEntry {
+                        path: if fork_path.is_empty() {
+                            "/".to_string()
+                        } else {
+                            fork_path
+                        },
+                        reference: Some(fork.child_ref),
+                        metadata: metadata_to_btree(fork.metadata),
+                    });
+                }
+                Err(_) => {
+                    entries.push(ManifestEntry {
+                        path: if fork_path.is_empty() {
+                            "/".to_string()
+                        } else {
+                            fork_path
+                        },
+                        reference: Some(fork.child_ref),
+                        metadata: metadata_to_btree(fork.metadata),
+                    });
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+fn child_listing_path(path: &str, node_type: u8) -> String {
+    if !path.is_empty() && !path.ends_with('/') && (node_type & NODE_TYPE_PATH_SEPARATOR) != 0 {
+        format!("{path}/")
+    } else {
+        path.to_string()
+    }
+}
 /// Fetch a manifest node by reference and unmarshal it.
 async fn load_node(fetcher: &dyn ChunkFetcher, addr: [u8; 32]) -> Result<Node, ManifestError> {
     // The node is itself a Swarm file: fetch the root chunk, then join.
@@ -307,6 +471,7 @@ struct Node {
 
 #[derive(Debug, Clone)]
 struct Fork {
+    node_type: u8,
     prefix: Vec<u8>,
     child_ref: [u8; 32],
     metadata: HashMap<String, String>,
@@ -436,12 +601,12 @@ impl Node {
                 forks.insert(
                     b,
                     Fork {
+                        node_type: f_type,
                         prefix,
                         child_ref,
                         metadata: HashMap::new(),
                     },
                 );
-                let _ = f_type;
                 offset += FORK_PRE_REF_SIZE + ref_size;
             } else {
                 // mantaray:0.2
@@ -495,6 +660,7 @@ impl Node {
                 forks.insert(
                     b,
                     Fork {
+                        node_type: f_type,
                         prefix,
                         child_ref,
                         metadata: fork_meta,

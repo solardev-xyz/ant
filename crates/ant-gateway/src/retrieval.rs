@@ -28,7 +28,7 @@ use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode}
 use axum::response::Response;
 use bytes::Bytes;
 use futures::stream;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
@@ -195,6 +195,23 @@ pub async fn bzz_with_path(
     bzz_inner(handle, addr, path, method, headers).await
 }
 
+/// `GET /v0/manifest/{addr}`. Lists the paths and metadata currently
+/// discoverable in a mantaray manifest. This is an Ant-specific
+/// extension — bee does not expose manifest enumeration on its public
+/// HTTP API — and is namespaced under `/v0/` to keep the bee Tier-A
+/// surface byte-for-byte compatible.
+pub async fn manifest(State(handle): State<GatewayHandle>, Path(addr): Path<String>) -> Response {
+    let reference = match parse_reference(&addr) {
+        Ok(r) => r,
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, e),
+    };
+
+    match dispatch_list_bzz(&handle, reference, DEFAULT_REQUEST_TIMEOUT).await {
+        Ok(entries) => json_response(StatusCode::OK, &ManifestListing { entries }),
+        Err(e) => e,
+    }
+}
+
 async fn bzz_inner(
     handle: GatewayHandle,
     addr: String,
@@ -236,6 +253,11 @@ struct BzzOutcome {
     data: Vec<u8>,
     content_type: Option<String>,
     filename: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ManifestListing {
+    entries: Vec<ant_control::ManifestEntryInfo>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -452,6 +474,36 @@ async fn dispatch_get_bzz(
             }
             other => {
                 warn!(target: "ant_gateway", ?other, "unexpected ack from GetBzz");
+                Err(json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "unexpected node ack",
+                ))
+            }
+        })
+}
+
+#[allow(clippy::result_large_err)]
+async fn dispatch_list_bzz(
+    handle: &GatewayHandle,
+    reference: [u8; 32],
+    timeout: Duration,
+) -> Result<Vec<ant_control::ManifestEntryInfo>, Response> {
+    let (ack_tx, mut ack_rx) = ant_control::streaming_ack_channel();
+    let cmd = ControlCommand::ListBzz {
+        reference,
+        bypass_cache: false,
+        ack: ack_tx,
+    };
+    if handle.commands.send(cmd).await.is_err() {
+        return Err(node_unavailable());
+    }
+    drain_terminal(&mut ack_rx, timeout)
+        .await
+        .and_then(|ack| match ack {
+            ControlAck::Manifest { entries } => Ok(entries),
+            ControlAck::Error { message } => Err(json_error(StatusCode::NOT_FOUND, message)),
+            other => {
+                warn!(target: "ant_gateway", ?other, "unexpected ack from ListBzz");
                 Err(json_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "unexpected node ack",
@@ -806,6 +858,17 @@ fn node_unavailable() -> Response {
         StatusCode::SERVICE_UNAVAILABLE,
         "node loop is no longer accepting commands",
     )
+}
+
+fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Response {
+    let body = serde_json::to_vec(value).expect("serialize json response");
+    let mut resp = Response::new(Body::from(body));
+    *resp.status_mut() = status;
+    let _ = resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    resp
 }
 
 /// Tiny `humantime`-shaped duration parser so we don't pull in a whole

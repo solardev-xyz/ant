@@ -54,8 +54,8 @@ pub use joiner::{
     join, join_to_sender, join_with_options, JoinError, JoinOptions, DEFAULT_MAX_FILE_BYTES,
 };
 pub use mantaray::{
-    lookup_path, LookupResult, ManifestError, MANTARAY_CONTENT_TYPE_KEY, MANTARAY_ERROR_DOC_KEY,
-    MANTARAY_INDEX_DOC_KEY,
+    list_manifest, lookup_path, LookupResult, ManifestEntry, ManifestError,
+    MANTARAY_CONTENT_TYPE_KEY, MANTARAY_ERROR_DOC_KEY, MANTARAY_INDEX_DOC_KEY,
 };
 pub use progress::{estimate_total_chunks, ProgressSample, ProgressTracker};
 

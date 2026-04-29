@@ -11,6 +11,8 @@
 use crate::protocol::{
     GetProgress, Request, Response, StatusSnapshot, VersionInfo, PROTOCOL_VERSION,
 };
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
@@ -106,6 +108,13 @@ pub enum ControlCommand {
         max_bytes: Option<u64>,
         ack: mpsc::Sender<ControlAck>,
     },
+    /// List the paths and metadata in a mantaray manifest. Gateway-only
+    /// helper for the `/manifest/{addr}` inspection endpoint.
+    ListBzz {
+        reference: [u8; 32],
+        bypass_cache: bool,
+        ack: mpsc::Sender<ControlAck>,
+    },
     /// Join the multi-chunk tree rooted at `reference` (a `/bytes/` ref,
     /// no manifest) and ack with the joined file bytes. See
     /// [`ControlCommand::GetBzz`] for `bypass_cache`, `progress`, and
@@ -147,6 +156,9 @@ pub enum ControlAck {
         content_type: Option<String>,
         filename: Option<String>,
     },
+    Manifest {
+        entries: Vec<ManifestEntryInfo>,
+    },
     /// Streaming progress sample for a `GetBytes` / `GetBzz` request.
     /// Producer can fire as many of these as it likes; the dispatcher
     /// keeps writing them until a terminal variant arrives or the
@@ -162,6 +174,15 @@ pub enum ControlAck {
     Error {
         message: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestEntryInfo {
+    pub path: String,
+    #[serde(default)]
+    pub reference: Option<String>,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
 }
 
 impl ControlAck {
@@ -490,6 +511,9 @@ fn ack_to_response(ack: ControlAck) -> Response {
             hex: format!("0x{}", hex::encode(data)),
             content_type,
             filename,
+        },
+        ControlAck::Manifest { .. } => Response::Error {
+            message: "manifest listing is only supported by ant-gateway".to_string(),
         },
         ControlAck::Progress(p) => Response::Progress(p),
         ControlAck::BytesStreamStart { .. } | ControlAck::BytesChunk { .. } => Response::Error {
