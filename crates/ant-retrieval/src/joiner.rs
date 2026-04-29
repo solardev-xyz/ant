@@ -261,8 +261,20 @@ fn join_subtree<'a>(
                 ),
             });
         }
+        // Bee's splitter zero-pads trailing ref slots when the last
+        // branch doesn't fill the chunk. Strip those before computing
+        // `refs`, otherwise we dispatch `fetch([0u8; 32])` requests
+        // that every peer rejects.
+        let effective = effective_payload_size(chunk_payload);
+        if effective == 0 {
+            return Err(JoinError::MalformedChunk {
+                offset,
+                detail: "intermediate chunk has no non-zero refs".into(),
+            });
+        }
+        let chunk_payload = &chunk_payload[..effective];
         let refs = chunk_payload.len() / 32;
-        if refs == 0 || refs > MAX_BRANCHES {
+        if refs > MAX_BRANCHES {
             return Err(JoinError::MalformedChunk {
                 offset,
                 detail: format!("intermediate ref count {refs} out of range"),
@@ -351,8 +363,18 @@ fn join_subtree_to_sender<'a>(
                 ),
             });
         }
+        // Strip trailing zero-padding before treating the chunk as a
+        // ref array; see `effective_payload_size` for the rationale.
+        let effective = effective_payload_size(chunk_payload);
+        if effective == 0 {
+            return Err(JoinError::MalformedChunk {
+                offset,
+                detail: "intermediate chunk has no non-zero refs".into(),
+            });
+        }
+        let chunk_payload = &chunk_payload[..effective];
         let refs = chunk_payload.len() / 32;
-        if refs == 0 || refs > MAX_BRANCHES {
+        if refs > MAX_BRANCHES {
             return Err(JoinError::MalformedChunk {
                 offset,
                 detail: format!("intermediate ref count {refs} out of range"),
@@ -501,6 +523,41 @@ fn split_chunk(data: &[u8], offset: u64) -> Result<([u8; 8], &[u8]), JoinError> 
 /// legitimate span has its high byte clear.
 fn is_redundancy_none(span: [u8; 8]) -> bool {
     span[7] == 0
+}
+
+/// Effective payload size of an intermediate chunk: trailing 32-byte
+/// all-zero ref slots are zero-padding, not real children.
+///
+/// Mirrors `bee/pkg/file/utils.go::ChunkPayloadSize`. The splitter that
+/// produces intermediate chunks always writes a `[ref; N]` array, but
+/// when the file's last branch isn't full it leaves the trailing slots
+/// zeroed. The joiner has to drop those slots before iterating —
+/// otherwise it dispatches `fetch([0u8; 32])` requests to peers, which
+/// bee's retrieval handler rejects with `invalid address queried by
+/// peer …`. (We saw this in the wild as a 30s timeout flood when
+/// serving a feed-backed `.eth` site whose index document was a 12-ref
+/// intermediate chunk in a 128-slot payload — 116 spurious fetches per
+/// request.)
+///
+/// Returns the byte length up to and including the last non-zero
+/// 32-byte slot, rounded up to a 32-byte boundary. Callers slice with
+/// `payload[..effective_payload_size(payload)]` before computing
+/// `refs`. An all-zero payload yields `0`, which the caller surfaces
+/// as a malformed chunk (intermediate payloads must hold at least one
+/// child).
+fn effective_payload_size(payload: &[u8]) -> usize {
+    const HASH: usize = 32;
+    let mut l = payload.len();
+    // Don't overshoot a non-multiple-of-32 payload; outer code already
+    // rejects those, but be defensive.
+    l -= l % HASH;
+    while l >= HASH {
+        if payload[l - HASH..l].iter().any(|&b| b != 0) {
+            return l;
+        }
+        l -= HASH;
+    }
+    0
 }
 
 /// Compute the per-child subtrie capacity of an intermediate chunk with
@@ -856,5 +913,73 @@ mod tests {
         // but here we have a synthetic span, so go via `bmt_hash_with_span`.
         let span_bytes: [u8; 8] = wire[..8].try_into().unwrap();
         ant_crypto::bmt_hash_with_span(&span_bytes, payload).unwrap()
+    }
+
+    /// `effective_payload_size` strips trailing zero refs and rounds
+    /// down to the last non-zero 32-byte slot. Pinned because a
+    /// regression here re-introduces the all-zero fetch flood that
+    /// shipped the joiner straight into a 30s timeout when serving a
+    /// feed-backed `.eth` site (3 leaves padded to 128 ref slots →
+    /// 125 spurious peer requests).
+    #[test]
+    fn effective_payload_size_strips_trailing_zeros() {
+        // No padding: the whole payload is real refs.
+        let mut full = vec![0u8; 128 * 32];
+        for slot in full.chunks_mut(32) {
+            slot[0] = 1;
+        }
+        assert_eq!(effective_payload_size(&full), 128 * 32);
+
+        // 12 real refs followed by 116 zero slots = bee's typical
+        // shape for a small file in a redundancy-NONE intermediate
+        // chunk. Effective size is 12 * 32 = 384.
+        let mut padded = vec![0u8; 128 * 32];
+        for slot in padded[..12 * 32].chunks_mut(32) {
+            slot[0] = 0xab;
+        }
+        assert_eq!(effective_payload_size(&padded), 12 * 32);
+
+        // All zeros: caller surfaces this as a malformed chunk error.
+        let zeros = vec![0u8; 4096];
+        assert_eq!(effective_payload_size(&zeros), 0);
+
+        // Single non-zero ref at the start.
+        let mut one = vec![0u8; 4096];
+        one[0] = 1;
+        assert_eq!(effective_payload_size(&one), 32);
+    }
+
+    /// End-to-end: the joiner must NOT dispatch zero-address fetches
+    /// when an intermediate chunk has trailing zero-padded ref slots.
+    /// Build a 12-leaf file whose intermediate root is zero-padded to
+    /// 128 slots, then prove `join` returns the joined bytes without
+    /// ever asking `MapFetcher` for `[0u8; 32]` (`MapFetcher` panics
+    /// on missing chunks, so a stray fetch surfaces as a test panic).
+    #[tokio::test]
+    async fn join_skips_trailing_zero_padded_refs() {
+        let mut fetcher = MapFetcher::new();
+        let mut leaf_addrs = Vec::new();
+        let mut expected = Vec::new();
+        for i in 0..12 {
+            let payload: Vec<u8> = (0..CHUNK_SIZE as u8).map(|b| b.wrapping_add(i)).collect();
+            let (addr, wire) = cac_new(&payload).unwrap();
+            fetcher.insert(addr, wire);
+            leaf_addrs.push(addr);
+            expected.extend_from_slice(&payload);
+        }
+        // Build the intermediate root: 12 real refs ‖ 116 zero refs.
+        let mut root_payload = vec![0u8; 128 * 32];
+        for (i, addr) in leaf_addrs.iter().enumerate() {
+            root_payload[i * 32..(i + 1) * 32].copy_from_slice(addr);
+        }
+        let total_span = expected.len() as u64;
+        let mut root_wire = Vec::new();
+        root_wire.extend_from_slice(&total_span.to_le_bytes());
+        root_wire.extend_from_slice(&root_payload);
+
+        let out = join(&fetcher, &root_wire, DEFAULT_MAX_FILE_BYTES)
+            .await
+            .expect("join should succeed without zero-ref fetches");
+        assert_eq!(out, expected);
     }
 }
