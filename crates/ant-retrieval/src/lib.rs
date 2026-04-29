@@ -43,23 +43,28 @@
 //! deliberately don't here.
 
 pub mod cache;
+pub mod feed;
 pub mod fetcher;
 pub mod joiner;
 pub mod mantaray;
 pub mod progress;
 
 pub use cache::{InMemoryChunkCache, DEFAULT_CAPACITY as DEFAULT_CACHE_CAPACITY};
+pub use feed::{
+    feed_from_metadata, resolve_sequence_feed, sequence_update_address, Feed, FeedError, FeedType,
+    FEED_OWNER_KEY, FEED_TOPIC_KEY, FEED_TYPE_KEY,
+};
 pub use fetcher::{Overlay, RoutingFetcher};
 pub use joiner::{
     join, join_to_sender, join_with_options, JoinError, JoinOptions, DEFAULT_MAX_FILE_BYTES,
 };
 pub use mantaray::{
-    list_manifest, lookup_path, LookupResult, ManifestEntry, ManifestError,
+    list_manifest, lookup_path, resolve_feed_root, LookupResult, ManifestEntry, ManifestError,
     MANTARAY_CONTENT_TYPE_KEY, MANTARAY_ERROR_DOC_KEY, MANTARAY_INDEX_DOC_KEY,
 };
 pub use progress::{estimate_total_chunks, ProgressSample, ProgressTracker};
 
-use ant_crypto::{cac_valid, CHUNK_SIZE, SPAN_SIZE};
+use ant_crypto::{cac_valid, soc_valid, CHUNK_SIZE, SOC_HEADER_SIZE, SPAN_SIZE};
 use async_trait::async_trait;
 use futures::io::{AsyncReadExt, AsyncWriteExt};
 use libp2p::{PeerId, StreamProtocol};
@@ -266,10 +271,24 @@ async fn retrieve_chunk_inner(
         return Err(RetrievalError::Remote(delivery.err));
     }
 
-    if delivery.data.len() < SPAN_SIZE || delivery.data.len() > SPAN_SIZE + CHUNK_SIZE {
+    // Size envelope covers both chunk types. CAC is `span(8) ‖
+    // payload` (≤ 4104). SOC is `id(32) ‖ sig(65) ‖ inner_cac` and the
+    // inner CAC can itself be up to `SPAN_SIZE + CHUNK_SIZE` (≤ 4201
+    // total). Use the SOC max as the cap; the lower cap is the
+    // smallest possible CAC (span only).
+    if delivery.data.len() < SPAN_SIZE
+        || delivery.data.len() > SOC_HEADER_SIZE + SPAN_SIZE + CHUNK_SIZE
+    {
         return Err(RetrievalError::BadPayloadSize(delivery.data.len()));
     }
-    if !cac_valid(&address, &delivery.data) {
+    // Bee accepts both content-addressed chunks (BMT-bound) and
+    // single-owner chunks (signature + owner-bound). The retrieval
+    // protocol returns the same `Delivery` shape for both — see
+    // `bee/pkg/retrieval/retrieval.go`, where the validator chain is
+    // `if !cac.Valid { if !soc.Valid { invalid } }`. SOC chunks carry
+    // feed updates and other mutable references, so a gateway that
+    // only accepts CAC silently breaks every feed-backed `.eth` site.
+    if !cac_valid(&address, &delivery.data) && !soc_valid(&address, &delivery.data) {
         return Err(RetrievalError::InvalidChunk);
     }
 
