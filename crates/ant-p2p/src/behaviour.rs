@@ -8,7 +8,7 @@ use crate::routing::{Overlay, RoutingTable};
 use crate::sinks;
 use ant_control::{
     ControlAck, ControlCommand, GetProgress, HandshakeReport, PeerConnectionInfo,
-    PeerConnectionState, PeerPipelineEntry, RoutingInfo, StatusSnapshot,
+    PeerConnectionState, PeerPipelineEntry, RoutingInfo, StatusSnapshot, StreamRange,
 };
 use ant_crypto::{
     ethereum_address_from_public_key, overlay_from_ethereum_address, OVERLAY_NONCE_LEN,
@@ -895,6 +895,8 @@ fn handle_control_command(
             reference,
             bypass_cache,
             max_bytes,
+            range,
+            head_only,
             ack,
         } => {
             let peers_rx = state.peers_watch.subscribe();
@@ -922,6 +924,52 @@ fn handle_control_command(
                     tracker,
                     reference,
                     max_bytes,
+                    range,
+                    head_only,
+                    ack,
+                )
+                .await;
+            });
+        }
+        ControlCommand::StreamBzz {
+            reference,
+            path,
+            allow_degraded_redundancy,
+            bypass_cache,
+            max_bytes,
+            range,
+            head_only,
+            ack,
+        } => {
+            let peers_rx = state.peers_watch.subscribe();
+            if peers_rx.borrow().is_empty() {
+                send_terminal_ack(
+                    &ack,
+                    ControlAck::Error {
+                        message: "no peers available; wait for handshakes to complete".to_string(),
+                    },
+                );
+                return;
+            }
+            let control = control.clone();
+            let cache = state.cache_for_request(bypass_cache);
+            let record_dir = state.chunk_record_dir.clone();
+            let inflight_limit = state.retrieval_inflight.clone();
+            let tracker = Arc::new(ProgressTracker::new(bypass_cache));
+            tokio::spawn(async move {
+                run_stream_bzz(
+                    control,
+                    peers_rx,
+                    cache,
+                    record_dir,
+                    inflight_limit,
+                    tracker,
+                    reference,
+                    path,
+                    allow_degraded_redundancy,
+                    max_bytes,
+                    range,
+                    head_only,
                     ack,
                 )
                 .await;
@@ -1028,6 +1076,8 @@ async fn run_stream_bytes(
     tracker: Arc<ProgressTracker>,
     reference: [u8; 32],
     max_bytes: Option<u64>,
+    range: Option<StreamRange>,
+    head_only: bool,
     ack: mpsc::Sender<ControlAck>,
 ) {
     use ant_retrieval::ChunkFetcher;
@@ -1050,7 +1100,12 @@ async fn run_stream_bytes(
             return;
         }
     };
-    let Some(total_bytes) = root_span_to_u64(&root) else {
+    // `/bytes` does not pass `allow_degraded_redundancy`; if the root
+    // span carries an RS level the joiner will reject the file later.
+    // We still mask before reporting `total_bytes` so the gateway's
+    // `Content-Length` reflects the real file size when (eventually) we
+    // wire RS recovery in.
+    let Some(total_bytes) = root_span_to_u64_masked(&root) else {
         let _ = ack
             .send(ControlAck::Error {
                 message: format!("root chunk {} shorter than span", hex::encode(reference)),
@@ -1067,17 +1122,242 @@ async fn run_stream_bytes(
         return;
     }
 
+    if head_only {
+        let _ = ack.send(ControlAck::StreamDone).await;
+        return;
+    }
+
+    stream_root_chunk_with_range(&fetcher, root, total_bytes, max_bytes, range, reference, ack)
+        .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_stream_bzz(
+    control: Control,
+    peers_rx: watch::Receiver<Vec<(libp2p::PeerId, [u8; 32])>>,
+    cache: Arc<ant_retrieval::InMemoryChunkCache>,
+    record_dir: Option<PathBuf>,
+    inflight_limit: Arc<Semaphore>,
+    tracker: Arc<ProgressTracker>,
+    reference: [u8; 32],
+    path: String,
+    allow_degraded_redundancy: bool,
+    max_bytes: Option<u64>,
+    range: Option<StreamRange>,
+    head_only: bool,
+    ack: mpsc::Sender<ControlAck>,
+) {
+    use ant_retrieval::{lookup_path, ChunkFetcher, ManifestError};
+
+    // Reuse the same retry envelope as `run_get_bzz` for the manifest
+    // walk. Once the data root has landed and we've emitted
+    // `BzzStreamStart`, we cannot restart the response — `join_to_sender`
+    // (and its range-aware sibling) handle in-place subtree retries
+    // themselves, so the consumer sees a continuous stream.
+    let mut last_error = None;
+    for attempt in 1..=MAX_FETCH_ATTEMPTS {
+        if peers_rx.borrow().is_empty() {
+            let _ = ack
+                .send(ControlAck::Error {
+                    message: "no peers available; wait for handshakes to complete".to_string(),
+                })
+                .await;
+            return;
+        }
+        let fetcher = ant_retrieval::RoutingFetcher::new(control.clone(), peers_rx.clone())
+            .with_cache(cache.clone())
+            .with_record_dir(record_dir.clone())
+            .with_progress(tracker.clone())
+            .with_inflight_limit(inflight_limit.clone())
+            .with_request_inflight_limit(RETRIEVAL_REQUEST_INFLIGHT_CAP);
+
+        let lookup = match lookup_path(&fetcher, reference, &path).await {
+            Ok(r) => r,
+            Err(ManifestError::NotAManifest) => {
+                let _ = ack
+                    .send(ControlAck::Error {
+                        message: format!(
+                            "{} is not a mantaray manifest; try /bytes",
+                            hex::encode(reference)
+                        ),
+                    })
+                    .await;
+                return;
+            }
+            Err(e) if is_manifest_transient(&e) && attempt < MAX_FETCH_ATTEMPTS => {
+                last_error = Some(format!("manifest lookup '{path}': {e}"));
+                let backoff = RETRY_BACKOFF_BASE * attempt as u32;
+                warn!(
+                    target: "ant_p2p",
+                    attempt,
+                    next_in_ms = backoff.as_millis() as u64,
+                    "stream_bzz manifest lookup failed, retrying: {e}",
+                );
+                tokio::time::sleep(backoff).await;
+                continue;
+            }
+            Err(e) => {
+                let _ = ack
+                    .send(ControlAck::Error {
+                        message: format!("manifest lookup '{path}': {e}"),
+                    })
+                    .await;
+                return;
+            }
+        };
+
+        let data_ref = lookup.data_ref;
+        debug!(
+            target: "ant_p2p",
+            manifest = %hex::encode(reference),
+            path = %path,
+            data_ref = %hex::encode(data_ref),
+            content_type = ?lookup.content_type,
+            "stream_bzz manifest resolved",
+        );
+
+        let root = match fetcher.fetch(data_ref).await {
+            Ok(r) => r,
+            Err(e) if attempt < MAX_FETCH_ATTEMPTS => {
+                last_error = Some(format!("fetch data root {}: {e}", hex::encode(data_ref)));
+                let backoff = RETRY_BACKOFF_BASE * attempt as u32;
+                warn!(
+                    target: "ant_p2p",
+                    attempt,
+                    next_in_ms = backoff.as_millis() as u64,
+                    "stream_bzz data root fetch failed, retrying: {e}",
+                );
+                tokio::time::sleep(backoff).await;
+                continue;
+            }
+            Err(e) => {
+                let _ = ack
+                    .send(ControlAck::Error {
+                        message: format!("fetch data root {}: {e}", hex::encode(data_ref)),
+                    })
+                    .await;
+                return;
+            }
+        };
+
+        let Some(total_bytes) = root_span_to_u64_masked(&root) else {
+            let _ = ack
+                .send(ControlAck::Error {
+                    message: format!("data root {} shorter than span", hex::encode(data_ref)),
+                })
+                .await;
+            return;
+        };
+        tracker.set_total_bytes(total_bytes);
+
+        let filename = lookup
+            .metadata
+            .get("Filename")
+            .cloned()
+            .or_else(|| derive_filename_from_path(&path));
+        if ack
+            .send(ControlAck::BzzStreamStart {
+                total_bytes,
+                content_type: lookup.content_type,
+                filename,
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        if head_only {
+            let _ = ack.send(ControlAck::StreamDone).await;
+            return;
+        }
+
+        // Once `BzzStreamStart` has been emitted we own the stream;
+        // any further failure terminates with `Error` on the same
+        // body channel. The joiner already wraps each subtree in its
+        // own retry loop, so transient chunk misses don't leak out.
+        let join_options = ant_retrieval::JoinOptions {
+            allow_degraded_redundancy,
+        };
+        stream_root_chunk_inner(
+            &fetcher,
+            root,
+            total_bytes,
+            max_bytes,
+            range,
+            data_ref,
+            join_options,
+            ack,
+        )
+        .await;
+        return;
+    }
+    let _ = ack
+        .send(ControlAck::Error {
+            message: last_error.unwrap_or_else(|| "stream_bzz exhausted retries".to_string()),
+        })
+        .await;
+}
+
+/// Drive a streaming joiner from an already-fetched root chunk and emit
+/// `BytesChunk` acks until completion. Used by both `StreamBytes` (which
+/// has already sent its `BytesStreamStart`) and `StreamBzz` (which has
+/// already sent its `BzzStreamStart`).
+async fn stream_root_chunk_with_range(
+    fetcher: &ant_retrieval::RoutingFetcher,
+    root: Vec<u8>,
+    total_bytes: u64,
+    max_bytes: Option<u64>,
+    range: Option<StreamRange>,
+    reference: [u8; 32],
+    ack: mpsc::Sender<ControlAck>,
+) {
+    stream_root_chunk_inner(
+        fetcher,
+        root,
+        total_bytes,
+        max_bytes,
+        range,
+        reference,
+        ant_retrieval::JoinOptions::default(),
+        ack,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_root_chunk_inner(
+    fetcher: &ant_retrieval::RoutingFetcher,
+    root: Vec<u8>,
+    total_bytes: u64,
+    max_bytes: Option<u64>,
+    range: Option<StreamRange>,
+    reference: [u8; 32],
+    options: ant_retrieval::JoinOptions,
+    ack: mpsc::Sender<ControlAck>,
+) {
     let (chunk_tx, mut chunk_rx) = mpsc::channel::<Vec<u8>>(16);
     let cap = clamp_max_bytes(max_bytes);
-    let mut join_fut = Box::pin(ant_retrieval::join_to_sender(
-        &fetcher,
+    let body_range = range.and_then(|r| {
+        ant_retrieval::ByteRange::clamp(r.start, r.end_inclusive, total_bytes)
+    });
+    if range.is_some() && body_range.is_none() {
+        let _ = ack
+            .send(ControlAck::Error {
+                message: "range not satisfiable for resource".to_string(),
+            })
+            .await;
+        return;
+    }
+    let mut join_fut = Box::pin(ant_retrieval::join_to_sender_range(
+        fetcher,
         &root,
         cap,
-        ant_retrieval::JoinOptions::default(),
+        options,
+        body_range,
         chunk_tx,
     ));
     let mut join_result = None;
-
     loop {
         tokio::select! {
             result = &mut join_fut, if join_result.is_none() => {
@@ -1357,6 +1637,22 @@ async fn try_get_bytes(
 /// CAC-verified output, but cheap to guard).
 fn root_span_to_u64(wire: &[u8]) -> Option<u64> {
     let span: [u8; 8] = wire.get(..8)?.try_into().ok()?;
+    Some(u64::from_le_bytes(span))
+}
+
+/// Like [`root_span_to_u64`] but masks the redundancy level byte off the
+/// span before decoding. Bee stores the RS level in the high byte of the
+/// chunk's 8-byte span (top of the range, since a real file's span fits
+/// in 56 bits / 72 PB). Reads that go through the joiner with
+/// `allow_degraded_redundancy` set already mask, but the streaming path
+/// also reports the file's total span over the wire (`BytesStreamStart`,
+/// `BzzStreamStart`), so we need the masked value there too — otherwise
+/// the gateway emits a `Content-Length` of `0x82_<...>` instead of the
+/// real file size, and HEAD / Content-Range responses look like the
+/// file is 9 exabytes long.
+fn root_span_to_u64_masked(wire: &[u8]) -> Option<u64> {
+    let mut span: [u8; 8] = wire.get(..8)?.try_into().ok()?;
+    span[7] = 0;
     Some(u64::from_le_bytes(span))
 }
 

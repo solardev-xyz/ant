@@ -143,15 +143,21 @@ async fn gateway_raises_joiner_max_bytes_above_cli_default() {
                         .await;
                     let _ = ack.send(ControlAck::StreamDone).await;
                 }
-                ControlCommand::GetBzz { max_bytes, ack, .. } => {
+                ControlCommand::StreamBzz { max_bytes, ack, .. } => {
                     captured.lock().await.push(max_bytes);
                     let _ = ack
-                        .send(ControlAck::BzzBytes {
-                            data: b"stub".to_vec(),
+                        .send(ControlAck::BzzStreamStart {
+                            total_bytes: 4,
                             content_type: Some("text/plain".to_string()),
                             filename: None,
                         })
                         .await;
+                    let _ = ack
+                        .send(ControlAck::BytesChunk {
+                            data: b"stub".to_vec(),
+                        })
+                        .await;
+                    let _ = ack.send(ControlAck::StreamDone).await;
                 }
                 _ => {}
             }
@@ -343,6 +349,244 @@ async fn bytes_rejects_short_reference_with_400() {
         .as_str()
         .unwrap()
         .contains("reference must be 32 bytes"));
+}
+
+/// `HEAD /bytes/{addr}` mirrors `HEAD /bzz/...`: it must return
+/// `Content-Length` and `Accept-Ranges` headers identical to the GET
+/// response, with an empty body.
+#[tokio::test]
+async fn bytes_head_omits_body() {
+    let router = handle_with_fixture_node();
+    let uri = format!("/bytes/{DATA_REF}");
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::HEAD)
+            .uri(&uri)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get(header::CONTENT_LENGTH).unwrap(),
+        BODY_LEN.to_string().as_str(),
+    );
+    assert_eq!(resp.headers().get(header::ACCEPT_RANGES).unwrap(), "bytes",);
+    let bytes = body_bytes(resp).await;
+    assert!(bytes.is_empty(), "HEAD must not carry a body");
+}
+
+/// `HEAD /bzz/...` and `HEAD /bytes/...` must signal `head_only=true`
+/// to the daemon so it returns size + content-type without joining the
+/// chunk tree. Asserts directly on the dispatched `ControlCommand` —
+/// catches regressions where the gateway accidentally falls back to the
+/// full-body path and just hides the body inside axum.
+#[tokio::test]
+async fn head_dispatches_head_only_flag() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let saw_head_only = Arc::new(AtomicBool::new(false));
+    let saw_body_join = Arc::new(AtomicBool::new(false));
+    let head_clone = saw_head_only.clone();
+    let body_clone = saw_body_join.clone();
+    let router = router_with_dispatcher(move |cmd| {
+        let head = head_clone.clone();
+        let body = body_clone.clone();
+        async move {
+            if let ControlCommand::StreamBzz {
+                head_only, ack, ..
+            } = cmd
+            {
+                if head_only {
+                    head.store(true, Ordering::SeqCst);
+                }
+                let _ = ack
+                    .send(ControlAck::BzzStreamStart {
+                        total_bytes: 1024,
+                        content_type: Some("video/mp4".to_string()),
+                        filename: Some("clip.mp4".to_string()),
+                    })
+                    .await;
+                if !head_only {
+                    // If the gateway ever drove a HEAD request through
+                    // the body path, we'd see this branch fire and
+                    // surface as an extra `BytesChunk` in the response.
+                    body.store(true, Ordering::SeqCst);
+                    let _ = ack
+                        .send(ControlAck::BytesChunk {
+                            data: vec![0u8; 1024],
+                        })
+                        .await;
+                }
+                let _ = ack.send(ControlAck::StreamDone).await;
+            }
+        }
+    });
+
+    let uri = format!("/bzz/{MANIFEST_ROOT}/clip.mp4");
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::HEAD)
+            .uri(&uri)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get(header::CONTENT_LENGTH).unwrap(),
+        "1024",
+    );
+    assert_eq!(
+        resp.headers().get(header::CONTENT_TYPE).unwrap(),
+        "video/mp4",
+    );
+    let bytes = body_bytes(resp).await;
+    assert!(bytes.is_empty());
+    assert!(
+        saw_head_only.load(Ordering::SeqCst),
+        "HEAD must dispatch with head_only=true",
+    );
+    assert!(
+        !saw_body_join.load(Ordering::SeqCst),
+        "HEAD must not trigger any body chunk fetch",
+    );
+}
+
+/// `Range: bytes=0-` (browser range-probe) returns `206 Partial Content`
+/// covering the whole file. Browsers issue this exact request to decide
+/// whether the server supports ranges; without `206` they fall back to
+/// progressive download and lose seeking.
+#[tokio::test]
+async fn bzz_range_zero_dash_returns_206() {
+    let router = handle_with_fixture_node();
+    let uri = format!("/bzz/{MANIFEST_ROOT}/13/4358/2645.png");
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::GET)
+            .uri(&uri)
+            .header(header::RANGE, "bytes=0-")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        resp.headers().get(header::CONTENT_RANGE).unwrap(),
+        format!("bytes 0-{}/{BODY_LEN}", BODY_LEN - 1).as_str(),
+    );
+    assert_eq!(
+        resp.headers().get(header::CONTENT_LENGTH).unwrap(),
+        BODY_LEN.to_string().as_str(),
+    );
+    let bytes = body_bytes(resp).await;
+    assert_eq!(bytes.len(), BODY_LEN);
+    assert_eq!(sha256_hex(&bytes), BODY_SHA256);
+}
+
+/// Suffix range (`bytes=-N`) returns the last N bytes. This is what
+/// browsers issue when a media container's metadata sits at the tail of
+/// the file (MP4 with `moov` at the end).
+#[tokio::test]
+async fn bzz_suffix_range_returns_tail() {
+    let router = handle_with_fixture_node();
+    let uri = format!("/bzz/{MANIFEST_ROOT}/13/4358/2645.png");
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::GET)
+            .uri(&uri)
+            .header(header::RANGE, "bytes=-256")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    let expected_start = BODY_LEN - 256;
+    let expected_end = BODY_LEN - 1;
+    assert_eq!(
+        resp.headers().get(header::CONTENT_RANGE).unwrap(),
+        format!("bytes {expected_start}-{expected_end}/{BODY_LEN}").as_str(),
+    );
+    let bytes = body_bytes(resp).await;
+    assert_eq!(bytes.len(), 256);
+}
+
+/// `Range: bytes=START-` (open-ended) returns `[START, END]` of the file.
+/// This is the canonical "resume my interrupted download" shape.
+#[tokio::test]
+async fn bzz_open_ended_range_returns_remainder() {
+    let router = handle_with_fixture_node();
+    let uri = format!("/bzz/{MANIFEST_ROOT}/13/4358/2645.png");
+    let start: usize = 10_000;
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::GET)
+            .uri(&uri)
+            .header(header::RANGE, format!("bytes={start}-"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        resp.headers().get(header::CONTENT_RANGE).unwrap(),
+        format!("bytes {start}-{}/{BODY_LEN}", BODY_LEN - 1).as_str(),
+    );
+    let bytes = body_bytes(resp).await;
+    assert_eq!(bytes.len(), BODY_LEN - start);
+}
+
+/// Range request with a single-range header that goes past EOF returns
+/// `416 Range Not Satisfiable` with a `Content-Range: bytes */<total>`
+/// header so the client can correct its request.
+#[tokio::test]
+async fn bzz_range_past_eof_returns_416() {
+    let router = handle_with_fixture_node();
+    let uri = format!("/bzz/{MANIFEST_ROOT}/13/4358/2645.png");
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::GET)
+            .uri(&uri)
+            .header(header::RANGE, "bytes=1000000-2000000")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(
+        resp.headers().get(header::CONTENT_RANGE).unwrap(),
+        format!("bytes */{BODY_LEN}").as_str(),
+    );
+}
+
+/// Range request on `/bytes/{addr}` mirrors the `/bzz` semantics.
+#[tokio::test]
+async fn bytes_range_request_returns_partial_content() {
+    let router = handle_with_fixture_node();
+    let uri = format!("/bytes/{DATA_REF}");
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::GET)
+            .uri(&uri)
+            .header(header::RANGE, "bytes=100-199")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        resp.headers().get(header::CONTENT_RANGE).unwrap(),
+        format!("bytes 100-199/{BODY_LEN}").as_str(),
+    );
+    let bytes = body_bytes(resp).await;
+    assert_eq!(bytes.len(), 100);
 }
 
 /// Unknown chunk → bee-shaped 404 (the joiner's "fetch failed" lands on

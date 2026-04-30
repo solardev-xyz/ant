@@ -1,27 +1,42 @@
-//! D.2.3 retrieval endpoints.
+//! D.2.3 retrieval endpoints, streaming edition.
 //!
 //! Wraps the existing `ant-retrieval` machinery exposed by the node loop
 //! over `ant-control`'s command channel. The gateway never talks to
 //! libp2p directly — every chunk fetch goes through
 //! [`ant_control::ControlCommand`], reusing the routing-aware
 //! [`ant_retrieval::RoutingFetcher`], its hedging, and the long-lived
-//! chunk cache. This also means tests can swap a fake "node loop" in
-//! that replies to the same commands from a fixture-backed map.
+//! chunk cache. Tests swap a fake "node loop" in that replies to the
+//! same commands from a fixture-backed map.
 //!
-//! Body payloads materialise in memory before streaming back. The plan
-//! (PLAN.md D.2.3) calls for `Body::from_stream` so large files don't
-//! materialise, but the underlying control command still acks one
-//! `Vec<u8>`; switching to chunk-by-chunk delivery would require a
-//! streaming retrieval API on `ant-control` and is deliberately out of
-//! scope for the Tier-A drop-in. We raise the joiner's `max_bytes`
-//! ceiling to [`GATEWAY_MAX_FILE_BYTES`] so real bzz sites with media
-//! payloads (videos, archives, large images) actually load — the CLI
-//! keeps the conservative `DEFAULT_MAX_FILE_BYTES` (32 MiB) where
-//! `antctl get` is the only caller.
+//! `/bytes` and `/bzz` go through the streaming dispatch path in all
+//! cases:
+//!
+//! - **GET, no Range**: full streaming join. Headers go out as soon as
+//!   the daemon emits `BytesStreamStart` / `BzzStreamStart`; body bytes
+//!   stream as the joiner emits ordered subtrees.
+//! - **HEAD**: streaming dispatch with `head_only = true`. The daemon
+//!   resolves manifest + root span and returns metadata without joining
+//!   the chunk tree.
+//! - **GET, single Range**: streaming dispatch with a clamped
+//!   `StreamRange`. The daemon's range-aware joiner walks only the
+//!   chunks that overlap the requested byte interval; the gateway emits
+//!   `206 Partial Content` with `Content-Range` and the slice length.
+//!
+//! Multi-range requests are still rejected with `416` — the joiner
+//! produces one ordered byte stream, multipart `byteranges` would
+//! demand framing logic the plan explicitly defers (PLAN.md E.20).
+//! Body payloads do not materialise in memory: `Body::from_stream`
+//! pumps `BytesChunk` acks into hyper as they arrive.
+//!
+//! `GATEWAY_MAX_FILE_BYTES` keeps the joiner's per-request size cap
+//! generous enough for real bzz sites with media payloads (videos,
+//! archives, large images); the CLI continues to use
+//! `ant_retrieval::DEFAULT_MAX_FILE_BYTES` (32 MiB) where `antctl get`
+//! is the only caller.
 
 use std::time::Duration;
 
-use ant_control::{ControlAck, ControlCommand};
+use ant_control::{ControlAck, ControlCommand, StreamRange};
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
@@ -119,13 +134,33 @@ pub async fn chunk(
             return json_error(StatusCode::INTERNAL_SERVER_ERROR, "unexpected node ack");
         }
     };
-
-    write_response(method, bytes, "application/octet-stream", None)
+    chunk_response(method, bytes)
 }
 
-/// `GET /bytes/{addr}` and `HEAD /bytes/{addr}`. Joins the chunk tree
-/// and streams the resulting bytes back as a single body. Honors a
-/// single-range `Range` header against the joined output.
+fn chunk_response(method: Method, body: Vec<u8>) -> Response {
+    let len = body.len();
+    let body = if method == Method::HEAD {
+        Body::empty()
+    } else {
+        Body::from(body)
+    };
+    let mut resp = Response::new(body);
+    let _ = resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    let _ = resp
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    resp
+}
+
+/// `GET /bytes/{addr}` and `HEAD /bytes/{addr}`.
+///
+/// Drives the streaming dispatcher for every shape: full GET, HEAD, and
+/// single-range GET. The daemon's range-aware joiner does the heavy
+/// lifting — the gateway only translates HTTP semantics into a
+/// [`StreamRange`] and emits the right status / headers.
 pub async fn bytes(
     State(handle): State<GatewayHandle>,
     Path(addr): Path<String>,
@@ -138,36 +173,113 @@ pub async fn bytes(
         Err(e) => return json_error(StatusCode::BAD_REQUEST, e),
     };
 
-    let range_header = headers
+    let raw_range = headers
         .get(header::RANGE)
         .and_then(|v| v.to_str().ok())
         .map(String::from);
     let timeout = request_timeout(&headers, DEFAULT_REQUEST_TIMEOUT);
+    let head_only = method == Method::HEAD;
 
-    if method == Method::GET && range_header.is_none() {
-        return match dispatch_stream_bytes(&handle, reference, timeout).await {
-            Ok(streamed) => {
-                let content_type = sniff_content_type(&streamed.first_bytes, query.filename());
-                let filename = raw_bytes_filename(&addr, query.filename(), content_type);
-                streaming_response(
-                    streamed.total_bytes,
-                    streamed.body,
-                    content_type,
-                    Some(&filename),
-                )
-            }
-            Err(e) => e,
-        };
-    }
-
-    let body = match dispatch_get_bytes(&handle, reference, timeout).await {
-        Ok(b) => b,
+    // Phase 1: dispatch with head_only=true if the caller is HEAD;
+    // for GET we go straight to the streaming dispatcher.
+    let mut started = match dispatch_stream_bytes(&handle, reference, timeout, None, head_only)
+        .await
+    {
+        Ok(s) => s,
         Err(e) => return e,
     };
 
-    let content_type = sniff_content_type(&body, query.filename());
+    let total = started.total_bytes;
+    let parsed_range = match raw_range.as_deref() {
+        None => None,
+        Some(raw) => match parse_single_range(raw, total) {
+            Ok(r) => r,
+            Err(RangeError::Multi) => {
+                started.cancel();
+                return json_error(
+                    StatusCode::RANGE_NOT_SATISFIABLE,
+                    "multi-range requests not supported",
+                );
+            }
+            Err(RangeError::Unsatisfiable) => {
+                started.cancel();
+                let mut resp = json_error(
+                    StatusCode::RANGE_NOT_SATISFIABLE,
+                    "range not satisfiable for this resource",
+                );
+                let cr = format!("bytes */{total}");
+                if let Ok(v) = HeaderValue::from_str(&cr) {
+                    resp.headers_mut().insert(header::CONTENT_RANGE, v);
+                }
+                return resp;
+            }
+            Err(RangeError::Malformed) => {
+                started.cancel();
+                return json_error(StatusCode::BAD_REQUEST, "malformed Range header");
+            }
+        },
+    };
+
+    // No Range, or Range covers the whole object: serve the in-flight
+    // full-stream response we already started.
+    if parsed_range.is_none() {
+        let content_type = sniff_content_type(&started.first_bytes, query.filename());
+        let filename = raw_bytes_filename(&addr, query.filename(), content_type);
+        return streaming_response(
+            head_only,
+            total,
+            started.into_body(head_only),
+            content_type,
+            Some(&filename),
+        );
+    }
+
+    // Range request: cancel the full-body stream we just started and
+    // dispatch a fresh range-scoped one. Cancellation is a drop on the
+    // ack receiver; the daemon notices the closed channel and stops
+    // joining further subtrees.
+    started.cancel();
+    let (start, end) = parsed_range.expect("parsed_range was just checked");
+    let stream_range = StreamRange {
+        start,
+        end_inclusive: end,
+    };
+    let ranged = match dispatch_stream_bytes(
+        &handle,
+        reference,
+        timeout,
+        Some(stream_range),
+        head_only,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let sniffable_total = ranged.total_bytes;
+    // Sniffing on a tail range would mis-detect an MP4 as octet-stream.
+    // Use the filename hint when it's a partial response and the leading
+    // bytes don't start at offset 0.
+    let content_type = if start == 0 {
+        sniff_content_type(&ranged.first_bytes, query.filename())
+    } else {
+        query
+            .filename()
+            .and_then(content_type_from_extension)
+            .unwrap_or("application/octet-stream")
+    };
     let filename = raw_bytes_filename(&addr, query.filename(), content_type);
-    finalize_with_range(method, body, content_type, Some(&filename), range_header)
+    let body_len = end - start + 1;
+    partial_content_response(
+        head_only,
+        sniffable_total,
+        start,
+        end,
+        body_len,
+        ranged.into_body(head_only),
+        content_type,
+        Some(&filename),
+    )
 }
 
 /// `GET /bzz/{addr}` and `HEAD /bzz/{addr}`. Empty path resolves to
@@ -224,35 +336,104 @@ async fn bzz_inner(
         Err(e) => return json_error(StatusCode::BAD_REQUEST, e),
     };
 
-    let timeout = request_timeout(&headers, DEFAULT_REQUEST_TIMEOUT);
-
-    let outcome = match dispatch_get_bzz(&handle, reference, path, timeout).await {
-        Ok(o) => o,
-        Err(e) => return e,
-    };
-
-    let content_type = outcome
-        .content_type
-        .as_deref()
-        .unwrap_or("application/octet-stream")
-        .to_string();
-    let range_header = headers
+    let raw_range = headers
         .get(header::RANGE)
         .and_then(|v| v.to_str().ok())
         .map(String::from);
-    finalize_with_range(
-        method,
-        outcome.data,
-        &content_type,
-        outcome.filename.as_deref(),
-        range_header,
-    )
-}
+    let timeout = request_timeout(&headers, DEFAULT_REQUEST_TIMEOUT);
+    let head_only = method == Method::HEAD;
 
-struct BzzOutcome {
-    data: Vec<u8>,
-    content_type: Option<String>,
-    filename: Option<String>,
+    let mut started = match dispatch_stream_bzz(
+        &handle,
+        reference,
+        path.clone(),
+        timeout,
+        None,
+        head_only,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+
+    let total = started.total_bytes;
+    let parsed_range = match raw_range.as_deref() {
+        None => None,
+        Some(raw) => match parse_single_range(raw, total) {
+            Ok(r) => r,
+            Err(RangeError::Multi) => {
+                started.cancel();
+                return json_error(
+                    StatusCode::RANGE_NOT_SATISFIABLE,
+                    "multi-range requests not supported",
+                );
+            }
+            Err(RangeError::Unsatisfiable) => {
+                started.cancel();
+                let mut resp = json_error(
+                    StatusCode::RANGE_NOT_SATISFIABLE,
+                    "range not satisfiable for this resource",
+                );
+                let cr = format!("bytes */{total}");
+                if let Ok(v) = HeaderValue::from_str(&cr) {
+                    resp.headers_mut().insert(header::CONTENT_RANGE, v);
+                }
+                return resp;
+            }
+            Err(RangeError::Malformed) => {
+                started.cancel();
+                return json_error(StatusCode::BAD_REQUEST, "malformed Range header");
+            }
+        },
+    };
+
+    let content_type = started
+        .content_type
+        .clone()
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let filename = started.filename.clone();
+
+    if parsed_range.is_none() {
+        return streaming_response(
+            head_only,
+            total,
+            started.into_body(head_only),
+            &content_type,
+            filename.as_deref(),
+        );
+    }
+
+    started.cancel();
+    let (start, end) = parsed_range.expect("parsed_range was just checked");
+    let stream_range = StreamRange {
+        start,
+        end_inclusive: end,
+    };
+    let ranged = match dispatch_stream_bzz(
+        &handle,
+        reference,
+        path,
+        timeout,
+        Some(stream_range),
+        head_only,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let body_len = end - start + 1;
+    partial_content_response(
+        head_only,
+        total,
+        start,
+        end,
+        body_len,
+        ranged.into_body(head_only),
+        &content_type,
+        filename.as_deref(),
+    )
 }
 
 #[derive(Debug, Serialize)]
@@ -275,77 +456,193 @@ impl BytesQuery {
     }
 }
 
-struct StreamedBytes {
+/// Result of dispatching a streaming retrieval against the node loop:
+/// the prologue ack (size + optional manifest metadata) plus the live
+/// receiver still draining body chunks. The gateway sends headers as
+/// soon as it has this struct in hand and, for non-HEAD GETs, drains
+/// the receiver into the HTTP response body via `Body::from_stream`.
+///
+/// `cancel()` drops the receiver so the daemon notices the closed
+/// channel and stops fetching further subtrees. We use that when a
+/// `Range` request comes in: we issue an unranged dispatch first to
+/// learn `total_bytes`, then re-dispatch with a `StreamRange` once
+/// the range parses. Cheap because the daemon's joiner has barely
+/// started by the time the gateway has parsed the range.
+struct Started {
     total_bytes: u64,
     first_bytes: Vec<u8>,
-    body: Body,
+    /// Manifest metadata: only populated for `StreamBzz`. `None` for
+    /// `StreamBytes` since the raw chunk tree carries no content type
+    /// or filename.
+    content_type: Option<String>,
+    filename: Option<String>,
+    first_chunk: Option<Vec<u8>>,
+    rx: mpsc::Receiver<ControlAck>,
+}
+
+impl Started {
+    fn cancel(&mut self) {
+        self.rx.close();
+    }
+
+    /// Hand back the response body. For `HEAD` we want an empty body
+    /// regardless of what the daemon sent; for `GET` we wrap the live
+    /// receiver in a stream that pulls each `BytesChunk` out as a
+    /// `Bytes` slice. Consumes `self` because the caller can either
+    /// drain the body or cancel — never both.
+    fn into_body(self, head_only: bool) -> Body {
+        if head_only {
+            self.rx.close_now();
+            return Body::empty();
+        }
+        let Started {
+            first_chunk, rx, ..
+        } = self;
+        let body_stream = stream::unfold(
+            (first_chunk, rx),
+            |(mut first, mut rx)| async move {
+                if let Some(data) = first.take() {
+                    return Some((Ok::<Bytes, std::io::Error>(Bytes::from(data)), (None, rx)));
+                }
+                loop {
+                    match rx.recv().await {
+                        Some(ControlAck::BytesChunk { data }) => {
+                            return Some((
+                                Ok::<Bytes, std::io::Error>(Bytes::from(data)),
+                                (None, rx),
+                            ));
+                        }
+                        Some(ControlAck::StreamDone) | None => return None,
+                        Some(ControlAck::Progress(_)) => continue,
+                        Some(ControlAck::Error { message }) => {
+                            return Some((Err(std::io::Error::other(message)), (None, rx)));
+                        }
+                        Some(other) => {
+                            warn!(
+                                target: "ant_gateway",
+                                ?other,
+                                "unexpected ack during streaming body"
+                            );
+                            return Some((
+                                Err(std::io::Error::other("unexpected node ack")),
+                                (None, rx),
+                            ));
+                        }
+                    }
+                }
+            },
+        );
+        Body::from_stream(body_stream)
+    }
+}
+
+/// Helper trait so we can `close_now()` a receiver synchronously after
+/// we've consumed `self`. `Receiver::close()` is async-cancellable but
+/// `close()` itself is sync — we just want it shut so the daemon's
+/// `send().await` returns Err and the spawned task tears down.
+trait ReceiverClose {
+    fn close_now(self);
+}
+
+impl ReceiverClose for mpsc::Receiver<ControlAck> {
+    fn close_now(mut self) {
+        self.close();
+    }
 }
 
 // `Err(Response)` is the routine "early-return an error response" path —
 // boxing it would add a heap alloc to the failure case for no benefit.
 #[allow(clippy::result_large_err)]
-async fn dispatch_get_bytes(
-    handle: &GatewayHandle,
-    reference: [u8; 32],
-    timeout: Duration,
-) -> Result<Vec<u8>, Response> {
-    let (ack_tx, mut ack_rx) = ant_control::streaming_ack_channel();
-    let cmd = ControlCommand::GetBytes {
-        reference,
-        bypass_cache: false,
-        // Keep the control ack channel active while large joins are
-        // making progress; `drain_terminal` drops these samples but each
-        // one proves the node task is alive, so the gateway timeout acts
-        // as an idle timeout instead of a hard wall for multi-minute media
-        // downloads.
-        progress: true,
-        max_bytes: Some(GATEWAY_MAX_FILE_BYTES),
-        ack: ack_tx,
-    };
-    if handle.commands.send(cmd).await.is_err() {
-        return Err(node_unavailable());
-    }
-    drain_terminal(&mut ack_rx, timeout)
-        .await
-        .and_then(|ack| match ack {
-            ControlAck::Bytes { data } => Ok(data),
-            ControlAck::Error { message } => Err(json_error(StatusCode::NOT_FOUND, message)),
-            other => {
-                warn!(target: "ant_gateway", ?other, "unexpected ack from GetBytes");
-                Err(json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "unexpected node ack",
-                ))
-            }
-        })
-}
-
-#[allow(clippy::result_large_err)]
 async fn dispatch_stream_bytes(
     handle: &GatewayHandle,
     reference: [u8; 32],
     timeout: Duration,
-) -> Result<StreamedBytes, Response> {
-    let (ack_tx, mut ack_rx) = ant_control::streaming_ack_channel();
+    range: Option<StreamRange>,
+    head_only: bool,
+) -> Result<Started, Response> {
+    let (ack_tx, ack_rx) = ant_control::streaming_ack_channel();
     let cmd = ControlCommand::StreamBytes {
         reference,
         bypass_cache: false,
         max_bytes: Some(GATEWAY_MAX_FILE_BYTES),
+        range,
+        head_only,
         ack: ack_tx,
     };
     if handle.commands.send(cmd).await.is_err() {
         return Err(node_unavailable());
     }
+    consume_stream_prologue(ack_rx, timeout, false, head_only).await
+}
 
-    let total_bytes = loop {
-        match tokio::time::timeout(timeout, ack_rx.recv()).await {
-            Ok(Some(ControlAck::BytesStreamStart { total_bytes })) => break total_bytes,
+#[allow(clippy::result_large_err)]
+async fn dispatch_stream_bzz(
+    handle: &GatewayHandle,
+    reference: [u8; 32],
+    path: String,
+    timeout: Duration,
+    range: Option<StreamRange>,
+    head_only: bool,
+) -> Result<Started, Response> {
+    let (ack_tx, ack_rx) = ant_control::streaming_ack_channel();
+    let cmd = ControlCommand::StreamBzz {
+        reference,
+        path,
+        // The plan calls out that mainnet bzz roots commonly carry a
+        // redundancy level byte we don't yet RS-decode; bee's reader
+        // strips it and serves anyway. We follow that — the joiner
+        // still fails fast if a data chunk is actually missing.
+        allow_degraded_redundancy: true,
+        bypass_cache: false,
+        max_bytes: Some(GATEWAY_MAX_FILE_BYTES),
+        range,
+        head_only,
+        ack: ack_tx,
+    };
+    if handle.commands.send(cmd).await.is_err() {
+        return Err(node_unavailable());
+    }
+    consume_stream_prologue(ack_rx, timeout, true, head_only).await
+}
+
+/// Walk the prologue of a `StreamBytes` / `StreamBzz` response: drop
+/// `Progress` samples, accept the appropriate `*StreamStart` ack, then
+/// peek the first body chunk so the caller can sniff content type and
+/// hand the rest off to hyper as a stream. For `head_only = true` we
+/// also accept a terminal `StreamDone` immediately after the prologue
+/// — no body to peek.
+#[allow(clippy::result_large_err)]
+async fn consume_stream_prologue(
+    mut rx: mpsc::Receiver<ControlAck>,
+    timeout: Duration,
+    expect_bzz: bool,
+    head_only: bool,
+) -> Result<Started, Response> {
+    let total_bytes;
+    let mut content_type = None;
+    let mut filename = None;
+    loop {
+        match tokio::time::timeout(timeout, rx.recv()).await {
+            Ok(Some(ControlAck::BytesStreamStart { total_bytes: t })) if !expect_bzz => {
+                total_bytes = t;
+                break;
+            }
+            Ok(Some(ControlAck::BzzStreamStart {
+                total_bytes: t,
+                content_type: ct,
+                filename: fn_,
+            })) if expect_bzz => {
+                total_bytes = t;
+                content_type = ct;
+                filename = fn_;
+                break;
+            }
             Ok(Some(ControlAck::Progress(_))) => continue,
             Ok(Some(ControlAck::Error { message })) => {
-                return Err(json_error(StatusCode::NOT_FOUND, message));
+                return Err(map_retrieval_error(message));
             }
             Ok(Some(other)) => {
-                warn!(target: "ant_gateway", ?other, "unexpected ack before StreamBytes start");
+                warn!(target: "ant_gateway", ?other, expect_bzz, "unexpected ack before stream start");
                 return Err(json_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "unexpected node ack",
@@ -359,18 +656,29 @@ async fn dispatch_stream_bytes(
                 ));
             }
         }
-    };
+    }
+
+    if head_only {
+        return Ok(Started {
+            total_bytes,
+            first_bytes: Vec::new(),
+            content_type,
+            filename,
+            first_chunk: None,
+            rx,
+        });
+    }
 
     let first_chunk = loop {
-        match tokio::time::timeout(timeout, ack_rx.recv()).await {
+        match tokio::time::timeout(timeout, rx.recv()).await {
             Ok(Some(ControlAck::BytesChunk { data })) => break Some(data),
             Ok(Some(ControlAck::StreamDone)) => break None,
             Ok(Some(ControlAck::Progress(_))) => continue,
             Ok(Some(ControlAck::Error { message })) => {
-                return Err(json_error(StatusCode::NOT_FOUND, message));
+                return Err(map_retrieval_error(message));
             }
             Ok(Some(other)) => {
-                warn!(target: "ant_gateway", ?other, "unexpected ack before first StreamBytes chunk");
+                warn!(target: "ant_gateway", ?other, "unexpected ack before first body chunk");
                 return Err(json_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "unexpected node ack",
@@ -390,96 +698,27 @@ async fn dispatch_stream_bytes(
         .map(|b| b[..b.len().min(512)].to_vec())
         .unwrap_or_default();
 
-    let body_stream = stream::unfold((first_chunk, ack_rx), |(mut first, mut rx)| async move {
-        if let Some(data) = first.take() {
-            return Some((Ok::<Bytes, std::io::Error>(Bytes::from(data)), (None, rx)));
-        }
-        loop {
-            match rx.recv().await {
-                Some(ControlAck::BytesChunk { data }) => {
-                    return Some((Ok::<Bytes, std::io::Error>(Bytes::from(data)), (None, rx)));
-                }
-                Some(ControlAck::StreamDone) | None => return None,
-                Some(ControlAck::Progress(_)) => continue,
-                Some(ControlAck::Error { message }) => {
-                    return Some((
-                        Err(std::io::Error::new(std::io::ErrorKind::Other, message)),
-                        (None, rx),
-                    ));
-                }
-                Some(other) => {
-                    warn!(target: "ant_gateway", ?other, "unexpected ack during StreamBytes body");
-                    return Some((
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            "unexpected node ack",
-                        )),
-                        (None, rx),
-                    ));
-                }
-            }
-        }
-    });
-
-    Ok(StreamedBytes {
+    Ok(Started {
         total_bytes,
         first_bytes,
-        body: Body::from_stream(body_stream),
+        content_type,
+        filename,
+        first_chunk,
+        rx,
     })
 }
 
-#[allow(clippy::result_large_err)]
-async fn dispatch_get_bzz(
-    handle: &GatewayHandle,
-    reference: [u8; 32],
-    path: String,
-    timeout: Duration,
-) -> Result<BzzOutcome, Response> {
-    let (ack_tx, mut ack_rx) = ant_control::streaming_ack_channel();
-    let cmd = ControlCommand::GetBzz {
-        reference,
-        path,
-        // The plan calls out that mainnet bzz roots commonly carry a
-        // redundancy level byte we don't yet RS-decode; bee's reader
-        // strips it and serves anyway. We follow that — the joiner
-        // still fails fast if a data chunk is actually missing.
-        allow_degraded_redundancy: true,
-        bypass_cache: false,
-        progress: true,
-        max_bytes: Some(GATEWAY_MAX_FILE_BYTES),
-        ack: ack_tx,
+/// Map a daemon-reported retrieval error string into the right HTTP
+/// status. `"not found"` (joiner's `FetchChunk` wrapping a "missing
+/// chunk" remote) and manifest-lookup misses (`'path'`) become 404; the
+/// rest are bad-gateway conditions.
+fn map_retrieval_error(message: String) -> Response {
+    let status = if message.contains("not found") || message.contains("'") {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::BAD_GATEWAY
     };
-    if handle.commands.send(cmd).await.is_err() {
-        return Err(node_unavailable());
-    }
-    drain_terminal(&mut ack_rx, timeout)
-        .await
-        .and_then(|ack| match ack {
-            ControlAck::BzzBytes {
-                data,
-                content_type,
-                filename,
-            } => Ok(BzzOutcome {
-                data,
-                content_type,
-                filename,
-            }),
-            ControlAck::Error { message } => {
-                let status = if message.contains("not found") || message.contains("'") {
-                    StatusCode::NOT_FOUND
-                } else {
-                    StatusCode::BAD_GATEWAY
-                };
-                Err(json_error(status, message))
-            }
-            other => {
-                warn!(target: "ant_gateway", ?other, "unexpected ack from GetBzz");
-                Err(json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "unexpected node ack",
-                ))
-            }
-        })
+    json_error(status, message)
 }
 
 #[allow(clippy::result_large_err)]
@@ -560,44 +799,18 @@ fn request_timeout(headers: &HeaderMap, default: Duration) -> Duration {
         .unwrap_or(default)
 }
 
-fn write_response(
-    method: Method,
-    body: Vec<u8>,
-    content_type: &str,
-    filename: Option<&str>,
-) -> Response {
-    let len = body.len();
-    let body = if method == Method::HEAD {
-        Body::empty()
-    } else {
-        Body::from(body)
-    };
-    let mut resp = Response::new(body);
-    let _ = resp.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_str(content_type)
-            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
-    );
-    let _ = resp
-        .headers_mut()
-        .insert(header::CONTENT_LENGTH, HeaderValue::from(len));
-    let _ = resp
-        .headers_mut()
-        .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-    if let Some(name) = filename {
-        if let Some(v) = content_disposition(name) {
-            resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
-        }
-    }
-    resp
-}
-
+/// Build a `200 OK` (or empty `200 OK` for `HEAD`) response for a full
+/// streaming GET. `body` should already be `Body::empty()` when
+/// `head_only`; we set headers identically either way so HEAD and GET
+/// agree on `Content-Length` / `Accept-Ranges` / `Content-Disposition`.
 fn streaming_response(
+    head_only: bool,
     total_bytes: u64,
     body: Body,
     content_type: &str,
     filename: Option<&str>,
 ) -> Response {
+    let body = if head_only { Body::empty() } else { body };
     let mut resp = Response::new(body);
     let _ = resp.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -610,6 +823,49 @@ fn streaming_response(
     let _ = resp
         .headers_mut()
         .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    if let Some(name) = filename {
+        if let Some(v) = content_disposition(name) {
+            resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
+        }
+    }
+    resp
+}
+
+/// Build a `206 Partial Content` (or empty `206 Partial Content` for
+/// `HEAD`) response with the canonical bee-shape headers: `Content-Range`,
+/// `Content-Length` (the slice length, not the total), `Accept-Ranges`,
+/// and `Content-Disposition` when a filename is known. `body` should
+/// already only contain the requested byte interval — the streaming
+/// joiner emits exactly those bytes on a range dispatch.
+#[allow(clippy::too_many_arguments)]
+fn partial_content_response(
+    head_only: bool,
+    total_bytes: u64,
+    start: u64,
+    end_inclusive: u64,
+    body_len: u64,
+    body: Body,
+    content_type: &str,
+    filename: Option<&str>,
+) -> Response {
+    let body = if head_only { Body::empty() } else { body };
+    let mut resp = Response::new(body);
+    *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+    let _ = resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(content_type)
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+    );
+    let _ = resp
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, HeaderValue::from(body_len));
+    let _ = resp
+        .headers_mut()
+        .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    let cr = format!("bytes {start}-{end_inclusive}/{total_bytes}");
+    if let Ok(v) = HeaderValue::from_str(&cr) {
+        resp.headers_mut().insert(header::CONTENT_RANGE, v);
+    }
     if let Some(name) = filename {
         if let Some(v) = content_disposition(name) {
             resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
@@ -733,75 +989,6 @@ fn extension_for_content_type(content_type: &str) -> Option<&'static str> {
         "text/html" => Some("html"),
         "application/json" => Some("json"),
         _ => None,
-    }
-}
-
-/// Apply a single-range `Range` header against the joined body if the
-/// caller sent one. Multi-range (`bytes=0-10,20-30`) is rejected with
-/// `416` per PLAN.md D.2.3 — bee does the same — because the joiner
-/// has already materialised the file, so streaming multi-part responses
-/// is not warranted.
-fn finalize_with_range(
-    method: Method,
-    body: Vec<u8>,
-    content_type: &str,
-    filename: Option<&str>,
-    range: Option<String>,
-) -> Response {
-    let Some(raw) = range else {
-        return write_response(method, body, content_type, filename);
-    };
-    match parse_single_range(&raw, body.len() as u64) {
-        Ok(Some((start, end))) => {
-            let total = body.len();
-            let slice = body[start as usize..=end as usize].to_vec();
-            let len = slice.len();
-            let body_obj = if method == Method::HEAD {
-                Body::empty()
-            } else {
-                Body::from(slice)
-            };
-            let mut resp = Response::new(body_obj);
-            *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
-            let _ = resp.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_str(content_type)
-                    .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
-            );
-            let _ = resp
-                .headers_mut()
-                .insert(header::CONTENT_LENGTH, HeaderValue::from(len));
-            let _ = resp
-                .headers_mut()
-                .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-            let cr = format!("bytes {start}-{end}/{total}");
-            if let Ok(v) = HeaderValue::from_str(&cr) {
-                resp.headers_mut().insert(header::CONTENT_RANGE, v);
-            }
-            if let Some(name) = filename {
-                if let Some(v) = content_disposition(name) {
-                    resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
-                }
-            }
-            resp
-        }
-        Ok(None) => write_response(method, body, content_type, filename),
-        Err(RangeError::Multi) => json_error(
-            StatusCode::RANGE_NOT_SATISFIABLE,
-            "multi-range requests not supported",
-        ),
-        Err(RangeError::Unsatisfiable) => {
-            let mut resp = json_error(
-                StatusCode::RANGE_NOT_SATISFIABLE,
-                "range not satisfiable for this resource",
-            );
-            let cr = format!("bytes */{}", body.len());
-            if let Ok(v) = HeaderValue::from_str(&cr) {
-                resp.headers_mut().insert(header::CONTENT_RANGE, v);
-            }
-            resp
-        }
-        Err(RangeError::Malformed) => json_error(StatusCode::BAD_REQUEST, "malformed Range header"),
     }
 }
 

@@ -56,7 +56,8 @@ pub use feed::{
 };
 pub use fetcher::{Overlay, RoutingFetcher};
 pub use joiner::{
-    join, join_to_sender, join_with_options, JoinError, JoinOptions, DEFAULT_MAX_FILE_BYTES,
+    join, join_to_sender, join_to_sender_range, join_with_options, ByteRange, JoinError,
+    JoinOptions, DEFAULT_MAX_FILE_BYTES,
 };
 pub use mantaray::{
     list_manifest, lookup_path, resolve_feed_root, LookupResult, ManifestEntry, ManifestError,

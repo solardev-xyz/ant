@@ -1037,3 +1037,889 @@ Roughly one engineering week if D.3.1 ships with it; three to four days without.
 3. D.2.4 + D.2.5 — an hour.
 4. D.3.1 — half a day, optional but high-leverage.
 5. D.4 acceptance.
+
+## Appendix E — Large-file retrieval and gateway streaming hardening
+
+This appendix is a focused hardening track for the gateway's read path. It builds on Appendix D's Tier-A drop-in: D.2.3 wires `ant-retrieval` into axum and ships a streaming `/bytes` GET; this appendix finishes the job for `/bzz`, `HEAD`, true HTTP ranges, browser media, and CLI streaming. It slots into §9 as a hardening sub-track that runs alongside Phases 4 and 10.
+
+### E.1 Purpose
+
+Improve large-file retrieval in Ant so gateway users, browser media elements, and `antctl get` receive stable, progressive downloads without forcing the daemon, gateway, or CLI to hold the entire file body in memory.
+
+The goal is not to build a downloader from scratch. Ant already has important pieces in place. The goal is to finish and harden the streaming path, especially for manifest-backed `/bzz` files, browser video/audio playback, HTTP range requests, and CLI downloads.
+
+Target behaviour:
+
+```text
+HTTP client / media element / antctl file writer
+        ↑
+ordered byte stream or requested byte range
+        ↑
+metadata-first gateway response
+        ↑
+bounded streaming buffer
+        ↑
+parallel Swarm chunk/subtree retrieval with retries
+        ↑
+routing-aware peer/chunk fetcher
+```
+
+### E.2 Current state
+
+Based on the current `solardev-xyz/ant` tree:
+
+- The gateway already has a streaming path for raw `/bytes/{addr}` GET requests without a `Range` header.
+- `/bzz/{addr}/path` still resolves the manifest, joins the resolved file body into memory, and then returns the full body.
+- HTTP `Range` handling is currently applied after the full body has been materialised.
+- `antctl get` receives terminal `Bytes` / `BzzBytes` responses over the public control protocol, with optional progress events, but not a real byte stream.
+- The internal retrieval machinery already has useful building blocks: ordered joining, parallel subtree traversal, retries, peer fallback, hedged requests, cache support, and concurrency limits.
+
+Relevant source areas:
+
+```text
+crates/ant-gateway/src/retrieval.rs
+crates/ant-p2p/src/behaviour.rs
+crates/ant-retrieval/src/joiner.rs
+crates/ant-retrieval/src/fetcher.rs
+crates/ant-control/src/protocol.rs
+crates/antctl/src/main.rs
+```
+
+### E.3 Browser media requirements
+
+Large audio and video files have stricter requirements than generic file downloads. A browser does not only need bytes. It needs enough HTTP and container metadata to decide whether it can play, how long the media is, and whether seeking is possible.
+
+#### E.3.1 HTTP metadata needed early
+
+For a normal media response, the gateway should provide these headers as soon as the manifest and root span are known:
+
+```http
+Content-Type: video/mp4
+Content-Length: 104857600
+Accept-Ranges: bytes
+```
+
+For a range response, the gateway should return:
+
+```http
+HTTP/1.1 206 Partial Content
+Content-Type: video/mp4
+Content-Range: bytes 0-1048575/104857600
+Content-Length: 1048576
+Accept-Ranges: bytes
+```
+
+Important distinction:
+
+- `Content-Length` tells the browser the total object size for full responses.
+- `Accept-Ranges: bytes` tells the browser it can ask for specific byte ranges.
+- `Content-Range` tells the browser which part of the file it received and the total size.
+
+For Ant, this means the gateway should fetch only the minimum required information first:
+
+```text
+/bzz path resolution
+    ↓
+file reference + content type + filename
+    ↓
+root chunk / span
+    ↓
+total size known
+    ↓
+headers can be returned
+```
+
+#### E.3.2 Media-container metadata needed early
+
+After receiving headers, the browser still needs enough file bytes to parse the media container.
+
+Examples:
+
+- MP4: `ftyp`, `moov`, track metadata, codec initialization data.
+- WebM: EBML header, segment info, track info, cues if present.
+- MP3: ID3 tags, MPEG frames, and sometimes Xing/VBRI metadata for variable-bitrate duration.
+- Ogg: Ogg pages and codec headers.
+
+The browser can show duration only after it has parsed the relevant container metadata. Until then, duration may be unknown.
+
+MP4 is especially important:
+
+```text
+Good for streaming:
+
+[ ftyp ][ moov ][ mdat ... media data ... ]
+
+Poor for first-byte-only streaming:
+
+[ ftyp ][ mdat ... large media data ... ][ moov ]
+```
+
+If the MP4 `moov` atom is at the end, the browser may need to request the tail of the file before it can know duration. This is why true HTTP range support is critical. Sequential streaming from byte `0` is not enough for robust media playback.
+
+#### E.3.3 Typical browser probing behaviour
+
+A browser or media element may first request the beginning:
+
+```http
+Range: bytes=0-
+```
+
+or:
+
+```http
+Range: bytes=0-1048575
+```
+
+If required metadata is not near the beginning, it may then request the end:
+
+```http
+Range: bytes=103809024-104857599
+```
+
+Therefore Ant should treat range support as a media feature, not merely a download-resume feature.
+
+#### E.3.4 Fastest useful response strategy
+
+For video/audio, optimize these steps in order:
+
+1. Resolve `/bzz` manifest path quickly.
+2. Fetch the root chunk and read the span to know total file size.
+3. Return `Content-Type`, `Content-Length`, and range capability immediately.
+4. Support `HEAD` so metadata probes do not fetch the body.
+5. Support single-range `GET` so browsers can fetch the beginning and/or tail.
+6. Stream only the requested byte range through a range-aware joiner.
+
+The browser-facing goal is not just "download fast". The useful metrics are:
+
+```text
+time to headers
+time to first body byte
+time to media loadedmetadata
+time to first frame / first audio
+time to seek completion
+```
+
+### E.4 Archive and ZIP file requirements
+
+Compressed archives benefit from the same generic streaming and range machinery, but they do not need the same metadata-first optimizations as browser media.
+
+For a normal ZIP download, the browser mainly needs:
+
+```http
+Content-Type: application/zip
+Content-Length: 104857600
+Accept-Ranges: bytes
+Content-Disposition: attachment; filename="archive.zip"
+```
+
+A browser can download a ZIP sequentially without knowing media duration, codecs, dimensions, or container playback metadata. Therefore ZIP support should not displace the media/range priority.
+
+The benefits of generic streaming and range support for archives are:
+
+1. **No full buffering.** The gateway can stream archive bytes directly to the client instead of joining the entire archive in memory first.
+2. **Download resume.** Browsers and download managers can resume interrupted downloads with a request such as:
+
+   ```http
+   Range: bytes=50000000-
+   ```
+
+3. **Advanced archive inspection.** ZIP files usually store the central directory near the end of the file. Archive-aware clients can request the tail, locate the central directory, list entries, and then selectively request the byte ranges needed for specific files inside the archive.
+4. **Selective extraction by smart clients.** A custom app or package manager could fetch only part of a ZIP after reading the central directory. This is not normal browser download behaviour, but generic byte-range support makes it possible.
+
+Important distinction:
+
+```text
+video/audio:
+    Range support is essential for playback, duration, and seeking
+
+zip download:
+    Range support is useful for resume, bounded memory, and advanced clients,
+    but not required for a simple sequential browser download
+```
+
+For `.tar.gz` or plain `.gz` files, range support is less useful for selective extraction because gzip decompression is mostly sequential unless an external index exists. The gateway can still stream and resume the compressed bytes, but it should not promise random access inside the compressed content.
+
+Implementation guidance:
+
+- Do not special-case ZIP in the first implementation.
+- Implement streaming and single-range retrieval generically for all large files.
+- Set archive-specific metadata correctly when known, especially `Content-Type` and `Content-Disposition`.
+- Treat ZIP resume and advanced inspection as automatic benefits of the generic range layer.
+
+The priority order remains:
+
+```text
+1. /bzz streaming
+2. HEAD support
+3. single Range support
+4. media playback validation
+5. generic large-file robustness, including ZIP resume
+```
+
+### E.5 Problem summary
+
+Large downloads can still fail, stall, or feel poor for several distinct reasons:
+
+1. **Manifest-backed `/bzz` retrieval still buffers the joined file.** This is the main browser-facing problem. Websites, videos, images, archives, and other normal dweb assets usually pass through `/bzz`, not raw `/bytes`.
+2. **Browser media needs metadata and ranges, not only streaming.** Video/audio duration and seeking depend on `Content-Length`, `Accept-Ranges`, valid `206 Partial Content` responses, and container metadata such as MP4 `moov` atoms.
+3. **The public CLI protocol is terminal-response based.** `antctl get` can show progress, but the actual file data still arrives as one final payload. This increases memory pressure and delays useful output.
+4. **Range requests are not true retrieval ranges yet.** Browser media seeking, resumable downloads, and archive-aware clients should fetch only the requested section. The current behaviour joins first and slices afterwards.
+5. **Archive downloads benefit from the same generic path.** ZIP files do not need media-style metadata probing, but they still need bounded memory use, clean resume support, and correct download headers.
+6. **Streaming output granularity may still be too coarse.** The joiner should emit ordered bytes frequently enough to keep HTTP clients alive and users confident, while still respecting the Swarm tree layout.
+7. **Missing data chunks remain fatal unless redundancy recovery is implemented.** Degraded redundancy handling can mask the redundancy level byte, but it does not reconstruct unavailable data chunks via Reed-Solomon recovery.
+8. **Failure modes are hard to diagnose.** A large retrieval may fail because of sparse chunks, stale peer state, queue saturation, retry exhaustion, malformed trees, unsupported redundancy, media client aborts, or gateway timeouts. These should be distinguishable in logs and user-facing errors.
+
+### E.6 Design principles
+
+#### E.6.1 Metadata first, body second
+
+The gateway should resolve enough information to answer HTTP metadata quickly before starting expensive body retrieval.
+
+For `/bzz`, that means:
+
+```text
+manifest lookup → file reference + metadata → root span → headers → body stream
+```
+
+#### E.6.2 Make HTTP ranges first-class
+
+For large media, range retrieval is as important as continuous streaming. The joiner should be able to stream a requested byte interval without first materialising the whole file.
+
+#### E.6.3 Stay Swarm-DAG-native
+
+Do not make arbitrary `100 KiB` byte parts the core abstraction. Fixed output windows are useful as a buffering and UX concept, but the downloader should remain aware of the Swarm chunk tree.
+
+Better model:
+
+```text
+Swarm chunks/subtrees fetched out of order
+        ↓
+joiner verifies and orders data
+        ↓
+small contiguous byte buffers are emitted
+        ↓
+gateway / CLI writes them sequentially
+```
+
+#### E.6.4 Emit bytes only in file order
+
+Network fetches may complete out of order. The client must receive a strictly ordered byte stream, or a strictly ordered byte stream inside the requested range.
+
+#### E.6.5 Keep buffers bounded
+
+The downloader may fetch ahead, but it must not accumulate unbounded output if the HTTP client or CLI writer is slow.
+
+#### E.6.6 Hide retry logic inside retrieval
+
+The gateway and CLI should consume an async byte stream. They should not know which chunk failed, which peer was retried, or whether a cache hit occurred.
+
+#### E.6.7 Prefer additive protocol changes
+
+Keep existing `GetBytes` / `GetBzz` terminal responses for compatibility. Add streaming variants rather than breaking current clients.
+
+### E.7 Proposed architecture
+
+```text
+Gateway / antctl
+        ↓
+metadata-first response layer
+        ↓
+streaming retrieval interface
+        ↓
+manifest resolver, if `/bzz`
+        ↓
+root/span reader
+        ↓
+full-stream or range-aware joiner
+        ↓
+bounded ordered output buffer
+        ↓
+routing-aware chunk fetcher
+        ↓
+libp2p retrieval streams
+```
+
+The main changes are:
+
+- make `/bzz` consume the same kind of ordered byte stream that raw `/bytes` already uses internally;
+- add true single-range retrieval instead of materialise-then-slice;
+- expose enough metadata early for browsers and media elements;
+- eventually make `antctl get` stream file bytes progressively.
+
+### E.8 Terminology
+
+- **Swarm chunk**: content-addressed chunk, usually around 4 KiB of payload.
+- **Intermediate chunk**: chunk containing child references in the Swarm file tree.
+- **HTTP body chunk**: arbitrary byte buffer emitted to the HTTP client.
+- **Streaming window**: bounded amount of ordered output data being prepared ahead of the client.
+- **Prefetch window**: limited lookahead over future chunks/subtrees.
+- **Terminal response**: a response that returns the whole joined file body at once.
+- **Range request**: HTTP request asking for a specific byte interval.
+- **Media metadata**: container-level data required for duration, dimensions, tracks, codecs, and seeking.
+
+### E.9 Phase 1 — Stream `/bzz` responses
+
+#### E.9.1 Goal
+
+Make the most important browser-facing path progressive and memory-bounded.
+
+#### E.9.2 Tasks
+
+- Add an internal `StreamBzz` command or equivalent gateway-facing streaming function.
+- Resolve the mantaray path first.
+- Once the file reference and metadata are known, return stream metadata:
+  - total file size, from the root span when known;
+  - content type;
+  - filename / content-disposition hint;
+  - resolved reference.
+- Stream the resolved file body through the same ordered joiner used for raw byte trees.
+- Preserve the existing materialising `GetBzz` path for compatibility, tests, and possibly small files.
+- For the first PR, keep range requests on the existing path or explicitly route them to the later range implementation.
+- Do not advertise `Accept-Ranges: bytes` for paths where true range retrieval is not yet implemented.
+
+#### E.9.3 Gateway requirements
+
+The gateway must:
+
+- start the HTTP response only after manifest/file metadata and root span are known;
+- set `Content-Type` from manifest metadata where available;
+- set `Content-Length` when the root span is known;
+- set `Accept-Ranges: bytes` only when range semantics are actually supported;
+- apply backpressure through bounded channels;
+- stop retrieval when the HTTP client disconnects;
+- avoid buffering the full response body in memory.
+
+#### E.9.4 Acceptance criteria
+
+- `GET /bzz/{addr}/large-file` starts sending body bytes before the full file has been fetched.
+- Gateway memory usage does not scale linearly with the full file size for non-range `/bzz` GETs.
+- Existing small `/bzz` website and file behaviour remains compatible.
+- Errors before the first byte return normal HTTP errors.
+- Errors after streaming has started terminate the body stream cleanly and are visible in logs.
+- Client disconnect cancels the retrieval task.
+
+#### E.9.5 Recommended first PR
+
+```text
+stream bzz file responses through the retrieval joiner
+```
+
+Scope:
+
+- add internal streaming BZZ retrieval;
+- reuse the existing streaming joiner path;
+- keep the existing terminal `GetBzz` path;
+- add tests proving `/bzz` large files begin responding before full retrieval completes.
+
+This is the highest-impact step because normal web/media access goes through `/bzz`.
+
+### E.10 Phase 2 — Add metadata-first `HEAD` support
+
+#### E.10.1 Goal
+
+Give browsers, media elements, download managers, and gateways the object metadata they need without forcing body retrieval.
+
+#### E.10.2 Tasks
+
+- Implement `HEAD` for `/bytes`.
+- Implement `HEAD` for `/bzz` after manifest path resolution.
+- Fetch only what is needed to determine:
+  - content type;
+  - total size;
+  - filename / content-disposition hint;
+  - entity tag / stable cache validator, if available;
+  - range support status.
+- For archives and other downloadable files, return `Content-Disposition: attachment` when manifest metadata or route semantics indicate a download.
+- Return headers without joining or streaming the body.
+- Keep behaviour consistent with the equivalent `GET` response.
+
+#### E.10.3 Headers to return
+
+For a known object:
+
+```http
+Content-Type: video/mp4
+Content-Length: 104857600
+Accept-Ranges: bytes
+ETag: "..."
+```
+
+Only return `Accept-Ranges: bytes` once true range retrieval is available for that route.
+
+#### E.10.4 Acceptance criteria
+
+- `HEAD /bytes/{addr}` returns size without body retrieval.
+- `HEAD /bzz/{addr}/video.mp4` resolves manifest metadata and returns size/content type without body retrieval.
+- `HEAD` does not materialise large files.
+- Browser/media metadata probes do not trigger a full download.
+- `HEAD /bzz/{addr}/archive.zip` returns size, content type, and download metadata without body retrieval.
+
+### E.11 Phase 3 — True HTTP range retrieval
+
+#### E.11.1 Goal
+
+Support efficient browser media metadata parsing, seeking, and resumable downloads without joining the whole file first.
+
+#### E.11.2 Tasks
+
+- Parse single-range HTTP headers before retrieval:
+
+  ```http
+  Range: bytes=start-end
+  Range: bytes=start-
+  Range: bytes=-suffixLength
+  ```
+
+- Resolve root span first to know total file length.
+- Map the requested byte range to required Swarm chunks/subtrees.
+- Skip output before `start` without sending it.
+- Stop retrieval after `end`.
+- Return proper `206 Partial Content` responses:
+  - `Content-Range`;
+  - `Accept-Ranges: bytes`;
+  - accurate `Content-Length` for the range body.
+- Return `416 Range Not Satisfiable` for invalid ranges.
+- Reject or defer multi-range support initially.
+
+#### E.11.3 Media-specific behaviour
+
+The gateway must handle the two most common browser media probes efficiently:
+
+```http
+Range: bytes=0-
+```
+
+and:
+
+```http
+Range: bytes=<tail-start>-<total-end>
+```
+
+This allows browsers to read MP4 metadata at the beginning or, when necessary, at the end of the file.
+
+#### E.11.4 Archive-specific behaviour
+
+The same single-range implementation should work for archives without special casing ZIP internals. For ZIP files, tail-range requests allow advanced clients to read the central directory near the end of the archive, while ordinary browsers mainly benefit from download resume.
+
+The gateway should serve the requested compressed bytes exactly as stored. It should not try to decompress, inspect, or rewrite archive contents in the first implementation.
+
+#### E.11.5 Acceptance criteria
+
+- `curl -r 0-999` fetches only the requested section.
+- `curl -I` returns metadata without body retrieval.
+- Browser video/audio can show duration for files with metadata near the start.
+- Browser video/audio can request the tail of an MP4 file when metadata is at the end.
+- Seeking works without fetching the whole file.
+- Range requests work for both `/bytes` and `/bzz` after manifest resolution.
+- Invalid ranges return `416`.
+- Multi-range requests are explicitly unsupported or handled safely.
+
+#### E.11.6 Recommended second PR
+
+```text
+add single-range streaming retrieval for bytes and bzz
+```
+
+Scope:
+
+- implement range parsing and response headers;
+- add a range-aware joiner entry point;
+- support single-range requests for `/bytes` and `/bzz`;
+- add browser/media integration tests where possible.
+
+### E.12 Phase 4 — Smooth ordered output
+
+#### E.12.1 Goal
+
+Make large downloads feel continuous without fighting the Swarm tree layout.
+
+#### E.12.2 Tasks
+
+- Review the current joiner emission threshold and subtree streaming behaviour.
+- Introduce a configurable target output buffer size, for example:
+
+  ```rust
+  STREAM_TARGET_OUTPUT_BYTES = 128 * 1024;
+  STREAM_MIN_EMIT_BYTES = 32 * 1024;
+  STREAM_PREFETCH_WINDOWS = 4;
+  ```
+
+- Treat those values as output-buffering goals, not as a requirement to split the Swarm tree into artificial byte ranges.
+- Emit as soon as a contiguous ordered byte buffer is available and large enough, or when EOF/range-end is reached.
+- Maintain bounded lookahead so later chunks/subtrees can be fetched while earlier bytes are being sent.
+- Preserve current retry semantics and content verification.
+
+#### E.12.3 Initial defaults
+
+```text
+output target:          128 KiB
+minimum emit size:       32 KiB
+prefetch windows:         4
+join fanout:              keep current default initially
+per-request concurrency: keep existing cap initially
+process-wide cap:        keep existing cap initially
+```
+
+These values should be tunable only after observability is in place. Hard-coded constants are acceptable for the first implementation.
+
+#### E.12.4 Acceptance criteria
+
+- Time to first body byte is low after manifest/root resolution.
+- Large downloads produce regular body progress under normal mainnet conditions.
+- One slow later chunk does not block already-complete earlier output.
+- Memory use is bounded approximately by:
+
+  ```text
+  active_streams × prefetch_windows × output_target_bytes
+  ```
+
+  plus chunk-fetch and protocol overhead.
+
+### E.13 Phase 5 — Add real CLI byte streaming
+
+#### E.13.1 Goal
+
+Allow `antctl get` to write progressively to stdout or disk instead of waiting for a final hex-encoded payload.
+
+#### E.13.2 Current distinction
+
+There are two relevant protocol layers:
+
+1. **Internal daemon/gateway command channel.** This already has chunk-streaming concepts for raw bytes.
+2. **Public `antctl` control protocol.** This currently exposes progress events plus terminal `Bytes` / `BzzBytes` payloads.
+
+Phase 5 concerns the public `antctl` control protocol.
+
+#### E.13.3 Tasks
+
+- Add additive public protocol request variants, for example:
+
+  ```rust
+  StreamBytes { reference, bypass_cache }
+  StreamBzz { reference, path, allow_degraded_redundancy, bypass_cache }
+  ```
+
+  or add a clearly versioned streaming mode to existing requests.
+
+- Add streamed response variants, for example:
+
+  ```rust
+  StreamStart {
+      total_bytes: u64,
+      content_type: Option<String>,
+      filename: Option<String>,
+  }
+
+  BytesChunk {
+      data: String, // base64 while NDJSON is used
+  }
+
+  StreamDone
+  ```
+
+- Continue to support existing terminal responses:
+
+  ```rust
+  Bytes { hex }
+  BzzBytes { hex, content_type, filename }
+  ```
+
+- Prefer base64 over hex for streamed chunks if the transport remains newline-delimited JSON.
+- Longer term, consider a framed binary control protocol for byte streams.
+- Update `antctl get -o` to stream directly into a file.
+- Keep progress rendering on stderr.
+
+#### E.13.4 Acceptance criteria
+
+- `antctl get bytes://... -o file.bin` writes progressively to disk.
+- `antctl get bzz://.../large.bin -o file.bin` writes progressively to disk.
+- `antctl get ... > file.bin` streams binary bytes to stdout when not in JSON mode.
+- Existing clients using terminal `Bytes` / `BzzBytes` still work.
+- JSON output mode remains safe for scripts and does not intermix raw binary with JSON.
+
+### E.14 Phase 6 — Observability and failure diagnostics
+
+#### E.14.1 Goal
+
+Make large-download and media-playback failures actionable.
+
+#### E.14.2 Metrics to record per retrieval
+
+- time to first peer;
+- time to manifest resolution, for `/bzz`;
+- time to root chunk;
+- time to headers ready;
+- time to first streamed byte;
+- time to first range byte;
+- total bytes streamed;
+- average throughput;
+- longest idle gap between emitted output chunks;
+- chunks fetched from cache vs network;
+- peer attempts per chunk;
+- retries per chunk/subtree;
+- terminal failure reason;
+- whether the downstream client disconnected first.
+
+#### E.14.3 Media-specific diagnostics
+
+When serving media, log:
+
+- whether request was full `GET`, `HEAD`, or range `GET`;
+- requested range;
+- returned range;
+- content type;
+- total file size;
+- whether the request targeted the beginning or tail of the file;
+- whether the response reached first byte.
+
+#### E.14.4 Error details
+
+When possible, include:
+
+- failing chunk address;
+- approximate byte offset;
+- retry count exhausted;
+- peers attempted;
+- whether the chunk was ever found in cache;
+- whether failure happened before or after first byte;
+- whether redundancy was present but unsupported.
+
+#### E.14.5 Acceptance criteria
+
+- Logs distinguish network timeout, missing chunk, malformed tree, unsupported redundancy, max-size rejection, gateway timeout, and client disconnect.
+- Logs distinguish full-body streaming failures from range-streaming failures.
+- `antctl get` shows a useful failure message without exposing excessive internals by default.
+- Retrying a failed command benefits from cached chunks already fetched.
+- Tuning fanout, retry count, and window size can be based on measurements rather than guesswork.
+
+### E.15 Phase 7 — Retry and concurrency tuning
+
+#### E.15.1 Goal
+
+Improve completion rate without overwhelming Bee peers, local queues, or Ant's own retrieval tasks.
+
+#### E.15.2 Tasks
+
+- Keep existing process-wide concurrency caps.
+- Add per-request budgets for:
+  - maximum chunk attempts;
+  - maximum distinct peers per chunk;
+  - maximum subtree retries;
+  - maximum idle time without emitted bytes.
+- Consider adaptive behaviour:
+  - reduce concurrency when many requests time out;
+  - hedge earlier when tail latency is high;
+  - retry more aggressively for large files after partial success;
+  - avoid blacklisting peers too broadly for isolated chunk failures.
+- Ensure concurrent browser media requests do not starve each other.
+
+#### E.15.3 Acceptance criteria
+
+- Four parallel large gateway downloads make progress without unbounded queue growth.
+- Four parallel browser media range requests make progress without starving full-file downloads.
+- A small number of slow peers does not stall an otherwise healthy download.
+- Retry exhaustion produces a precise error.
+- Throughput improves or stays stable compared with the current implementation.
+
+### E.16 Phase 8 — Reed-Solomon / redundancy recovery
+
+#### E.16.1 Goal
+
+Stop treating every missing data chunk as fatal when the file was uploaded with recoverable redundancy.
+
+#### E.16.2 Tasks
+
+- Decode Swarm redundancy metadata properly.
+- Implement or integrate Bee-compatible Reed-Solomon recovery.
+- Recover missing data chunks from parity chunks where possible.
+- Keep current degraded mode as a fallback/debug mode.
+
+#### E.16.3 Acceptance criteria
+
+- Files with supported redundancy decode correctly.
+- Recoverable missing data chunks no longer fail the whole download.
+- Non-recoverable missing chunks still produce precise diagnostics.
+
+### E.17 Milestone plan
+
+#### E.17.1 Milestone A — Browser-facing `/bzz` improvement
+
+1. Stream non-range `/bzz` GET responses.
+2. Preserve current `/bytes` streaming behaviour.
+3. Add integration tests for large `/bzz` files.
+4. Do not advertise range support until true ranges are implemented.
+
+#### E.17.2 Milestone B — Media metadata and ranges
+
+1. Add metadata-first `HEAD` for `/bytes` and `/bzz`.
+2. Add true single-range retrieval.
+3. Return correct `206`, `Content-Range`, `Content-Length`, and `Accept-Ranges` headers.
+4. Test MP4/WebM/audio behaviour in real browsers.
+
+#### E.17.3 Milestone C — Smoothness
+
+1. Tune output granularity.
+2. Add bounded prefetch/lookahead.
+3. Measure time to first byte and longest output idle gap.
+
+#### E.17.4 Milestone D — CLI streaming
+
+1. Add public streamed control responses.
+2. Make `antctl get -o` stream to disk.
+3. Keep terminal responses for compatibility.
+
+#### E.17.5 Milestone E — Robustness
+
+1. Improve observability.
+2. Tune retry/concurrency behaviour.
+3. Add Reed-Solomon recovery.
+
+### E.18 Test plan
+
+#### E.18.1 Unit tests
+
+- Joiner emits bytes in order even when child fetches complete out of order.
+- Range-aware joiner emits only the requested byte interval.
+- Suffix ranges resolve to the correct byte interval after total size is known.
+- Failed chunks are retried before stream failure.
+- Receiver drop cancels retrieval cleanly.
+- Streaming buffer stays bounded under slow consumer conditions.
+- Range mapping selects the correct Swarm chunks.
+- Malformed intermediate chunks fail deterministically.
+
+#### E.18.2 Integration tests
+
+- `/bytes/{addr}` large file streams without full materialisation.
+- `/bzz/{addr}/large.bin` streams without full materialisation.
+- `/bzz/{addr}/index.html` still serves normal website files correctly.
+- `HEAD /bytes/{addr}` returns metadata without body.
+- `HEAD /bzz/{addr}/video.mp4` returns metadata without body.
+- `GET /bytes/{addr}` with `Range: bytes=0-999` fetches only that range.
+- `GET /bzz/{addr}/video.mp4` with `Range: bytes=0-999` fetches only that range.
+- `GET /bzz/{addr}/video.mp4` with a tail range fetches only the tail.
+- `GET /bzz/{addr}/archive.zip` streams without full materialisation.
+- `GET /bzz/{addr}/archive.zip` with `Range: bytes=50000000-` resumes from the requested offset.
+- `GET /bzz/{addr}/archive.zip` with a tail range fetches only the ZIP tail.
+- `antctl get -o large.bin` writes progressively to disk.
+- Concurrent large downloads respect process-wide concurrency caps.
+- Slow/missing peer simulation triggers fallback without corrupting output order.
+- Client disconnect cancels the retrieval task.
+
+#### E.18.3 Browser media tests
+
+Test with at least:
+
+```text
+MP4 with moov atom at the beginning
+MP4 with moov atom at the end
+WebM file
+MP3 or Ogg audio file
+```
+
+Check:
+
+- video/audio starts without downloading the full file;
+- duration appears after metadata is loaded;
+- seeking near the middle works;
+- seeking near the end works;
+- browser performs range requests and receives valid `206` responses;
+- tail metadata probing does not trigger full-file retrieval.
+
+#### E.18.4 Archive tests
+
+Test with at least:
+
+```text
+ZIP archive around 10 MiB
+ZIP archive around 100 MiB
+tar.gz archive around 10 MiB
+```
+
+Check:
+
+- archive downloads start without full materialisation;
+- interrupted ZIP downloads can resume through `Range`;
+- tail-range requests against ZIP files return only the requested tail bytes;
+- `tar.gz` files stream and resume as compressed bytes, without implying random access inside the compressed content;
+- correct `Content-Type`, `Content-Length`, `Accept-Ranges`, and `Content-Disposition` are returned when known.
+
+#### E.18.5 Manual mainnet tests
+
+Test files around:
+
+```text
+100 KiB
+1 MiB
+10 MiB
+50 MiB
+100 MiB
+```
+
+Measure:
+
+- time to headers;
+- time to first byte;
+- time to browser `loadedmetadata`;
+- time to first frame/audio;
+- average throughput;
+- peak memory;
+- longest output idle gap;
+- retries per chunk;
+- peers used;
+- cache hit ratio;
+- completion rate under concurrent browser loads.
+
+### E.19 Final acceptance criteria
+
+The improvement is successful when:
+
+- a 10 MiB file streams through `/bytes` without full buffering;
+- a 10 MiB file streams through `/bzz` without full buffering;
+- a 100 MiB file starts sending bytes soon after root/manifest resolution;
+- `HEAD` returns accurate metadata for `/bytes` and `/bzz` without body retrieval;
+- single-range requests fetch only the requested byte interval;
+- browsers can show duration for normal MP4/WebM/audio files without downloading the full file;
+- browsers can seek within large media files using range requests;
+- ZIP downloads can resume via range requests without full re-download;
+- memory usage remains bounded and does not scale linearly with file size;
+- one slow or failing chunk triggers local retry rather than immediate request failure;
+- retry exhaustion identifies the failing chunk or approximate byte offset;
+- client disconnect cancels retrieval;
+- four parallel large gateway downloads do not starve each other;
+- warm-cache repeat downloads are materially faster than cold-cache downloads;
+- existing small-file, website, and compatibility paths still work.
+
+### E.20 Non-goals for the first pass
+
+- Multi-range HTTP responses.
+- Transcoding or rewriting media files.
+- Moving MP4 `moov` atoms during gateway serving.
+- ZIP-specific central-directory parsing or selective extraction in the gateway.
+- Encrypted chunk support.
+- Reed-Solomon recovery.
+- Replacing the Swarm retrieval protocol.
+- Replacing the current control protocol immediately.
+- Perfect Bee parity for every edge case.
+- Unbounded file sizes.
+
+### E.21 Recommended immediate implementation sequence
+
+1. Add internal `StreamBzz` support.
+2. Route non-range `/bzz` GETs through that stream.
+3. Add cancellation on downstream HTTP disconnect.
+4. Add metadata-first `HEAD` support.
+5. Add true single-range retrieval for `/bytes` and `/bzz`.
+6. Return correct media-relevant headers: `Content-Type`, `Content-Length`, `Accept-Ranges`, and `Content-Range`.
+7. Ensure the same range layer works for generic downloads, including ZIP resume and tail-range requests.
+8. Add metrics for time to headers, time to first byte, longest idle gap, retries, and terminal failure reason.
+9. Add CLI streaming only after the gateway/media path is stable.
+
+### E.22 Implementation notes
+
+#### E.22.1 Media files
+
+The gateway should not try to fix badly packaged media in the first pass. If an MP4 file has the `moov` atom at the end, the correct gateway behaviour is to support range requests so the browser can fetch the tail quickly. Rewriting the file into "fast start" layout is an upload/tooling concern, not a gateway-serving concern.
+
+#### E.22.2 Archives
+
+The gateway should not try to understand or optimize archive internals in the first pass. ZIP central-directory access and selective extraction are client-level capabilities enabled by generic byte ranges. Ant should focus on correct metadata, bounded streaming, and exact byte-range serving for any file type.

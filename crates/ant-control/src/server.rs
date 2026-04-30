@@ -132,12 +132,53 @@ pub enum ControlCommand {
     /// or [`ControlAck::Error`]. The JSON control socket does not expose
     /// this command; it exists so `ant-gateway` can behave like Bee and
     /// write the HTTP body while the joiner is still retrieving.
+    ///
+    /// `range` is interpreted against the file body (the joined bytes,
+    /// not chunk wire bytes). `None` streams the whole file. The
+    /// daemon clamps `range.end_inclusive` to `total_bytes - 1`.
+    /// `head_only` short-circuits the body retrieval entirely: the
+    /// daemon emits a `BytesStreamStart` with the file size and goes
+    /// straight to `StreamDone`. This is what backs `HEAD /bytes/{addr}`
+    /// without joining the chunk tree.
     StreamBytes {
         reference: [u8; 32],
         bypass_cache: bool,
         max_bytes: Option<u64>,
+        range: Option<StreamRange>,
+        head_only: bool,
         ack: mpsc::Sender<ControlAck>,
     },
+    /// Gateway-only streaming `/bzz/{ref}/{path}` path. Resolves the
+    /// manifest, then streams the file body the same way `StreamBytes`
+    /// does. Sends [`ControlAck::BzzStreamStart`] (with content type +
+    /// filename + total size), zero or more
+    /// [`ControlAck::BytesChunk`] messages, then
+    /// [`ControlAck::StreamDone`] or [`ControlAck::Error`].
+    ///
+    /// `range` and `head_only` behave identically to `StreamBytes`.
+    /// `head_only` is what backs `HEAD /bzz/{ref}/{path}`: the daemon
+    /// resolves the manifest, fetches the data root chunk to learn
+    /// the size, returns metadata + total span, and never joins.
+    StreamBzz {
+        reference: [u8; 32],
+        path: String,
+        allow_degraded_redundancy: bool,
+        bypass_cache: bool,
+        max_bytes: Option<u64>,
+        range: Option<StreamRange>,
+        head_only: bool,
+        ack: mpsc::Sender<ControlAck>,
+    },
+}
+
+/// Inclusive byte range used by [`ControlCommand::StreamBytes`] and
+/// [`ControlCommand::StreamBzz`]. Mirrors
+/// [`ant_retrieval::ByteRange`] but kept local so `ant-control` doesn't
+/// take a build-graph dependency on the retrieval crate.
+#[derive(Debug, Clone, Copy)]
+pub struct StreamRange {
+    pub start: u64,
+    pub end_inclusive: u64,
 }
 
 /// Node-loop reply to a [`ControlCommand`]. Serialized back to the client as
@@ -167,6 +208,15 @@ pub enum ControlAck {
     BytesStreamStart {
         total_bytes: u64,
     },
+    /// Streaming-bzz prologue: emitted by `StreamBzz` once the manifest
+    /// has resolved and the data root chunk has been fetched (so the
+    /// total span is known). Followed by zero or more `BytesChunk`s
+    /// and a terminal `StreamDone` / `Error`.
+    BzzStreamStart {
+        total_bytes: u64,
+        content_type: Option<String>,
+        filename: Option<String>,
+    },
     BytesChunk {
         data: Vec<u8>,
     },
@@ -191,6 +241,7 @@ impl ControlAck {
             self,
             ControlAck::Progress(_)
                 | ControlAck::BytesStreamStart { .. }
+                | ControlAck::BzzStreamStart { .. }
                 | ControlAck::BytesChunk { .. }
         )
     }
@@ -516,7 +567,9 @@ fn ack_to_response(ack: ControlAck) -> Response {
             message: "manifest listing is only supported by ant-gateway".to_string(),
         },
         ControlAck::Progress(p) => Response::Progress(p),
-        ControlAck::BytesStreamStart { .. } | ControlAck::BytesChunk { .. } => Response::Error {
+        ControlAck::BytesStreamStart { .. }
+        | ControlAck::BzzStreamStart { .. }
+        | ControlAck::BytesChunk { .. } => Response::Error {
             message: "streaming byte bodies are only supported by ant-gateway".to_string(),
         },
         ControlAck::StreamDone => Response::Ok {

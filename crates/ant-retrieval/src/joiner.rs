@@ -205,6 +205,57 @@ pub async fn join_to_sender(
     options: JoinOptions,
     out: mpsc::Sender<Vec<u8>>,
 ) -> Result<(), JoinError> {
+    join_to_sender_range(fetcher, root_chunk_data, max_bytes, options, None, out).await
+}
+
+/// Inclusive byte range expressed against the joined file body.
+///
+/// Both ends are inclusive (matching HTTP `Range: bytes=start-end`);
+/// callers ensure `start <= end < total_span` and convert HTTP suffix
+/// or open-ended ranges to absolute bounds before calling.
+#[derive(Debug, Clone, Copy)]
+pub struct ByteRange {
+    pub start: u64,
+    pub end_inclusive: u64,
+}
+
+impl ByteRange {
+    /// Build a range covering `[start, end_inclusive]` after clamping to
+    /// `total - 1` on the right edge. Returns `None` for empty / invalid
+    /// inputs so the caller can short-circuit to a 416 response.
+    pub fn clamp(start: u64, end_inclusive: u64, total: u64) -> Option<Self> {
+        if total == 0 || start > end_inclusive || start >= total {
+            return None;
+        }
+        Some(Self {
+            start,
+            end_inclusive: end_inclusive.min(total - 1),
+        })
+    }
+}
+
+/// Like [`join_to_sender`], but only emits the requested byte range.
+///
+/// `range = None` is identical to [`join_to_sender`]: the whole body
+/// streams. With `range = Some(_)` the joiner walks the chunk tree
+/// without fetching subtrees that fall entirely outside `[start, end]`,
+/// and slices the leftmost / rightmost subtrees to drop any prefix or
+/// suffix bytes outside the range. This is what lets `/bzz` and
+/// `/bytes` answer browser media seeks (`Range: bytes=N-M`) without
+/// joining the whole file first.
+///
+/// Callers are responsible for emitting the correct HTTP `206
+/// Partial Content` headers — this function only produces the body
+/// bytes for the range. It does not emit chunks before `start` or
+/// after `end`.
+pub async fn join_to_sender_range(
+    fetcher: &dyn ChunkFetcher,
+    root_chunk_data: &[u8],
+    max_bytes: usize,
+    options: JoinOptions,
+    range: Option<ByteRange>,
+    out: mpsc::Sender<Vec<u8>>,
+) -> Result<(), JoinError> {
     let (span_raw, payload) = split_chunk(root_chunk_data, 0)?;
     let span_raw = if is_redundancy_none(span_raw) {
         span_raw
@@ -223,7 +274,16 @@ pub async fn join_to_sender(
         });
     }
 
-    join_subtree_to_sender(fetcher, payload, span, 0, &out).await
+    match range {
+        None => join_subtree_to_sender(fetcher, payload, span, 0, &out).await,
+        Some(range) => {
+            let clamped = ByteRange {
+                start: range.start.min(span.saturating_sub(1)),
+                end_inclusive: range.end_inclusive.min(span.saturating_sub(1)),
+            };
+            join_subtree_range_to_sender(fetcher, payload, span, 0, clamped, &out).await
+        }
+    }
 }
 
 /// Recursive joiner core. Returns `subtree_span` bytes worth of file data,
@@ -460,6 +520,155 @@ async fn join_child_to_sender(
     let child_chunk = child_chunk.expect("retry loop always runs at least once");
     let (_, child_payload) = split_chunk(&child_chunk, child_offset)?;
     join_subtree_to_sender(fetcher, child_payload, child_span, child_offset, out).await
+}
+
+/// Range-aware version of [`join_subtree_to_sender`].
+///
+/// `range` is expressed against the **whole file**, not the subtree. The
+/// caller passes the subtree's absolute `offset` and `subtree_span` so
+/// every level can convert "which part of this subtree falls inside the
+/// requested range?" into chunk-local terms without rebuilding state.
+///
+/// At an intermediate level we drop child subtrees that fall entirely
+/// outside `[start, end]` (no fetch issued at all) and recurse only into
+/// the ones that overlap. The leftmost overlapping leaf is sliced to
+/// drop any prefix before `range.start`; the rightmost is truncated at
+/// `range.end_inclusive + 1`. Output stays strictly in file order so
+/// the gateway can pipe it straight into the HTTP response body.
+fn join_subtree_range_to_sender<'a>(
+    fetcher: &'a dyn ChunkFetcher,
+    chunk_payload: &'a [u8],
+    subtree_span: u64,
+    offset: u64,
+    range: ByteRange,
+    out: &'a mpsc::Sender<Vec<u8>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), JoinError>> + Send + 'a>> {
+    Box::pin(async move {
+        let subtree_end = offset.saturating_add(subtree_span);
+        // The caller already filtered overlapping subtrees; defensive
+        // bound check keeps a buggy descent from emitting stray bytes.
+        if subtree_end <= range.start || offset > range.end_inclusive {
+            return Ok(());
+        }
+
+        if subtree_span <= chunk_payload.len() as u64 {
+            // Leaf. Slice down to the file-relative window.
+            let leaf = &chunk_payload[..subtree_span as usize];
+            let leaf_start = offset;
+            let leaf_end_excl = offset + subtree_span;
+            let lo = range.start.max(leaf_start) - leaf_start;
+            let hi = (range.end_inclusive + 1).min(leaf_end_excl) - leaf_start;
+            if lo >= hi {
+                return Ok(());
+            }
+            out.send(leaf[lo as usize..hi as usize].to_vec())
+                .await
+                .map_err(|_| JoinError::OutputClosed)?;
+            return Ok(());
+        }
+
+        if !chunk_payload.len().is_multiple_of(32) {
+            return Err(JoinError::MalformedChunk {
+                offset,
+                detail: format!(
+                    "intermediate payload len {} not a multiple of 32",
+                    chunk_payload.len()
+                ),
+            });
+        }
+        let effective = effective_payload_size(chunk_payload);
+        if effective == 0 {
+            return Err(JoinError::MalformedChunk {
+                offset,
+                detail: "intermediate chunk has no non-zero refs".into(),
+            });
+        }
+        let chunk_payload = &chunk_payload[..effective];
+        let refs = chunk_payload.len() / 32;
+        if refs > MAX_BRANCHES {
+            return Err(JoinError::MalformedChunk {
+                offset,
+                detail: format!("intermediate ref count {refs} out of range"),
+            });
+        }
+        let branch_size = subtrie_section(refs, subtree_span);
+
+        // Build per-child specs first, then keep only the ones whose
+        // [child_offset, child_offset+child_span) overlaps the range.
+        let mut specs: Vec<(usize, [u8; 32], u64, u64)> = Vec::with_capacity(refs);
+        let mut remaining = subtree_span;
+        let mut child_offset = offset;
+        for i in 0..refs {
+            let mut child_addr = [0u8; 32];
+            child_addr.copy_from_slice(&chunk_payload[i * 32..(i + 1) * 32]);
+            let child_span = if i == refs - 1 {
+                remaining
+            } else {
+                branch_size.min(remaining)
+            };
+            let child_end = child_offset + child_span;
+            let overlaps = child_end > range.start && child_offset <= range.end_inclusive;
+            if overlaps {
+                specs.push((i, child_addr, child_span, child_offset));
+            }
+            remaining = remaining.saturating_sub(child_span);
+            child_offset = child_offset.saturating_add(child_span);
+        }
+
+        if specs.is_empty() {
+            return Ok(());
+        }
+
+        // Walk overlapping children in document order. We can't use the
+        // unordered fan-out trick from the full-file path because the
+        // sliced leftmost / rightmost children must reach the consumer
+        // in order. Inner full-coverage subtrees are still parallelised
+        // by [`join_subtree_to_sender`] when we descend into them via
+        // `join_child_to_sender`.
+        for (_, addr, child_span, child_offset) in specs {
+            let child_end = child_offset + child_span;
+            let fully_inside = child_offset >= range.start && child_end <= range.end_inclusive + 1;
+            if fully_inside {
+                join_child_to_sender(fetcher, addr, child_span, child_offset, out).await?;
+            } else {
+                join_child_range_to_sender(fetcher, addr, child_span, child_offset, range, out)
+                    .await?;
+            }
+        }
+        Ok(())
+    })
+}
+
+async fn join_child_range_to_sender(
+    fetcher: &dyn ChunkFetcher,
+    addr: [u8; 32],
+    child_span: u64,
+    child_offset: u64,
+    range: ByteRange,
+    out: &mpsc::Sender<Vec<u8>>,
+) -> Result<(), JoinError> {
+    let mut child_chunk = None;
+    for attempt in 1..=SUBTREE_RETRY_ATTEMPTS {
+        match fetcher.fetch(addr).await {
+            Ok(chunk) => {
+                child_chunk = Some(chunk);
+                break;
+            }
+            Err(e) if attempt < SUBTREE_RETRY_ATTEMPTS => {
+                tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
+                drop(e);
+            }
+            Err(e) => {
+                return Err(JoinError::FetchChunk {
+                    addr: hex::encode(addr),
+                    source: e,
+                });
+            }
+        }
+    }
+    let child_chunk = child_chunk.expect("retry loop always runs at least once");
+    let (_, child_payload) = split_chunk(&child_chunk, child_offset)?;
+    join_subtree_range_to_sender(fetcher, child_payload, child_span, child_offset, range, out).await
 }
 
 async fn join_child_with_retries(
@@ -981,5 +1190,248 @@ mod tests {
             .await
             .expect("join should succeed without zero-ref fetches");
         assert_eq!(out, expected);
+    }
+
+    /// Build a 130-leaf 3-level tree (same shape as `joins_three_level_tree`)
+    /// and return the root wire bytes plus the expected joined body.
+    /// Reused across the range tests below so each one stays focused on
+    /// the slicing semantics rather than fixture construction.
+    async fn build_three_level_fixture(fetcher: &mut MapFetcher) -> (Vec<u8>, Vec<u8>) {
+        let mut leaf_addrs = Vec::with_capacity(130);
+        let mut expected: Vec<u8> = Vec::with_capacity(130 * CHUNK_SIZE);
+        for i in 0..130u8 {
+            let payload = vec![i; CHUNK_SIZE];
+            let (addr, wire) = cac_new(&payload).unwrap();
+            fetcher.insert(addr, wire);
+            leaf_addrs.push(addr);
+            expected.extend_from_slice(&payload);
+        }
+        let mut int1_payload = Vec::with_capacity(128 * 32);
+        for addr in &leaf_addrs[..128] {
+            int1_payload.extend_from_slice(addr);
+        }
+        let int1_span: u64 = 128 * CHUNK_SIZE as u64;
+        let int1_addr = chunk_addr(&int1_payload, int1_span);
+        let mut int1_wire = Vec::new();
+        int1_wire.extend_from_slice(&int1_span.to_le_bytes());
+        int1_wire.extend_from_slice(&int1_payload);
+        fetcher.insert(int1_addr, int1_wire);
+
+        let mut int2_payload = Vec::with_capacity(2 * 32);
+        for addr in &leaf_addrs[128..] {
+            int2_payload.extend_from_slice(addr);
+        }
+        let int2_span: u64 = 2 * CHUNK_SIZE as u64;
+        let int2_addr = chunk_addr(&int2_payload, int2_span);
+        let mut int2_wire = Vec::new();
+        int2_wire.extend_from_slice(&int2_span.to_le_bytes());
+        int2_wire.extend_from_slice(&int2_payload);
+        fetcher.insert(int2_addr, int2_wire);
+
+        let mut root_payload = Vec::with_capacity(64);
+        root_payload.extend_from_slice(&int1_addr);
+        root_payload.extend_from_slice(&int2_addr);
+        let total_span: u64 = 130 * CHUNK_SIZE as u64;
+        let mut root_wire = Vec::new();
+        root_wire.extend_from_slice(&total_span.to_le_bytes());
+        root_wire.extend_from_slice(&root_payload);
+        (root_wire, expected)
+    }
+
+    /// Drain the streaming joiner into a single buffer for comparison.
+    async fn drain(rx: &mut mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
+        let mut out = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            out.extend_from_slice(&chunk);
+        }
+        out
+    }
+
+    /// `join_to_sender_range` with `range = None` matches `join_to_sender`
+    /// byte-for-byte. Pins the no-range path against a regression that
+    /// would otherwise show up only in integration.
+    #[tokio::test]
+    async fn range_none_matches_full_join() {
+        let mut fetcher = MapFetcher::new();
+        let (root_wire, expected) = build_three_level_fixture(&mut fetcher).await;
+        let (tx, mut rx) = mpsc::channel(8);
+        let join = tokio::spawn(async move {
+            join_to_sender_range(
+                &fetcher,
+                &root_wire,
+                DEFAULT_MAX_FILE_BYTES,
+                JoinOptions::default(),
+                None,
+                tx,
+            )
+            .await
+        });
+        let body = drain(&mut rx).await;
+        join.await.unwrap().unwrap();
+        assert_eq!(body, expected);
+    }
+
+    /// Single-leaf prefix range. Verifies the leftmost-leaf slicing
+    /// path returns exactly the requested bytes.
+    #[tokio::test]
+    async fn range_prefix_single_leaf() {
+        let mut fetcher = MapFetcher::new();
+        let (root_wire, expected) = build_three_level_fixture(&mut fetcher).await;
+        let (tx, mut rx) = mpsc::channel(8);
+        let join = tokio::spawn(async move {
+            join_to_sender_range(
+                &fetcher,
+                &root_wire,
+                DEFAULT_MAX_FILE_BYTES,
+                JoinOptions::default(),
+                Some(ByteRange {
+                    start: 0,
+                    end_inclusive: 999,
+                }),
+                tx,
+            )
+            .await
+        });
+        let body = drain(&mut rx).await;
+        join.await.unwrap().unwrap();
+        assert_eq!(body.len(), 1000);
+        assert_eq!(body, expected[..1000]);
+    }
+
+    /// Suffix range crosses an L1 subtree boundary (last 4 KiB of int1 +
+    /// first 4 KiB of int2). Exercises both right-edge slicing of int1
+    /// and left-edge slicing of int2 in the same request.
+    #[tokio::test]
+    async fn range_crosses_subtree_boundary() {
+        let mut fetcher = MapFetcher::new();
+        let (root_wire, expected) = build_three_level_fixture(&mut fetcher).await;
+        // int1 covers [0, 128*4096); int2 starts at 128*4096.
+        let pivot = 128 * CHUNK_SIZE as u64;
+        let start = pivot - 1024;
+        let end = pivot + 1023;
+        let (tx, mut rx) = mpsc::channel(8);
+        let join = tokio::spawn(async move {
+            join_to_sender_range(
+                &fetcher,
+                &root_wire,
+                DEFAULT_MAX_FILE_BYTES,
+                JoinOptions::default(),
+                Some(ByteRange {
+                    start,
+                    end_inclusive: end,
+                }),
+                tx,
+            )
+            .await
+        });
+        let body = drain(&mut rx).await;
+        join.await.unwrap().unwrap();
+        let want = &expected[start as usize..=end as usize];
+        assert_eq!(body, want);
+    }
+
+    /// Tail range of the very last leaf: this is the MP4 `moov`-at-end
+    /// case the plan cares about. Browser issues a single
+    /// `Range: bytes=<tail>-<total-1>` and only the trailing slice
+    /// should reach the consumer.
+    #[tokio::test]
+    async fn range_tail_only() {
+        let mut fetcher = MapFetcher::new();
+        let (root_wire, expected) = build_three_level_fixture(&mut fetcher).await;
+        let total = expected.len() as u64;
+        let start = total - 256;
+        let end = total - 1;
+        let (tx, mut rx) = mpsc::channel(8);
+        let join = tokio::spawn(async move {
+            join_to_sender_range(
+                &fetcher,
+                &root_wire,
+                DEFAULT_MAX_FILE_BYTES,
+                JoinOptions::default(),
+                Some(ByteRange {
+                    start,
+                    end_inclusive: end,
+                }),
+                tx,
+            )
+            .await
+        });
+        let body = drain(&mut rx).await;
+        join.await.unwrap().unwrap();
+        assert_eq!(body, &expected[start as usize..=end as usize]);
+    }
+
+    /// Range fetch must not touch chunks fully outside the requested
+    /// window. Build a fixture where the second L1 subtree's leaves
+    /// (last two 4 KiB chunks) are deliberately *not* inserted into
+    /// the fetcher; a request for the first 4 KiB must succeed
+    /// because the joiner never asks for them. The previous
+    /// implementation joined first and sliced afterwards, so it would
+    /// trip the missing-chunk error before returning a single byte.
+    #[tokio::test]
+    async fn range_avoids_fetching_unrelated_subtrees() {
+        // Build the same 130-leaf tree, but only insert leaves 0..128
+        // into the fetcher. The L1 #2 intermediate chunk is also
+        // omitted so a stray fetch panics.
+        let mut fetcher = MapFetcher::new();
+        let mut leaf_addrs = Vec::with_capacity(130);
+        for i in 0..130u8 {
+            let payload = vec![i; CHUNK_SIZE];
+            let (addr, wire) = cac_new(&payload).unwrap();
+            // Skip leaves 128/129 — they live under int2 which we
+            // expect never to touch.
+            if i < 128 {
+                fetcher.insert(addr, wire);
+            }
+            leaf_addrs.push(addr);
+        }
+        let mut int1_payload = Vec::with_capacity(128 * 32);
+        for addr in &leaf_addrs[..128] {
+            int1_payload.extend_from_slice(addr);
+        }
+        let int1_span: u64 = 128 * CHUNK_SIZE as u64;
+        let int1_addr = chunk_addr(&int1_payload, int1_span);
+        let mut int1_wire = Vec::new();
+        int1_wire.extend_from_slice(&int1_span.to_le_bytes());
+        int1_wire.extend_from_slice(&int1_payload);
+        fetcher.insert(int1_addr, int1_wire);
+
+        // Compute (but don't insert) int2. Its address must still be
+        // valid in the root chunk so the joiner can pick it as a
+        // candidate; we just expect the range filter to discard it.
+        let mut int2_payload = Vec::with_capacity(2 * 32);
+        for addr in &leaf_addrs[128..] {
+            int2_payload.extend_from_slice(addr);
+        }
+        let int2_span: u64 = 2 * CHUNK_SIZE as u64;
+        let int2_addr = chunk_addr(&int2_payload, int2_span);
+
+        let mut root_payload = Vec::with_capacity(64);
+        root_payload.extend_from_slice(&int1_addr);
+        root_payload.extend_from_slice(&int2_addr);
+        let total_span: u64 = 130 * CHUNK_SIZE as u64;
+        let mut root_wire = Vec::new();
+        root_wire.extend_from_slice(&total_span.to_le_bytes());
+        root_wire.extend_from_slice(&root_payload);
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let join = tokio::spawn(async move {
+            join_to_sender_range(
+                &fetcher,
+                &root_wire,
+                DEFAULT_MAX_FILE_BYTES,
+                JoinOptions::default(),
+                Some(ByteRange {
+                    start: 0,
+                    end_inclusive: 1023,
+                }),
+                tx,
+            )
+            .await
+        });
+        let body = drain(&mut rx).await;
+        join.await.unwrap().expect("range fetch must succeed");
+        assert_eq!(body.len(), 1024);
+        assert!(body.iter().all(|&b| b == 0u8), "leaf 0 is all zeros");
     }
 }

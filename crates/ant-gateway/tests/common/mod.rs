@@ -25,13 +25,13 @@
 
 use ant_control::{
     ControlAck, ControlCommand, IdentityInfo, PeerConnectionInfo, PeerInfo, RoutingInfo,
-    StatusSnapshot, PROTOCOL_VERSION,
+    StatusSnapshot, StreamRange, PROTOCOL_VERSION,
 };
 use ant_gateway::testkit::build_router;
 use ant_gateway::{GatewayHandle, GatewayIdentity};
 use ant_retrieval::{
-    join_to_sender, join_with_options, list_manifest, lookup_path, ChunkFetcher, JoinOptions,
-    DEFAULT_MAX_FILE_BYTES,
+    join_to_sender_range, join_with_options, list_manifest, lookup_path, ByteRange, ChunkFetcher,
+    JoinOptions, DEFAULT_MAX_FILE_BYTES,
 };
 use async_trait::async_trait;
 use axum::body::Body;
@@ -288,51 +288,43 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
             reference,
             bypass_cache: _,
             max_bytes,
+            range,
+            head_only,
             ack,
         } => {
-            let result = async {
-                let root = fetcher.fetch(reference).await.map_err(|e| e.to_string())?;
-                let total = root
-                    .get(..8)
-                    .and_then(|s| s.try_into().ok())
-                    .map(u64::from_le_bytes)
-                    .ok_or_else(|| "root shorter than span".to_string())?;
-                ack.send(ControlAck::BytesStreamStart { total_bytes: total })
-                    .await
-                    .map_err(|_| "stream closed".to_string())?;
-                let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel(8);
-                let opts = JoinOptions {
-                    allow_degraded_redundancy: true,
-                };
-                let cap = max_bytes
-                    .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
-                    .unwrap_or(DEFAULT_MAX_FILE_BYTES);
-                let mut join_fut = Box::pin(join_to_sender(fetcher, &root, cap, opts, chunk_tx));
-                let mut join_result = None;
-                loop {
-                    tokio::select! {
-                        result = &mut join_fut, if join_result.is_none() => {
-                            join_result = Some(result.map_err(|e| e.to_string()));
-                        }
-                        maybe_chunk = chunk_rx.recv() => {
-                            match maybe_chunk {
-                                Some(data) => {
-                                    ack.send(ControlAck::BytesChunk { data })
-                                        .await
-                                        .map_err(|_| "stream closed".to_string())?;
-                                }
-                                None => return join_result.unwrap_or(Ok(())),
-                            }
-                        }
-                    }
-                }
-            }
+            stream_via_fetcher(
+                fetcher,
+                reference,
+                /* path */ None,
+                /* allow_degraded */ true,
+                max_bytes,
+                range,
+                head_only,
+                ack,
+            )
             .await;
-            let terminal = match result {
-                Ok(()) => ControlAck::StreamDone,
-                Err(e) => ControlAck::Error { message: e },
-            };
-            let _ = ack.send(terminal).await;
+        }
+        ControlCommand::StreamBzz {
+            reference,
+            path,
+            allow_degraded_redundancy,
+            bypass_cache: _,
+            max_bytes,
+            range,
+            head_only,
+            ack,
+        } => {
+            stream_via_fetcher(
+                fetcher,
+                reference,
+                Some(path),
+                allow_degraded_redundancy,
+                max_bytes,
+                range,
+                head_only,
+                ack,
+            )
+            .await;
         }
         ControlCommand::GetBzz {
             reference,
@@ -450,4 +442,100 @@ pub async fn body_bytes(resp: Response<Body>) -> Vec<u8> {
 /// Helper: send a request through a router via `tower::ServiceExt::oneshot`.
 pub async fn send(router: Router, req: Request<Body>) -> Response<Body> {
     router.oneshot(req).await.expect("router oneshot")
+}
+
+/// Streaming dispatcher used by both `StreamBytes` and `StreamBzz` in
+/// the fake node loop. `path = None` means "treat `reference` as a raw
+/// `/bytes` data root"; `path = Some(_)` walks the manifest first.
+#[allow(clippy::too_many_arguments)]
+async fn stream_via_fetcher(
+    fetcher: &DirFetcher,
+    reference: [u8; 32],
+    path: Option<String>,
+    allow_degraded: bool,
+    max_bytes: Option<u64>,
+    range: Option<StreamRange>,
+    head_only: bool,
+    ack: tokio::sync::mpsc::Sender<ControlAck>,
+) {
+    let is_bzz = path.is_some();
+    let result = async {
+        let (data_ref, content_type, filename) = match path {
+            None => (reference, None, None),
+            Some(p) => {
+                let lookup = lookup_path(fetcher, reference, &p)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let filename = lookup.metadata.get("Filename").cloned().or_else(|| {
+                    let trimmed = p.trim_matches('/');
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        trimmed.rsplit('/').next().map(|s| s.to_string())
+                    }
+                });
+                (lookup.data_ref, lookup.content_type, filename)
+            }
+        };
+        let root = fetcher.fetch(data_ref).await.map_err(|e| e.to_string())?;
+        // Mask the redundancy level off the high byte of the span so
+        // the reported total reflects the real file size, matching the
+        // production node loop's `root_span_to_u64_masked`.
+        let mut span_bytes: [u8; 8] = root
+            .get(..8)
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| "root shorter than span".to_string())?;
+        span_bytes[7] = 0;
+        let total = u64::from_le_bytes(span_bytes);
+        let prologue = if is_bzz {
+            ControlAck::BzzStreamStart {
+                total_bytes: total,
+                content_type,
+                filename,
+            }
+        } else {
+            ControlAck::BytesStreamStart { total_bytes: total }
+        };
+        ack.send(prologue)
+            .await
+            .map_err(|_| "stream closed".to_string())?;
+        if head_only {
+            return Ok::<(), String>(());
+        }
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel(8);
+        let opts = JoinOptions {
+            allow_degraded_redundancy: allow_degraded,
+        };
+        let cap = max_bytes
+            .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
+            .unwrap_or(DEFAULT_MAX_FILE_BYTES);
+        let body_range = range.and_then(|r| ByteRange::clamp(r.start, r.end_inclusive, total));
+        let mut join_fut = Box::pin(join_to_sender_range(
+            fetcher, &root, cap, opts, body_range, chunk_tx,
+        ));
+        let mut join_result = None;
+        loop {
+            tokio::select! {
+                result = &mut join_fut, if join_result.is_none() => {
+                    join_result = Some(result.map_err(|e| e.to_string()));
+                }
+                maybe_chunk = chunk_rx.recv() => {
+                    match maybe_chunk {
+                        Some(data) => {
+                            ack.send(ControlAck::BytesChunk { data })
+                                .await
+                                .map_err(|_| "stream closed".to_string())?;
+                        }
+                        None => return join_result.unwrap_or(Ok(())),
+                    }
+                }
+            }
+        }
+    }
+    .await;
+    let terminal = match result {
+        Ok(()) => ControlAck::StreamDone,
+        Err(e) => ControlAck::Error { message: e },
+    };
+    let _ = ack.send(terminal).await;
 }

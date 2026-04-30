@@ -22,4 +22,5 @@ pub use client::{request_streaming, request_sync, ClientError, StreamEvent};
 #[cfg(unix)]
 pub use server::{
     serve, streaming_ack_channel, ControlAck, ControlCommand, ManifestEntryInfo, ServerError,
+    StreamRange,
 };
