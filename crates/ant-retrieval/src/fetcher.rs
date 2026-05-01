@@ -19,7 +19,7 @@
 //! the command is cheap.
 
 use crate::progress::ProgressTracker;
-use crate::{retrieve_chunk, ChunkFetcher, InMemoryChunkCache, RetrievalError};
+use crate::{retrieve_chunk, ChunkFetcher, InMemoryChunkCache, RetrievalError, RetrievedChunk};
 use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
 use libp2p::PeerId;
@@ -36,33 +36,28 @@ use tracing::{debug, trace, warn};
 /// `ant_p2p::routing` to keep `ant-retrieval` free of a circular dep.
 pub type Overlay = [u8; 32];
 
-/// Per-fetch retry budget. Multi-MiB files under browser-style
-/// concurrency routinely hit chunks where dozens of close peers either
-/// answer `storage: not found` or have already disappeared from the
-/// address book (`no addresses for peer`) by the time we ask them. A
-/// budget of 32 was enough for isolated single-file fetches, but live
-/// four-WAV gateway verification still exhausted it on rare chunks
-/// while the daemon had ~100 warm BZZ peers. Search nearly the whole
-/// warm set on the failure path; hedging width and the process-wide
-/// semaphore still cap actual in-flight retrieval streams.
-const FALLBACK_PEERS: usize = 96;
+/// Per-chunk error budget, matching bee `maxOriginErrors` in
+/// `pkg/retrieval/retrieval.go`. Bee's origin path tolerates up to 32
+/// peer errors (Remote / Timeout / Io / OpenStream) before giving up
+/// on a chunk; we mirror that exactly so behaviour is comparable
+/// chunk-for-chunk. Beyond ~32 candidates the chunk is almost
+/// certainly not retrievable from our connected set anyway.
+const MAX_ORIGIN_ERRORS: usize = 32;
 
-/// Hedging width. We may have at most this many in-flight retrieval
-/// streams for a single chunk at once; whichever returns a valid
-/// delivery first wins, the rest get cancelled. Bee origin retrieval can
-/// multiplex to the initial peer plus two forwards; keep the same
-/// effective breadth here.
-const HEDGE_FANOUT: usize = 3;
-
-/// How long we wait on the first peer before firing a hedge. Most
-/// chunks resolve in well under this on the happy path (typical fast
-/// peer is 100–300 ms end-to-end), so the second request is only
-/// fired when the first peer is genuinely tail-slow. This avoids
-/// hammering bee peers — and getting disconnected for it — on every
-/// fetch, while still capping tail latency at roughly
-/// `HEDGE_DELAY + min_hedge_response`. If the first peer *errors*
-/// before the timer fires we hedge immediately rather than waiting.
-const HEDGE_DELAY: Duration = Duration::from_millis(500);
+/// Idle hedge interval. If the active retrieval stream hasn't returned
+/// a delivery within this window we dispatch a single backup peer in
+/// parallel. Set deliberately well above bee's per-chunk timeout's
+/// median (typical `retrieve-chunk` round-trip is 100–800 ms) so this
+/// only fires on genuinely tail-slow chunks — every preemptive dispatch
+/// either accumulates *applied* debt (if we then cancel after read) or
+/// *ghost* debt (if we cancel before read) on bee, both of which count
+/// against `lightDisconnectLimit`. Bee's own retrieval uses a 1 s
+/// preemptive ticker, but bee is also serving its own neighbourhood
+/// where per-chunk RTT is much shorter; for an origin client streaming
+/// from forwarders we eat fewer ghost debits by waiting longer before
+/// hedging. Hedging is still bounded by the 32-attempt error budget
+/// for that single chunk.
+const HEDGE_DELAY: Duration = Duration::from_secs(4);
 
 /// Stateful per-call fetcher. Owns a clone of `Control` and a live
 /// peer-snapshot subscription via `tokio::sync::watch::Receiver`.
@@ -291,9 +286,6 @@ impl RoutingFetcher {
 #[async_trait]
 impl ChunkFetcher for RoutingFetcher {
     async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
-        // Cache hit short-circuits the entire network path. `retrieve_chunk`
-        // CAC-validates before we ever cache, so cached entries are trusted
-        // without re-hashing.
         if let Some(cache) = self.cache.as_ref() {
             if let Some(bytes) = cache.get(&addr) {
                 trace!(
@@ -311,41 +303,49 @@ impl ChunkFetcher for RoutingFetcher {
             }
         }
 
-        let candidates = self.ranked(&addr);
-        if candidates.is_empty() {
-            return Err("no BZZ peers available".into());
-        }
-
-        // Hedged retrieval with a delay. We walk the ranked candidate
-        // list (capped at `FALLBACK_PEERS`) and keep up to
-        // `HEDGE_FANOUT` requests in flight at once. The first request
-        // is fired immediately. If it hasn't completed within
-        // `HEDGE_DELAY`, we add a hedge request to the next-closest
-        // peer. If a request errors, we backfill with the next peer
-        // straight away (don't wait on the timer — keep race breadth).
-        // The first peer to return a valid chunk wins; the rest get
-        // dropped, which cancels their libp2p streams.
-        let mut iter = candidates.into_iter().take(FALLBACK_PEERS);
-        let mut in_flight = FuturesUnordered::new();
-        // The initial `None` is observably dead — the only path that
-        // reads it goes through the `Err` arm below, which always
-        // overwrites it — but the type annotation on first use needs a
-        // value here.
-        #[allow(unused_assignments)]
+        // Bee-shaped retrieval, lightly tuned for the origin / forwarder
+        // split (`bee/pkg/retrieval/retrieval.go`):
+        //
+        //  - dispatch the closest unasked peer immediately;
+        //  - if the chunk hasn't returned within `HEDGE_DELAY`, dispatch
+        //    one more peer in parallel and reset the timer (so a really
+        //    pathological chunk can build up 2-3 racers, but only after
+        //    several seconds of silence on each); whichever returns the
+        //    delivery first wins and the remaining streams are dropped;
+        //  - on per-stream error, backfill with the next-closest peer
+        //    immediately (no timer wait — the racer pool just lost a
+        //    slot and we want it filled before the consumer notices);
+        //  - the per-chunk skip set keeps growing until either someone
+        //    answers, the candidate pool is empty, or `errors_left`
+        //    drops to zero.
+        //
+        // Why we wait `HEDGE_DELAY` instead of bee's `1 s` preemptive
+        // ticker: bee dispatches another peer every second on the
+        // origin path so a slow forwarder doesn't stall the chunk —
+        // but every cancelled inflight stream lands either as an
+        // *applied debit* (we read past their write) or a *ghost
+        // overdraw* (we don't read, so bee's `debitAction.Cleanup`
+        // bumps `accountingPeer.ghostBalance` by the chunk price; cf.
+        // `bee/pkg/accounting/accounting.go::debitAction.Cleanup`).
+        // Either kind of debit counts against bee's
+        // `lightDisconnectLimit` (≈1.69M units). The previous design
+        // (1 s preemptive on every chunk that took >1 s) showed up as
+        // a peer-set collapse from 100 → 37 over a 4-track media
+        // benchmark; widening the hedge window to several seconds
+        // dramatically reduces those redundant dispatches without
+        // losing the safety net.
+        //
+        // We deliberately do not implement the `proximity >= radius`
+        // multiplex-forward branch from bee's code — that's for nodes
+        // that ARE in the chunk's neighbourhood (storage nodes pushing
+        // to neighbours). As a light origin we always walk closest-first
+        // through forwarder peers.
+        let mut asked: Vec<PeerId> = Vec::new();
+        let mut errors_left = MAX_ORIGIN_ERRORS;
         let mut last_err: Option<RetrievalError> = None;
+        let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+        let mut hedge_timer = Box::pin(tokio::time::sleep(HEDGE_DELAY));
 
-        // Each in-flight fetch gets its own `Control` clone; libp2p's
-        // stream control multiplexes over the existing yamux session
-        // so this is cheap (no transport-level handshake), and lets
-        // hedge attempts truly run in parallel rather than queuing
-        // behind a single shared `&mut Control`. The optional
-        // process-wide semaphore is acquired *inside* the spawned
-        // future (not at scheduling time) so a hot-running joiner
-        // backpressures into the semaphore queue rather than into
-        // bee's per-peer stream queue. The acquire awaits before
-        // `retrieve_chunk`, and the permit drops with the future at
-        // completion — no manual release dance, no leak on the
-        // `drop(in_flight)` cancel-the-losers path.
         let make_fut = |peer: PeerId| {
             let mut control = self.control.clone();
             let sem = self.inflight_limit.clone();
@@ -368,35 +368,94 @@ impl ChunkFetcher for RoutingFetcher {
             }
         };
 
-        match iter.next() {
-            Some((peer, _)) => in_flight.push(make_fut(peer)),
+        // Pick the next-closest live peer that we haven't asked yet for
+        // THIS chunk. Reads `peers_rx` afresh on every call so peers
+        // that disconnect mid-fetch automatically drop out of the
+        // candidate pool, and a peer that gets blacklisted (CAC
+        // mismatch, malformed framing) by a sibling chunk's fetcher
+        // also disappears here.
+        let pick_next = |asked: &Vec<PeerId>| -> Option<PeerId> {
+            let ranked = self.ranked(&addr);
+            ranked.into_iter().find_map(|(peer, _)| {
+                if asked.contains(&peer) {
+                    None
+                } else {
+                    Some(peer)
+                }
+            })
+        };
+
+        // Initial dispatch.
+        match pick_next(&asked) {
+            Some(peer) => {
+                asked.push(peer);
+                in_flight.push(make_fut(peer));
+            }
             None => return Err("no BZZ peers available".into()),
         }
 
-        let mut hedge_timer = Box::pin(tokio::time::sleep(HEDGE_DELAY));
-
         loop {
+            // Loop exit when we've burned the error budget AND have
+            // nothing else racing. Mirrors bee's `for errorsLeft > 0`
+            // outer loop with the "continue if inflight" inner check.
+            if errors_left == 0 && in_flight.is_empty() {
+                break;
+            }
+            // No more candidates and nothing inflight → can't possibly
+            // succeed. This is bee's `topology.ErrNotFound` arm: it
+            // returns immediately with the underlying error rather
+            // than ticking against a frozen candidate list forever.
+            if in_flight.is_empty() && pick_next(&asked).is_none() {
+                break;
+            }
+
             tokio::select! {
+                biased;
                 Some((peer, result)) = in_flight.next() => {
                     match result {
                         Ok(chunk) => {
-                            // Drop the rest — `FuturesUnordered`'s drop
-                            // runs each remaining future's destructor,
-                            // which cancels its libp2p stream. Bee on
-                            // the other side just sees a stream reset.
-                            drop(in_flight);
-                            // Caller wants `span (8 LE) || payload`,
-                            // exactly what arrives on the wire.
-                            // `retrieve_chunk` already CAC-validates so
-                            // we can hand bytes back without a re-check.
+                            // Cancel-tolerant hedging. Instead of
+                            // `drop(in_flight)`, hand the remaining
+                            // futures to a detached drain task that
+                            // reads each loser's delivery message to
+                            // completion before letting the future drop.
+                            //
+                            // Why: bee's retrieval handler in
+                            // `pkg/retrieval/retrieval.go::handler`
+                            // calls `accounting.PrepareDebit` *before*
+                            // `WriteMsgWithContext(&Delivery{...})`,
+                            // and only then `debit.Apply()`. If we drop
+                            // the future mid-write, bee's write fails,
+                            // `Apply()` doesn't run, and bee's deferred
+                            // `debit.Cleanup()` increments
+                            // `accountingPeer.ghostBalance` by the chunk
+                            // price — which counts against
+                            // `lightDisconnectLimit` exactly like real
+                            // debt does, but pseudosettle does NOT clear
+                            // ghostBalance. The result was a peer-set
+                            // collapse from 100 → 36 over a four-track
+                            // benchmark even with HEDGE_DELAY = 4 s.
+                            //
+                            // By draining the loser to completion we
+                            // turn the cancellation into a real applied
+                            // debit on bee's side. Pseudosettle clears
+                            // those, and the peer set stays warm.
+                            //
+                            // The drain task also write-throughs cached
+                            // wire bytes (free, CAC-validated) and
+                            // notifies pseudosettle for every success,
+                            // so hot peers stay debt-cleared even when
+                            // they lose the race.
+                            spawn_drain_losers(
+                                in_flight,
+                                addr,
+                                self.cache.clone(),
+                                self.record_dir.clone(),
+                                self.payment_notify.clone(),
+                            );
                             let mut wire = Vec::with_capacity(8 + chunk.payload().len());
                             wire.extend_from_slice(&chunk.span_bytes());
                             wire.extend_from_slice(chunk.payload());
-                            // Write-through to the cache so the next
-                            // fetcher (next retry attempt, or a future
-                            // `antctl get` of the same reference)
-                            // skips the network for this chunk. The
-                            // clone is one 4 KiB memcpy per success.
                             if let Some(cache) = self.cache.as_ref() {
                                 cache.put(addr, wire.clone());
                             }
@@ -412,59 +471,49 @@ impl ChunkFetcher for RoutingFetcher {
                             // hasn't drained the bounded channel yet,
                             // missing one notification just delays the
                             // next refresh by at most one driver tick
-                            // (`REFRESH_TICK`, ~1 s) and is harmless.
+                            // (~1 s) and is harmless.
                             if let Some(notify) = self.payment_notify.as_ref() {
                                 let _ = notify.try_send(peer);
                             }
                             return Ok(wire);
                         }
                         Err(e) => {
-                            // Only globally blacklist for errors that
-                            // reflect on the *peer's* health (we couldn't
-                            // open a stream, the connection broke, the
-                            // peer fed us a malformed or non-CAC chunk,
-                            // etc.). A `Remote("...not found...")`
-                            // response just means this one peer can't
-                            // help with this one chunk — they may still
-                            // have hundreds of other chunks in this
-                            // file. Same for a single `Timeout`: a peer
-                            // that's slow forwarding chunk A is often
-                            // perfectly fine for chunk B which lands in
-                            // a different neighbourhood. Local-only
-                            // skipping (via `iter` already excluding
-                            // tried peers for this chunk) handles the
-                            // "don't retry this peer for THIS chunk"
-                            // case without poisoning the rest of the
-                            // file fetch.
                             let blacklist = is_peer_fatal(&e);
                             debug!(
                                 target: "ant_retrieval::fetcher",
                                 %peer,
                                 chunk = %hex::encode(addr),
                                 blacklist,
+                                inflight = in_flight.len(),
+                                errors_left,
                                 "fetch failed: {e}",
                             );
                             if blacklist {
                                 self.blacklist_peer(peer);
                             }
                             last_err = Some(e);
-                            // Eagerly backfill with the next candidate
-                            // so the race stays alive. Reset the hedge
-                            // timer so the new request gets a fair shot
-                            // before we layer another hedge on top.
-                            if let Some((peer, _)) = iter.next() {
+                            errors_left = errors_left.saturating_sub(1);
+                            if errors_left == 0 {
+                                continue;
+                            }
+                            // Backfill immediately on error: don't wait
+                            // for the next preemptive tick. Mirrors bee's
+                            // `retry()` call inside the error arm.
+                            if let Some(peer) = pick_next(&asked) {
+                                asked.push(peer);
                                 in_flight.push(make_fut(peer));
-                                hedge_timer = Box::pin(tokio::time::sleep(HEDGE_DELAY));
-                            } else if in_flight.is_empty() {
-                                break;
                             }
                         }
                     }
                 }
-                _ = &mut hedge_timer, if in_flight.len() < HEDGE_FANOUT => {
-                    // First peer is taking a while; fire a hedge to the
-                    // next-closest candidate, if any.
-                    if let Some((peer, _)) = iter.next() {
+                _ = &mut hedge_timer, if errors_left > 0 => {
+                    // Tail-slow chunk: layer one more peer onto the race.
+                    // Reset the timer so the next hedge needs another
+                    // full HEDGE_DELAY of silence before firing — we
+                    // don't want a single stuck chunk to spin up 32
+                    // hedges in a tight loop.
+                    if let Some(peer) = pick_next(&asked) {
+                        asked.push(peer);
                         in_flight.push(make_fut(peer));
                     }
                     hedge_timer = Box::pin(tokio::time::sleep(HEDGE_DELAY));
@@ -473,8 +522,9 @@ impl ChunkFetcher for RoutingFetcher {
         }
 
         Err(format!(
-            "all peers failed for chunk {} (last: {})",
+            "all peers failed for chunk {} after {} attempts (last: {})",
             hex::encode(addr),
+            asked.len(),
             last_err
                 .map(|e| e.to_string())
                 .unwrap_or_else(|| "no candidates".into())
@@ -541,6 +591,89 @@ fn is_peer_fatal(err: &RetrievalError) -> bool {
         | RetrievalError::InvalidChunk
         | RetrievalError::BadPayloadSize(_) => true,
     }
+}
+
+/// Detached drain of the losing in-flight fetches after a winner has
+/// returned. See the comment at the call site for the full ghost-balance
+/// rationale; the short version is that bee's retrieval handler debits
+/// us *only* once `WriteMsgWithContext` succeeds, so we let each loser
+/// run to completion on a background task instead of cancelling its
+/// libp2p stream mid-write.
+///
+/// Side effects performed by the drain task on each loser that returns
+/// a CAC-valid chunk:
+///   - **Cache write-through.** The loser already paid for the bytes;
+///     caching them is free and a sibling fetch (or a future request
+///     for the same chunk) skips the network entirely.
+///   - **Pseudosettle notify.** The chunk price was applied as a real
+///     debit on bee's accounting, so the pseudosettle driver needs to
+///     know we owe this peer. Without this notify, debt would still
+///     accumulate and we'd just trade ghost-overdraw blocklists for
+///     `lightDisconnectLimit` blocklists.
+///   - **`record_chunk`** if recording is enabled.
+///
+/// Errors from losing fetches are silently discarded — the winner has
+/// already returned so there's nothing useful for the caller to do
+/// with them.
+///
+/// The spawned task is detached: we don't await it, and dropping the
+/// `JoinHandle` (returned implicitly by `tokio::spawn` and ignored
+/// here) does not cancel the task. The loser permits on the per-request
+/// and process-wide retrieval semaphores stay held until the drain
+/// task finishes, which is exactly the back-pressure we want — sibling
+/// chunks of the same request keep waiting until losers finish, so we
+/// don't pile on the network while old hedges are still resolving.
+fn spawn_drain_losers<S>(
+    in_flight: S,
+    addr: [u8; 32],
+    cache: Option<Arc<InMemoryChunkCache>>,
+    record_dir: Option<PathBuf>,
+    payment_notify: Option<mpsc::Sender<PeerId>>,
+) where
+    S: futures::stream::Stream<Item = (PeerId, Result<RetrievedChunk, RetrievalError>)>
+        + Send
+        + 'static,
+{
+    tokio::spawn(async move {
+        let mut s = Box::pin(in_flight);
+        while let Some((peer, result)) = s.next().await {
+            match result {
+                Ok(chunk) => {
+                    let mut wire = Vec::with_capacity(8 + chunk.payload().len());
+                    wire.extend_from_slice(&chunk.span_bytes());
+                    wire.extend_from_slice(chunk.payload());
+                    if let Some(cache) = cache.as_ref() {
+                        cache.put(addr, wire.clone());
+                    }
+                    if let Some(dir) = record_dir.as_ref() {
+                        record_chunk(dir, &addr, &wire);
+                    }
+                    // We deliberately do NOT call
+                    // `progress.record_chunk(...)`: the winner already
+                    // counted this chunk against the request's totals
+                    // and we don't want this loser to double-count the
+                    // bytes-served gauge.
+                    if let Some(notify) = payment_notify.as_ref() {
+                        let _ = notify.try_send(peer);
+                    }
+                    trace!(
+                        target: "ant_retrieval::fetcher",
+                        %peer,
+                        chunk = %hex::encode(addr),
+                        "drained losing hedge to applied debit",
+                    );
+                }
+                Err(e) => {
+                    trace!(
+                        target: "ant_retrieval::fetcher",
+                        %peer,
+                        chunk = %hex::encode(addr),
+                        "drained losing hedge errored: {e}",
+                    );
+                }
+            }
+        }
+    });
 }
 
 /// Best-effort dump of a CAC-validated chunk's wire bytes to

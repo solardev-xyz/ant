@@ -1381,7 +1381,15 @@ async fn stream_root_chunk_inner(
     options: ant_retrieval::JoinOptions,
     ack: mpsc::Sender<ControlAck>,
 ) {
-    let (chunk_tx, mut chunk_rx) = mpsc::channel::<Vec<u8>>(16);
+    // 64 × ~4 KiB ≈ 256 KiB of decoded body buffered between the
+    // joiner and the control reply pump. This matches bee's small-file
+    // lookahead window (`langos` with `smallFileBufferSize` = 8 ×
+    // 32 KiB) so a slow-draining HTTP consumer doesn't immediately
+    // back-pressure into the joiner's per-child pipes. Combined with
+    // the joiner's `STREAM_PIPE_DEPTH` per-child buffers, a healthy
+    // download keeps roughly 2-3 MiB of decoded body ahead of the
+    // gateway at any given moment.
+    let (chunk_tx, mut chunk_rx) = mpsc::channel::<Vec<u8>>(64);
     let cap = clamp_max_bytes(max_bytes);
     let body_range = range.and_then(|r| {
         ant_retrieval::ByteRange::clamp(r.start, r.end_inclusive, total_bytes)
@@ -1508,20 +1516,27 @@ fn send_terminal_ack(ack: &mpsc::Sender<ControlAck>, reply: ControlAck) {
 const MAX_FETCH_ATTEMPTS: usize = 10;
 
 /// Process-wide cap on concurrent `retrieve_chunk` calls (see
-/// `SwarmState::retrieval_inflight`). Unbounded four-file gateway
-/// fetches stampede bee with ~60 streams and trigger chunk timeouts;
-/// 16 avoids the stampede but leaves four 44 MiB WAVs short of the
-/// gateway's 600 s envelope. With per-request fairness in front of this
-/// global queue we can safely let the daemon use more aggregate network
-/// parallelism without one request monopolising all permits.
-const RETRIEVAL_INFLIGHT_CAP: usize = 64;
+/// `SwarmState::retrieval_inflight`). Bee's retrieval has no
+/// equivalent — it spawns one goroutine per chunk fetch and lets the
+/// Go runtime sort it out. We keep a soft cap so a stuck network
+/// can't chew through unbounded yamux streams; 256 is well above
+/// what 4–8 concurrent media downloads ever drive at once but caps
+/// pathological loops. The per-request cap is what does the actual
+/// fairness work between requests.
+const RETRIEVAL_INFLIGHT_CAP: usize = 256;
 
 /// Per-user-request cap layered in front of the process-wide semaphore.
-/// This keeps four concurrent large media downloads fair: no single
-/// joiner can queue every global permit with descendant leaf fetches
-/// while another request is still waiting on its root or first ordered
-/// subtree.
-const RETRIEVAL_REQUEST_INFLIGHT_CAP: usize = 16;
+/// Sized to roughly match bee's effective chunk-level parallelism for
+/// a single file (one langos lookahead window of ~256 KiB ≈ 64 chunks)
+/// while keeping per-peer chunk rate inside the headroom that the
+/// pseudosettle driver can clear. Going higher (e.g. 128) makes a
+/// fresh peer set drain faster on a single file but punches through
+/// the per-peer debt allowance for sustained multi-file streaming —
+/// the hottest peers see ≥10× their share when chunk addresses cluster
+/// around a small neighbourhood, and the pseudosettle refresh budget
+/// per peer (`450k units/s × MIN_REFRESH_INTERVAL` = 900k units / 2 s)
+/// caps the steady-state per-peer fetch rate at ~12 chunks / 2 s.
+const RETRIEVAL_REQUEST_INFLIGHT_CAP: usize = 64;
 
 /// Multiplier base for inter-attempt backoff. Attempt N waits
 /// `RETRY_BACKOFF_BASE * N` before retrying — small enough not to

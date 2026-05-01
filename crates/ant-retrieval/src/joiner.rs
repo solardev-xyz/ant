@@ -57,9 +57,9 @@ const MAX_BRANCHES: usize = CHUNK_SIZE / 32;
 /// daemon's process-wide retrieval semaphore remains the final cap on
 /// live libp2p streams; this fanout controls how much of a deep file can
 /// make progress instead of walking left-to-right one subtree at a time.
-/// Keep this close to Bee's worker-style prefetching while relying on
-/// `RoutingFetcher`'s per-request and process-wide semaphores to prevent
-/// concurrent media requests from stampeding the network.
+/// Combined with bee's per-chunk retrieval client (preemptive multi-peer
+/// fanout, 1 s ticker), this gives roughly the same effective breadth
+/// per file as bee's `errgroup.Group` model in `pkg/file/joiner`.
 const FETCH_FANOUT: usize = 8;
 /// Retry a child subtree in place when it fails because one descendant
 /// chunk could not be fetched. This is the streaming equivalent of the
@@ -69,12 +69,19 @@ const FETCH_FANOUT: usize = 8;
 /// descendant chunks are cached by `RoutingFetcher`, so retries normally
 /// jump straight to the missing tail.
 const SUBTREE_RETRY_ATTEMPTS: usize = 32;
-/// Above this span, the streaming joiner descends into a child subtree
-/// instead of materialising that whole child as one output buffer. This
-/// is what fixes Bee-shaped roots with only a couple of very large
-/// children: `/bytes` can emit the first 512 KiB-ish descendants instead
-/// of waiting for a 64 MiB subtree to finish.
-const STREAM_RECURSE_THRESHOLD: u64 = 1024 * 1024;
+/// Per-child output-channel depth for the streaming joiner. This is
+/// exactly bee's "moving window" knob: each in-flight sibling subtree
+/// has at most this many resolved 4 KiB chunks (≈ 256 KiB) buffered
+/// while waiting for the in-order merger to forward them downstream.
+/// Combined with `FETCH_FANOUT`, the joiner keeps roughly
+/// `FETCH_FANOUT * STREAM_PIPE_DEPTH` chunks (≈ 2 MiB) ahead of the
+/// consumer at any given level — comparable to bee's langos lookahead
+/// (256–512 KiB) layered on top of its joiner errgroup. Output stays
+/// strictly in document order at every level because the merger drains
+/// children left-to-right; later siblings backfill as soon as the first
+/// finishes, so a fast 4 MiB child never has to wait for the slow
+/// previous 4 MiB child to produce its first byte.
+const STREAM_PIPE_DEPTH: usize = 64;
 
 /// Knobs that aren't span/payload-defined. Pass [`JoinOptions::default`]
 /// for the strict joiner; flip flags on for explicit, narrowly-scoped
@@ -442,7 +449,7 @@ fn join_subtree_to_sender<'a>(
         }
 
         let branch_size = subtrie_section(refs, subtree_span);
-        let mut specs: Vec<(usize, [u8; 32], u64, u64)> = Vec::with_capacity(refs);
+        let mut specs: Vec<([u8; 32], u64, u64)> = Vec::with_capacity(refs);
         let mut remaining = subtree_span;
         let mut child_offset = offset;
         for i in 0..refs {
@@ -453,40 +460,69 @@ fn join_subtree_to_sender<'a>(
             } else {
                 branch_size.min(remaining)
             };
-            specs.push((i, child_addr, child_span, child_offset));
+            specs.push((child_addr, child_span, child_offset));
             remaining = remaining.saturating_sub(child_span);
             child_offset = child_offset.saturating_add(child_span);
         }
 
-        if specs
-            .iter()
-            .any(|(_, _, child_span, _)| *child_span > STREAM_RECURSE_THRESHOLD)
-        {
-            for (_, addr, child_span, child_offset) in specs {
-                join_child_to_sender(fetcher, addr, child_span, child_offset, out).await?;
-            }
-            return Ok(());
-        }
-
+        // Streaming pipelined fan-out. Each sibling subtree gets its own
+        // bounded `mpsc::channel(STREAM_PIPE_DEPTH)`, so it can keep
+        // producing chunks ahead of the in-order merger until its buffer
+        // fills. The merger drains receivers strictly left-to-right, so
+        // output stays in document order while later siblings can already
+        // be fetching descendants. This is the streaming analogue of
+        // bee's `errgroup.Group` model in `pkg/file/joiner.readAtOffset`,
+        // and matches bee's "moving window" by way of the per-child
+        // depth (the consumer-side `langos` buffer in bee).
+        //
+        // We bound concurrent producers with `buffer_unordered(fanout)`
+        // so a deep tree doesn't spawn 128 simultaneous subtree workers
+        // at the leaf level — the process-wide retrieval semaphore
+        // remains the final cap, but this keeps the joiner's own
+        // bookkeeping in check too.
+        type ProducerFut<'b> =
+            std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), JoinError>> + Send + 'b>>;
         let fanout = FETCH_FANOUT.min(refs).max(1);
-        let mut children = stream::iter(specs.into_iter().map(
-            |(index, addr, child_span, child_offset)| async move {
-                let child =
-                    join_child_with_retries(fetcher, addr, child_span, child_offset).await?;
-                Ok((index, child))
-            },
-        ))
-        .buffer_unordered(fanout);
-
-        let mut pending = BTreeMap::new();
-        let mut next_index = 0;
-        while let Some((index, child)) = children.try_next().await? {
-            pending.insert(index, child);
-            while let Some(child) = pending.remove(&next_index) {
-                out.send(child).await.map_err(|_| JoinError::OutputClosed)?;
-                next_index += 1;
-            }
+        let mut child_rxs: Vec<mpsc::Receiver<Vec<u8>>> = Vec::with_capacity(refs);
+        let mut producers: Vec<ProducerFut<'a>> = Vec::with_capacity(refs);
+        for (addr, child_span, child_offset) in specs.into_iter() {
+            let (tx, rx) = mpsc::channel::<Vec<u8>>(STREAM_PIPE_DEPTH);
+            child_rxs.push(rx);
+            producers.push(Box::pin(async move {
+                let r = join_child_to_sender(fetcher, addr, child_span, child_offset, &tx).await;
+                drop(tx);
+                r
+            }));
         }
+
+        // Driver: run up to `fanout` producers concurrently and surface
+        // the first error. Producers carry their own per-child sender,
+        // so dropping the stream after a failure cleanly tears down
+        // every in-flight subtree (their `tx` drops → the merger's `rx`
+        // closes on the next read → joiner returns `OutputClosed`).
+        let producers_drive = async move {
+            let mut s = stream::iter(producers).buffer_unordered(fanout);
+            while let Some(result) = s.next().await {
+                result?;
+            }
+            Ok::<(), JoinError>(())
+        };
+
+        // Merger: drain receivers left-to-right and forward each
+        // buffer downstream. `out.send` honours the consumer's own
+        // back-pressure, which fans back up through this channel into
+        // each child's bounded receiver, then into the producer that
+        // blocks on `tx.send` once its window is full.
+        let merger = async move {
+            for mut rx in child_rxs {
+                while let Some(buf) = rx.recv().await {
+                    out.send(buf).await.map_err(|_| JoinError::OutputClosed)?;
+                }
+            }
+            Ok::<(), JoinError>(())
+        };
+
+        tokio::try_join!(producers_drive, merger)?;
         Ok(())
     })
 }

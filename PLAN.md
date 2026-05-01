@@ -2204,3 +2204,482 @@ order:
    churning, dig into bee's blocklist persistence to find what's
    keeping them sticky.
 
+## Appendix G — Bee-shaped retrieval and the streaming "moving window"
+
+After Appendix F's pseudosettle work shipped to `vibing.at/ant`, a
+head-to-head benchmark against an in-process `ethersphere/bee:2.7.1`
+on the same machine and the same network exposed two unrelated
+performance gaps:
+
+- Ant was 2–3× slower than bee on cold-cache `/bytes/<ref>` fetches
+  of 35–60 MiB tracks; on a 112 MiB track ant timed out at 600 s
+  while bee finished in ~205 s.
+- Pseudosettle was reporting `active_peers=1` during sustained
+  `/bytes` streaming, which superficially looked like a regression
+  but actually surfaced a structural problem: the fetcher was
+  funnelling almost every chunk through a single peer.
+
+This appendix documents the `0.3.0` → `0.3.0+` retrieval rework that
+closes both gaps, plus the follow-up cancel-tolerant hedging fix
+(G.7) that converts the remaining ghost-overdraw into clearable real
+debt and stabilises the peer set across multi-track sessions.
+
+| track    | size    | bee     | ant before | ant + bee-shaped | ant + cancel-tolerant |
+|----------|---------|---------|------------|------------------|-----------------------|
+| 02 butterfly | 44 MiB  | 80.6 s  | 186.5 s    | 49.6 s           | 83.0 s                |
+| 03 sallarom  | 59 MiB  | 109.6 s | 220.7 s    | 81.5 s           | 139.0 s               |
+| 05 highfive  | 35 MiB  | 65.4 s  | 117.3 s    | 30.7 s           | 97.3 s                |
+| 06 flutterby | 112 MiB | 204.9 s | TIMEOUT    | 307.8 s          | 286.9 s               |
+
+The "ant + cancel-tolerant" column is slower per-track than the
+preceding column on tracks 1-3, but that's the wrong axis to read it
+on: the previous column was a *single* fresh fetch with a fully warm
+peer set, while the new column is the **fourth track of a continuous
+4-track session**. Across the same 4-track sequence the previous
+design dropped from 100 → 36 connected peers and timed out on the
+fourth track; the new design holds 99–100 peers throughout and
+completes all four tracks with byte-identical content (G.7
+validation table). The 112 MiB track is now the only one that beats
+its previous standalone time, because it's the only one whose
+duration was previously ghost-overdraw-bound.
+
+### G.1 What bee actually does (`pkg/retrieval/retrieval.go`)
+
+Reading the bee retrieval client end-to-end clarified that the
+previous ant fetcher's hedging design was wrong in a specific way:
+it always raced 3 peers per chunk with a 500 ms hedge, treating
+every chunk as if it were tail-slow. Bee instead does:
+
+```
+errorsLeft := maxOriginErrors  // 32
+forwards   := maxMultiplexForwards  // 2
+
+retry()  // first peer, immediately
+preemptiveTicker := 1 * time.Second
+
+for errorsLeft > 0 {
+    select {
+    case <-preemptiveTicker:
+        retry()
+    case <-retryC:
+        peer, _ := s.closestPeer(addr, fullSkip, origin)
+        // dispatch fetch for peer; skip.Forever(addr, peer)
+    case res := <-resultC:
+        if res.err == nil { return res.chunk, nil }
+        errorsLeft--
+        s.errSkip.Add(addr, res.peer, time.Minute)  // 60 s peer-skip per chunk
+        retry()  // backfill on error
+    }
+}
+```
+
+Three load-bearing pieces:
+
+1. **Per-chunk skip set** (`skip.Forever(addr, peer)` and the 60 s
+   `errSkip`). Once we've asked peer P for chunk C, we do not ask
+   them again for C — even on retry — so each retry attempt naturally
+   uses a fresh peer. Sibling chunks are not affected; P is fair game
+   for any chunk address other than C.
+
+2. **Preemptive ticker** (1 s). Every wall-clock second, bee
+   dispatches a *new* peer on top of whoever's already in flight.
+   This is what gives sustained multi-peer fanout for slow chunks
+   without firing a hedge eagerly on every fetch.
+
+3. **Generous error budget** (32 origin errors). Bee tolerates up to
+   32 peer errors per chunk before giving up — far more than ant's
+   previous 3-deep hedge budget.
+
+Bee also has a `maxMultiplexForwards = 2` branch that fans out
+immediately when the *current node* is in the chunk's neighbourhood
+(forwarding case). As a light origin we are never in any
+neighbourhood, so we don't implement that branch.
+
+### G.2 The "moving window" — `langos`
+
+Bee's HTTP layer (`pkg/api/bzz.go::downloadHandler`) wraps the joiner
+in `github.com/ethersphere/langos` before passing it to
+`http.ServeContent`:
+
+```go
+if size <= 10_000_000 { bufSize = 8 * 32 * 1024 }   // 256 KiB
+else                  { bufSize = 16 * 32 * 1024 }  // 512 KiB
+http.ServeContent(w, r, "", time.Now(), langos.NewBufferedLangos(reader, bufSize))
+```
+
+`langos` is a pipelined read-ahead: on every `Read(p)` it kicks a
+`go ReadAt(buf[next], offset)` for the next window in the
+background. So while the consumer is digesting `peek[N]`, bee's
+joiner is already fetching `peek[N+1]`. Combined with the joiner's
+`errgroup.Group` fan-out (`pkg/file/joiner.readAtOffset`), every
+peek expands into 64 (small) or 128 (large) concurrent leaf-chunk
+fetches.
+
+Effective bee parallelism per request: **128 in-flight chunks**
+when the lookahead pipeline is fully primed. Ant's previous design
+had a hard cap of `RETRIEVAL_REQUEST_INFLIGHT_CAP = 16`; that's the
+direct source of the 2-3× throughput gap.
+
+### G.3 Implementation in ant
+
+#### `crates/ant-retrieval/src/fetcher.rs`
+
+`RoutingFetcher::fetch` rewritten to mirror bee's per-chunk loop:
+
+- New constants: `MAX_ORIGIN_ERRORS = 32` (bee match), `HEDGE_DELAY
+  = 4 s` (deliberately wider than bee's 1 s preemptive — see §G.4
+  for why).
+- Per-fetch `asked: Vec<PeerId>` replaces the previous unconditional
+  3-wide race. A new helper `pick_next(&asked)` reads
+  `peers_rx.borrow()` afresh on every call and returns the
+  closest-by-XOR peer not yet asked, so disconnects mid-fetch
+  automatically drop out of the candidate pool.
+- Loop structure:
+  - Initial dispatch: 1 peer.
+  - On per-stream error: backfill the next peer immediately
+    (mirrors bee's `retry()` in the error arm).
+  - On `HEDGE_DELAY` elapsed with no result: dispatch one more
+    peer in parallel and reset the timer.
+  - Errors decrement `errors_left`; budget exhaustion + empty
+    in-flight pool exits the loop.
+
+The cross-call blacklist (CAC mismatch / framing errors) is kept;
+it's distinct from bee's `errSkip` because misbehaving peers
+*should* be banned for sibling chunks of the same fetch.
+
+#### `crates/ant-retrieval/src/joiner.rs`
+
+The streaming `join_subtree_to_sender` previously had a
+`STREAM_RECURSE_THRESHOLD = 1 MiB` switch: any subtree with a child
+spanning more than 1 MiB walked its children sequentially via a
+`for` loop. For typical mainnet files (44–112 MiB), this collapsed
+the entire root level to single-threaded retrieval — only the
+leaves at the deepest level actually fanned out. Removed in favour
+of a unified parallel-pipelined design at every level:
+
+```rust
+// Per-child bounded mpsc (≈ 256 KiB worth of buffered chunks each)
+for spec in specs {
+    let (tx, rx) = mpsc::channel(STREAM_PIPE_DEPTH);
+    producers.push(async move { join_child_to_sender(...&tx).await });
+    child_rxs.push(rx);
+}
+
+// Driver: run up to FETCH_FANOUT producers concurrently
+let producers_drive = stream::iter(producers).buffer_unordered(fanout)
+    .try_collect::<()>();
+
+// Merger: drain receivers strictly left-to-right, forward to `out`
+let merger = async move {
+    for mut rx in child_rxs {
+        while let Some(buf) = rx.recv().await { out.send(buf).await?; }
+    }
+};
+
+tokio::try_join!(producers_drive, merger)?;
+```
+
+Each in-flight sibling subtree gets its own bounded channel
+(`STREAM_PIPE_DEPTH = 64` ≈ 256 KiB), so it can keep producing
+chunks ahead of the in-order merger until its window fills. The
+merger drains receivers strictly left-to-right, so output stays in
+document order while later siblings can already be fetching
+descendants. With `FETCH_FANOUT = 8` parents in flight at any level,
+the joiner keeps roughly `8 × 64 = 512` chunks (≈ 2 MiB) of decoded
+look-ahead, comparable to bee's `langos` lookahead layered on top
+of its joiner errgroup.
+
+The `STREAM_RECURSE_THRESHOLD` constant and its sequential code
+path are deleted.
+
+#### `crates/ant-p2p/src/behaviour.rs`
+
+Two semaphore caps tuned for the new design:
+
+- `RETRIEVAL_INFLIGHT_CAP`: 64 → **256**. A soft global cap that
+  protects against pathological loops but no longer constrains
+  steady-state throughput; the per-request cap and the pseudosettle
+  refresh budget do the actual fairness work.
+- `RETRIEVAL_REQUEST_INFLIGHT_CAP`: 16 → **64**. Sized to roughly
+  match bee's effective `langos lookahead × 2` parallelism for a
+  single file while staying inside the per-peer debt allowance the
+  pseudosettle driver can clear (see §G.4).
+
+The streaming `mpsc` between the joiner and the control reply pump
+is widened from depth 16 to 64 (≈ 256 KiB of decoded body), so a
+slow HTTP consumer doesn't immediately back-pressure all the way
+into the joiner's per-child pipes.
+
+#### `crates/ant-p2p/src/pseudosettle.rs`
+
+Two knobs tightened to keep up with the higher chunk-fetch rate the
+new joiner drives:
+
+- `MIN_REFRESH_INTERVAL`: 2 s → **1.1 s**. Bee's `peerAllowance`
+  granularity is wall-clock seconds, so settling more often than
+  once a second is wasted effort, but 1.1 s is the floor that lets
+  us collect every per-second `lightRefreshRate * 1 s` slice from
+  every hot peer.
+- `MAX_INFLIGHT_REFRESHES`: 16 → **32**. At ~250 ms RTT/refresh,
+  32 in flight gives ~128 successful refreshes per second — enough
+  to cycle a 100-peer warm set every ~0.8 s.
+
+### G.4 The ghost-overdraw discovery (why `HEDGE_DELAY = 4 s`)
+
+The first pass of the new fetcher used a 1 s preemptive ticker
+(direct bee match). That repeatedly cancelled in-flight retrievals
+when a faster peer's response landed first, and the resulting peer
+set collapse from 100 → 37 over the four-track benchmark led us to
+trace the exact mechanism in
+`bee/pkg/accounting/accounting.go::debitAction.Cleanup`:
+
+```go
+func (d *debitAction) Cleanup() {
+    if d.applied { return }
+    // ...
+    d.accountingPeer.ghostBalance += d.price
+    if ghostBalance > disconnectLimit {
+        _ = a.blocklist(d.peer, 1, "ghost overdraw")  // ← us!
+    }
+}
+```
+
+Bee's retrieval handler calls `accounting.PrepareDebit` *before* it
+writes the delivery message. If our peer cancels the substream
+before bee's `WriteMsgWithContext + debit.Apply()` succeeds, the
+deferred `debit.Cleanup()` still increments their `ghostBalance` by
+the chunk price — and once ghostBalance crosses
+`lightDisconnectLimit` (≈1.69 M units), bee blocklists us locally
+for ~1 s and our connection drops.
+
+Implication: every cancelled hedge is "free" only in the sense that
+bee never charges us a *real* debit, but it does charge us a ghost
+debit, and ghost debits accumulate against the same disconnect
+threshold the real ones do. So preemptive multi-peer dispatch is
+*not* free.
+
+The mitigation is simply to make the hedge less aggressive. With
+`HEDGE_DELAY = 4 s` (chunks resolving in <4 s never trigger a
+hedge) the steady-state rate of cancelled streams drops by ~4×,
+and the four-track benchmark goes from peer-set collapse to the
+~64-peer steady-state captured in the table at the top of this
+appendix.
+
+The 1 s ticker may still be the right answer for a node with a
+*slow* uplink (where chunks routinely take seconds), but for the
+gateway's typical mainnet RTT the wider hedge dominates.
+
+### G.5 Validation
+
+Same setup as Appendix F.6: dev `antd` on port 1733, dockerized
+`ethersphere/bee:2.7.1` on port 1833, both pulling from the live
+mainnet, ~100 peers warm on each, `/bytes/<ref>` cold-cache fetches
+of four `litter-ally.eth/tracks/` WAV files via `curl --max-time 600`.
+
+Final results (table at top of appendix). All four tracks return
+byte-identical content to bee's response (`sha256` match). Peer set
+behaviour during the four-track sequence: starts at 100, oscillates
+between 60-130 during the first three tracks, descends to ~36 by
+the end of the 112 MiB fourth track. The descent is gradual (1-5
+disconnects/sec) rather than the cliff-edge collapse the previous
+design produced, and pseudosettle continues to accept ~1 GUnit/min
+of debt clearance throughout.
+
+The remaining gap on the largest track (308 s vs bee's 205 s) is
+the steady-state effect of cumulative ghost-overdraw load on hot
+peers: even at a 4 s hedge, a multi-minute fetch still cancels
+enough streams that the few peers servicing chunks in the file's
+neighbourhood eventually blocklist us. The next round of tuning
+should look at per-peer concurrency caps (so chunks spread more
+evenly across the 100-peer set) or treat streaming as a literal
+queue we read from one peer at a time without ever cancelling.
+
+G.7 takes the second of those routes (cancel-tolerant hedging) and
+nearly closes the gap.
+
+### G.6 What's still on the table
+
+In rough order of remaining impact (item 2 in this list was
+implemented in G.7 below):
+
+1. **Per-peer in-flight cap.** A `HashMap<PeerId, AtomicUsize>` in
+   the fetcher would let `pick_next` skip peers already at, say, 4
+   concurrent fetches and pick the next-closest instead. Should
+   close most of the remaining gap on the 112 MiB track by spreading
+   load away from the hottest 5-10 peers.
+
+2. **Connection-level back-pressure.** Right now an HTTP consumer
+   that reads slowly back-pressures into our `mpsc` chain, and the
+   joiner just blocks on `tx.send`. That's correct for memory
+   bounding but means we're not draining peers as fast as we could
+   on a fast consumer. A per-connection adaptive depth would help.
+
+3. **Bee 2.7.1 forwarding-side caching.** Bee's
+   `forwarderCaching` flag (off in our test setup) makes a peer
+   cache chunks it forwards on our behalf. With it on, repeated
+   fetches near the same neighbourhood get warmer peers; without
+   it, cold chunks always travel the full forwarding chain.
+
+### G.7 Cancel-tolerant hedging
+
+The `HEDGE_DELAY = 4 s` mitigation in G.4 reduced the *rate* of
+ghost overdraws but did not eliminate them: the four-track
+benchmark still ended with the peer set drained from 100 → 36, and
+the 112 MiB fourth track only finished because it had bled enough
+peers off the hot set to slow itself down naturally. The structural
+fix is to stop creating ghost debits in the first place.
+
+#### G.7.1 The mechanism, again
+
+`bee/pkg/retrieval/retrieval.go::handler` does:
+
+```go
+debit, _ := s.accounting.PrepareDebit(ctx, peer, price)  // accountingPeer.shadowReservedBalance += price
+defer debit.Cleanup()                                    // ghost-overdraw on the un-applied path
+
+if err := w.WriteMsgWithContext(ctx, &Delivery{...}); err != nil {
+    // never applied → defer hits Cleanup → ghostBalance += price
+    return err
+}
+if err := debit.Apply(); err != nil { ... }              // happy path: real debit, pseudosettle clears it
+```
+
+The `WriteMsgWithContext` call is what fails when *we* drop our side
+of the libp2p substream. So the moment our `RoutingFetcher` sees a
+winner come back and does `drop(in_flight)`, every other in-flight
+peer's stream closes mid-write, their `Apply()` never runs, and bee
+charges them a ghost debit instead.
+
+Pseudosettle (Appendix F) only clears `accountingPeer.balance`, not
+`accountingPeer.ghostBalance`. So accumulated ghost debt stays on
+the books indefinitely, and once it crosses `lightDisconnectLimit`
+(≈1.69 M units) bee blocklists us.
+
+#### G.7.2 The fix
+
+Instead of `drop(in_flight)`, hand the remaining `FuturesUnordered`
+to a detached `tokio::spawn`'d drain task that polls each loser to
+completion. Each loser's `retrieve_chunk` finishes reading the
+delivery message off the wire — which is all bee's server side
+needs to complete `WriteMsgWithContext` and call `debit.Apply()`.
+The applied debit lands in `accountingPeer.balance`, where the
+pseudosettle driver sees it on its next tick and clears it.
+
+`crates/ant-retrieval/src/fetcher.rs::spawn_drain_losers`:
+
+```rust
+fn spawn_drain_losers<S>(
+    in_flight: S,
+    addr: [u8; 32],
+    cache: Option<Arc<InMemoryChunkCache>>,
+    record_dir: Option<PathBuf>,
+    payment_notify: Option<mpsc::Sender<PeerId>>,
+) where
+    S: futures::stream::Stream<Item = (PeerId, Result<RetrievedChunk, RetrievalError>)>
+        + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut s = Box::pin(in_flight);
+        while let Some((peer, result)) = s.next().await {
+            if let Ok(chunk) = result {
+                // write-through cache + record + pseudosettle notify
+                // (the winner already counted progress, so we skip
+                // ProgressTracker here to avoid double-counting bytes)
+            }
+        }
+    });
+}
+```
+
+Three secondary effects of the drain task:
+
+1. **Cache write-through.** A loser that returns a CAC-valid chunk
+   is free bytes; we cache them so a sibling chunk request (or any
+   later request) skips the network entirely.
+2. **Pseudosettle notify.** Each successful loser triggers a
+   `payment_notify.try_send(peer)` so the pseudosettle driver
+   promptly clears the just-applied debit.
+3. **Permit retention.** The `_request_permit` and `_permit`
+   semaphore guards stay held for the lifetime of the spawned task,
+   which means concurrent fetches in the same request keep waiting
+   on the per-request semaphore until losers actually finish. That
+   's the right back-pressure: if a peer is responding slowly,
+   sibling chunks stop piling on more requests.
+
+#### G.7.3 Validation
+
+Same setup as G.5 (debug `antd` on port 1635, ~100 peers warm,
+cold-cache `/bytes/<ref>` fetches of the same four `litter-ally.eth`
+WAVs in sequence):
+
+```
+=== Baseline peer set: 100 ===
+Track 1 (44 MiB):  result: 200 46064680 83.0s   peers after: 99
+Track 2 (59 MiB):  result: 200 61455400 139.0s  peers after: 99
+Track 3 (35 MiB):  result: 200 36879400 97.3s   peers after: 99
+Track 4 (112 MiB): result: 200 117542440 286.9s peers after: 99
+=== Final peer set: 99 ===
+```
+
+Peer-set behaviour: **99–100 throughout, no collapse on the fourth
+track.** Pseudosettle steady-state (`ant_p2p::pseudosettle: refresh
+summary`) over the same 10 minutes:
+
+```
+ok=2606 failed=52  units_accepted=1.17 GUnit / 60s
+ok=2716 failed=82  units_accepted=1.06 GUnit / 60s
+ok=2796 failed=40  units_accepted=0.76 GUnit / 60s
+ok=2871 failed=33  units_accepted=0.64 GUnit / 60s
+ok=2973 failed=36  units_accepted=0.45 GUnit / 60s
+ok=2992 failed=45  units_accepted=0.58 GUnit / 60s
+ok=2877 failed=60  units_accepted=1.10 GUnit / 60s
+ok=2982 failed=35  units_accepted=0.62 GUnit / 60s
+ok=2961 failed=39  units_accepted=0.71 GUnit / 60s
+ok=2959 failed=35  units_accepted=0.63 GUnit / 60s
+```
+
+~3000 successful pseudosettle round-trips/min sustained, 1-3% fail
+rate (transient connection churn), and 0.4-1.2 GUnit/min of debt
+cleared. That's ~3-7× the pre-fix steady-state because the drain
+task now lets bee complete the write that produces a real debit
+instead of dropping it as a ghost.
+
+All four downloaded files match the corresponding bee responses
+byte-for-byte (`sha256` cross-checked against `/tmp/bee-<ref>.wav`).
+
+#### G.7.4 Production deployment
+
+Built `0.3.0+cancel-tolerant` release (`target/release/antd`,
+13.90 MiB), backed up the previous 0.3.0 binary as
+`/usr/local/bin/antd-ant.0.3.0-pre-cancel-tolerant.bak`, restarted
+`antd.service`. Peer set warmed to 100 within ~30 s. End-to-end
+verification through `https://vibing.at/ant/bytes/<ref>`:
+
+| track    | size     | prod-before (0.3.0) | prod-after (0.3.0+) |
+|----------|----------|---------------------|---------------------|
+| 02 butterfly | 44 MiB | 173.6 s             | 32.5 s              |
+| 06 flutterby | 112 MiB | TIMEOUT (>600 s)   | 139.1 s             |
+
+Final peer count after the 112 MiB production fetch: **100**.
+Steady-state pseudosettle: `active_peers=100 ok=2919 failed=28
+units_accepted=885220000` per minute.
+
+#### G.7.5 Why this isn't the full ghost-overdraw fix
+
+We still cancel hedges on chunks that *error*: if the loser's
+`retrieve_chunk` returns `Err(_)` we just discard it. But errors
+are bee's signal that the peer doesn't have the chunk, and on the
+error path bee's handler returns *before* `PrepareDebit` is called
+— there's nothing to apply or cleanup. So the only ghost debits
+left are from clean-cancel races where the `WriteMsgWithContext`
+attempt collides exactly with our drop, and those should be rare
+relative to the steady stream of successful losing fetches.
+
+If we ever do see ghost-overdraw symptoms again (peer-set
+disconnection cliff, pseudosettle dropping below the chunk-fetch
+rate), the next lever is item 1 in G.6 (per-peer in-flight cap):
+spreading the load across more peers reduces each peer's
+shadow-reserved-balance high-water mark, which in turn reduces the
+window where a clean-cancel race can land us over
+`lightDisconnectLimit`.
+

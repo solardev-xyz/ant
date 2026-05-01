@@ -100,11 +100,14 @@ pub const LIGHT_REFRESH_RATE_UNITS_PER_SEC: u64 = 450_000;
 const REFRESH_TICK: Duration = Duration::from_millis(1000);
 
 /// Minimum spacing between successive pseudosettle calls to the same peer.
-/// Bee's `peerAllowance` returns `ErrSettlementTooSoon` when two settles
-/// land in the same wall-clock second on its side, which both wastes a
-/// stream and increments their error metric. 2 s leaves a safe margin for
-/// network jitter and clock drift between us and the peer.
-const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+/// Bee's `peerAllowance` clamps the accepted amount to
+/// `lightRefreshRate * (now - lastTimestamp_seconds)`, with second-level
+/// granularity, so settling more often than once a second is wasted
+/// effort: bee will accept `0` for the in-second second call.
+/// 1 s is the floor; gateway-scale streaming bumps a hot peer's debt
+/// at 100k+ units/s, and the available `lightRefreshRate` (450k units/s)
+/// can keep up only if we collect every wall-clock second's allowance.
+const MIN_REFRESH_INTERVAL: Duration = Duration::from_millis(1100);
 
 /// Maximum window we ever ask bee to clear in a single pseudosettle.
 /// Mostly cosmetic — bee clamps internally — but keeps the wire amount
@@ -116,7 +119,11 @@ const MAX_REFRESH_WINDOW_SECS: u64 = 60;
 /// libp2p stream and waits up to [`STREAM_TIMEOUT`] for the round trip,
 /// so a hard cap protects the libp2p control's stream queue from a
 /// gateway burst that touches hundreds of new peers in a few seconds.
-const MAX_INFLIGHT_REFRESHES: usize = 16;
+/// Sized to keep up with a 100-peer warm set settling every
+/// [`MIN_REFRESH_INTERVAL`]: at ~250 ms RTT/refresh, 32 in flight gives
+/// us ~128 successful refreshes per second — enough to maintain a
+/// 1.1 s cadence on every hot peer simultaneously.
+const MAX_INFLIGHT_REFRESHES: usize = 32;
 
 /// Bound on the "I just fetched from X" channel into the driver. Drops
 /// on backpressure (the driver is a small fixed work queue; missing a
