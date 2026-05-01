@@ -29,7 +29,7 @@ use std::error::Error as StdError;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::{mpsc, watch, Semaphore};
 use tracing::{debug, trace, warn};
 
 /// 32-byte Swarm overlay. Duplicated locally rather than re-exported from
@@ -129,6 +129,14 @@ pub struct RoutingFetcher {
     /// hundreds of descendant chunk fetches while another HTTP request is
     /// still trying to fetch its root or first ordered subtree.
     request_inflight_limit: Option<Arc<Semaphore>>,
+    /// Notification channel into the pseudosettle driver. When set, every
+    /// successful chunk fetch sends the source peer's id; the driver
+    /// uses that to schedule periodic
+    /// `/swarm/pseudosettle/1.0.0/pseudosettle` refreshes and keep our
+    /// per-peer debt below bee's light-mode `disconnectLimit`. Omitted in
+    /// unit tests (no real bee on the other end means there's no debt to
+    /// settle).
+    payment_notify: Option<mpsc::Sender<PeerId>>,
 }
 
 impl RoutingFetcher {
@@ -157,6 +165,7 @@ impl RoutingFetcher {
             progress: None,
             inflight_limit: None,
             request_inflight_limit: None,
+            payment_notify: None,
         }
     }
 
@@ -222,6 +231,20 @@ impl RoutingFetcher {
     /// while still allowing the daemon as a whole to use the network.
     pub fn with_request_inflight_limit(mut self, limit: usize) -> Self {
         self.request_inflight_limit = Some(Arc::new(Semaphore::new(limit.max(1))));
+        self
+    }
+
+    /// Wire this fetcher to the daemon's pseudosettle driver. On every
+    /// successful chunk fetch, the source peer's id is sent on
+    /// `notify_tx`; the driver uses that as a heartbeat to schedule
+    /// `/swarm/pseudosettle/1.0.0/pseudosettle` refreshes. Without this,
+    /// debt accumulates on every peer that serves us until bee's
+    /// `disconnectLimit` kicks in (~7-30 chunks per peer in light mode)
+    /// — see the 0.3.0 streaming-regression appendix in `PLAN.md` for the
+    /// full analysis. The channel is bounded; if it backs up the fetcher
+    /// drops the notification rather than blocking the hot path.
+    pub fn with_payment_notify(mut self, notify_tx: mpsc::Sender<PeerId>) -> Self {
+        self.payment_notify = Some(notify_tx);
         self
     }
 
@@ -382,6 +405,16 @@ impl ChunkFetcher for RoutingFetcher {
                             }
                             if let Some(tracker) = self.progress.as_ref() {
                                 tracker.record_chunk(Some(peer), wire.len() as u64);
+                            }
+                            // Heartbeat into the pseudosettle driver. We
+                            // use `try_send` to keep the hot path
+                            // strictly non-blocking: if the driver
+                            // hasn't drained the bounded channel yet,
+                            // missing one notification just delays the
+                            // next refresh by at most one driver tick
+                            // (`REFRESH_TICK`, ~1 s) and is harmless.
+                            if let Some(notify) = self.payment_notify.as_ref() {
+                                let _ = notify.try_send(peer);
                             }
                             return Ok(wire);
                         }

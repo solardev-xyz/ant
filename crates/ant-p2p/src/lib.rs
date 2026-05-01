@@ -5,6 +5,7 @@ mod dial;
 pub mod dnsaddr;
 mod handshake;
 mod peerstore;
+pub mod pseudosettle;
 pub mod routing;
 mod sinks;
 mod underlay;

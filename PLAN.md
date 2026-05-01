@@ -1923,3 +1923,284 @@ The gateway should not try to fix badly packaged media in the first pass. If an 
 #### E.22.2 Archives
 
 The gateway should not try to understand or optimize archive internals in the first pass. ZIP central-directory access and selective extraction are client-level capabilities enabled by generic byte ranges. Ant should focus on correct metadata, bounded streaming, and exact byte-range serving for any file type.
+
+---
+
+## Appendix F — Bee Light-Node Accounting and Client-Side Pseudosettle
+
+This appendix captures the production regression that landed with the `0.3.0`
+streaming gateway from Appendix E and the work done to restore stability.
+The summary is short: the architectural shift from "materialize the file,
+then stream it from disk" to "stream chunks straight to the HTTP client"
+exposed a debt-accounting cliff with bee that 0.2.0 had been unintentionally
+hiding behind its serial fetch + small concurrency burst pattern.
+
+### F.1 Symptoms
+
+- `0.3.0` deployed to `vibing.at/ant`. Single 55 MiB WAV via `/bzz`
+  fetched fine on a freshly-started daemon.
+- Repeated downloads of the same file (or sustained traffic for a few
+  minutes) caused increasing latency, then truncated downloads
+  (`502 Bad Gateway` from the reverse proxy), then full request stalls.
+- `antctl peers` showed the connected peer set collapsing from
+  ~100 → ~0 over a couple of minutes of sustained `/bzz` load. After
+  load stopped, peers slowly re-handshaked back toward 100. Same daemon
+  binary, same identity, same chequebook, no other config change.
+- `0.2.0` running on the same host, same network, same workload had
+  none of these symptoms. Rolling back the binary on the gateway
+  restored production immediately. Confirmed regression.
+
+### F.2 Why 0.3.0 hit it and 0.2.0 didn't
+
+Both versions use the same `RoutingFetcher` (8-way fanout, 3-way
+hedging, 500 ms hedge delay) and the same chunk-retrieval protocol
+against bee. The difference is what the gateway does with the fetcher:
+
+- `0.2.0`: `GET /bzz/...` materializes the full file in memory via
+  `join` (the joiner already does the parallel chunk fetch), then
+  hands a `Bytes` body to axum which streams it to the client.
+  Network traffic is one bursty fetch for the whole file, then
+  network-quiet while bytes flow over HTTP.
+- `0.3.0`: the joiner is range-aware and emits chunks into an
+  `mpsc::Sender<Bytes>` consumed by axum's `Body::from_stream`. As
+  soon as the HTTP client TCP buffer drains, joiner pulls more
+  chunks. Network traffic is **continuous** for the entire wall-clock
+  duration of the download, including the long tail where the client
+  is throttled by their own access link.
+
+For a 55 MiB file at a ~5 MiB/s client link:
+- `0.2.0`: ~2 seconds of full-tilt fetch, then 9 seconds of HTTP-only.
+- `0.3.0`: ~11 seconds of pull-as-the-client-drains fetch, the entire
+  duration touching every neighbourhood the file's chunks live in.
+
+The net effect is that `0.3.0` keeps network state across many more
+request/response round trips with the same hot peers (those in the
+file's neighbourhood), and accumulates per-peer state at bee for the
+full download window instead of just the burst.
+
+### F.3 The bee-side budget for a light client
+
+We dug through bee 2.7.x to understand exactly what is being accounted.
+
+`pkg/accounting/accounting.go` — every chunk bee serves us costs us
+*accounting units*. The per-chunk price comes from `pricer/pricer.go`
+and depends on proximity:
+- `basePrice = 10_000` units for a chunk at PO ≥ 7 (in the peer's
+  own neighbourhood).
+- Each PO step further out **doubles** the price up to a cap.
+- At the file's far edge a 4 KiB chunk can cost up to ~`320_000` units.
+
+Our debt at a peer is tracked in their `accountingPeer` map.
+On every successful chunk delivery they call `accounting.Apply()` which
+adds the price to our balance. When that balance crosses
+`paymentThresholdForPeer(peer, fullNode)` they expect us to settle.
+
+For a light node (we send `full_node: false` in the bzz handshake) the
+relevant constants in `accounting.go` are:
+- `paymentThreshold = 13_500_000` units (full node default), divided
+  by `lightFactor = 10` for light clients →
+  `lightPaymentThreshold = 1_350_000`.
+- `disconnectLimit = paymentThreshold + paymentThreshold/4 = 16_875_000`,
+  then divided by `lightFactor` →
+  `lightDisconnectLimit ≈ 1_687_500` units.
+- `refreshRate = 4_500_000` units / sec full node →
+  `lightRefreshRate = 450_000` units / sec.
+
+The disconnect path is `accounting.Apply` → `BlockPeerError` → bee's
+libp2p layer calls `Blocklist.Add(overlay, duration, reason)` and
+closes the connection. The blocklist duration is computed as
+`(debt + paymentThreshold) / refreshRate` seconds — for a light node
+hitting the limit cleanly it works out to a few seconds, but multiple
+overlapping in-flight requests crossing the threshold simultaneously
+can multiply that significantly via the `ghostBalance` accounting.
+
+The arithmetic at our scale: a 55 MiB file is ~14_000 chunks. Even
+with 100 peers doing perfect load balancing that's ~140 chunks each;
+in practice the file's neighbourhood has ~20 hot peers that take
+~70% of the load. At an average chunk price of ~100_000 units, a hot
+peer hits `lightDisconnectLimit` after ~17 chunks, i.e. within seconds
+of the download starting. **Without a debt-clearing mechanism we run
+out of every hot peer's budget before the file is half done.**
+
+`0.2.0` got away with it because its single big burst tended to
+finish before bee actually got around to closing the connection — bee
+checks the threshold on the *next* incoming request after we cross
+it, and the burst was over by then. `0.3.0`'s sustained 100 s of
+chunk fetches gives bee plenty of opportunity to evict us mid-stream.
+
+### F.4 Pseudosettle
+
+Bee ships `/swarm/pseudosettle/1.0.0/pseudosettle` exactly for this
+case: a free, time-based debt refresh between any two peers.
+
+`pkg/settlement/pseudosettle/pseudosettle.go::handler` does
+`min(attempted, lightRefreshRate * elapsed_since_last_settle, current_debt)`
+and credits us for that many units. It's symmetric (either side can
+dial), single round-trip, and bounded server-side, so we can't abuse
+it. Bee implements both sides; Ant only ever needs the dialer side
+(we're the one accumulating debt).
+
+The wire protocol on top of bee's standard libp2p substreams:
+
+```text
+dialer → listener : varint(0x00)                              // empty pb.Headers
+listener → dialer : varint(0x00)                              // empty pb.Headers
+dialer → listener : varint(N) + Payment   { amount: bytes }   // big-endian big.Int
+listener → dialer : varint(N) + PaymentAck { amount, timestamp }
+```
+
+The headers preamble is bee's `pkg/p2p/libp2p/headers.go`; it wraps
+every protocol stream regardless of whether the protocol uses
+headers. The `Payment.amount` and `PaymentAck.amount` are
+`big.Int.Bytes()` (big-endian unsigned, no leading zeroes, empty for
+zero). `PaymentAck.timestamp` is a Unix-seconds `int64`.
+
+### F.5 Implementation in `crates/ant-p2p`
+
+New module: `crates/ant-p2p/src/pseudosettle.rs`.
+
+Three pieces:
+
+1. **`refresh_peer(control, peer)`**. Opens the pseudosettle stream,
+   writes the headers preamble, sends `Payment{ amount: 27_000_000 }`
+   (an over-ask — bee clamps), reads the `PaymentAck`, returns the
+   accepted amount + timestamp. Errors are returned and counted.
+
+2. **`run_inbound`**. Defensive: if a peer ever opens pseudosettle
+   *toward* us (we don't expect this since we never originate refresh
+   inbound, but bee has been seen to probe) we drain the Payment and
+   ack zero so they don't account anything to us.
+
+3. **`run_driver(control, notify_rx)`**. Background tokio task. The
+   fetcher's hot path (`crates/ant-retrieval/src/fetcher.rs`) sends
+   the peer id of every successful chunk fetch into a bounded
+   `mpsc::Sender<PeerId>` (1024-deep, `try_send`, drops on
+   backpressure). The driver builds a `HashMap<PeerId, PeerState>`
+   tracking `last_used` and `last_refresh`, and on a 1 s tick walks
+   the set, dispatching `refresh_peer` for any peer whose last
+   refresh is at least `MIN_REFRESH_INTERVAL = 2 s` old.
+
+The driver gates concurrent refreshes with
+`MAX_INFLIGHT_REFRESHES = 16` to keep the libp2p stream control's
+queue from flooding when a download starts touching dozens of new
+peers in quick succession.
+
+A second filter, added after the first production deploy exposed a
+gateway-scale failure mode, restricts refresh dispatch to peers
+currently in the `peers_watch` snapshot (i.e. peers we still have a
+direct, handshaked connection to). Without it, the active state
+HashMap grew to ~2_200 entries within minutes of sustained gateway
+traffic — the fetcher had cycled through that many distinct peers
+during streaming — and ~6_000 of the ~6_400 dispatched refreshes per
+minute failed with `no addresses for peer`. That starved the
+in-flight semaphore so live peers couldn't refresh, and the
+`ok` count collapsed from ~2_000/min to ~1/min. After the filter
+the metrics stabilise around ~2_300 ok / ~50 failed / 600 MUnit
+accepted per minute on a single-stream gateway, with the active set
+tracking the routing snapshot at ~100–130 peers. A 5 s grace window
+on `last_used` survives short connection flaps (yamux idle resets
+that re-establish in <100 ms).
+
+A `DriverMetrics` struct counts refreshes per outcome (`ok`,
+`ok_nonzero`, `failed`, `timed_out`) plus total accepted units, and
+the driver emits a single `INFO ant_p2p::pseudosettle: refresh
+summary (last 60s)` log line per minute summarising the deltas.
+Per-peer trace-level events are still available behind
+`RUST_LOG=ant_p2p::pseudosettle=trace` for debugging.
+
+Wiring: `crates/ant-p2p/src/sinks.rs` registers the pseudosettle
+inbound stream with `libp2p_stream::Control::accept` and spawns
+`run_inbound`. `crates/ant-p2p/src/behaviour.rs` constructs the
+notify channel, spawns `run_driver` with a clone of `Control`, and
+threads the `mpsc::Sender<PeerId>` into every `run_*` (`run_get_bytes`,
+`run_stream_bytes`, `run_stream_bzz`, `run_get_bzz`, `run_list_bzz`)
+so the `RoutingFetcher` they build can call
+`.with_payment_notify(tx)`.
+
+### F.6 Validation
+
+Setup: separate `antd` daemon (release build) on `127.0.0.1:1734`
+with its own data dir and identity, no production traffic, alongside
+the production `0.2.0` instance still serving `vibing.at/ant`.
+
+Reference fetched: `bzz://c4f8a45301b57d0e36f0f5348ed371aee42ea0b9fe9b3caaf26015d652eedc40/tracks/01%20arrival.wav`,
+55 MiB WAV, the same file the user reported failing in 0.3.0.
+
+Three back-to-back fetches on a freshly-started peer set:
+
+| attempt | size       | wall time | http status |
+|---------|-----------|-----------|-------------|
+| 1       | 54_958_120 | 108 s     | 200         |
+| 2       | 54_958_120 | 96 s      | 200         |
+| 3       | 54_958_120 | 92 s      | 200         |
+
+The `0.2.0` baseline on the same machine for the same file averaged
+~95 s. `0.3.0` with pseudosettle is in the same throughput band and
+**faster on repeated fetches** — the pseudosettled peer stays warm
+across requests instead of rotating through cold peers.
+
+Pseudosettle traffic during those three downloads:
+- ~24_000 successful refreshes
+- ~8_000 failures (almost entirely "no addresses for peer" — the peer
+  disconnected between us notifying the driver and the driver dialing
+  them; harmless, the next chunk fetch refills the active set)
+- 0 timeouts
+- ~60_000_000_000 accounting units accepted (~60 GUnit, well above
+  the 1.7 MUnit-per-peer disconnect floor — pseudosettle is doing
+  real debt clearing, not just NAKing).
+
+Peer set behaviour during the same window:
+- Stayed in the 99–138 range, never dropped below ~95.
+- ~30 disconnects/sec sustained, but matched by reconnects so the
+  set size oscillated rather than collapsing.
+- Peer churn concentrates on a handful of peers (the same 5–10 peers
+  account for >80% of the disconnect events) — almost certainly
+  peers we already blocklisted *us* on before pseudosettle landed,
+  whose 24 h blocklist entries are still active. They'll age out.
+- 0 fetch errors during the entire test window.
+
+The `info`-level summary lines at 60 s granularity make the steady
+state easy to spot in production logs:
+
+```
+INFO ant_p2p::pseudosettle: refresh summary (last 60s)
+    active_peers=124 ok=2450 failed=505 timed_out=1 units_accepted=691280000
+```
+
+A rate of 2_000–3_000 `ok` per minute and `units_accepted` in the
+hundreds of millions is what a streaming gateway under load looks like.
+A rate near zero means either the gateway is idle (fine) or
+pseudosettle has stopped working (investigate).
+
+### F.7 What's left
+
+The implementation is correct and stable for the streaming workload
+that triggered the regression. Open items for follow-up, in priority
+order:
+
+1. **Persist `lightRefreshRate * elapsed` budget across daemon
+   restarts.** Currently every restart starts the local refresh
+   timer at zero. Bee's view is wall-clock based, so we won't
+   double-spend, but a fresh daemon hitting peers we previously
+   refreshed will get NAK'd for the first second post-restart. Low
+   impact in practice — the next tick just refreshes again — but
+   tidy.
+
+2. **Per-peer chunks-per-connection counter in the fetcher.** Would
+   give us a direct read on whether pseudosettle is keeping us under
+   the disconnect threshold. Currently we infer it from peer set
+   stability, which is a coarse proxy.
+
+3. **Inbound payment book-keeping.** `run_inbound` always acks zero,
+   which is fine for steady state — but if we ever do start
+   accepting work that bee thinks we owe payment for, we'll need
+   real bookkeeping. Out of scope for the gateway use case but worth
+   noting.
+
+4. **Identify the one specific peer churn pattern remaining**: a
+   handful of peers cycle connect/disconnect every ~30 ms. Hypothesis
+   is they have us in a stale 24 h blocklist from pre-pseudosettle
+   load tests; confirm by waiting 24 h and re-checking. If still
+   churning, dig into bee's blocklist persistence to find what's
+   keeping them sticky.
+

@@ -70,11 +70,11 @@ const HIVE_MAX: usize = 128 * 1024;
 /// never send non-trivial headers so a much tighter cap is safe here — but
 /// giving bee the same 8 KiB window it uses lets us stay compatible with
 /// tracing, settlement, and any future non-empty headers payload.
-const HEADERS_MAX: usize = 8 * 1024;
+pub(crate) const HEADERS_MAX: usize = 8 * 1024;
 /// Per-stream wall-clock cap; bee's `pricing.AnnouncePaymentThreshold` uses
 /// a 5 s context and its headers exchange a 10 s one, so 15 s is enough to
 /// survive both without letting a stuck stream leak forever.
-const STREAM_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const STREAM_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A decoded hive `BzzAddress` reduced to the fields the swarm loop needs
 /// to dial the peer. The overlay is carried through so the swarm loop can
@@ -116,6 +116,7 @@ struct BzzAddressPb {
 pub struct Registrations {
     pricing: IncomingStreams,
     hive: IncomingStreams,
+    pseudosettle: IncomingStreams,
     hint_tx: mpsc::Sender<PeerHint>,
 }
 
@@ -130,9 +131,13 @@ pub fn register(control: &mut Control, hint_tx: mpsc::Sender<PeerHint>) -> Regis
     let hive = control
         .accept(StreamProtocol::new(PROTOCOL_HIVE_PEERS))
         .expect("hive peers protocol registered exactly once");
+    let pseudosettle = control
+        .accept(StreamProtocol::new(crate::pseudosettle::PROTOCOL_PSEUDOSETTLE))
+        .expect("pseudosettle protocol registered exactly once");
     Registrations {
         pricing,
         hive,
+        pseudosettle,
         hint_tx,
     }
 }
@@ -141,6 +146,7 @@ pub fn register(control: &mut Control, hint_tx: mpsc::Sender<PeerHint>) -> Regis
 pub fn spawn(reg: Registrations) {
     tokio::spawn(run_pricing(reg.pricing));
     tokio::spawn(run_hive(reg.hive, reg.hint_tx));
+    tokio::spawn(crate::pseudosettle::run_inbound(reg.pseudosettle));
 }
 
 async fn run_pricing(mut incoming: IncomingStreams) {

@@ -299,6 +299,12 @@ struct SwarmState {
     /// streams in the four-WAV repro), but high enough that several
     /// large gateway downloads can make progress at once.
     retrieval_inflight: Arc<Semaphore>,
+    /// Notification channel into the pseudosettle driver. Cloned into
+    /// every `RoutingFetcher` so successful chunk fetches feed the
+    /// driver's per-peer activity tracker. Set lazily by the run loop
+    /// after `mpsc::channel` is created (the channel sender doesn't
+    /// outlive the driver task, and the run loop owns both).
+    payment_notify: Option<mpsc::Sender<PeerId>>,
 }
 
 impl SwarmState {
@@ -334,6 +340,7 @@ impl SwarmState {
             chunk_record_dir,
             peers_watch: watch::channel(Vec::new()).0,
             retrieval_inflight: Arc::new(Semaphore::new(RETRIEVAL_INFLIGHT_CAP)),
+            payment_notify: None,
         }
     }
 
@@ -624,6 +631,24 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
         cfg.per_request_chunk_cache,
         cfg.chunk_record_dir.clone(),
     );
+
+    // Pseudosettle driver: keeps our per-peer debt below bee's
+    // light-mode `disconnectLimit` by periodically opening
+    // `/swarm/pseudosettle/1.0.0/pseudosettle` and asking bee to clear
+    // the time-based allowance worth. The fetcher feeds this driver
+    // via `payment_notify` (see [`RoutingFetcher::with_payment_notify`]).
+    // The driver also subscribes to `peers_watch` so it skips
+    // refreshes for peers we no longer have a direct connection to —
+    // critical for gateway loads where the routing set churns through
+    // thousands of peers per hour.
+    let (payment_notify_for_state, payment_notify_rx) =
+        mpsc::channel::<PeerId>(crate::pseudosettle::NOTIFY_CHANNEL_CAP);
+    tokio::spawn(crate::pseudosettle::run_driver(
+        control.clone(),
+        payment_notify_rx,
+        state.peers_watch.subscribe(),
+    ));
+    state.payment_notify = Some(payment_notify_for_state);
     let mut peerstore = match cfg.peerstore_path.clone() {
         Some(p) => PeerStore::load(p),
         None => PeerStore::disabled(),
@@ -861,6 +886,7 @@ fn handle_control_command(
             let cache = state.cache_for_request(bypass_cache);
             let record_dir = state.chunk_record_dir.clone();
             let inflight_limit = state.retrieval_inflight.clone();
+            let payment_notify = state.payment_notify.clone();
             let tracker = Arc::new(ProgressTracker::new(bypass_cache));
             let started = Instant::now();
             let emitter = if progress {
@@ -880,6 +906,7 @@ fn handle_control_command(
                     cache,
                     record_dir,
                     inflight_limit,
+                    payment_notify,
                     tracker_for_run,
                     reference,
                     max_bytes,
@@ -913,6 +940,7 @@ fn handle_control_command(
             let cache = state.cache_for_request(bypass_cache);
             let record_dir = state.chunk_record_dir.clone();
             let inflight_limit = state.retrieval_inflight.clone();
+            let payment_notify = state.payment_notify.clone();
             let tracker = Arc::new(ProgressTracker::new(bypass_cache));
             tokio::spawn(async move {
                 run_stream_bytes(
@@ -921,6 +949,7 @@ fn handle_control_command(
                     cache,
                     record_dir,
                     inflight_limit,
+                    payment_notify,
                     tracker,
                     reference,
                     max_bytes,
@@ -955,6 +984,7 @@ fn handle_control_command(
             let cache = state.cache_for_request(bypass_cache);
             let record_dir = state.chunk_record_dir.clone();
             let inflight_limit = state.retrieval_inflight.clone();
+            let payment_notify = state.payment_notify.clone();
             let tracker = Arc::new(ProgressTracker::new(bypass_cache));
             tokio::spawn(async move {
                 run_stream_bzz(
@@ -963,6 +993,7 @@ fn handle_control_command(
                     cache,
                     record_dir,
                     inflight_limit,
+                    payment_notify,
                     tracker,
                     reference,
                     path,
@@ -999,6 +1030,7 @@ fn handle_control_command(
             let cache = state.cache_for_request(bypass_cache);
             let record_dir = state.chunk_record_dir.clone();
             let inflight_limit = state.retrieval_inflight.clone();
+            let payment_notify = state.payment_notify.clone();
             let tracker = Arc::new(ProgressTracker::new(bypass_cache));
             let started = Instant::now();
             let emitter = if progress {
@@ -1018,6 +1050,7 @@ fn handle_control_command(
                     cache,
                     record_dir,
                     inflight_limit,
+                    payment_notify,
                     tracker_for_run,
                     reference,
                     path,
@@ -1050,6 +1083,7 @@ fn handle_control_command(
             let cache = state.cache_for_request(bypass_cache);
             let record_dir = state.chunk_record_dir.clone();
             let inflight_limit = state.retrieval_inflight.clone();
+            let payment_notify = state.payment_notify.clone();
             tokio::spawn(async move {
                 let reply = run_list_bzz(
                     control,
@@ -1057,6 +1091,7 @@ fn handle_control_command(
                     cache,
                     record_dir,
                     inflight_limit,
+                    payment_notify,
                     reference,
                 )
                 .await;
@@ -1073,6 +1108,7 @@ async fn run_stream_bytes(
     cache: Arc<ant_retrieval::InMemoryChunkCache>,
     record_dir: Option<PathBuf>,
     inflight_limit: Arc<Semaphore>,
+    payment_notify: Option<mpsc::Sender<PeerId>>,
     tracker: Arc<ProgressTracker>,
     reference: [u8; 32],
     max_bytes: Option<u64>,
@@ -1082,12 +1118,16 @@ async fn run_stream_bytes(
 ) {
     use ant_retrieval::ChunkFetcher;
 
-    let fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx)
+    let mut builder = ant_retrieval::RoutingFetcher::new(control, peers_rx)
         .with_cache(cache)
         .with_record_dir(record_dir)
         .with_progress(tracker.clone())
         .with_inflight_limit(inflight_limit)
         .with_request_inflight_limit(RETRIEVAL_REQUEST_INFLIGHT_CAP);
+    if let Some(tx) = payment_notify {
+        builder = builder.with_payment_notify(tx);
+    }
+    let fetcher = builder;
 
     let root = match fetcher.fetch(reference).await {
         Ok(root) => root,
@@ -1138,6 +1178,7 @@ async fn run_stream_bzz(
     cache: Arc<ant_retrieval::InMemoryChunkCache>,
     record_dir: Option<PathBuf>,
     inflight_limit: Arc<Semaphore>,
+    payment_notify: Option<mpsc::Sender<PeerId>>,
     tracker: Arc<ProgressTracker>,
     reference: [u8; 32],
     path: String,
@@ -1164,12 +1205,16 @@ async fn run_stream_bzz(
                 .await;
             return;
         }
-        let fetcher = ant_retrieval::RoutingFetcher::new(control.clone(), peers_rx.clone())
+        let mut builder = ant_retrieval::RoutingFetcher::new(control.clone(), peers_rx.clone())
             .with_cache(cache.clone())
             .with_record_dir(record_dir.clone())
             .with_progress(tracker.clone())
             .with_inflight_limit(inflight_limit.clone())
             .with_request_inflight_limit(RETRIEVAL_REQUEST_INFLIGHT_CAP);
+        if let Some(tx) = payment_notify.clone() {
+            builder = builder.with_payment_notify(tx);
+        }
+        let fetcher = builder;
 
         let lookup = match lookup_path(&fetcher, reference, &path).await {
             Ok(r) => r,
@@ -1546,6 +1591,7 @@ async fn run_get_bytes(
     cache: Arc<ant_retrieval::InMemoryChunkCache>,
     record_dir: Option<PathBuf>,
     inflight_limit: Arc<Semaphore>,
+    payment_notify: Option<mpsc::Sender<PeerId>>,
     tracker: Arc<ProgressTracker>,
     reference: [u8; 32],
     max_bytes: Option<u64>,
@@ -1560,12 +1606,16 @@ async fn run_get_bytes(
         // per-chunk `ranked()` call rereads it so peers that disconnect
         // during the attempt drop out of subsequent chunks' candidate
         // pools immediately.
-        let fetcher = ant_retrieval::RoutingFetcher::new(control.clone(), peers_rx.clone())
+        let mut builder = ant_retrieval::RoutingFetcher::new(control.clone(), peers_rx.clone())
             .with_cache(cache.clone())
             .with_record_dir(record_dir.clone())
             .with_progress(tracker.clone())
             .with_inflight_limit(inflight_limit.clone())
             .with_request_inflight_limit(RETRIEVAL_REQUEST_INFLIGHT_CAP);
+        if let Some(tx) = payment_notify.clone() {
+            builder = builder.with_payment_notify(tx);
+        }
+        let fetcher = builder;
         match try_get_bytes(&fetcher, &tracker, reference, max_bytes).await {
             Ok(data) => {
                 debug!(
@@ -1663,6 +1713,7 @@ async fn run_list_bzz(
     cache: Arc<ant_retrieval::InMemoryChunkCache>,
     record_dir: Option<PathBuf>,
     inflight_limit: Arc<Semaphore>,
+    payment_notify: Option<mpsc::Sender<PeerId>>,
     reference: [u8; 32],
 ) -> ControlAck {
     if peers_rx.borrow().is_empty() {
@@ -1671,11 +1722,15 @@ async fn run_list_bzz(
         };
     }
 
-    let fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx)
+    let mut builder = ant_retrieval::RoutingFetcher::new(control, peers_rx)
         .with_cache(cache)
         .with_record_dir(record_dir)
         .with_inflight_limit(inflight_limit)
         .with_request_inflight_limit(RETRIEVAL_REQUEST_INFLIGHT_CAP);
+    if let Some(tx) = payment_notify {
+        builder = builder.with_payment_notify(tx);
+    }
+    let fetcher = builder;
 
     match ant_retrieval::list_manifest(&fetcher, reference).await {
         Ok(entries) => ControlAck::Manifest {
@@ -1723,6 +1778,7 @@ async fn run_get_bzz(
     cache: Arc<ant_retrieval::InMemoryChunkCache>,
     record_dir: Option<PathBuf>,
     inflight_limit: Arc<Semaphore>,
+    payment_notify: Option<mpsc::Sender<PeerId>>,
     tracker: Arc<ProgressTracker>,
     reference: [u8; 32],
     path: String,
@@ -1737,12 +1793,16 @@ async fn run_get_bzz(
         }
         // Pass the watch receiver itself: see `run_get_bytes` for
         // rationale on per-chunk peer freshness.
-        let fetcher = ant_retrieval::RoutingFetcher::new(control.clone(), peers_rx.clone())
+        let mut builder = ant_retrieval::RoutingFetcher::new(control.clone(), peers_rx.clone())
             .with_cache(cache.clone())
             .with_record_dir(record_dir.clone())
             .with_progress(tracker.clone())
             .with_inflight_limit(inflight_limit.clone())
             .with_request_inflight_limit(RETRIEVAL_REQUEST_INFLIGHT_CAP);
+        if let Some(tx) = payment_notify.clone() {
+            builder = builder.with_payment_notify(tx);
+        }
+        let fetcher = builder;
         match try_get_bzz(
             &fetcher,
             &tracker,
