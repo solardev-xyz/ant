@@ -1,11 +1,12 @@
 //! Minimal node orchestration for M1.0 (p2p dial + handshake loop).
 
-use ant_control::{ControlCommand, StatusSnapshot};
+use ant_control::{ControlCommand, GatewayActivity, StatusSnapshot};
 use ant_crypto::{OVERLAY_NONCE_LEN, SECP256K1_SECRET_LEN};
 use ant_p2p::{run, RunConfig};
 use libp2p::identity::Keypair;
 use libp2p::multiaddr::Multiaddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
 use tokio::sync::{mpsc, watch};
@@ -49,6 +50,12 @@ pub struct NodeConfig {
     /// chunk a successful `antctl get` touched. The directory must
     /// already exist; `None` (the default) disables recording.
     pub chunk_record_dir: Option<PathBuf>,
+    /// Live registry of in-flight gateway HTTP requests, shared with
+    /// `ant-gateway`. Wired up by `antd::main` when the HTTP API is
+    /// enabled; `None` for headless deployments
+    /// (`antd --no-http-api`). Surfaces in `antctl top`'s Retrieval
+    /// tab.
+    pub gateway_activity: Option<Arc<GatewayActivity>>,
 }
 
 impl NodeConfig {
@@ -71,6 +78,7 @@ impl NodeConfig {
             process_start: Instant::now(),
             per_request_chunk_cache: false,
             chunk_record_dir: None,
+            gateway_activity: None,
         }
     }
 
@@ -108,6 +116,11 @@ impl NodeConfig {
         self.chunk_record_dir = dir;
         self
     }
+
+    pub fn with_gateway_activity(mut self, activity: Option<Arc<GatewayActivity>>) -> Self {
+        self.gateway_activity = activity;
+        self
+    }
 }
 
 /// Run the M1.0 node loop until the process is interrupted.
@@ -126,6 +139,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<(), NodeError> {
         process_start: cfg.process_start,
         per_request_chunk_cache: cfg.per_request_chunk_cache,
         chunk_record_dir: cfg.chunk_record_dir,
+        gateway_activity: cfg.gateway_activity,
     })
     .await?;
     Ok(())

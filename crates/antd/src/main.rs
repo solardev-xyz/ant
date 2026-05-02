@@ -1,6 +1,8 @@
 //! `antd` — Swarm light node daemon (M1.0: mainnet dial + BZZ handshake).
 
-use ant_control::{ControlCommand, IdentityInfo, PeerInfo, StatusSnapshot, PROTOCOL_VERSION};
+use ant_control::{
+    ControlCommand, GatewayActivity, IdentityInfo, PeerInfo, StatusSnapshot, PROTOCOL_VERSION,
+};
 use ant_crypto::{
     ethereum_address_from_public_key, overlay_from_ethereum_address, random_overlay_nonce,
     random_secp256k1_secret, SECP256K1_SECRET_LEN,
@@ -211,6 +213,7 @@ async fn main() -> Result<()> {
         },
         listeners: Vec::new(),
         control_socket: control_socket.display().to_string(),
+        retrieval: Default::default(),
     };
     let (status_tx, status_rx) = watch::channel(initial_snapshot);
 
@@ -272,6 +275,14 @@ async fn main() -> Result<()> {
         opt.record_chunks.as_deref(),
     )?;
 
+    // Single shared registry for in-flight gateway HTTP requests.
+    // Built unconditionally so the node loop can read from it; only
+    // the gateway side ever writes when `--no-http-api` is set, in
+    // which case `gateway_activity` stays empty and `antctl top`
+    // shows zero gateway rows. Empty registry costs one `Arc` and
+    // a `Mutex<HashMap>` — well below a rounding error.
+    let gateway_activity: Arc<GatewayActivity> = GatewayActivity::new();
+
     let node_fut = run_node(
         NodeConfig::mainnet_default(signing_secret, overlay_nonce, bootnodes, libp2p_keypair)
             .with_status(status_tx)
@@ -280,7 +291,8 @@ async fn main() -> Result<()> {
             .with_peerstore_path(peerstore_path)
             .with_commands(cmd_rx)
             .with_per_request_chunk_cache(opt.per_request_chunk_cache)
-            .with_chunk_record_dir(chunk_record_dir),
+            .with_chunk_record_dir(chunk_record_dir)
+            .with_gateway_activity(Some(gateway_activity.clone())),
     );
 
     let gateway_handle = if opt.no_http_api {
@@ -297,6 +309,7 @@ async fn main() -> Result<()> {
             }),
             status: status_rx.clone(),
             commands: cmd_tx.clone(),
+            activity: gateway_activity.clone(),
         })
     };
 

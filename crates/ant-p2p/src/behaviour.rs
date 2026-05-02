@@ -7,14 +7,15 @@ use crate::peerstore::PeerStore;
 use crate::routing::{Overlay, RoutingTable};
 use crate::sinks;
 use ant_control::{
-    ControlAck, ControlCommand, GetProgress, HandshakeReport, PeerConnectionInfo,
-    PeerConnectionState, PeerPipelineEntry, RoutingInfo, StatusSnapshot, StreamRange,
+    CacheInfo, ControlAck, ControlCommand, GatewayActivity, GetProgress, HandshakeReport,
+    PeerConnectionInfo, PeerConnectionState, PeerPipelineEntry, RetrievalInfo, RoutingInfo,
+    StatusSnapshot, StreamRange,
 };
 use ant_crypto::{
     ethereum_address_from_public_key, overlay_from_ethereum_address, OVERLAY_NONCE_LEN,
     SECP256K1_SECRET_LEN,
 };
-use ant_retrieval::ProgressTracker;
+use ant_retrieval::{ProgressTracker, RetrievalCounters, DEFAULT_CACHE_CAPACITY};
 use futures::StreamExt;
 use k256::ecdsa::{SigningKey, VerifyingKey};
 use libp2p::core::connection::ConnectedPoint;
@@ -91,6 +92,13 @@ pub struct RunConfig {
     /// daemon only honours the flag in debug builds (the `antd` CLI
     /// hides it otherwise); the directory must already exist.
     pub chunk_record_dir: Option<PathBuf>,
+    /// Live registry of currently-active gateway HTTP requests,
+    /// shared with `ant-gateway`. The swarm loop reads a snapshot
+    /// from it on every status tick to populate
+    /// `StatusSnapshot::retrieval.gateway_requests` so `antctl top`
+    /// can render the Retrieval tab. `None` when the gateway is
+    /// disabled (e.g. `antd --no-http-api`).
+    pub gateway_activity: Option<Arc<GatewayActivity>>,
 }
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
@@ -314,6 +322,16 @@ struct SwarmState {
     /// `Accounting::forget` from `ConnectionClosed` so peer state
     /// matches bee's `notifyPeerConnect` reset on the remote end.
     accounting: Option<Arc<ant_retrieval::accounting::Accounting>>,
+    /// Process-wide retrieval counters. Cloned into every
+    /// `RoutingFetcher` we build; read on every status tick to
+    /// populate the cumulative `bytes_fetched_total` /
+    /// `chunks_fetched_total` fields in `StatusSnapshot::retrieval`.
+    retrieval_counters: Arc<RetrievalCounters>,
+    /// Optional live registry of in-flight gateway HTTP requests.
+    /// `None` when `--no-http-api` was passed; `Some` when the
+    /// gateway is wired up. Read by the status publisher for the
+    /// Retrieval tab in `antctl top`.
+    gateway_activity: Option<Arc<GatewayActivity>>,
 }
 
 impl SwarmState {
@@ -322,6 +340,7 @@ impl SwarmState {
         base_overlay: Overlay,
         per_request_chunk_cache: bool,
         chunk_record_dir: Option<PathBuf>,
+        gateway_activity: Option<Arc<GatewayActivity>>,
     ) -> Self {
         let chunk_cache = if per_request_chunk_cache {
             None
@@ -351,6 +370,8 @@ impl SwarmState {
             retrieval_inflight: Arc::new(Semaphore::new(RETRIEVAL_INFLIGHT_CAP)),
             payment_notify: None,
             accounting: None,
+            retrieval_counters: Arc::new(RetrievalCounters::new()),
+            gateway_activity,
         }
     }
 
@@ -549,10 +570,43 @@ fn sync_peer_pipeline(status: &Option<watch::Sender<StatusSnapshot>>, state: &mu
     state.failed.retain(|f| f.at.elapsed() < FAIL_TTL);
     let Some(tx) = status else { return };
     let routing = routing_snapshot(&state.routing);
+    let retrieval = build_retrieval_info(state);
     tx.send_modify(|st| {
         st.peers.peer_pipeline = build_peer_pipeline_entries(state, &st.peers.connected_peers);
         st.peers.routing = routing.clone();
+        st.retrieval = retrieval.clone();
     });
+}
+
+/// Read the live data-plane snapshot for `StatusSnapshot::retrieval`.
+/// Cheap: each load is a single relaxed atomic; the gateway-activity
+/// snapshot grabs one Mutex per call but the entry count is small
+/// (typically ≤ a few dozen) so it never shows up in profiles.
+fn build_retrieval_info(state: &SwarmState) -> RetrievalInfo {
+    let cache_used = state
+        .chunk_cache
+        .as_ref()
+        .map(|c| c.len() as u32)
+        .unwrap_or(0);
+    let in_flight = (RETRIEVAL_INFLIGHT_CAP - state.retrieval_inflight.available_permits()) as u32;
+    let counters = state.retrieval_counters.snapshot();
+    let gateway_requests = state
+        .gateway_activity
+        .as_ref()
+        .map(|a| a.snapshot())
+        .unwrap_or_default();
+    RetrievalInfo {
+        cache: CacheInfo {
+            used: cache_used,
+            capacity: DEFAULT_CACHE_CAPACITY as u32,
+        },
+        in_flight,
+        in_flight_capacity: RETRIEVAL_INFLIGHT_CAP as u32,
+        chunks_fetched_total: counters.chunks_fetched,
+        bytes_fetched_total: counters.bytes_fetched,
+        cache_hits_total: counters.cache_hits,
+        gateway_requests,
+    }
 }
 
 /// Build a `RoutingInfo` that mirrors the live routing table for the
@@ -640,6 +694,7 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
         base_overlay,
         cfg.per_request_chunk_cache,
         cfg.chunk_record_dir.clone(),
+        cfg.gateway_activity.clone(),
     );
 
     // Pseudosettle driver: keeps our per-peer debt below bee's
@@ -710,6 +765,17 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Skip the immediate first tick — we have nothing to flush at startup.
     flush_timer.tick().await;
+    // Floor on how often the status snapshot is republished even when
+    // the swarm is fully idle. `sync_peer_pipeline` already runs from
+    // the loop top on every wakeup, gated by `PIPELINE_SYNC_INTERVAL`;
+    // this timer just guarantees `antctl top` keeps seeing a live
+    // `RetrievalInfo` (cache fill, in-flight count, gateway-request
+    // list) even when no swarm events fire. Cadence chosen to match
+    // `antctl top --interval`'s 1 s default while still letting
+    // operators run with sub-second polling without seeing stale data.
+    let mut status_pulse = tokio::time::interval(Duration::from_millis(250));
+    status_pulse.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    status_pulse.tick().await;
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
     let mut last_pipeline_sync = Instant::now()
@@ -761,6 +827,12 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
             }
             _ = flush_timer.tick() => {
                 peerstore.flush();
+            }
+            _ = status_pulse.tick() => {
+                // No-op arm: the loop-top `sync_peer_pipeline` call
+                // does the actual work. We just need *some* event to
+                // wake the select up regularly so the snapshot stays
+                // live during gateway-only / fully-idle periods.
             }
             Some(cmd) = recv_command(commands.as_mut()) => {
                 handle_control_command(&mut state, &mut peerstore, &control, cmd);
@@ -915,6 +987,7 @@ fn handle_control_command(
             let inflight_limit = state.retrieval_inflight.clone();
             let payment_notify = state.payment_notify.clone();
             let accounting = state.accounting.clone();
+            let counters = state.retrieval_counters.clone();
             let tracker = Arc::new(ProgressTracker::new(bypass_cache));
             let started = Instant::now();
             let emitter = if progress {
@@ -936,6 +1009,7 @@ fn handle_control_command(
                     inflight_limit,
                     payment_notify,
                     accounting,
+                    counters,
                     tracker_for_run,
                     reference,
                     max_bytes,
@@ -971,7 +1045,20 @@ fn handle_control_command(
             let inflight_limit = state.retrieval_inflight.clone();
             let payment_notify = state.payment_notify.clone();
             let accounting = state.accounting.clone();
+            let counters = state.retrieval_counters.clone();
             let tracker = Arc::new(ProgressTracker::new(bypass_cache));
+            // Always spawn the progress emitter for streaming requests:
+            // the gateway uses the periodic `Progress` acks to update
+            // its `GatewayActivity` entry so `antctl top`'s Retrieval
+            // tab reflects live per-request chunks/bytes/in-flight
+            // counts. Unlike `GetBytes` (where the client opts in via
+            // the `progress` flag), streaming has no "consumer doesn't
+            // care" mode — the gateway always wants the updates and a
+            // 150 ms tick is well below the rate at which `BytesChunk`
+            // acks already flow.
+            let started = Instant::now();
+            let emitter = spawn_progress_emitter(tracker.clone(), ack.clone(), started);
+            let tracker_for_run = tracker.clone();
             tokio::spawn(async move {
                 run_stream_bytes(
                     control,
@@ -981,7 +1068,8 @@ fn handle_control_command(
                     inflight_limit,
                     payment_notify,
                     accounting,
-                    tracker,
+                    counters,
+                    tracker_for_run,
                     reference,
                     max_bytes,
                     range,
@@ -989,6 +1077,7 @@ fn handle_control_command(
                     ack,
                 )
                 .await;
+                emitter.abort();
             });
         }
         ControlCommand::StreamBzz {
@@ -1017,7 +1106,14 @@ fn handle_control_command(
             let inflight_limit = state.retrieval_inflight.clone();
             let payment_notify = state.payment_notify.clone();
             let accounting = state.accounting.clone();
+            let counters = state.retrieval_counters.clone();
             let tracker = Arc::new(ProgressTracker::new(bypass_cache));
+            // Same rationale as the StreamBytes arm above: gateway-side
+            // activity rendering depends on the periodic `Progress`
+            // acks, so the streaming path always runs the emitter.
+            let started = Instant::now();
+            let emitter = spawn_progress_emitter(tracker.clone(), ack.clone(), started);
+            let tracker_for_run = tracker.clone();
             tokio::spawn(async move {
                 run_stream_bzz(
                     control,
@@ -1027,7 +1123,8 @@ fn handle_control_command(
                     inflight_limit,
                     payment_notify,
                     accounting,
-                    tracker,
+                    counters,
+                    tracker_for_run,
                     reference,
                     path,
                     allow_degraded_redundancy,
@@ -1037,6 +1134,7 @@ fn handle_control_command(
                     ack,
                 )
                 .await;
+                emitter.abort();
             });
         }
         ControlCommand::GetBzz {
@@ -1065,6 +1163,7 @@ fn handle_control_command(
             let inflight_limit = state.retrieval_inflight.clone();
             let payment_notify = state.payment_notify.clone();
             let accounting = state.accounting.clone();
+            let counters = state.retrieval_counters.clone();
             let tracker = Arc::new(ProgressTracker::new(bypass_cache));
             let started = Instant::now();
             let emitter = if progress {
@@ -1086,6 +1185,7 @@ fn handle_control_command(
                     inflight_limit,
                     payment_notify,
                     accounting,
+                    counters,
                     tracker_for_run,
                     reference,
                     path,
@@ -1120,6 +1220,7 @@ fn handle_control_command(
             let inflight_limit = state.retrieval_inflight.clone();
             let payment_notify = state.payment_notify.clone();
             let accounting = state.accounting.clone();
+            let counters = state.retrieval_counters.clone();
             tokio::spawn(async move {
                 let reply = run_list_bzz(
                     control,
@@ -1129,6 +1230,7 @@ fn handle_control_command(
                     inflight_limit,
                     payment_notify,
                     accounting,
+                    counters,
                     reference,
                 )
                 .await;
@@ -1147,6 +1249,7 @@ async fn run_stream_bytes(
     inflight_limit: Arc<Semaphore>,
     payment_notify: Option<mpsc::Sender<PeerId>>,
     accounting: Option<Arc<ant_retrieval::accounting::Accounting>>,
+    counters: Arc<RetrievalCounters>,
     tracker: Arc<ProgressTracker>,
     reference: [u8; 32],
     max_bytes: Option<u64>,
@@ -1161,6 +1264,7 @@ async fn run_stream_bytes(
         .with_record_dir(record_dir)
         .with_progress(tracker.clone())
         .with_inflight_limit(inflight_limit)
+        .with_counters(counters)
         .with_request_inflight_limit(RETRIEVAL_REQUEST_INFLIGHT_CAP);
     if let Some(tx) = payment_notify {
         builder = builder.with_payment_notify(tx);
@@ -1221,6 +1325,7 @@ async fn run_stream_bzz(
     inflight_limit: Arc<Semaphore>,
     payment_notify: Option<mpsc::Sender<PeerId>>,
     accounting: Option<Arc<ant_retrieval::accounting::Accounting>>,
+    counters: Arc<RetrievalCounters>,
     tracker: Arc<ProgressTracker>,
     reference: [u8; 32],
     path: String,
@@ -1252,6 +1357,7 @@ async fn run_stream_bzz(
             .with_record_dir(record_dir.clone())
             .with_progress(tracker.clone())
             .with_inflight_limit(inflight_limit.clone())
+            .with_counters(counters.clone())
             .with_request_inflight_limit(RETRIEVAL_REQUEST_INFLIGHT_CAP);
         if let Some(tx) = payment_notify.clone() {
             builder = builder.with_payment_notify(tx);
@@ -1509,6 +1615,7 @@ fn build_progress(tracker: &ProgressTracker, started: Instant) -> GetProgress {
         cache_hits: sample.cache_hits,
         peers_used: sample.peers_used,
         bypass_cache: sample.bypass_cache,
+        in_flight: sample.in_flight,
     }
 }
 
@@ -1653,6 +1760,7 @@ async fn run_get_bytes(
     inflight_limit: Arc<Semaphore>,
     payment_notify: Option<mpsc::Sender<PeerId>>,
     accounting: Option<Arc<ant_retrieval::accounting::Accounting>>,
+    counters: Arc<RetrievalCounters>,
     tracker: Arc<ProgressTracker>,
     reference: [u8; 32],
     max_bytes: Option<u64>,
@@ -1672,6 +1780,7 @@ async fn run_get_bytes(
             .with_record_dir(record_dir.clone())
             .with_progress(tracker.clone())
             .with_inflight_limit(inflight_limit.clone())
+            .with_counters(counters.clone())
             .with_request_inflight_limit(RETRIEVAL_REQUEST_INFLIGHT_CAP);
         if let Some(tx) = payment_notify.clone() {
             builder = builder.with_payment_notify(tx);
@@ -1779,6 +1888,7 @@ async fn run_list_bzz(
     inflight_limit: Arc<Semaphore>,
     payment_notify: Option<mpsc::Sender<PeerId>>,
     accounting: Option<Arc<ant_retrieval::accounting::Accounting>>,
+    counters: Arc<RetrievalCounters>,
     reference: [u8; 32],
 ) -> ControlAck {
     if peers_rx.borrow().is_empty() {
@@ -1791,6 +1901,7 @@ async fn run_list_bzz(
         .with_cache(cache)
         .with_record_dir(record_dir)
         .with_inflight_limit(inflight_limit)
+        .with_counters(counters)
         .with_request_inflight_limit(RETRIEVAL_REQUEST_INFLIGHT_CAP);
     if let Some(tx) = payment_notify {
         builder = builder.with_payment_notify(tx);
@@ -1848,6 +1959,7 @@ async fn run_get_bzz(
     inflight_limit: Arc<Semaphore>,
     payment_notify: Option<mpsc::Sender<PeerId>>,
     accounting: Option<Arc<ant_retrieval::accounting::Accounting>>,
+    counters: Arc<RetrievalCounters>,
     tracker: Arc<ProgressTracker>,
     reference: [u8; 32],
     path: String,
@@ -1867,6 +1979,7 @@ async fn run_get_bzz(
             .with_record_dir(record_dir.clone())
             .with_progress(tracker.clone())
             .with_inflight_limit(inflight_limit.clone())
+            .with_counters(counters.clone())
             .with_request_inflight_limit(RETRIEVAL_REQUEST_INFLIGHT_CAP);
         if let Some(tx) = payment_notify.clone() {
             builder = builder.with_payment_notify(tx);
@@ -2765,7 +2878,7 @@ mod tests {
     /// 502s on multi-MiB media files.
     #[test]
     fn publish_peers_reflects_admit_and_forget() {
-        let mut state = SwarmState::new(32, [0u8; 32], false, None);
+        let mut state = SwarmState::new(32, [0u8; 32], false, None, None);
         let mut rx = state.peers_watch.subscribe();
         // Initial state: empty.
         assert!(rx.borrow_and_update().is_empty());

@@ -4,8 +4,8 @@
 //! `ant-control::Request` / `Response`).
 
 use ant_control::{
-    request_streaming, request_sync, GetProgress, PeerConnectionInfo, PeerConnectionState, Request,
-    Response, StatusSnapshot,
+    request_streaming, request_sync, GatewayRequestInfo, GetProgress, PeerConnectionInfo,
+    PeerConnectionState, Request, Response, RetrievalInfo, StatusSnapshot,
 };
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -915,11 +915,13 @@ fn run_top(socket: &Path, interval_ms: u64) -> Result<()> {
     let mut last_error: Option<String> = None;
     let mut page = TopPage::Nodes;
     let mut selection = NodeSelection::default();
+    let mut bandwidth = BandwidthTracker::new();
 
     loop {
         if Instant::now() >= next_refresh {
             match fetch_status(socket) {
                 Ok(snap) => {
+                    bandwidth.observe(&snap.retrieval, Instant::now());
                     let idx = selection.current_index(&snap);
                     render_top(
                         terminal.terminal_mut(),
@@ -928,6 +930,7 @@ fn run_top(socket: &Path, interval_ms: u64) -> Result<()> {
                         interval_ms,
                         page,
                         idx,
+                        &bandwidth,
                     )?;
                     last_status = Some(snap);
                     last_error = None;
@@ -967,6 +970,7 @@ fn run_top(socket: &Path, interval_ms: u64) -> Result<()> {
                         interval_ms,
                         page,
                         idx,
+                        &bandwidth,
                     )?;
                 } else if let Some(error) = &last_error {
                     render_top_error(terminal.terminal_mut(), socket, interval_ms, page, error)?;
@@ -975,6 +979,87 @@ fn run_top(socket: &Path, interval_ms: u64) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Rolling bandwidth estimate derived from successive
+/// `RetrievalInfo` snapshots.
+///
+/// The daemon publishes only cumulative `bytes_fetched_total`; the
+/// instantaneous rate is `(b2 - b1) / (t2 - t1)`. We smooth that with
+/// a simple EMA so a 100 ms cache-warm spike or a one-off lull
+/// doesn't make the gauge flap, and remember the all-time peak so
+/// the user can spot how close the current run came to saturating
+/// the connection.
+///
+/// Counters reset to zero on daemon restart (the `Arc<RetrievalCounters>`
+/// is fresh per process); we detect that as a backwards delta and
+/// reset the EMA rather than reporting a giant negative rate.
+struct BandwidthTracker {
+    last_sample: Option<(u64, Instant)>,
+    /// Smoothed bytes/sec. `None` until at least two samples have
+    /// been observed and a non-zero delta has been computed.
+    ema_bps: Option<f64>,
+    /// All-time peak over a single sample window. Useful for "what's
+    /// the best this daemon ever managed?" without scrolling the log.
+    peak_bps: f64,
+    peak_chunks: u64,
+}
+
+impl BandwidthTracker {
+    /// EMA smoothing factor. 0.3 keeps the gauge responsive (a real
+    /// step up to a new rate stabilises in ~3 samples) without
+    /// jittering visibly between consecutive reads of an active
+    /// stream.
+    const ALPHA: f64 = 0.3;
+
+    fn new() -> Self {
+        Self {
+            last_sample: None,
+            ema_bps: None,
+            peak_bps: 0.0,
+            peak_chunks: 0,
+        }
+    }
+
+    /// Fold one fresh snapshot into the rolling state. Cheap; safe
+    /// to call on every refresh tick.
+    fn observe(&mut self, info: &RetrievalInfo, now: Instant) {
+        let bytes = info.bytes_fetched_total;
+        if info.chunks_fetched_total > self.peak_chunks {
+            self.peak_chunks = info.chunks_fetched_total;
+        }
+        let prev = self.last_sample;
+        self.last_sample = Some((bytes, now));
+        let Some((prev_bytes, prev_at)) = prev else {
+            return;
+        };
+        // Daemon restart or counter wraparound: drop the EMA so we
+        // don't sample a wildly negative delta as legitimate.
+        if bytes < prev_bytes {
+            self.ema_bps = None;
+            return;
+        }
+        let dt = now.saturating_duration_since(prev_at).as_secs_f64();
+        if dt <= 0.0 {
+            return;
+        }
+        let rate = (bytes - prev_bytes) as f64 / dt;
+        self.ema_bps = Some(match self.ema_bps {
+            Some(prev) => Self::ALPHA * rate + (1.0 - Self::ALPHA) * prev,
+            None => rate,
+        });
+        if rate > self.peak_bps {
+            self.peak_bps = rate;
+        }
+    }
+
+    fn current_bps(&self) -> Option<f64> {
+        self.ema_bps
+    }
+
+    fn peak_bps(&self) -> f64 {
+        self.peak_bps
+    }
 }
 
 fn clamp_selection(selected: usize, len: usize) -> usize {
@@ -1134,11 +1219,12 @@ fn handle_selection_event(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TopPage {
     Nodes,
+    Retrieval,
     Status,
 }
 
 impl TopPage {
-    const ALL: [TopPage; 2] = [TopPage::Nodes, TopPage::Status];
+    const ALL: [TopPage; 3] = [TopPage::Nodes, TopPage::Retrieval, TopPage::Status];
 
     fn index(self) -> usize {
         Self::ALL.iter().position(|p| *p == self).unwrap_or(0)
@@ -1147,6 +1233,7 @@ impl TopPage {
     fn title(self) -> &'static str {
         match self {
             TopPage::Nodes => "Nodes",
+            TopPage::Retrieval => "Retrieval",
             TopPage::Status => "Status",
         }
     }
@@ -1251,24 +1338,24 @@ fn print_status(s: &StatusSnapshot) {
     println!();
     println!("Network:");
     println!(
-        "  network_id:  {}{}",
+        "  Network ID:  {}{}",
         s.network_id,
         if s.network_id == 1 { " (mainnet)" } else { "" },
     );
-    println!("  eth:         {}", s.identity.eth_address);
-    println!("  overlay:     {}", s.identity.overlay);
-    println!("  peer_id:     {}", s.identity.peer_id);
+    println!("  ETH:         {}", s.identity.eth_address);
+    println!("  Overlay:     {}", s.identity.overlay);
+    println!("  Peer ID:     {}", s.identity.peer_id);
     if s.listeners.is_empty() {
-        println!("  listeners:   (none yet)");
+        println!("  Listeners:   (none yet)");
     } else {
-        println!("  listeners:");
+        println!("  Listeners:");
         for l in &s.listeners {
             println!("    - {l}");
         }
     }
     println!();
     println!("Peers:");
-    println!("  connected:   {}", s.peers.connected);
+    println!("  Connected:   {}", s.peers.connected);
     if let Some(h) = &s.peers.last_handshake {
         let age = now.saturating_sub(h.at_unix);
         let agent = if h.agent_version.is_empty() {
@@ -1277,20 +1364,21 @@ fn print_status(s: &StatusSnapshot) {
             h.agent_version.clone()
         };
         println!(
-            "  last bzz:    {} ({}, {} ago){}",
+            "  Last BZZ:    {} ({}, {} ago){}",
             h.remote_overlay,
             agent,
             format_duration(age),
             if h.full_node { ", full-node" } else { "" },
         );
     } else {
-        println!("  last bzz:    (none yet)");
+        println!("  Last BZZ:    (none yet)");
     }
     println!();
     println!("Control:");
-    println!("  socket:      {}", s.control_socket);
+    println!("  Socket:      {}", s.control_socket);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_top(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     s: &StatusSnapshot,
@@ -1298,6 +1386,7 @@ fn render_top(
     interval_ms: u64,
     page: TopPage,
     selected_node: usize,
+    bandwidth: &BandwidthTracker,
 ) -> Result<()> {
     let now = current_unix();
     let uptime = now.saturating_sub(s.started_at_unix);
@@ -1309,6 +1398,7 @@ fn render_top(
         selected_node,
         now,
         uptime,
+        bandwidth,
     };
     terminal.draw(|frame| {
         draw_top_frame(frame, &ctx);
@@ -1324,6 +1414,7 @@ struct TopFrameContext<'a> {
     selected_node: usize,
     now: u64,
     uptime: u64,
+    bandwidth: &'a BandwidthTracker,
 }
 
 fn render_top_error(
@@ -1381,27 +1472,30 @@ fn draw_top_frame(frame: &mut Frame, ctx: &TopFrameContext<'_>) {
         TopPage::Nodes => {
             draw_nodes_page(frame, body, ctx.status, ctx.now, ctx.selected_node);
         }
+        TopPage::Retrieval => {
+            draw_retrieval_page(frame, body, ctx);
+        }
         TopPage::Status => {
             let rows = vec![
-                kv("process", ""),
-                kv("agent", &ctx.status.agent),
-                kv("pid", &ctx.status.pid.to_string()),
-                kv("uptime", &format_duration(ctx.uptime)),
-                kv("refresh", &format!("{}ms", ctx.interval_ms)),
-                kv("updated", &ctx.now.to_string()),
+                kv("Process", ""),
+                kv("Agent", &ctx.status.agent),
+                kv("PID", &ctx.status.pid.to_string()),
+                kv("Uptime", &format_duration(ctx.uptime)),
+                kv("Refresh", &format!("{}ms", ctx.interval_ms)),
+                kv("Updated", &ctx.now.to_string()),
                 kv("", ""),
-                kv("network", ""),
-                kv("network", &network_id),
-                kv("eth", &ctx.status.identity.eth_address),
-                kv("overlay", &ctx.status.identity.overlay),
-                kv("peer_id", &ctx.status.identity.peer_id),
-                kv("connected", &ctx.status.peers.connected.to_string()),
-                kv("listeners", &ctx.status.listeners.len().to_string()),
+                kv("Network", ""),
+                kv("Network", &network_id),
+                kv("ETH", &ctx.status.identity.eth_address),
+                kv("Overlay", &ctx.status.identity.overlay),
+                kv("Peer ID", &ctx.status.identity.peer_id),
+                kv("Connected", &ctx.status.peers.connected.to_string()),
+                kv("Listeners", &ctx.status.listeners.len().to_string()),
                 kv("", ""),
-                kv("control", ""),
-                kv("socket", &ctx.status.control_socket),
-                kv("requested", &ctx.socket.display().to_string()),
-                kv("protocol", &format!("v{}", ctx.status.protocol_version)),
+                kv("Control", ""),
+                kv("Socket", &ctx.status.control_socket),
+                kv("Requested", &ctx.socket.display().to_string()),
+                kv("Protocol", &format!("v{}", ctx.status.protocol_version)),
             ];
             draw_panel(frame, body, ctx.page.title(), &rows);
         }
@@ -1438,15 +1532,15 @@ fn draw_error_frame(
     draw_tabs(frame, tabs, page);
     match page {
         TopPage::Nodes => draw_disconnected_nodes_page(frame, body, error),
-        TopPage::Status => {
+        TopPage::Retrieval | TopPage::Status => {
             let rows = [
-                kv("daemon", "disconnected"),
-                kv("socket", &socket.display().to_string()),
-                kv("error", error),
-                kv("retry", "polling"),
-                kv("refresh", &format!("{interval_ms}ms")),
+                kv("Daemon", "disconnected"),
+                kv("Socket", &socket.display().to_string()),
+                kv("Error", error),
+                kv("Retry", "polling"),
+                kv("Refresh", &format!("{interval_ms}ms")),
             ];
-            draw_panel(frame, body, "Status", &rows);
+            draw_panel(frame, body, page.title(), &rows);
         }
     }
 }
@@ -1553,6 +1647,232 @@ fn draw_panel(frame: &mut Frame, area: TuiRect, title: &str, rows: &[PanelRow]) 
             .block(block),
         area,
     );
+}
+
+/// Lay out the Retrieval tab: a 7-row metrics panel at the top
+/// (cache, in-flight, bandwidth) and the gateway-requests table
+/// underneath. The panel needs a fixed height so the table reflows
+/// gracefully when the terminal is short — without it, ratatui would
+/// hand the table all the slack and clip the metrics readout.
+fn draw_retrieval_page(frame: &mut Frame, area: TuiRect, ctx: &TopFrameContext<'_>) {
+    let r = &ctx.status.retrieval;
+    let [metrics_area, requests_area] = vertical_chunks(
+        area,
+        [Constraint::Length(8), Constraint::Min(0)],
+    );
+    draw_retrieval_metrics(frame, metrics_area, r, ctx.bandwidth);
+    draw_gateway_requests(frame, requests_area, r, ctx.now);
+}
+
+/// Top-of-tab metrics readout: cache fill, in-flight count, and
+/// bandwidth. Uses the same `draw_panel` helper as the Status tab so
+/// the colour palette matches.
+fn draw_retrieval_metrics(
+    frame: &mut Frame,
+    area: TuiRect,
+    r: &RetrievalInfo,
+    bandwidth: &BandwidthTracker,
+) {
+    let cache = format!(
+        "{}/{} chunks ({})",
+        r.cache.used,
+        r.cache.capacity,
+        format_percentage(r.cache.used as u64, r.cache.capacity as u64),
+    );
+    let in_flight = format!("{}/{} chunks", r.in_flight, r.in_flight_capacity);
+    let totals = format!(
+        "{} fetched · {} ({} cache hits)",
+        format_count(r.chunks_fetched_total),
+        format_bytes(r.bytes_fetched_total),
+        format_count(r.cache_hits_total),
+    );
+    let bw_now = bandwidth
+        .current_bps()
+        .map(format_byte_rate)
+        .unwrap_or_else(|| "—".to_string());
+    let bw_peak = if bandwidth.peak_bps() > 0.0 {
+        format_byte_rate(bandwidth.peak_bps())
+    } else {
+        "—".to_string()
+    };
+    let bandwidth_row = format!("{bw_now}  (peak {bw_peak})");
+
+    let rows = vec![
+        kv("Cache", &cache),
+        kv("In-flight", &in_flight),
+        kv("Bandwidth", &bandwidth_row),
+        kv("Totals", &totals),
+        kv("Requests", &r.gateway_requests.len().to_string()),
+    ];
+    draw_panel(frame, area, "Retrieval", &rows);
+}
+
+/// Minimum widths for the fixed columns of the gateway-requests
+/// table. The `Path` column is rendered with a `Min` constraint
+/// (see [`gateway_constraints`]) so it absorbs all leftover
+/// horizontal space — long bzz paths are visible in full on a wide
+/// terminal but the table still renders cleanly at the 50-column
+/// floor enforced by `draw_top_frame`.
+///
+/// Each width is `max(header, an upper bound on the longest cell
+/// ever rendered)`:
+///
+/// * `Kind` — up to 5-char label (`Bytes` / `BZZ` / `Chunk` /
+///   `Manif`); 5 fits all of them and the header.
+/// * `Age` — `format_duration` emits `<60s` / `Mm Ss` / `Hh Mm Ss`;
+///   8 fits up to ~99 hours of uptime before clipping.
+/// * `Done` — `chunks_done/total_chunks` with up to ~6-digit values
+///   each, plus the `/` separator (~14).
+/// * `Infl` — `chunks_in_flight` is bounded by
+///   `RETRIEVAL_REQUEST_INFLIGHT_CAP` (≤3 digits today).
+/// * `Bytes` — `format_bytes` always emits `<7 chars` (`9.9GiB`).
+const GATEWAY_FIXED_WIDTHS: [u16; 5] = [5, 8, 14, 6, 12];
+/// Floor on the `Path` column so the header stays legible even when
+/// every other column is fully expanded. Anything beyond this is
+/// growth space the column claims via `Constraint::Min`.
+const GATEWAY_PATH_MIN_WIDTH: u16 = 22;
+const GATEWAY_HEADER: [&str; 6] = ["Kind", "Path", "Age", "Done", "Infl", "Bytes"];
+
+/// Build the per-column constraint set. `Path` gets `Min` so any
+/// horizontal slack the table area has after the fixed columns and
+/// inter-column spacing goes to it; the other five columns stay at
+/// their constant `Length` so numbers don't bounce around as the
+/// terminal resizes.
+fn gateway_constraints() -> [Constraint; 6] {
+    [
+        Constraint::Length(GATEWAY_FIXED_WIDTHS[0]),
+        Constraint::Min(GATEWAY_PATH_MIN_WIDTH),
+        Constraint::Length(GATEWAY_FIXED_WIDTHS[1]),
+        Constraint::Length(GATEWAY_FIXED_WIDTHS[2]),
+        Constraint::Length(GATEWAY_FIXED_WIDTHS[3]),
+        Constraint::Length(GATEWAY_FIXED_WIDTHS[4]),
+    ]
+}
+
+fn draw_gateway_requests(
+    frame: &mut Frame,
+    area: TuiRect,
+    r: &RetrievalInfo,
+    now: u64,
+) {
+    let block = Block::default()
+        .title(" Gateway requests ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(Style::default().bg(Color::Blue));
+
+    let header = Row::new(GATEWAY_HEADER.to_vec()).style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    // Trim to whatever fits in the available rows. The body grows
+    // top-down (oldest request first); when more requests arrive
+    // than fit we drop the newest ones rather than older ones —
+    // older requests are the ones likely to need attention if
+    // they're hung.
+    let visible_rows = area.height.saturating_sub(3).max(1) as usize;
+    let cells: Vec<Vec<String>> = if r.gateway_requests.is_empty() {
+        vec![vec![
+            "—".to_string(),
+            "(idle)".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+        ]]
+    } else {
+        r.gateway_requests
+            .iter()
+            .take(visible_rows)
+            .map(|req| gateway_request_cells(req, now))
+            .collect()
+    };
+
+    let rows: Vec<Row> = cells.into_iter().map(Row::new).collect();
+    let table = Table::new(rows, gateway_constraints())
+        .header(header)
+        .column_spacing(2)
+        .style(Style::default().bg(Color::Blue).fg(Color::White))
+        .block(block);
+    frame.render_widget(table, area);
+}
+
+/// Build the cell strings for one row. The `Path` cell is *not*
+/// truncated here — ratatui clips it to the rendered column width,
+/// which lets the column expand to show the full path on wide
+/// terminals.
+fn gateway_request_cells(req: &GatewayRequestInfo, now: u64) -> Vec<String> {
+    let age_secs = now.saturating_sub(req.started_at_unix);
+    let done = if req.total_chunks_estimate > 0 {
+        format!("{}/{}", req.chunks_done, req.total_chunks_estimate)
+    } else {
+        format!("{}", req.chunks_done)
+    };
+    vec![
+        req.kind.label().to_string(),
+        req.path.clone(),
+        format_duration(age_secs),
+        done,
+        req.chunks_in_flight.to_string(),
+        format_bytes(req.bytes_done),
+    ]
+}
+
+/// Compact "X / max" percentage shown next to the cache fill in the
+/// Retrieval metrics panel. Returns `0%` for `max == 0` rather than
+/// dividing by zero (defensive — capacity is always non-zero in the
+/// daemon, but a misbehaving fixture or future config could ship a
+/// `0` value).
+fn format_percentage(used: u64, max: u64) -> String {
+    if max == 0 {
+        return "0%".to_string();
+    }
+    let pct = (used as f64 / max as f64) * 100.0;
+    format!("{pct:.0}%")
+}
+
+/// SI-ish chunk count: `1234` → `1.2K`, `1_234_567` → `1.2M`. Keeps
+/// the totals column from sprawling when a busy daemon has fetched
+/// millions of chunks across uptime.
+fn format_count(n: u64) -> String {
+    const K: u64 = 1_000;
+    const M: u64 = 1_000_000;
+    const G: u64 = 1_000_000_000;
+    if n >= G {
+        format!("{:.1}G", n as f64 / G as f64)
+    } else if n >= M {
+        format!("{:.1}M", n as f64 / M as f64)
+    } else if n >= K {
+        format!("{:.1}K", n as f64 / K as f64)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Bytes-per-second pretty printer for the bandwidth gauge.
+/// Mirrors `format_bytes` but always emits `…/s` — even at 0 B/s
+/// to make it obvious the field is a rate.
+fn format_byte_rate(bps: f64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * KIB;
+    const GIB: f64 = 1024.0 * MIB;
+    if bps >= GIB {
+        format!("{:.2} GiB/s", bps / GIB)
+    } else if bps >= MIB {
+        format!("{:.2} MiB/s", bps / MIB)
+    } else if bps >= KIB {
+        format!("{:.1} KiB/s", bps / KIB)
+    } else {
+        format!("{:.0} B/s", bps)
+    }
 }
 
 fn draw_nodes_page(
@@ -1709,15 +2029,15 @@ fn draw_disconnected_nodes_page(frame: &mut Frame, area: TuiRect, error: &str) {
     );
     draw_empty_nodes_table(frame, table_area);
     let rows = [
-        kv("daemon", "disconnected"),
-        kv("nodes", "(waiting for antd)"),
-        kv("error", error),
+        kv("Daemon", "disconnected"),
+        kv("Nodes", "(waiting for antd)"),
+        kv("Error", error),
     ];
     draw_panel(frame, detail_area, "Details", &rows);
 }
 
 const NODES_HEADER: [&str; 7] = [
-    "peer id", "state", "ready in", "ip", "type", "agent", "version",
+    "Peer ID", "State", "Ready in", "IP", "Type", "Agent", "Version",
 ];
 /// Gap between adjacent columns; `column_spacing(2)` so each column gets
 /// exactly two spaces of breathing room before the next one starts.
@@ -1726,17 +2046,17 @@ const NODES_COLUMN_SPACING: u16 = 2;
 /// between frames. Each width is `max(header, an upper bound on the longest
 /// cell ever rendered)`:
 ///
-/// * `peer id` — `short_peer_id` always emits `XXXX…YYYY` (9 chars); 10
+/// * `Peer ID` — `short_peer_id` always emits `XXXX…YYYY` (9 chars); 10
 ///   leaves room for the `(none yet)` placeholder when the daemon has no
 ///   peers yet.
-/// * `status` — longest pipeline label is `Identifying`/`Handshaking` (11).
-/// * `ready in` — `format_ready_in_ms` emits `<999 ms` (3 ascii digits +
+/// * `State` — longest pipeline label is `Identifying`/`Handshaking` (11).
+/// * `Ready in` — `format_ready_in_ms` emits `<999 ms` (3 ascii digits +
 ///   space + unit) or `<99.9 s` (4 ascii chars + space + unit), so 8
 ///   covers both plus the header.
-/// * `ip` — fits IPv4 `255.255.255.255` (15); rarer IPv6 / DNS values clip.
-/// * `type` — `light` is the longest of `full` / `light` / `-` (5).
-/// * `agent` — `bee` is 3; allow up to 8 for future clients without reflow.
-/// * `version` — `10.20.30` (8) covers any plausible semver core.
+/// * `IP` — fits IPv4 `255.255.255.255` (15); rarer IPv6 / DNS values clip.
+/// * `Type` — `light` is the longest of `full` / `light` / `-` (5).
+/// * `Agent` — `bee` is 3; allow up to 8 for future clients without reflow.
+/// * `Version` — `10.20.30` (8) covers any plausible semver core.
 const NODES_COLUMN_WIDTHS: [u16; 7] = [10, 11, 8, 15, 5, 8, 8];
 
 fn nodes_table_block() -> Block<'static> {
@@ -1951,7 +2271,7 @@ fn draw_node_details(
     let n = peer_list_len(s);
     let selected = clamp_selection(selected, n);
     let rows: Vec<PanelRow> = if n == 0 {
-        vec![kv("node", "(none selected)")]
+        vec![kv("Node", "(none selected)")]
     } else if !s.peers.peer_pipeline.is_empty() {
         let order = pipeline_view_order(s);
         let row_idx = order.get(selected).copied();
@@ -1963,16 +2283,16 @@ fn draw_node_details(
                     .iter()
                     .find(|p| p.peer_id == row.peer_id);
                 let mut rows = vec![
-                    kv("peer_id", &row.peer_id),
-                    kv("state", pipeline_state_label(row.state)),
+                    kv("Peer ID", &row.peer_id),
+                    kv("State", pipeline_state_label(row.state)),
                     kv(
-                        "ready in",
+                        "Ready in",
                         &row.ready_in_ms
                             .map(format_ready_in_ms)
                             .unwrap_or_else(|| "-".to_string()),
                     ),
                     kv(
-                        "ip",
+                        "IP",
                         if row.ip.is_empty() {
                             "-"
                         } else {
@@ -1985,27 +2305,27 @@ fn draw_node_details(
                 }
                 rows
             }
-            None => vec![kv("node", "(none selected)")],
+            None => vec![kv("Node", "(none selected)")],
         }
     } else {
         match s.peers.connected_peers.get(selected) {
             Some(peer) => {
                 let mut r = vec![
-                    kv("peer_id", &peer.peer_id),
+                    kv("Peer ID", &peer.peer_id),
                     kv(
-                        "state",
+                        "State",
                         if peer.bzz_overlay.is_some() {
                             "Ready"
                         } else {
                             "Handshaking"
                         },
                     ),
-                    kv("ip", &status_addr_ip(peer)),
+                    kv("IP", &status_addr_ip(peer)),
                 ];
                 r.extend(detail_rows_from_connection(peer, now));
                 r
             }
-            None => vec![kv("node", "(none selected)")],
+            None => vec![kv("Node", "(none selected)")],
         }
     };
     draw_panel(frame, area, "Details", &rows);
@@ -2033,26 +2353,26 @@ fn extract_ip_from_multiaddr_str(a: &str) -> String {
 
 fn detail_rows_from_connection(peer: &PeerConnectionInfo, now: u64) -> Vec<PanelRow> {
     let mut rows = vec![
-        kv("direction", &peer.direction),
-        kv("address", &peer.address),
-        kv("agent", unknown_if_empty(&peer.agent_version)),
+        kv("Direction", &peer.direction),
+        kv("Address", &peer.address),
+        kv("Agent", unknown_if_empty(&peer.agent_version)),
         kv(
-            "connected",
+            "Connected",
             &format_duration(now.saturating_sub(peer.connected_at_unix)),
         ),
     ];
     if let Some(overlay) = &peer.bzz_overlay {
-        rows.push(kv("overlay", overlay));
+        rows.push(kv("Overlay", overlay));
     }
     if let Some(full_node) = peer.full_node {
         rows.push(kv(
-            "kind",
+            "Kind",
             if full_node { "full-node" } else { "light-node" },
         ));
     }
     if let Some(at) = peer.last_bzz_at_unix {
         rows.push(kv(
-            "bzz age",
+            "BZZ age",
             &format!("{} ago", format_duration(now.saturating_sub(at))),
         ));
     }
@@ -2136,6 +2456,7 @@ mod tests {
             cache_hits: 0,
             peers_used: 0,
             bypass_cache: false,
+            in_flight: 0,
         }
     }
 

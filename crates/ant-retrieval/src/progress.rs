@@ -19,7 +19,7 @@
 
 use libp2p::PeerId;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// One read of a [`ProgressTracker`]. All counters are cumulative
@@ -35,6 +35,12 @@ pub struct ProgressSample {
     pub cache_hits: u64,
     pub peers_used: u32,
     pub bypass_cache: bool,
+    /// Chunk fetches the request currently has on the wire (acquired the
+    /// retrieval semaphore but haven't yet returned a delivery). Cache
+    /// hits never increment this counter because no semaphore
+    /// round-trip happens. Useful for `antctl top` to show how
+    /// busy each in-progress gateway request is.
+    pub in_flight: u32,
 }
 
 /// Cheap, lock-free-on-the-hot-path counter struct shared between the
@@ -55,6 +61,12 @@ pub struct ProgressTracker {
     /// contention with the joiner's per-chunk fan-out.
     peers: Mutex<HashSet<PeerId>>,
     bypass_cache: bool,
+    /// Live count of chunk fetches the request has dispatched but
+    /// not yet seen a result for. Bumped by [`Self::begin_fetch`] /
+    /// [`Self::end_fetch`] from the retrieval client's per-fetch
+    /// dispatch closure, so cache hits (which never enter that
+    /// closure) are correctly excluded.
+    in_flight: AtomicU32,
 }
 
 impl ProgressTracker {
@@ -69,7 +81,27 @@ impl ProgressTracker {
             total_bytes: AtomicU64::new(0),
             peers: Mutex::new(HashSet::new()),
             bypass_cache,
+            in_flight: AtomicU32::new(0),
         }
+    }
+
+    /// Mark one chunk fetch as on-the-wire. The retrieval client calls
+    /// this immediately after acquiring the per-request and
+    /// process-wide retrieval semaphore permits, so a fetch waiting in
+    /// the semaphore queue does not yet count as "in flight". Cache
+    /// hits don't go through the dispatch closure and so don't bump
+    /// this counter at all — that's deliberate: "in flight" should
+    /// reflect bytes the daemon is genuinely waiting on the network
+    /// for.
+    pub fn begin_fetch(&self) {
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Pair with [`Self::begin_fetch`]. Must be called for every
+    /// `begin_fetch`, including on error paths, so the counter
+    /// doesn't drift up over the lifetime of a long request.
+    pub fn end_fetch(&self) {
+        self.in_flight.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Record one delivered chunk. `peer = Some(p)` for a successful
@@ -113,6 +145,7 @@ impl ProgressTracker {
             cache_hits: self.cache_hits.load(Ordering::Relaxed),
             peers_used: self.peers.lock().expect("progress mutex poisoned").len() as u32,
             bypass_cache: self.bypass_cache,
+            in_flight: self.in_flight.load(Ordering::Relaxed),
         }
     }
 }
@@ -181,6 +214,25 @@ mod tests {
         assert_eq!(snap.total_bytes_estimate, 0, "not yet known");
         assert_eq!(snap.total_chunks_estimate, 0);
         assert!(!snap.bypass_cache);
+        assert_eq!(snap.in_flight, 0, "no fetches outstanding by end of test");
+    }
+
+    /// `begin_fetch` / `end_fetch` are paired by the retrieval client
+    /// around every dispatched fetch; the snapshot reflects the
+    /// instantaneous count at the moment of `snapshot()`.
+    #[test]
+    fn in_flight_tracks_dispatches() {
+        let t = ProgressTracker::new(false);
+        assert_eq!(t.snapshot().in_flight, 0);
+        t.begin_fetch();
+        t.begin_fetch();
+        t.begin_fetch();
+        assert_eq!(t.snapshot().in_flight, 3);
+        t.end_fetch();
+        t.end_fetch();
+        assert_eq!(t.snapshot().in_flight, 1);
+        t.end_fetch();
+        assert_eq!(t.snapshot().in_flight, 0);
     }
 
     #[test]

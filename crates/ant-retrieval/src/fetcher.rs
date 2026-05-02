@@ -20,6 +20,7 @@
 
 use crate::progress::ProgressTracker;
 use crate::accounting::{Accounting, DebitGuard};
+use crate::counters::RetrievalCounters;
 use crate::{retrieve_chunk, ChunkFetcher, InMemoryChunkCache, RetrievalError, RetrievedChunk};
 use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -149,6 +150,13 @@ pub struct RoutingFetcher {
     /// when the daemon's accounting hasn't been constructed
     /// (legacy `antctl get` paths).
     accounting: Option<Arc<Accounting>>,
+    /// Process-wide cumulative counters. Bumped on every chunk the
+    /// fetcher hands back (network or cache); read by the status
+    /// publisher to populate `StatusSnapshot::retrieval` so `antctl
+    /// top` can derive instantaneous bandwidth from the snapshot
+    /// delta. `None` in unit tests (no daemon); the daemon clones
+    /// one shared `Arc` into every fetcher.
+    counters: Option<Arc<RetrievalCounters>>,
 }
 
 impl RoutingFetcher {
@@ -179,7 +187,16 @@ impl RoutingFetcher {
             request_inflight_limit: None,
             payment_notify: None,
             accounting: None,
+            counters: None,
         }
+    }
+
+    /// Attach the process-wide retrieval counters. The daemon shares
+    /// one `Arc<RetrievalCounters>` across every fetcher it builds;
+    /// `antctl top` reads it from `StatusSnapshot::retrieval`.
+    pub fn with_counters(mut self, counters: Arc<RetrievalCounters>) -> Self {
+        self.counters = Some(counters);
+        self
     }
 
     /// Attach a shared client-side accounting mirror. Once set,
@@ -329,6 +346,9 @@ impl ChunkFetcher for RoutingFetcher {
                 if let Some(tracker) = self.progress.as_ref() {
                     tracker.record_chunk(None, bytes.len() as u64);
                 }
+                if let Some(counters) = self.counters.as_ref() {
+                    counters.record_chunk(bytes.len() as u64, true);
+                }
                 return Ok(bytes);
             }
         }
@@ -390,6 +410,7 @@ impl ChunkFetcher for RoutingFetcher {
             let mut control = self.control.clone();
             let sem = self.inflight_limit.clone();
             let request_sem = self.request_inflight_limit.clone();
+            let tracker = self.progress.clone();
             async move {
                 let _request_permit = match request_sem {
                     Some(s) => Some(
@@ -403,7 +424,16 @@ impl ChunkFetcher for RoutingFetcher {
                     Some(s) => Some(s.acquire_owned().await.expect("retrieval semaphore closed")),
                     None => None,
                 };
+                // Count "in flight" only after both semaphore permits
+                // are held — fetches still queued at the semaphore are
+                // not yet consuming network bandwidth.
+                if let Some(t) = tracker.as_ref() {
+                    t.begin_fetch();
+                }
                 let r = retrieve_chunk(&mut control, peer, addr).await;
+                if let Some(t) = tracker.as_ref() {
+                    t.end_fetch();
+                }
                 (peer, r, guard)
             }
         };
@@ -582,6 +612,9 @@ impl ChunkFetcher for RoutingFetcher {
                             }
                             if let Some(tracker) = self.progress.as_ref() {
                                 tracker.record_chunk(Some(peer), wire.len() as u64);
+                            }
+                            if let Some(counters) = self.counters.as_ref() {
+                                counters.record_chunk(wire.len() as u64, false);
                             }
                             // Heartbeat into the pseudosettle driver. We
                             // use `try_send` to keep the hot path

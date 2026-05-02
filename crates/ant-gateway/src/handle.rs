@@ -13,7 +13,7 @@
 //!   means the Web3 v3 keystore (PLAN.md D.3.2) can land later without
 //!   touching `ant-gateway`.
 
-use ant_control::{ControlCommand, StatusSnapshot};
+use ant_control::{ControlCommand, GatewayActivity, StatusSnapshot};
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 
@@ -59,4 +59,9 @@ pub struct GatewayHandle {
     /// Dispatch channel into the node loop for retrieval and
     /// peerstore commands.
     pub commands: mpsc::Sender<ControlCommand>,
+    /// Live registry the gateway writes every in-flight retrieval
+    /// request into. The same `Arc` is held by the daemon's status
+    /// publisher, which snapshots it for `StatusSnapshot::retrieval`
+    /// so `antctl top` can render the Retrieval tab.
+    pub activity: Arc<GatewayActivity>,
 }

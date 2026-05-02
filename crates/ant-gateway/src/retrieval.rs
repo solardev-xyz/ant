@@ -36,7 +36,9 @@
 
 use std::time::Duration;
 
-use ant_control::{ControlAck, ControlCommand, StreamRange};
+use ant_control::{
+    ActiveRequestGuard, ControlAck, ControlCommand, GatewayRequestKind, StreamRange,
+};
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
@@ -102,6 +104,14 @@ pub async fn chunk(
         Err(e) => return json_error(StatusCode::BAD_REQUEST, e),
     };
 
+    // Register the request with the live gateway-activity registry so
+    // it shows up in the `antctl top` Retrieval tab. The guard's
+    // `Drop` impl removes the entry when this handler returns, so
+    // panics and early `return`s clean up automatically.
+    let guard = handle
+        .activity
+        .begin(GatewayRequestKind::Chunk, short_reference(&addr));
+
     let timeout = request_timeout(&headers, CHUNK_REQUEST_TIMEOUT);
 
     let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
@@ -112,6 +122,12 @@ pub async fn chunk(
     if handle.commands.send(cmd).await.is_err() {
         return node_unavailable();
     }
+    // Single-chunk fetches go through `GetChunkRaw`, which doesn't
+    // emit `Progress` acks — we just record the in-flight count
+    // until the bytes come back. The body materialises in one
+    // shot so there's no streaming-body lifetime to worry about
+    // beyond this handler frame.
+    guard.update(0, 1, 1, 0);
 
     let ack = match tokio::time::timeout(timeout, ack_rx).await {
         Ok(Ok(ack)) => ack,
@@ -134,7 +150,25 @@ pub async fn chunk(
             return json_error(StatusCode::INTERNAL_SERVER_ERROR, "unexpected node ack");
         }
     };
+    let len = bytes.len() as u64;
+    guard.update(1, 1, 0, len);
     chunk_response(method, bytes)
+}
+
+/// Trim a hex reference to its leading 8 chars (16 if the caller
+/// passed `0x` prefix) so the `antctl top` Retrieval tab column stays
+/// readable. Empty / invalid references just round-trip unchanged.
+fn short_reference(addr: &str) -> String {
+    let stripped = addr
+        .strip_prefix("0x")
+        .or_else(|| addr.strip_prefix("0X"))
+        .unwrap_or(addr);
+    let head: String = stripped.chars().take(8).collect();
+    if head.is_empty() {
+        addr.to_string()
+    } else {
+        head
+    }
 }
 
 fn chunk_response(method: Method, body: Vec<u8>) -> Response {
@@ -180,10 +214,23 @@ pub async fn bytes(
     let timeout = request_timeout(&headers, DEFAULT_REQUEST_TIMEOUT);
     let head_only = method == Method::HEAD;
 
+    let activity_guard = Some(
+        handle
+            .activity
+            .begin(GatewayRequestKind::Bytes, short_reference(&addr)),
+    );
+
     // Phase 1: dispatch with head_only=true if the caller is HEAD;
     // for GET we go straight to the streaming dispatcher.
-    let mut started = match dispatch_stream_bytes(&handle, reference, timeout, None, head_only)
-        .await
+    let mut started = match dispatch_stream_bytes(
+        &handle,
+        reference,
+        timeout,
+        None,
+        head_only,
+        activity_guard,
+    )
+    .await
     {
         Ok(s) => s,
         Err(e) => return e,
@@ -237,7 +284,11 @@ pub async fn bytes(
     // Range request: cancel the full-body stream we just started and
     // dispatch a fresh range-scoped one. Cancellation is a drop on the
     // ack receiver; the daemon notices the closed channel and stops
-    // joining further subtrees.
+    // joining further subtrees. Move the activity guard from the
+    // cancelled `Started` into the new dispatch so the registry slot
+    // stays alive across the swap (otherwise `antctl top` would see
+    // the row blink out and back in for every range request).
+    let carry_guard = started.take_activity_guard();
     started.cancel();
     let (start, end) = parsed_range.expect("parsed_range was just checked");
     let stream_range = StreamRange {
@@ -250,6 +301,7 @@ pub async fn bytes(
         timeout,
         Some(stream_range),
         head_only,
+        carry_guard,
     )
     .await
     {
@@ -318,6 +370,10 @@ pub async fn manifest(State(handle): State<GatewayHandle>, Path(addr): Path<Stri
         Err(e) => return json_error(StatusCode::BAD_REQUEST, e),
     };
 
+    let _guard = handle
+        .activity
+        .begin(GatewayRequestKind::Manifest, short_reference(&addr));
+
     match dispatch_list_bzz(&handle, reference, DEFAULT_REQUEST_TIMEOUT).await {
         Ok(entries) => json_response(StatusCode::OK, &ManifestListing { entries }),
         Err(e) => e,
@@ -343,6 +399,13 @@ async fn bzz_inner(
     let timeout = request_timeout(&headers, DEFAULT_REQUEST_TIMEOUT);
     let head_only = method == Method::HEAD;
 
+    let activity_label = if path.is_empty() {
+        short_reference(&addr)
+    } else {
+        format!("{}/{path}", short_reference(&addr))
+    };
+    let activity_guard = Some(handle.activity.begin(GatewayRequestKind::Bzz, activity_label));
+
     let mut started = match dispatch_stream_bzz(
         &handle,
         reference,
@@ -350,6 +413,7 @@ async fn bzz_inner(
         timeout,
         None,
         head_only,
+        activity_guard,
     )
     .await
     {
@@ -404,6 +468,7 @@ async fn bzz_inner(
         );
     }
 
+    let carry_guard = started.take_activity_guard();
     started.cancel();
     let (start, end) = parsed_range.expect("parsed_range was just checked");
     let stream_range = StreamRange {
@@ -417,6 +482,7 @@ async fn bzz_inner(
         timeout,
         Some(stream_range),
         head_only,
+        carry_guard,
     )
     .await
     {
@@ -478,11 +544,27 @@ struct Started {
     filename: Option<String>,
     first_chunk: Option<Vec<u8>>,
     rx: mpsc::Receiver<ControlAck>,
+    /// RAII guard for the gateway-activity registry slot. Lives for
+    /// the duration of the HTTP exchange: handed off into the
+    /// streaming-body unfold state on `into_body` so the slot stays
+    /// alive while the response body drains, and dropped explicitly
+    /// in `cancel()` when we redispatch a fresh `Started` for a
+    /// range request (the new `Started` brings its own guard).
+    activity_guard: Option<ActiveRequestGuard>,
 }
 
 impl Started {
     fn cancel(&mut self) {
         self.rx.close();
+    }
+
+    /// Extract the activity guard so the caller can carry the
+    /// registry slot across a cancel-and-redispatch (Range parsing
+    /// path). The redispatched `Started` brings its own `cancel`
+    /// semantics; reusing the existing guard keeps the entry stable
+    /// across the brief window where two streams are active.
+    fn take_activity_guard(&mut self) -> Option<ActiveRequestGuard> {
+        self.activity_guard.take()
     }
 
     /// Hand back the response body. For `HEAD` we want an empty body
@@ -496,26 +578,46 @@ impl Started {
             return Body::empty();
         }
         let Started {
-            first_chunk, rx, ..
+            first_chunk,
+            rx,
+            activity_guard,
+            ..
         } = self;
+        let activity = activity_guard.as_ref().map(|g| g.handle());
         let body_stream = stream::unfold(
-            (first_chunk, rx),
-            |(mut first, mut rx)| async move {
+            (first_chunk, rx, activity, activity_guard),
+            |(mut first, mut rx, activity, guard)| async move {
                 if let Some(data) = first.take() {
-                    return Some((Ok::<Bytes, std::io::Error>(Bytes::from(data)), (None, rx)));
+                    return Some((
+                        Ok::<Bytes, std::io::Error>(Bytes::from(data)),
+                        (None, rx, activity, guard),
+                    ));
                 }
                 loop {
                     match rx.recv().await {
                         Some(ControlAck::BytesChunk { data }) => {
                             return Some((
                                 Ok::<Bytes, std::io::Error>(Bytes::from(data)),
-                                (None, rx),
+                                (None, rx, activity, guard),
                             ));
                         }
                         Some(ControlAck::StreamDone) | None => return None,
-                        Some(ControlAck::Progress(_)) => continue,
+                        Some(ControlAck::Progress(p)) => {
+                            if let Some(h) = activity.as_ref() {
+                                h.update(
+                                    p.chunks_done,
+                                    p.total_chunks_estimate,
+                                    p.in_flight,
+                                    p.bytes_done,
+                                );
+                            }
+                            continue;
+                        }
                         Some(ControlAck::Error { message }) => {
-                            return Some((Err(std::io::Error::other(message)), (None, rx)));
+                            return Some((
+                                Err(std::io::Error::other(message)),
+                                (None, rx, activity, guard),
+                            ));
                         }
                         Some(other) => {
                             warn!(
@@ -525,7 +627,7 @@ impl Started {
                             );
                             return Some((
                                 Err(std::io::Error::other("unexpected node ack")),
-                                (None, rx),
+                                (None, rx, activity, guard),
                             ));
                         }
                     }
@@ -559,6 +661,7 @@ async fn dispatch_stream_bytes(
     timeout: Duration,
     range: Option<StreamRange>,
     head_only: bool,
+    activity_guard: Option<ActiveRequestGuard>,
 ) -> Result<Started, Response> {
     let (ack_tx, ack_rx) = ant_control::streaming_ack_channel();
     let cmd = ControlCommand::StreamBytes {
@@ -572,7 +675,7 @@ async fn dispatch_stream_bytes(
     if handle.commands.send(cmd).await.is_err() {
         return Err(node_unavailable());
     }
-    consume_stream_prologue(ack_rx, timeout, false, head_only).await
+    consume_stream_prologue(ack_rx, timeout, false, head_only, activity_guard).await
 }
 
 #[allow(clippy::result_large_err)]
@@ -583,6 +686,7 @@ async fn dispatch_stream_bzz(
     timeout: Duration,
     range: Option<StreamRange>,
     head_only: bool,
+    activity_guard: Option<ActiveRequestGuard>,
 ) -> Result<Started, Response> {
     let (ack_tx, ack_rx) = ant_control::streaming_ack_channel();
     let cmd = ControlCommand::StreamBzz {
@@ -602,22 +706,24 @@ async fn dispatch_stream_bzz(
     if handle.commands.send(cmd).await.is_err() {
         return Err(node_unavailable());
     }
-    consume_stream_prologue(ack_rx, timeout, true, head_only).await
+    consume_stream_prologue(ack_rx, timeout, true, head_only, activity_guard).await
 }
 
-/// Walk the prologue of a `StreamBytes` / `StreamBzz` response: drop
-/// `Progress` samples, accept the appropriate `*StreamStart` ack, then
-/// peek the first body chunk so the caller can sniff content type and
-/// hand the rest off to hyper as a stream. For `head_only = true` we
-/// also accept a terminal `StreamDone` immediately after the prologue
-/// — no body to peek.
+/// Walk the prologue of a `StreamBytes` / `StreamBzz` response: forward
+/// `Progress` samples to the activity registry, accept the appropriate
+/// `*StreamStart` ack, then peek the first body chunk so the caller can
+/// sniff content type and hand the rest off to hyper as a stream. For
+/// `head_only = true` we also accept a terminal `StreamDone`
+/// immediately after the prologue — no body to peek.
 #[allow(clippy::result_large_err)]
 async fn consume_stream_prologue(
     mut rx: mpsc::Receiver<ControlAck>,
     timeout: Duration,
     expect_bzz: bool,
     head_only: bool,
+    activity_guard: Option<ActiveRequestGuard>,
 ) -> Result<Started, Response> {
+    let activity_handle = activity_guard.as_ref().map(|g| g.handle());
     let total_bytes;
     let mut content_type = None;
     let mut filename = None;
@@ -637,7 +743,17 @@ async fn consume_stream_prologue(
                 filename = fn_;
                 break;
             }
-            Ok(Some(ControlAck::Progress(_))) => continue,
+            Ok(Some(ControlAck::Progress(p))) => {
+                if let Some(h) = activity_handle.as_ref() {
+                    h.update(
+                        p.chunks_done,
+                        p.total_chunks_estimate,
+                        p.in_flight,
+                        p.bytes_done,
+                    );
+                }
+                continue;
+            }
             Ok(Some(ControlAck::Error { message })) => {
                 return Err(map_retrieval_error(message));
             }
@@ -666,6 +782,7 @@ async fn consume_stream_prologue(
             filename,
             first_chunk: None,
             rx,
+            activity_guard,
         });
     }
 
@@ -673,7 +790,17 @@ async fn consume_stream_prologue(
         match tokio::time::timeout(timeout, rx.recv()).await {
             Ok(Some(ControlAck::BytesChunk { data })) => break Some(data),
             Ok(Some(ControlAck::StreamDone)) => break None,
-            Ok(Some(ControlAck::Progress(_))) => continue,
+            Ok(Some(ControlAck::Progress(p))) => {
+                if let Some(h) = activity_handle.as_ref() {
+                    h.update(
+                        p.chunks_done,
+                        p.total_chunks_estimate,
+                        p.in_flight,
+                        p.bytes_done,
+                    );
+                }
+                continue;
+            }
             Ok(Some(ControlAck::Error { message })) => {
                 return Err(map_retrieval_error(message));
             }
@@ -705,6 +832,7 @@ async fn consume_stream_prologue(
         filename,
         first_chunk,
         rx,
+        activity_guard,
     })
 }
 

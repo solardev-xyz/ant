@@ -139,6 +139,12 @@ pub enum Response {
 /// learn the file size until it has fetched the data root chunk and
 /// inspected its 8-byte span prefix, so the first few samples on a
 /// large file may report only `chunks_done` / `bytes_done`.
+///
+/// `in_flight` (added in v3 of this crate) is the only non-cumulative
+/// field — it's an instantaneous count of chunk fetches the request
+/// has dispatched but not yet seen a delivery for. Old daemons leave
+/// it at `0`; a `0` value on a new daemon is also legitimate (cache
+/// hits and idle moments).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GetProgress {
     /// Wall-clock milliseconds since the daemon accepted the request.
@@ -171,6 +177,13 @@ pub struct GetProgress {
     /// Echoes the request's `bypass_cache` flag so a client that
     /// forgot which mode it asked for can reconcile when rendering.
     pub bypass_cache: bool,
+    /// Chunks the request currently has dispatched (acquired the
+    /// retrieval semaphore but not yet returned a delivery). Cache
+    /// hits don't increment this; an idle stretch reads `0` even on
+    /// a healthy connection. Old daemons leave this at the
+    /// `#[serde(default)]` zero value.
+    #[serde(default)]
+    pub in_flight: u32,
 }
 
 /// Everything `antctl status` wants to show.
@@ -185,6 +198,13 @@ pub struct StatusSnapshot {
     pub peers: PeerInfo,
     pub listeners: Vec<String>,
     pub control_socket: String,
+    /// Data-plane snapshot: chunk cache fill, in-flight retrievals,
+    /// cumulative download counters, and the list of currently active
+    /// gateway HTTP requests. Populated by the daemon on every status
+    /// update; surfaced as the `Retrieval` tab in `antctl top`. Old
+    /// daemons leave this at the `#[serde(default)]` zero value.
+    #[serde(default)]
+    pub retrieval: RetrievalInfo,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -295,4 +315,112 @@ pub struct HandshakeReport {
 pub struct VersionInfo {
     pub agent: String,
     pub protocol_version: u32,
+}
+
+/// Snapshot of the in-memory chunk cache.
+///
+/// `capacity` reflects `ant_retrieval::DEFAULT_CACHE_CAPACITY` (or
+/// whatever the daemon was configured with) and is constant for the
+/// lifetime of the process; `used` is the live LRU fill, refreshed
+/// on every status tick.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct CacheInfo {
+    pub used: u32,
+    pub capacity: u32,
+}
+
+/// Data-plane snapshot read by the `Retrieval` tab in `antctl top`.
+///
+/// All numeric fields are cumulative since process start except
+/// `cache.used`, `in_flight`, and the per-request entries in
+/// `gateway_requests`, which are instantaneous. Bandwidth is *not*
+/// reported as a derived rate here — the daemon publishes raw
+/// cumulative `bytes_fetched_total` and `chunks_fetched_total`, and
+/// the consumer (`antctl top`) computes whatever smoothing /
+/// peak-tracking it wants from successive snapshots. That keeps the
+/// daemon free of UI-tier policy and makes the rate trivially
+/// reproducible from the wire log.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RetrievalInfo {
+    pub cache: CacheInfo,
+    /// Chunk fetches the daemon currently has on the wire across all
+    /// in-flight requests (sum of `RoutingFetcher::FuturesUnordered`
+    /// pools that are past their semaphore acquire). Bounded above by
+    /// `in_flight_capacity`.
+    pub in_flight: u32,
+    /// Process-wide cap on concurrent retrievals
+    /// (`RETRIEVAL_INFLIGHT_CAP` in `ant-p2p`).
+    pub in_flight_capacity: u32,
+    /// Cumulative chunk count delivered to joiners since process
+    /// start. Includes both network deliveries and cache hits.
+    pub chunks_fetched_total: u64,
+    /// Cumulative wire bytes (`span (8) || payload`) delivered to
+    /// joiners. Used by `antctl top` to compute instantaneous
+    /// bandwidth as `(b2 - b1) / dt`.
+    pub bytes_fetched_total: u64,
+    /// Cumulative cache hits (subset of `chunks_fetched_total`).
+    pub cache_hits_total: u64,
+    /// Snapshot of currently-active gateway HTTP requests. Empty when
+    /// the gateway is idle or disabled.
+    #[serde(default)]
+    pub gateway_requests: Vec<GatewayRequestInfo>,
+}
+
+/// One in-flight gateway request as surfaced by `StatusSnapshot::retrieval`.
+///
+/// `path` is a short human-readable label — usually `<short_ref>` for
+/// `/bytes` and `/chunks` and `<short_ref>/<path>` for `/bzz`. The
+/// daemon truncates the reference to its leading 8 hex chars to keep
+/// the table column width sane in `antctl top`; clients that need the
+/// full reference can correlate via the gateway access log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayRequestInfo {
+    pub kind: GatewayRequestKind,
+    pub path: String,
+    pub started_at_unix: u64,
+    /// Chunks delivered to the joiner so far for this request (network +
+    /// cache). `0` until the first chunk lands; common for fresh
+    /// requests where the root hasn't been fetched yet.
+    pub chunks_done: u64,
+    /// Best-effort total derived from the data root's span. `0` until
+    /// the daemon has fetched the root chunk.
+    pub total_chunks_estimate: u64,
+    /// Live count of chunk fetches the request has dispatched but not
+    /// yet seen a delivery for. Mirrors
+    /// [`GetProgress::in_flight`] for this request.
+    pub chunks_in_flight: u32,
+    pub bytes_done: u64,
+}
+
+/// Coarse classification of the gateway endpoint so `antctl top` can
+/// label each row. Mapped from the axum handler that registered the
+/// active request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayRequestKind {
+    /// `GET/HEAD /bytes/{addr}` — raw chunk-tree streaming.
+    Bytes,
+    /// `GET/HEAD /bzz/{addr}` or `/bzz/{addr}/{path}` — manifest-aware
+    /// streaming.
+    Bzz,
+    /// `GET/HEAD /chunks/{addr}` — single-chunk wire fetch.
+    Chunk,
+    /// `GET /v0/manifest/{addr}` — Ant-specific manifest enumeration.
+    Manifest,
+}
+
+impl GatewayRequestKind {
+    /// Short label shown in the `antctl top` Retrieval tab. Up to 5
+    /// ASCII characters so the table's `Kind` column stays narrow
+    /// while still being self-explanatory: each label is the bee /
+    /// Ant endpoint name (`/bytes`, `/bzz`, `/chunks`, `/v0/manifest`)
+    /// either spelled in full or trimmed to the same root.
+    pub fn label(self) -> &'static str {
+        match self {
+            GatewayRequestKind::Bytes => "Bytes",
+            GatewayRequestKind::Bzz => "BZZ",
+            GatewayRequestKind::Chunk => "Chunk",
+            GatewayRequestKind::Manifest => "Manif",
+        }
+    }
 }

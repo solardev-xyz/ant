@@ -44,6 +44,7 @@
 
 pub mod accounting;
 pub mod cache;
+pub mod counters;
 pub mod feed;
 pub mod fetcher;
 pub mod joiner;
@@ -52,6 +53,7 @@ pub mod progress;
 
 pub use accounting::{Accounting, DebitGuard, HotHint, OVERDRAFT_REFRESH};
 pub use cache::{InMemoryChunkCache, DEFAULT_CAPACITY as DEFAULT_CACHE_CAPACITY};
+pub use counters::{RetrievalCounters, RetrievalCountersSnapshot};
 pub use feed::{
     feed_from_metadata, resolve_sequence_feed, sequence_update_address, Feed, FeedError, FeedType,
     FEED_OWNER_KEY, FEED_TOPIC_KEY, FEED_TYPE_KEY,

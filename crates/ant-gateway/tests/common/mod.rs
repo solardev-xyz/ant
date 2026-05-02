@@ -24,8 +24,8 @@
 #![allow(dead_code)]
 
 use ant_control::{
-    ControlAck, ControlCommand, IdentityInfo, PeerConnectionInfo, PeerInfo, RoutingInfo,
-    StatusSnapshot, StreamRange, PROTOCOL_VERSION,
+    ControlAck, ControlCommand, GatewayActivity, IdentityInfo, PeerConnectionInfo, PeerInfo,
+    RoutingInfo, StatusSnapshot, StreamRange, PROTOCOL_VERSION,
 };
 use ant_gateway::testkit::build_router;
 use ant_gateway::{GatewayHandle, GatewayIdentity};
@@ -151,6 +151,7 @@ pub fn snapshot_with_one_peer() -> StatusSnapshot {
         },
         listeners: vec!["/ip4/127.0.0.1/tcp/1634".to_string()],
         control_socket: "/tmp/antd.sock".to_string(),
+        retrieval: Default::default(),
     }
 }
 
@@ -191,6 +192,7 @@ pub fn status_only_router(snapshot: StatusSnapshot) -> Router {
         identity: Arc::new(test_identity()),
         status: status_rx,
         commands: cmd_tx,
+        activity: GatewayActivity::new(),
     };
     build_router(handle)
 }
@@ -221,6 +223,7 @@ pub fn handle_with_fixture_node() -> Router {
         identity: Arc::new(test_identity()),
         status: status_rx,
         commands: cmd_tx,
+        activity: GatewayActivity::new(),
     };
     build_router(handle)
 }
@@ -423,6 +426,7 @@ where
         identity: Arc::new(test_identity()),
         status: status_rx,
         commands: cmd_tx,
+        activity: GatewayActivity::new(),
     };
     build_router(handle)
 }

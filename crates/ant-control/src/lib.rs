@@ -4,6 +4,7 @@
 //! one response, then close. Keeping the wire format framing-trivial lets us
 //! debug with `nc -U ~/.antd/antd.sock` and evolve the payload independently.
 
+mod activity;
 mod protocol;
 
 #[cfg(unix)]
@@ -11,10 +12,11 @@ mod client;
 #[cfg(unix)]
 mod server;
 
+pub use activity::{ActiveRequestGuard, GatewayActivity, GatewayActivityHandle};
 pub use protocol::{
-    GetProgress, HandshakeReport, IdentityInfo, PeerConnectionInfo, PeerConnectionState, PeerInfo,
-    PeerPipelineEntry, ProtocolError, Request, Response, RoutingInfo, StatusSnapshot, VersionInfo,
-    PROTOCOL_VERSION,
+    CacheInfo, GatewayRequestInfo, GatewayRequestKind, GetProgress, HandshakeReport, IdentityInfo,
+    PeerConnectionInfo, PeerConnectionState, PeerInfo, PeerPipelineEntry, ProtocolError, Request,
+    Response, RetrievalInfo, RoutingInfo, StatusSnapshot, VersionInfo, PROTOCOL_VERSION,
 };
 
 #[cfg(unix)]
