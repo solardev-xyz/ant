@@ -1,6 +1,6 @@
 [package]
 name = "ant-gateway"
-version = "0.3.1"
+version = "0.3.2"
 edition.workspace = true
 
 # Bee-shaped HTTP gateway in front of `antd`. The crate is feature-gated so

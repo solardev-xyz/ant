@@ -68,6 +68,7 @@
 //!    burst of new peers can't starve the libp2p control of stream slots.
 
 use crate::sinks::{HEADERS_MAX, STREAM_TIMEOUT};
+use ant_retrieval::accounting::{Accounting, HotHint};
 use futures::io::{AsyncReadExt, AsyncWriteExt};
 use futures::StreamExt;
 use libp2p::{PeerId, StreamProtocol};
@@ -93,11 +94,20 @@ pub const PROTOCOL_PSEUDOSETTLE: &str = "/swarm/pseudosettle/1.0.0/pseudosettle"
 pub const LIGHT_REFRESH_RATE_UNITS_PER_SEC: u64 = 450_000;
 
 /// How often [`run_driver`] wakes to scan active peers. Bee's per-peer
-/// allowance grows at `LIGHT_REFRESH_RATE_UNITS_PER_SEC` per second, so a
-/// 1 s tick is enough resolution to keep up with sustained streaming
-/// without burning CPU on idle peers. Aligns with bee's `sequencerResolution
-/// = 1 s` granularity in the blocker, too.
-const REFRESH_TICK: Duration = Duration::from_millis(1000);
+/// allowance grows at `LIGHT_REFRESH_RATE_UNITS_PER_SEC` per second,
+/// but hot peers may need a refresh sooner than that — so we tick at
+/// 100 ms and rely on the per-peer `MIN_REFRESH_INTERVAL` to keep us
+/// from spamming refreshes faster than bee will accept them.
+///
+/// The 100 ms cadence lets a `HotHint` from the fetcher (fired when
+/// a peer's mirrored debt crosses [`crate::accounting::HOT_DEBT_THRESHOLD`])
+/// land on the next tick instead of waiting up to a full second for
+/// the periodic walk. That closes the gap to bee's settlement
+/// reactivity, where bee's `pkg/accounting/accounting.go::settle()`
+/// fires `RefreshFunc` synchronously from `PrepareCredit` /
+/// `creditAction.Apply` — i.e. zero scheduling latency between the
+/// debt build-up and the refresh attempt.
+const REFRESH_TICK: Duration = Duration::from_millis(100);
 
 /// Minimum spacing between successive pseudosettle calls to the same peer.
 /// Bee's `peerAllowance` clamps the accepted amount to
@@ -129,6 +139,13 @@ const MAX_INFLIGHT_REFRESHES: usize = 32;
 /// on backpressure (the driver is a small fixed work queue; missing a
 /// notification only delays the next refresh by one tick).
 pub const NOTIFY_CHANNEL_CAP: usize = 1024;
+
+/// Bound on the hot-hint channel into the driver. Hot hints are rare
+/// (only fire on debt-threshold crossings), so a smaller cap is fine.
+/// Drops on backpressure: the driver still picks up the peer on its
+/// next periodic walk via the regular notify path, hot hints just
+/// shave off the latency.
+pub const HOT_HINT_CHANNEL_CAP: usize = 256;
 
 /// Bee's `pseudosettle.proto::Payment { bytes Amount = 1 }`.
 #[derive(Clone, PartialEq, Message)]
@@ -384,6 +401,11 @@ struct PeerState {
     /// pruning: peers we haven't used in a while drop out of the active
     /// set and stop generating refresh attempts.
     last_used: Instant,
+    /// Set when a [`HotHint`] arrives. Hot peers are processed before
+    /// the regular periodic walk on the next tick. Cleared once a
+    /// refresh dispatch fires for the peer (whether it's accepted by
+    /// bee or not — the hint is one-shot).
+    hot: bool,
 }
 
 /// Aggregate counters surfaced periodically by the driver so an
@@ -422,7 +444,9 @@ struct DriverMetrics {
 pub async fn run_driver(
     control: Control,
     mut notify_rx: mpsc::Receiver<PeerId>,
+    mut hot_rx: mpsc::Receiver<HotHint>,
     peers_rx: watch::Receiver<Vec<(PeerId, [u8; 32])>>,
+    accounting: Option<Arc<Accounting>>,
 ) {
     let mut state: HashMap<PeerId, PeerState> = HashMap::new();
     let semaphore = Arc::new(Semaphore::new(MAX_INFLIGHT_REFRESHES));
@@ -453,6 +477,26 @@ pub async fn run_driver(
                     .or_insert(PeerState {
                         last_refresh: None,
                         last_used: now,
+                        hot: false,
+                    });
+            }
+            recv = hot_rx.recv() => {
+                let Some(hint) = recv else {
+                    // Hot channel closed but notify channel might still be live;
+                    // keep running on time-driven refreshes only.
+                    continue;
+                };
+                let now = Instant::now();
+                state
+                    .entry(hint.peer)
+                    .and_modify(|s| {
+                        s.last_used = now;
+                        s.hot = true;
+                    })
+                    .or_insert(PeerState {
+                        last_refresh: None,
+                        last_used: now,
+                        hot: true,
                     });
             }
             _ = tick.tick() => {
@@ -468,6 +512,23 @@ pub async fn run_driver(
                         .or_insert(PeerState {
                             last_refresh: None,
                             last_used: now,
+                            hot: false,
+                        });
+                }
+                // Same opportunistic drain for hot hints, so a burst
+                // of crossings between two ticks all set the hot flag
+                // before the dispatch walk consults it.
+                while let Ok(hint) = hot_rx.try_recv() {
+                    state
+                        .entry(hint.peer)
+                        .and_modify(|s| {
+                            s.last_used = now;
+                            s.hot = true;
+                        })
+                        .or_insert(PeerState {
+                            last_refresh: None,
+                            last_used: now,
+                            hot: true,
                         });
                 }
                 // Snapshot the live routing set once per tick. Reading
@@ -499,13 +560,30 @@ pub async fn run_driver(
                 });
 
                 // Walk active peers and dispatch refreshes for those
-                // that are past `MIN_REFRESH_INTERVAL`. Spawn detached
-                // tasks gated by the semaphore: a refresh that takes a
-                // long time mustn't stall the driver's tick.
-                for (peer, s) in state.iter_mut() {
-                    if !live.contains(peer) {
+                // that are past `MIN_REFRESH_INTERVAL`. Hot peers
+                // (those whose mirrored debt crossed
+                // `HOT_DEBT_THRESHOLD` since the last tick) go first
+                // so a burst of saturation events doesn't queue
+                // behind unrelated low-debt peers in the
+                // `HashMap` iteration order.
+                //
+                // Spawn detached tasks gated by the semaphore: a
+                // refresh that takes a long time mustn't stall the
+                // driver's tick.
+                let mut walk: Vec<PeerId> = state.keys().copied().collect();
+                walk.sort_by_key(|p| {
+                    state
+                        .get(p)
+                        .map(|s| if s.hot { 0u8 } else { 1u8 })
+                        .unwrap_or(1)
+                });
+                for peer in walk {
+                    if !live.contains(&peer) {
                         continue;
                     }
+                    let Some(s) = state.get_mut(&peer) else {
+                        continue;
+                    };
                     let due = match s.last_refresh {
                         None => true,
                         Some(last) => now.duration_since(last) >= MIN_REFRESH_INTERVAL,
@@ -514,10 +592,11 @@ pub async fn run_driver(
                         continue;
                     }
                     s.last_refresh = Some(now);
-                    let peer = *peer;
+                    s.hot = false;
                     let mut control = control.clone();
                     let sem = semaphore.clone();
                     let metrics = metrics.clone();
+                    let accounting = accounting.clone();
                     tokio::spawn(async move {
                         let Ok(_permit) = sem.acquire_owned().await else {
                             return;
@@ -536,6 +615,9 @@ pub async fn run_driver(
                                     m.units_accepted = m
                                         .units_accepted
                                         .saturating_add(ok.accepted as u128);
+                                    if let Some(acc) = accounting.as_ref() {
+                                        acc.credit(peer, ok.accepted);
+                                    }
                                 }
                                 trace!(
                                     target: "ant_p2p::pseudosettle",

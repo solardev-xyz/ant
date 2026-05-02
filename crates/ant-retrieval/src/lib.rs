@@ -42,6 +42,7 @@
 //! sustained reader would need to honor SWAP debits (M3 territory); we
 //! deliberately don't here.
 
+pub mod accounting;
 pub mod cache;
 pub mod feed;
 pub mod fetcher;
@@ -49,6 +50,7 @@ pub mod joiner;
 pub mod mantaray;
 pub mod progress;
 
+pub use accounting::{Accounting, DebitGuard, HotHint, OVERDRAFT_REFRESH};
 pub use cache::{InMemoryChunkCache, DEFAULT_CAPACITY as DEFAULT_CACHE_CAPACITY};
 pub use feed::{
     feed_from_metadata, resolve_sequence_feed, sequence_update_address, Feed, FeedError, FeedType,

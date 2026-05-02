@@ -19,6 +19,7 @@
 //! the command is cheap.
 
 use crate::progress::ProgressTracker;
+use crate::accounting::{Accounting, DebitGuard};
 use crate::{retrieve_chunk, ChunkFetcher, InMemoryChunkCache, RetrievalError, RetrievedChunk};
 use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -46,18 +47,22 @@ const MAX_ORIGIN_ERRORS: usize = 32;
 
 /// Idle hedge interval. If the active retrieval stream hasn't returned
 /// a delivery within this window we dispatch a single backup peer in
-/// parallel. Set deliberately well above bee's per-chunk timeout's
-/// median (typical `retrieve-chunk` round-trip is 100–800 ms) so this
-/// only fires on genuinely tail-slow chunks — every preemptive dispatch
-/// either accumulates *applied* debt (if we then cancel after read) or
-/// *ghost* debt (if we cancel before read) on bee, both of which count
-/// against `lightDisconnectLimit`. Bee's own retrieval uses a 1 s
-/// preemptive ticker, but bee is also serving its own neighbourhood
-/// where per-chunk RTT is much shorter; for an origin client streaming
-/// from forwarders we eat fewer ghost debits by waiting longer before
-/// hedging. Hedging is still bounded by the 32-attempt error budget
-/// for that single chunk.
-const HEDGE_DELAY: Duration = Duration::from_secs(4);
+/// parallel. Mirrors bee's `preemptiveInterval = time.Second` from
+/// `pkg/retrieval/retrieval.go` exactly.
+///
+/// History: this used to be 4 s — we widened it deliberately when
+/// hedge-induced ghost debits were collapsing the peer set during
+/// large-file streaming. The widening worked, but at the cost of
+/// per-chunk latency (a tail-slow chunk waited 4 s before getting a
+/// second chance). Now that admission control via [`Accounting`]
+/// keeps hedges off already-saturated peers (bee's
+/// `pkg/retrieval/retrieval.go::case ErrOverdraft` arm in
+/// `prepareCredit`), we can match bee's 1 s preemptive cadence
+/// without re-introducing the cascade — the worst a 1 s hedge can
+/// do now is dispatch a request to a peer with admission headroom,
+/// not pile debt onto a hot peer. Hedging remains bounded by the
+/// 32-attempt error budget for that single chunk.
+const HEDGE_DELAY: Duration = Duration::from_secs(1);
 
 /// Stateful per-call fetcher. Owns a clone of `Control` and a live
 /// peer-snapshot subscription via `tokio::sync::watch::Receiver`.
@@ -132,6 +137,18 @@ pub struct RoutingFetcher {
     /// unit tests (no real bee on the other end means there's no debt to
     /// settle).
     payment_notify: Option<mpsc::Sender<PeerId>>,
+    /// Optional client-side accounting mirror. When set, every
+    /// chunk fetch dispatch goes through
+    /// [`Accounting::try_reserve`] first; peers whose mirrored
+    /// debt would cross
+    /// [`crate::accounting::OVERDRAFT_LIMIT`] are skipped for
+    /// [`crate::accounting::OVERDRAFT_REFRESH`] and the
+    /// next-closest peer is picked instead — exactly bee's
+    /// `pkg/retrieval/retrieval.go::case ErrOverdraft` arm.
+    /// Omitted in unit tests (no real bee debt to mirror) and
+    /// when the daemon's accounting hasn't been constructed
+    /// (legacy `antctl get` paths).
+    accounting: Option<Arc<Accounting>>,
 }
 
 impl RoutingFetcher {
@@ -161,7 +178,20 @@ impl RoutingFetcher {
             inflight_limit: None,
             request_inflight_limit: None,
             payment_notify: None,
+            accounting: None,
         }
+    }
+
+    /// Attach a shared client-side accounting mirror. Once set,
+    /// the fetcher consults it on every dispatch decision and
+    /// updates per-peer balance on every successful fetch — the
+    /// `RoutingFetcher` owns no accounting state of its own, so
+    /// the same `Arc<Accounting>` must be shared across all
+    /// fetchers built for one daemon process for the mirror to
+    /// reflect cross-request debt.
+    pub fn with_accounting(mut self, accounting: Arc<Accounting>) -> Self {
+        self.accounting = Some(accounting);
+        self
     }
 
     /// Test helper: wrap a fixed peer list in a watch channel. The
@@ -345,8 +375,18 @@ impl ChunkFetcher for RoutingFetcher {
         let mut last_err: Option<RetrievalError> = None;
         let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
         let mut hedge_timer = Box::pin(tokio::time::sleep(HEDGE_DELAY));
+        // Per-chunk overdraft skip: a peer landed here when
+        // `Accounting::try_reserve` refused to admit the dispatch.
+        // The entry expires after `OVERDRAFT_REFRESH` (600 ms),
+        // mirroring bee's `pkg/retrieval/retrieval.go::skip.Add`
+        // with the `overDraftRefresh` TTL. We also keep the
+        // entry in `asked` for the same chunk so we never
+        // re-dispatch a saturated peer twice without a refresh
+        // having had a chance to land.
+        let mut overdraft_skip: std::collections::HashMap<PeerId, std::time::Instant> =
+            std::collections::HashMap::new();
 
-        let make_fut = |peer: PeerId| {
+        let make_fut = |peer: PeerId, guard: Option<DebitGuard>| {
             let mut control = self.control.clone();
             let sem = self.inflight_limit.clone();
             let request_sem = self.request_inflight_limit.clone();
@@ -364,32 +404,100 @@ impl ChunkFetcher for RoutingFetcher {
                     None => None,
                 };
                 let r = retrieve_chunk(&mut control, peer, addr).await;
-                (peer, r)
+                (peer, r, guard)
             }
         };
 
         // Pick the next-closest live peer that we haven't asked yet for
-        // THIS chunk. Reads `peers_rx` afresh on every call so peers
-        // that disconnect mid-fetch automatically drop out of the
-        // candidate pool, and a peer that gets blacklisted (CAC
-        // mismatch, malformed framing) by a sibling chunk's fetcher
-        // also disappears here.
-        let pick_next = |asked: &Vec<PeerId>| -> Option<PeerId> {
+        // THIS chunk *and* that has admission-control headroom. Reads
+        // `peers_rx` afresh on every call so peers that disconnect
+        // mid-fetch automatically drop out of the candidate pool, and a
+        // peer that gets blacklisted (CAC mismatch, malformed framing)
+        // by a sibling chunk's fetcher also disappears here.
+        //
+        // When [`Accounting`] is attached, the picker calls
+        // `try_reserve(peer, price)` for each candidate in proximity
+        // order. The first peer that accepts the reservation wins; the
+        // returned [`DebitGuard`] is moved into the dispatched future.
+        // Peers that refuse the reservation are added to
+        // `overdraft_skip` for [`OVERDRAFT_REFRESH`] (600 ms) and the
+        // walk continues to the next-closest peer — exactly bee's
+        // `pkg/retrieval/retrieval.go` flow when `prepareCredit`
+        // returns `ErrOverdraft`.
+        let pick_next = |asked: &Vec<PeerId>,
+                         overdraft_skip: &mut std::collections::HashMap<
+            PeerId,
+            std::time::Instant,
+        >|
+         -> Option<(PeerId, Option<DebitGuard>)> {
+            let now = std::time::Instant::now();
+            // Sweep expired overdraft entries so the candidate set
+            // reopens once `lightRefreshRate` has had time to clear
+            // the peer's debt on bee's side.
+            overdraft_skip.retain(|_, until| now < *until);
             let ranked = self.ranked(&addr);
-            ranked.into_iter().find_map(|(peer, _)| {
+            for (peer, peer_overlay) in ranked {
                 if asked.contains(&peer) {
-                    None
-                } else {
-                    Some(peer)
+                    continue;
                 }
-            })
+                if overdraft_skip.contains_key(&peer) {
+                    continue;
+                }
+                match self.accounting.as_ref() {
+                    Some(acc) => {
+                        let price = Accounting::peer_price(&peer_overlay, &addr);
+                        match acc.try_reserve(peer, price) {
+                            Some(guard) => return Some((peer, Some(guard))),
+                            None => {
+                                trace!(
+                                    target: "ant_retrieval::fetcher",
+                                    %peer,
+                                    chunk = %hex::encode(addr),
+                                    price,
+                                    "overdraft skip; trying next-closest peer",
+                                );
+                                overdraft_skip
+                                    .insert(peer, now + crate::accounting::OVERDRAFT_REFRESH);
+                                continue;
+                            }
+                        }
+                    }
+                    None => return Some((peer, None)),
+                }
+            }
+            None
+        };
+
+        // True iff at least one ranked peer is admissible right now —
+        // i.e., not in `asked`, not in the overdraft skip set. Used by
+        // the "give up" arm of the loop. Doesn't actually try_reserve
+        // (cheaper, and avoids burning a reservation we'd discard).
+        let candidate_available = |asked: &Vec<PeerId>,
+                                   overdraft_skip: &std::collections::HashMap<
+            PeerId,
+            std::time::Instant,
+        >|
+         -> bool {
+            let now = std::time::Instant::now();
+            for (peer, _) in self.ranked(&addr) {
+                if asked.contains(&peer) {
+                    continue;
+                }
+                if let Some(until) = overdraft_skip.get(&peer) {
+                    if now < *until {
+                        continue;
+                    }
+                }
+                return true;
+            }
+            false
         };
 
         // Initial dispatch.
-        match pick_next(&asked) {
-            Some(peer) => {
+        match pick_next(&asked, &mut overdraft_skip) {
+            Some((peer, guard)) => {
                 asked.push(peer);
-                in_flight.push(make_fut(peer));
+                in_flight.push(make_fut(peer, guard));
             }
             None => return Err("no BZZ peers available".into()),
         }
@@ -405,15 +513,25 @@ impl ChunkFetcher for RoutingFetcher {
             // succeed. This is bee's `topology.ErrNotFound` arm: it
             // returns immediately with the underlying error rather
             // than ticking against a frozen candidate list forever.
-            if in_flight.is_empty() && pick_next(&asked).is_none() {
+            if in_flight.is_empty() && !candidate_available(&asked, &overdraft_skip) {
                 break;
             }
 
             tokio::select! {
                 biased;
-                Some((peer, result)) = in_flight.next() => {
+                Some((peer, result, guard)) = in_flight.next() => {
                     match result {
                         Ok(chunk) => {
+                            // Apply the accounting debit now that we
+                            // know the chunk arrived: mirrors bee's
+                            // `creditAction.Apply()` from
+                            // `pkg/accounting/accounting.go:337`.
+                            // Bumps balance, fires hot hint into
+                            // pseudosettle if the peer just crossed
+                            // HOT_DEBT_THRESHOLD.
+                            if let Some(g) = guard {
+                                g.apply();
+                            }
                             // Cancel-tolerant hedging. Instead of
                             // `drop(in_flight)`, hand the remaining
                             // futures to a detached drain task that
@@ -478,6 +596,12 @@ impl ChunkFetcher for RoutingFetcher {
                             return Ok(wire);
                         }
                         Err(e) => {
+                            // Drop the guard: error means the request
+                            // never reached bee's `PrepareDebit`, so
+                            // bee's `creditAction.Cleanup` has already
+                            // released its reserve too. Our reservation
+                            // releases via guard's Drop impl.
+                            drop(guard);
                             let blacklist = is_peer_fatal(&e);
                             debug!(
                                 target: "ant_retrieval::fetcher",
@@ -499,9 +623,9 @@ impl ChunkFetcher for RoutingFetcher {
                             // Backfill immediately on error: don't wait
                             // for the next preemptive tick. Mirrors bee's
                             // `retry()` call inside the error arm.
-                            if let Some(peer) = pick_next(&asked) {
+                            if let Some((peer, guard)) = pick_next(&asked, &mut overdraft_skip) {
                                 asked.push(peer);
-                                in_flight.push(make_fut(peer));
+                                in_flight.push(make_fut(peer, guard));
                             }
                         }
                     }
@@ -512,9 +636,9 @@ impl ChunkFetcher for RoutingFetcher {
                     // full HEDGE_DELAY of silence before firing — we
                     // don't want a single stuck chunk to spin up 32
                     // hedges in a tight loop.
-                    if let Some(peer) = pick_next(&asked) {
+                    if let Some((peer, guard)) = pick_next(&asked, &mut overdraft_skip) {
                         asked.push(peer);
-                        in_flight.push(make_fut(peer));
+                        in_flight.push(make_fut(peer, guard));
                     }
                     hedge_timer = Box::pin(tokio::time::sleep(HEDGE_DELAY));
                 }
@@ -630,15 +754,27 @@ fn spawn_drain_losers<S>(
     record_dir: Option<PathBuf>,
     payment_notify: Option<mpsc::Sender<PeerId>>,
 ) where
-    S: futures::stream::Stream<Item = (PeerId, Result<RetrievedChunk, RetrievalError>)>
-        + Send
+    S: futures::stream::Stream<
+            Item = (
+                PeerId,
+                Result<RetrievedChunk, RetrievalError>,
+                Option<DebitGuard>,
+            ),
+        > + Send
         + 'static,
 {
     tokio::spawn(async move {
         let mut s = Box::pin(in_flight);
-        while let Some((peer, result)) = s.next().await {
+        while let Some((peer, result, guard)) = s.next().await {
             match result {
                 Ok(chunk) => {
+                    // Apply the loser's debit too: bee's
+                    // `creditAction.Apply` ran on its end (we read
+                    // their delivery), so the chunk price is real
+                    // debt now and pseudosettle needs to clear it.
+                    if let Some(g) = guard {
+                        g.apply();
+                    }
                     let mut wire = Vec::with_capacity(8 + chunk.payload().len());
                     wire.extend_from_slice(&chunk.span_bytes());
                     wire.extend_from_slice(chunk.payload());
@@ -664,6 +800,7 @@ fn spawn_drain_losers<S>(
                     );
                 }
                 Err(e) => {
+                    drop(guard);
                     trace!(
                         target: "ant_retrieval::fetcher",
                         %peer,

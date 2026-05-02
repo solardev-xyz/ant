@@ -2683,3 +2683,177 @@ shadow-reserved-balance high-water mark, which in turn reduces the
 window where a clean-cancel race can land us over
 `lightDisconnectLimit`.
 
+
+## Appendix H — Bee-parity admission control: the `Accounting` mirror
+
+After Appendix G's cancel-tolerant hedging stabilised the peer set
+during normal large-file streaming, a follow-up benchmark surfaced
+a residual gap: the 112 MiB track still finished in 312 s (vs bee
+ultra-light at 195 s on the identical file), and the peer set
+quietly halved (100 → 48) over the four-track run. The pattern was
+the same root cause but a different angle: bee was RST'ing
+saturated forwarders before pseudosettle could refresh them.
+
+Reading bee's `pkg/accounting/accounting.go::PrepareCredit`
+revealed three structural pieces ant was missing:
+
+1. **Client-side admission control.** Bee's `prepareCredit` checks
+   the *predicted* per-peer balance against
+   `disconnectLimit + min(int64(elapsed), 1) × refreshRate` *before*
+   dispatching, and refuses to dispatch if the prediction would
+   cross. The retrieval loop catches `ErrOverdraft` and skips the
+   peer for `overDraftRefresh = 600 ms`, then tries the next-closest
+   one. Ant had no client-side equivalent; the only signal a peer
+   was over its limit was being RST'd at the TCP layer.
+
+2. **Debt-driven pseudosettle trigger.** Bee fires `RefreshFunc`
+   synchronously from `creditAction.Apply` when expected debt
+   crosses `earlyPayment = 50 % × paymentThreshold`. Ant's
+   pseudosettle driver was purely time-driven on a 1 s tick, so a
+   peer that crossed the early-payment line between ticks had to
+   wait up to a full second before its refresh dispatched.
+
+3. **Faster preemptive fan-out.** Bee's hedge cadence is 1 s; ant
+   was at 4 s. Ant widened the cadence in Appendix G specifically
+   to reduce hedge-induced ghost debits. With (1) in place the
+   widening becomes unnecessary: hedges land on admissible peers
+   only, so the worst case of a 1 s hedge is one extra dispatch on
+   a peer with headroom, not a pile-on saturating an already-hot
+   peer.
+
+### H.1 Implementation
+
+`crates/ant-retrieval/src/accounting.rs` is a new module that
+mirrors bee's per-peer `accountingPeer` struct, restricted to the
+four fields that affect admission: `balance`, `reserved`,
+`last_refresh`, and `last_used`. The module exposes:
+
+- `Accounting::peer_price(overlay, chunk_addr)` — bee's
+  `pricer.PeerPrice` formula
+  (`(MAX_PO − proximity + 1) × basePrice`).
+- `Accounting::try_reserve(peer, price) -> Option<DebitGuard>` — the
+  admission gate. Returns `None` (i.e. `ErrOverdraft`) when
+  `balance + reserved + price > disconnectLimit`. The fetcher's
+  `pick_next` walks ranked peers, calls `try_reserve` on each, and
+  the first peer that admits wins; refused peers go on a per-chunk
+  skip list with the [`OVERDRAFT_REFRESH = 600 ms`] TTL.
+- `DebitGuard::apply()` — moves `price` from `reserved` to
+  `balance` on a successful chunk delivery. If the post-apply
+  balance crosses `HOT_DEBT_THRESHOLD`, fires a `HotHint` into the
+  pseudosettle driver.
+- `DebitGuard::Drop` — releases the reservation without applying
+  if the chunk fetch errored or was cancelled. Mirrors bee's
+  `creditAction.Cleanup`.
+- `Accounting::credit(peer, accepted)` — the pseudosettle ack
+  callback. Subtracts `accepted` from `balance`, bumps
+  `last_refresh` to `Instant::now()`.
+- `Accounting::forget(peer)` — invoked from the swarm's
+  `ConnectionClosed` handler so a peer's mirror state matches
+  bee's `notifyPeerConnect` reset on reconnect.
+
+The thresholds are sized off bee's constants:
+
+| Constant | Value | Origin |
+|----------|-------|--------|
+| `LIGHT_DISCONNECT_LIMIT` | 1,687,500 units | `(100+25)% × (paymentThreshold/lightFactor) = 1.25 × (13.5 M / 10)` |
+| `LIGHT_REFRESH_RATE_PER_SEC` | 450,000 units/s | `refreshRate / lightFactor = 4.5 M / 10` |
+| `OVERDRAFT_LIMIT` | 1,687,500 units | `LIGHT_DISCONNECT_LIMIT` (no allowance term) |
+| `HOT_DEBT_THRESHOLD` | 843,750 units | `LIGHT_DISCONNECT_LIMIT / 2`, matching bee's `earlyPayment = 50 %` |
+| `OVERDRAFT_REFRESH` | 600 ms | `bee/pkg/retrieval/retrieval.go` |
+| `HEDGE_DELAY` | 1 s | bee's `preemptiveInterval` |
+
+`OVERDRAFT_LIMIT` is set to the *lower* of bee's two boundaries
+(`disconnectLimit` alone, no `min(elapsed, 1) × refreshRate`
+allowance term). Bee's allowance is binary on a one-second
+boundary — `min(int64(elapsed), 1) × refreshRate` is *either* 0
+*or* `refreshRate`, never anything in between — so any
+interpolated estimate would either over- or under-shoot. Picking
+the lower bound leaves us with a ~450 k unit safety margin between
+"ant refuses to dispatch" and "bee disconnects", which is exactly
+one second of pseudosettle work.
+
+The pseudosettle driver in `crates/ant-p2p/src/pseudosettle.rs`
+gained two changes:
+
+- A second `mpsc::Receiver<HotHint>` channel. Hot hints set the
+  `hot` flag on the per-peer state; the dispatch walk on each
+  tick processes hot peers first (sorts by `hot ? 0 : 1` before
+  iterating).
+- `REFRESH_TICK` was tightened from 1 s to 100 ms. The 100 ms
+  cadence makes hot hints land on the next tick rather than
+  waiting up to a full second for the periodic walk; the existing
+  per-peer `MIN_REFRESH_INTERVAL = 1.1 s` still keeps us from
+  spamming bee with same-second refreshes (`ErrSettlementTooSoon`).
+
+The driver also accepts an optional `Arc<Accounting>` and calls
+`accounting.credit(peer, accepted)` on every successful refresh,
+closing the loop between bee's `PaymentAck.accepted` field and our
+admission mirror.
+
+### H.2 Wiring
+
+`SwarmState` gained an `accounting: Option<Arc<Accounting>>` field.
+The daemon constructs one shared `Accounting` at startup, hands a
+clone to every `RoutingFetcher` it builds (via
+`with_accounting`), and the same clone to the pseudosettle driver
+for crediting back. `ConnectionClosed` calls
+`accounting.forget(&peer)` so a flapping peer's mirror state
+doesn't carry stale balance across reconnects.
+
+The fetcher's `pick_next` was rewritten to take `&mut
+overdraft_skip` and walk ranked peers calling `try_reserve` on
+each. The first admissible peer wins; refused peers go in
+`overdraft_skip` with a 600 ms expiry. The dispatched future
+carries the `DebitGuard` and applies it on success / drops it on
+error. The cancel-tolerant drain task (Appendix G) was extended to
+apply guards too — losing hedges that delivered still apply their
+debits because bee already ran `creditAction.Apply` on its end.
+
+### H.3 Validation
+
+Test bench: `ant 0.3.x` (this commit, with H.1–H.2 wired in) vs
+`bee 2.7.1` ultra-light, both fresh datadirs, both 100/136-peer
+warm pools, four-track wav benchmark
+(`bee-bench/cmp-bench-test.sh`):
+
+| Track | File | Ant | Bee | Δ |
+|-------|------|-----|-----|---|
+| 1 | butterfly (44 MiB) | **69.7 s** | 75.0 s | ant +7 % faster |
+| 2 | sallarom (59 MiB) | **95.4 s** | 102.8 s | ant +7 % faster |
+| 3 | high five (35 MiB) | **54.8 s** | 62.6 s | ant +13 % faster |
+| 4 | flutterby (112 MiB) | **184.6 s** | 200.1 s | ant +8 % faster |
+
+All four files completed with byte-perfect SHA-256 match between
+ant and bee. Ant's peer set stayed at 100 throughout the entire
+12-minute bench (28 total disconnects, 24 of them in the warmup
+window before the bench started). Pseudosettle accepted 1.3–2.7
+billion units/min across the four tracks, vs ~660 M units/min
+during the pre-fix collapse.
+
+Two earlier bench iterations during this work showed the regime
+sensitivity:
+
+- With `OVERDRAFT_LIMIT = LIGHT_DISCONNECT_LIMIT +
+  LIGHT_REFRESH_RATE_PER_SEC` (the upper bound, matching bee's
+  max-allowance line): tracks 1–2 ran at 24 s and 27 s (3× faster
+  than bee), but tracks 3–4 collapsed the peer set 100 → 1 and
+  failed mid-stream. Pulling the cap down to
+  `LIGHT_DISCONNECT_LIMIT` alone trades that 3× speedup for
+  stability — ant gets bee-parity throughput with bee-parity
+  resilience.
+- Two earlier attempts at a per-peer in-flight cap
+  (`PER_PEER_INFLIGHT_CAP = 8` and `= 16` in
+  `RoutingFetcher::fetch`) both *worsened* stability: forcing
+  requests onto less-optimal forwarders increased cancellations,
+  which increased ghost debits, which collapsed the peer set
+  faster. The admission-control mirror replaces this lever
+  cleanly: it spreads load to peers with *headroom* rather than
+  to peers chosen by an arbitrary hard cap.
+
+### H.4 Deployment
+
+After validation: bump `0.3.1 → 0.3.2` across all eight workspace
+crates per `AGENTS.md`'s policy, build the release binary, deploy
+to `vibing.at/ant`, and confirm `antd --version` matches what's
+serving. The same `0.3.2` binary serves `*.eth.freedom.baby` since
+it's the same `antd` instance.

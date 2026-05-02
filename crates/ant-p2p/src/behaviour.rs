@@ -305,6 +305,15 @@ struct SwarmState {
     /// after `mpsc::channel` is created (the channel sender doesn't
     /// outlive the driver task, and the run loop owns both).
     payment_notify: Option<mpsc::Sender<PeerId>>,
+    /// Shared client-side accounting mirror. Built once and cloned
+    /// into every fetcher and into the pseudosettle driver. The
+    /// fetcher uses it for admission control on dispatch
+    /// (`Accounting::try_reserve`); the driver uses it to credit
+    /// peers back on every accepted refresh
+    /// (`Accounting::credit`); the swarm calls
+    /// `Accounting::forget` from `ConnectionClosed` so peer state
+    /// matches bee's `notifyPeerConnect` reset on the remote end.
+    accounting: Option<Arc<ant_retrieval::accounting::Accounting>>,
 }
 
 impl SwarmState {
@@ -341,6 +350,7 @@ impl SwarmState {
             peers_watch: watch::channel(Vec::new()).0,
             retrieval_inflight: Arc::new(Semaphore::new(RETRIEVAL_INFLIGHT_CAP)),
             payment_notify: None,
+            accounting: None,
         }
     }
 
@@ -641,14 +651,31 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     // refreshes for peers we no longer have a direct connection to —
     // critical for gateway loads where the routing set churns through
     // thousands of peers per hour.
+    //
+    // The shared `Accounting` mirror is the same one we hand to every
+    // `RoutingFetcher` we build below; it gives the fetcher's hot path
+    // admission control (refuse to dispatch to peers near
+    // `lightDisconnectLimit`) and the driver a way to credit peers
+    // back as bee accepts our refresh attempts. The driver also
+    // listens for `HotHint`s on a separate channel so a debt crossing
+    // can leapfrog the periodic walk.
     let (payment_notify_for_state, payment_notify_rx) =
         mpsc::channel::<PeerId>(crate::pseudosettle::NOTIFY_CHANNEL_CAP);
+    let (hot_hint_tx, hot_hint_rx) = mpsc::channel::<ant_retrieval::accounting::HotHint>(
+        crate::pseudosettle::HOT_HINT_CHANNEL_CAP,
+    );
+    let accounting = Arc::new(
+        ant_retrieval::accounting::Accounting::new().with_hot_hint(hot_hint_tx),
+    );
     tokio::spawn(crate::pseudosettle::run_driver(
         control.clone(),
         payment_notify_rx,
+        hot_hint_rx,
         state.peers_watch.subscribe(),
+        Some(accounting.clone()),
     ));
     state.payment_notify = Some(payment_notify_for_state);
+    state.accounting = Some(accounting);
     let mut peerstore = match cfg.peerstore_path.clone() {
         Some(p) => PeerStore::load(p),
         None => PeerStore::disabled(),
@@ -887,6 +914,7 @@ fn handle_control_command(
             let record_dir = state.chunk_record_dir.clone();
             let inflight_limit = state.retrieval_inflight.clone();
             let payment_notify = state.payment_notify.clone();
+            let accounting = state.accounting.clone();
             let tracker = Arc::new(ProgressTracker::new(bypass_cache));
             let started = Instant::now();
             let emitter = if progress {
@@ -907,6 +935,7 @@ fn handle_control_command(
                     record_dir,
                     inflight_limit,
                     payment_notify,
+                    accounting,
                     tracker_for_run,
                     reference,
                     max_bytes,
@@ -941,6 +970,7 @@ fn handle_control_command(
             let record_dir = state.chunk_record_dir.clone();
             let inflight_limit = state.retrieval_inflight.clone();
             let payment_notify = state.payment_notify.clone();
+            let accounting = state.accounting.clone();
             let tracker = Arc::new(ProgressTracker::new(bypass_cache));
             tokio::spawn(async move {
                 run_stream_bytes(
@@ -950,6 +980,7 @@ fn handle_control_command(
                     record_dir,
                     inflight_limit,
                     payment_notify,
+                    accounting,
                     tracker,
                     reference,
                     max_bytes,
@@ -985,6 +1016,7 @@ fn handle_control_command(
             let record_dir = state.chunk_record_dir.clone();
             let inflight_limit = state.retrieval_inflight.clone();
             let payment_notify = state.payment_notify.clone();
+            let accounting = state.accounting.clone();
             let tracker = Arc::new(ProgressTracker::new(bypass_cache));
             tokio::spawn(async move {
                 run_stream_bzz(
@@ -994,6 +1026,7 @@ fn handle_control_command(
                     record_dir,
                     inflight_limit,
                     payment_notify,
+                    accounting,
                     tracker,
                     reference,
                     path,
@@ -1031,6 +1064,7 @@ fn handle_control_command(
             let record_dir = state.chunk_record_dir.clone();
             let inflight_limit = state.retrieval_inflight.clone();
             let payment_notify = state.payment_notify.clone();
+            let accounting = state.accounting.clone();
             let tracker = Arc::new(ProgressTracker::new(bypass_cache));
             let started = Instant::now();
             let emitter = if progress {
@@ -1051,6 +1085,7 @@ fn handle_control_command(
                     record_dir,
                     inflight_limit,
                     payment_notify,
+                    accounting,
                     tracker_for_run,
                     reference,
                     path,
@@ -1084,6 +1119,7 @@ fn handle_control_command(
             let record_dir = state.chunk_record_dir.clone();
             let inflight_limit = state.retrieval_inflight.clone();
             let payment_notify = state.payment_notify.clone();
+            let accounting = state.accounting.clone();
             tokio::spawn(async move {
                 let reply = run_list_bzz(
                     control,
@@ -1092,6 +1128,7 @@ fn handle_control_command(
                     record_dir,
                     inflight_limit,
                     payment_notify,
+                    accounting,
                     reference,
                 )
                 .await;
@@ -1109,6 +1146,7 @@ async fn run_stream_bytes(
     record_dir: Option<PathBuf>,
     inflight_limit: Arc<Semaphore>,
     payment_notify: Option<mpsc::Sender<PeerId>>,
+    accounting: Option<Arc<ant_retrieval::accounting::Accounting>>,
     tracker: Arc<ProgressTracker>,
     reference: [u8; 32],
     max_bytes: Option<u64>,
@@ -1126,6 +1164,9 @@ async fn run_stream_bytes(
         .with_request_inflight_limit(RETRIEVAL_REQUEST_INFLIGHT_CAP);
     if let Some(tx) = payment_notify {
         builder = builder.with_payment_notify(tx);
+    }
+    if let Some(acc) = accounting {
+        builder = builder.with_accounting(acc);
     }
     let fetcher = builder;
 
@@ -1179,6 +1220,7 @@ async fn run_stream_bzz(
     record_dir: Option<PathBuf>,
     inflight_limit: Arc<Semaphore>,
     payment_notify: Option<mpsc::Sender<PeerId>>,
+    accounting: Option<Arc<ant_retrieval::accounting::Accounting>>,
     tracker: Arc<ProgressTracker>,
     reference: [u8; 32],
     path: String,
@@ -1213,6 +1255,9 @@ async fn run_stream_bzz(
             .with_request_inflight_limit(RETRIEVAL_REQUEST_INFLIGHT_CAP);
         if let Some(tx) = payment_notify.clone() {
             builder = builder.with_payment_notify(tx);
+        }
+        if let Some(acc) = accounting.clone() {
+            builder = builder.with_accounting(acc);
         }
         let fetcher = builder;
 
@@ -1607,6 +1652,7 @@ async fn run_get_bytes(
     record_dir: Option<PathBuf>,
     inflight_limit: Arc<Semaphore>,
     payment_notify: Option<mpsc::Sender<PeerId>>,
+    accounting: Option<Arc<ant_retrieval::accounting::Accounting>>,
     tracker: Arc<ProgressTracker>,
     reference: [u8; 32],
     max_bytes: Option<u64>,
@@ -1629,6 +1675,9 @@ async fn run_get_bytes(
             .with_request_inflight_limit(RETRIEVAL_REQUEST_INFLIGHT_CAP);
         if let Some(tx) = payment_notify.clone() {
             builder = builder.with_payment_notify(tx);
+        }
+        if let Some(acc) = accounting.clone() {
+            builder = builder.with_accounting(acc);
         }
         let fetcher = builder;
         match try_get_bytes(&fetcher, &tracker, reference, max_bytes).await {
@@ -1729,6 +1778,7 @@ async fn run_list_bzz(
     record_dir: Option<PathBuf>,
     inflight_limit: Arc<Semaphore>,
     payment_notify: Option<mpsc::Sender<PeerId>>,
+    accounting: Option<Arc<ant_retrieval::accounting::Accounting>>,
     reference: [u8; 32],
 ) -> ControlAck {
     if peers_rx.borrow().is_empty() {
@@ -1744,6 +1794,9 @@ async fn run_list_bzz(
         .with_request_inflight_limit(RETRIEVAL_REQUEST_INFLIGHT_CAP);
     if let Some(tx) = payment_notify {
         builder = builder.with_payment_notify(tx);
+    }
+    if let Some(acc) = accounting {
+        builder = builder.with_accounting(acc);
     }
     let fetcher = builder;
 
@@ -1794,6 +1847,7 @@ async fn run_get_bzz(
     record_dir: Option<PathBuf>,
     inflight_limit: Arc<Semaphore>,
     payment_notify: Option<mpsc::Sender<PeerId>>,
+    accounting: Option<Arc<ant_retrieval::accounting::Accounting>>,
     tracker: Arc<ProgressTracker>,
     reference: [u8; 32],
     path: String,
@@ -1816,6 +1870,9 @@ async fn run_get_bzz(
             .with_request_inflight_limit(RETRIEVAL_REQUEST_INFLIGHT_CAP);
         if let Some(tx) = payment_notify.clone() {
             builder = builder.with_payment_notify(tx);
+        }
+        if let Some(acc) = accounting.clone() {
+            builder = builder.with_accounting(acc);
         }
         let fetcher = builder;
         match try_get_bzz(
@@ -2133,11 +2190,21 @@ fn handle_swarm_event(
             // forwarder would keep picking a peer we have no live
             // connection to.
             state.routing.forget(&peer_id);
+            // Drop the accounting mirror for this peer too: bee's
+            // `notifyPeerConnect` resets the `accountingPeer` on
+            // reconnect, so our balance must reset alongside.
+            // Without this, a peer that flapped the connection would
+            // come back in our peerstore with stale debt and we'd
+            // refuse to dispatch to it for ~1 s for no reason.
+            if let Some(acc) = state.accounting.as_ref() {
+                acc.forget(&peer_id);
+            }
             state.publish_peers();
             if was_bzz {
                 info!(
                     target: "ant_p2p",
                     %peer_id,
+                    cause = ?cause,
                     "peer disconnected; peer set size={}",
                     state.peer_set_size(),
                 );
