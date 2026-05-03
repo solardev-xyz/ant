@@ -329,6 +329,36 @@ pub struct CacheInfo {
     pub capacity: u32,
 }
 
+/// Snapshot of the persistent (SQLite-backed) chunk cache.
+///
+/// All-zero / `enabled = false` when the daemon was started with
+/// `--no-disk-cache` (or with no disk cache wired up at all). Sizes
+/// are tracked in *bytes* — unlike the in-memory tier the disk
+/// cache's eviction key is total bytes, not slot count, so the row
+/// count is informational and the byte total is what drives the
+/// "fullness" gauge in `antctl top`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct DiskCacheInfo {
+    /// Whether the daemon has a persistent cache attached. When
+    /// `false`, every other field is zero and `antctl top` should
+    /// label the row as `disabled` rather than render
+    /// `0/0 (0.0%)`.
+    pub enabled: bool,
+    /// Live byte total mirrored from `SUM(size)`. May lag by a
+    /// single in-flight write but never diverges by more than one
+    /// chunk.
+    pub used_bytes: u64,
+    /// Configured hard cap (`--disk-cache-max-gb` × 1 GiB).
+    pub capacity_bytes: u64,
+    /// Cumulative tier-2 hits since process start. A subset of
+    /// `RetrievalInfo::chunks_fetched_total` and disjoint from
+    /// `mem_hits_total` — a chunk that lifts from disk into memory
+    /// counts toward `disk_hits_total` only on the lifting fetch;
+    /// subsequent fetches from the warm in-memory entry count toward
+    /// `mem_hits_total`.
+    pub hits_total: u64,
+}
+
 /// Data-plane snapshot read by the `Retrieval` tab in `antctl top`.
 ///
 /// All numeric fields are cumulative since process start except
@@ -359,7 +389,18 @@ pub struct RetrievalInfo {
     /// bandwidth as `(b2 - b1) / dt`.
     pub bytes_fetched_total: u64,
     /// Cumulative cache hits (subset of `chunks_fetched_total`).
+    /// Equal to `mem_hits_total + disk_hits_total`; kept on the
+    /// snapshot for backward compatibility with consumers that
+    /// don't yet split memory and disk hits.
     pub cache_hits_total: u64,
+    /// Cumulative tier-1 (in-memory LRU) hits. Disjoint from
+    /// `disk_hits_total`.
+    #[serde(default)]
+    pub mem_hits_total: u64,
+    /// Persistent (SQLite) chunk-cache snapshot. `enabled = false`
+    /// when the daemon was started without a disk cache.
+    #[serde(default)]
+    pub disk: DiskCacheInfo,
     /// Snapshot of currently-active gateway HTTP requests. Empty when
     /// the gateway is idle or disabled.
     #[serde(default)]

@@ -56,6 +56,14 @@ pub struct NodeConfig {
     /// (`antd --no-http-api`). Surfaces in `antctl top`'s Retrieval
     /// tab.
     pub gateway_activity: Option<Arc<GatewayActivity>>,
+    /// Persistent (SQLite-backed) chunk cache, opened by the daemon
+    /// at startup and shared across every retrieval request.
+    /// `Some(cache)` makes the lookup order `memory -> disk ->
+    /// network`; `None` keeps the legacy `memory -> network`
+    /// behaviour. `antd` opens it from `--disk-cache-path` (or the
+    /// computed default in `<data-dir>/chunks.sqlite`); embedders can
+    /// disable it by passing `None`.
+    pub disk_cache: Option<Arc<ant_retrieval::DiskChunkCache>>,
 }
 
 impl NodeConfig {
@@ -79,6 +87,7 @@ impl NodeConfig {
             per_request_chunk_cache: false,
             chunk_record_dir: None,
             gateway_activity: None,
+            disk_cache: None,
         }
     }
 
@@ -121,6 +130,11 @@ impl NodeConfig {
         self.gateway_activity = activity;
         self
     }
+
+    pub fn with_disk_cache(mut self, disk_cache: Option<Arc<ant_retrieval::DiskChunkCache>>) -> Self {
+        self.disk_cache = disk_cache;
+        self
+    }
 }
 
 /// Run the M1.0 node loop until the process is interrupted.
@@ -140,6 +154,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<(), NodeError> {
         per_request_chunk_cache: cfg.per_request_chunk_cache,
         chunk_record_dir: cfg.chunk_record_dir,
         gateway_activity: cfg.gateway_activity,
+        disk_cache: cfg.disk_cache,
     })
     .await?;
     Ok(())

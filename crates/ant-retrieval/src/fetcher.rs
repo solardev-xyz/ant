@@ -21,6 +21,7 @@
 use crate::progress::ProgressTracker;
 use crate::accounting::{Accounting, DebitGuard};
 use crate::counters::RetrievalCounters;
+use crate::disk_cache::DiskChunkCache;
 use crate::{retrieve_chunk, ChunkFetcher, InMemoryChunkCache, RetrievalError, RetrievedChunk};
 use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -97,6 +98,18 @@ pub struct RoutingFetcher {
     /// re-fetches (within a retry attempt or across `antctl get`
     /// invocations) skip the network entirely.
     cache: Option<Arc<InMemoryChunkCache>>,
+    /// Optional persistent (SQLite-backed) tier-2 chunk cache. When
+    /// set, the [`ChunkFetcher::fetch`] lookup order is `memory ->
+    /// disk -> network`. Disk hits are CAC/SOC-validated before
+    /// being returned (a corrupt row is deleted in place and the
+    /// fetch falls through to the network). Network successes
+    /// write through to both tiers; the writes are dispatched
+    /// without blocking the retrieval task.
+    ///
+    /// `bypass_cache` semantics are honoured by *not* attaching the
+    /// disk cache for that request — see
+    /// `ant-p2p::behaviour::cache_for_request` for the wiring.
+    disk_cache: Option<Arc<DiskChunkCache>>,
     /// When set, every CAC-validated chunk is dumped to
     /// `<dir>/<hex_addr>.bin` (wire bytes: `span || payload`) just
     /// before being returned to the caller. Used by `antd
@@ -181,6 +194,7 @@ impl RoutingFetcher {
             peers_rx,
             blacklist: Mutex::new(Vec::new()),
             cache: None,
+            disk_cache: None,
             record_dir: None,
             progress: None,
             inflight_limit: None,
@@ -231,6 +245,19 @@ impl RoutingFetcher {
     /// attempts and across `antctl get` invocations.
     pub fn with_cache(mut self, cache: Arc<InMemoryChunkCache>) -> Self {
         self.cache = Some(cache);
+        self
+    }
+
+    /// Attach a shared persistent chunk cache (SQLite-backed) as
+    /// tier 2. The same `Arc<DiskChunkCache>` should be passed to
+    /// every fetcher built for the same daemon process so the
+    /// underlying connection (and its byte-total mirror) is shared
+    /// rather than rebuilt per request. Omitted when the daemon-
+    /// wide disk cache is disabled or when `bypass_cache` is set
+    /// for the request — both bypass the disk read *and* the disk
+    /// write, exactly per `PLAN.md` § 6.1.
+    pub fn with_disk_cache(mut self, disk_cache: Arc<DiskChunkCache>) -> Self {
+        self.disk_cache = Some(disk_cache);
         self
     }
 
@@ -338,7 +365,7 @@ impl ChunkFetcher for RoutingFetcher {
                 trace!(
                     target: "ant_retrieval::fetcher",
                     chunk = %hex::encode(addr),
-                    "cache hit",
+                    "cache hit (memory)",
                 );
                 if let Some(dir) = self.record_dir.as_ref() {
                     record_chunk(dir, &addr, &bytes);
@@ -347,9 +374,52 @@ impl ChunkFetcher for RoutingFetcher {
                     tracker.record_chunk(None, bytes.len() as u64);
                 }
                 if let Some(counters) = self.counters.as_ref() {
-                    counters.record_chunk(bytes.len() as u64, true);
+                    counters.record_chunk(bytes.len() as u64, crate::ChunkSource::Memory);
                 }
                 return Ok(bytes);
+            }
+        }
+
+        // Tier 2: persistent (SQLite) cache. The blocking SQLite work
+        // runs on the blocking pool inside [`DiskChunkCache::get`], so
+        // the retrieval task yields rather than holding a Tokio worker
+        // across `read_blob` + `fsync`. A failed validation deletes
+        // the row in-place (handled by `DiskChunkCache::get`) and
+        // reports `Ok(None)`, so the fetch falls through to the
+        // network exactly like a regular miss.
+        if let Some(disk) = self.disk_cache.as_ref() {
+            match disk.get(addr).await {
+                Ok(Some(bytes)) => {
+                    trace!(
+                        target: "ant_retrieval::fetcher",
+                        chunk = %hex::encode(addr),
+                        "cache hit (disk)",
+                    );
+                    // Lift the chunk into the in-memory tier so
+                    // subsequent fetches in this process don't have to
+                    // hit SQLite again.
+                    if let Some(cache) = self.cache.as_ref() {
+                        cache.put(addr, bytes.clone());
+                    }
+                    if let Some(dir) = self.record_dir.as_ref() {
+                        record_chunk(dir, &addr, &bytes);
+                    }
+                    if let Some(tracker) = self.progress.as_ref() {
+                        tracker.record_chunk(None, bytes.len() as u64);
+                    }
+                    if let Some(counters) = self.counters.as_ref() {
+                        counters.record_chunk(bytes.len() as u64, crate::ChunkSource::Disk);
+                    }
+                    return Ok(bytes);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(
+                        target: "ant_retrieval::fetcher",
+                        chunk = %hex::encode(addr),
+                        "disk cache read errored, falling through to network: {e}",
+                    );
+                }
             }
         }
 
@@ -598,6 +668,7 @@ impl ChunkFetcher for RoutingFetcher {
                                 in_flight,
                                 addr,
                                 self.cache.clone(),
+                                self.disk_cache.clone(),
                                 self.record_dir.clone(),
                                 self.payment_notify.clone(),
                             );
@@ -607,6 +678,28 @@ impl ChunkFetcher for RoutingFetcher {
                             if let Some(cache) = self.cache.as_ref() {
                                 cache.put(addr, wire.clone());
                             }
+                            // Tier-2 write-through. We dispatch this on a
+                            // detached `tokio::spawn` so the blocking
+                            // SQLite write doesn't sit on the retrieval
+                            // task's critical path — the caller sees
+                            // `Ok(wire)` the moment the in-memory cache
+                            // is populated. Errors are logged but not
+                            // propagated; a failed disk write only loses
+                            // a future cache hit, never the current
+                            // chunk.
+                            if let Some(disk) = self.disk_cache.as_ref() {
+                                let disk = disk.clone();
+                                let wire_clone = wire.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = disk.put(addr, wire_clone).await {
+                                        warn!(
+                                            target: "ant_retrieval::fetcher",
+                                            chunk = %hex::encode(addr),
+                                            "disk cache write-through failed: {e}",
+                                        );
+                                    }
+                                });
+                            }
                             if let Some(dir) = self.record_dir.as_ref() {
                                 record_chunk(dir, &addr, &wire);
                             }
@@ -614,7 +707,7 @@ impl ChunkFetcher for RoutingFetcher {
                                 tracker.record_chunk(Some(peer), wire.len() as u64);
                             }
                             if let Some(counters) = self.counters.as_ref() {
-                                counters.record_chunk(wire.len() as u64, false);
+                                counters.record_chunk(wire.len() as u64, crate::ChunkSource::Network);
                             }
                             // Heartbeat into the pseudosettle driver. We
                             // use `try_send` to keep the hot path
@@ -784,6 +877,7 @@ fn spawn_drain_losers<S>(
     in_flight: S,
     addr: [u8; 32],
     cache: Option<Arc<InMemoryChunkCache>>,
+    disk_cache: Option<Arc<DiskChunkCache>>,
     record_dir: Option<PathBuf>,
     payment_notify: Option<mpsc::Sender<PeerId>>,
 ) where
@@ -813,6 +907,26 @@ fn spawn_drain_losers<S>(
                     wire.extend_from_slice(chunk.payload());
                     if let Some(cache) = cache.as_ref() {
                         cache.put(addr, wire.clone());
+                    }
+                    // Tier-2 write-through for losers. The bytes have
+                    // already been validated (the loser future returned
+                    // a `RetrievedChunk`, which goes through CAC/SOC
+                    // verification in `retrieve_chunk`), so persisting
+                    // them is free safety net for the *next* request.
+                    // Errors are downgraded to a trace because the
+                    // winner has already returned to the caller.
+                    if let Some(disk) = disk_cache.as_ref() {
+                        let disk = disk.clone();
+                        let wire_clone = wire.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = disk.put(addr, wire_clone).await {
+                                trace!(
+                                    target: "ant_retrieval::fetcher",
+                                    chunk = %hex::encode(addr),
+                                    "disk cache loser write-through failed: {e}",
+                                );
+                            }
+                        });
                     }
                     if let Some(dir) = record_dir.as_ref() {
                         record_chunk(dir, &addr, &wire);
@@ -1055,5 +1169,115 @@ mod tests {
         // satisfy `retrieve_chunk`.
         drop(hold);
         h.abort();
+    }
+
+    /// Tier-2 short-circuit: a `fetch` whose chunk is already stored
+    /// in the persistent disk cache must return the wire bytes
+    /// without ever reaching the network. Without an empty peer set
+    /// (which would normally produce `"no BZZ peers available"`) the
+    /// disk hit must succeed *before* we get to the dispatcher loop.
+    /// This test pins the load-bearing rule that the disk tier sits
+    /// in front of the network, not behind it.
+    #[tokio::test]
+    async fn fetch_returns_disk_cache_hit_without_peers() {
+        use ant_crypto::cac_new;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let disk = Arc::new(
+            DiskChunkCache::open(dir.path().join("disk.sqlite"), 1 << 20).unwrap(),
+        );
+        let (addr, wire) = cac_new(b"tier-2 hit").unwrap();
+        disk.put(addr, wire.clone()).await.unwrap();
+
+        // Empty peer set: any code path that reaches the dispatcher
+        // returns `Err("no BZZ peers available")`. The disk hit must
+        // short-circuit it.
+        let (_tx, rx) = watch::channel(Vec::new());
+        let behaviour = libp2p_stream::Behaviour::default();
+        let control = behaviour.new_control();
+        let mem = Arc::new(InMemoryChunkCache::new(8));
+        let counters = Arc::new(RetrievalCounters::new());
+        let fetcher = RoutingFetcher::new(control, rx)
+            .with_cache(mem.clone())
+            .with_disk_cache(disk)
+            .with_counters(counters.clone());
+
+        let bytes = fetcher.fetch(addr).await.expect("disk hit");
+        assert_eq!(bytes, wire, "disk hit returned the wrong bytes");
+
+        // Tier promotion: a disk hit must also lift the chunk into
+        // the in-memory tier so the next fetch in this process skips
+        // SQLite. Without this, every fetch in a hot loop would pay
+        // the spawn_blocking + lock + UPDATE last_access cost even
+        // though the bytes are already in RAM.
+        assert_eq!(
+            mem.get(&addr),
+            Some(wire.clone()),
+            "disk hit must write through to the in-memory tier",
+        );
+
+        // Counter accounting: the first fetch was a disk hit (tier
+        // promotion writes back to memory but the *delivery* came
+        // from disk), so `disk_hits` must bump and `mem_hits` must
+        // stay at zero. A second fetch then comes out of the
+        // freshly-warmed in-memory tier, so it bumps `mem_hits`
+        // without re-incrementing `disk_hits`. This pins the
+        // tier-attribution rule the `antctl top` Disk-cache row
+        // depends on.
+        let snap = counters.snapshot();
+        assert_eq!(snap.disk_hits, 1, "disk delivery must record disk_hits");
+        assert_eq!(snap.mem_hits, 0, "tier-promotion is not a memory hit");
+        assert_eq!(snap.chunks_fetched, 1);
+
+        let _ = fetcher.fetch(addr).await.expect("memory hit");
+        let snap = counters.snapshot();
+        assert_eq!(snap.disk_hits, 1, "warm in-memory hit must not bump disk_hits");
+        assert_eq!(snap.mem_hits, 1, "warm in-memory hit must bump mem_hits");
+        assert_eq!(snap.chunks_fetched, 2);
+    }
+
+    /// Tier-2 bypass: when the daemon runs in `bypass_cache` mode for
+    /// a given request, neither disk reads nor disk writes happen.
+    /// We model that here by simply not attaching the disk cache to
+    /// the fetcher — the production wiring in
+    /// `ant-p2p::SwarmState::cache_for_request` does the same thing.
+    /// The test asserts: with a chunk planted on disk and bypass in
+    /// effect, the fetch falls through to the network (no peers →
+    /// errors out). The disk row must still be there afterwards (no
+    /// stealth read-and-discard).
+    #[tokio::test]
+    async fn fetch_with_bypass_skips_disk_reads() {
+        use ant_crypto::cac_new;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let disk = Arc::new(
+            DiskChunkCache::open(dir.path().join("disk.sqlite"), 1 << 20).unwrap(),
+        );
+        let (addr, wire) = cac_new(b"bypass test").unwrap();
+        disk.put(addr, wire.clone()).await.unwrap();
+        assert_eq!(disk.row_count().await.unwrap(), 1);
+
+        // Same empty peer set as above: the only way `fetch` returns
+        // bytes is if the disk hit short-circuits. We deliberately
+        // build the fetcher *without* `.with_disk_cache(...)` — that
+        // is the bypass path.
+        let (_tx, rx) = watch::channel(Vec::new());
+        let behaviour = libp2p_stream::Behaviour::default();
+        let control = behaviour.new_control();
+        let fetcher = RoutingFetcher::new(control, rx)
+            .with_cache(Arc::new(InMemoryChunkCache::new(8)));
+
+        let res = fetcher.fetch(addr).await;
+        assert!(res.is_err(), "bypass must not consult the disk cache");
+
+        // The disk row must remain untouched — bypass means "skip
+        // the disk", not "read it and pretend the row didn't exist".
+        assert_eq!(
+            disk.row_count().await.unwrap(),
+            1,
+            "bypass must not read or delete the planted disk row",
+        );
     }
 }

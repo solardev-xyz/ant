@@ -58,6 +58,40 @@ use crate::handle::GatewayHandle;
 /// channel is deferred (PLAN.md D.2.3 explicitly allows this scope).
 const SWARM_CHUNK_RETRIEVAL_TIMEOUT: HeaderName =
     HeaderName::from_static("swarm-chunk-retrieval-timeout");
+
+/// `Cache-Control` value emitted on every content-addressed response
+/// (`/chunks`, `/bytes`, `/bzz`, `/v0/manifest`). All four endpoints
+/// take a 32-byte content hash in the URL — the asset *is* its hash,
+/// so revisiting the same URL is provably safe to serve from the
+/// browser's HTTP cache forever.
+///
+/// This matches what bee's gateway has historically returned (cf.
+/// `ethersphere/swarm` issue #2213, where bee shipped `max-age=
+/// 2147483648, immutable` for bzz responses) and is the reason bee
+/// "loads super-fast on reload": after the first fetch, the browser
+/// services subsequent requests entirely out of its own HTTP cache
+/// without re-walking the manifest or re-joining the BMT. Without
+/// this header, a music-player UI loading 13 audio tracks plus
+/// artwork on every page navigation re-pays the full retrieval cost,
+/// which is a noticeable user-facing regression vs bee.
+///
+/// Year (`31_536_000` s) instead of bee's 68-year value because some
+/// HTTP intermediaries treat unrealistically large `max-age` as
+/// invalid; `immutable` already encodes "don't ever revalidate" for
+/// browsers that support it (Firefox, Safari, modern Chrome).
+const IMMUTABLE_CACHE_CONTROL: HeaderValue =
+    HeaderValue::from_static("public, max-age=31536000, immutable");
+
+/// Apply the immutable `Cache-Control` header to a response targeted
+/// at a content-addressed endpoint. Idempotent — calling twice just
+/// overwrites the existing entry. Public to the module so each
+/// response builder can opt in without re-inserting the header
+/// inline.
+fn set_immutable_cache_headers(resp: &mut Response) {
+    let _ = resp
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, IMMUTABLE_CACHE_CONTROL);
+}
 /// Hard cap on a `/bytes` or `/bzz` request even with no header.
 ///
 /// Sized for the realistic worst case observed in production: a 44 MiB
@@ -186,6 +220,7 @@ fn chunk_response(method: Method, body: Vec<u8>) -> Response {
     let _ = resp
         .headers_mut()
         .insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    set_immutable_cache_headers(&mut resp);
     resp
 }
 
@@ -375,7 +410,15 @@ pub async fn manifest(State(handle): State<GatewayHandle>, Path(addr): Path<Stri
         .begin(GatewayRequestKind::Manifest, short_reference(&addr));
 
     match dispatch_list_bzz(&handle, reference, DEFAULT_REQUEST_TIMEOUT).await {
-        Ok(entries) => json_response(StatusCode::OK, &ManifestListing { entries }),
+        Ok(entries) => {
+            // Manifest listing keys off the same content-addressed
+            // root the user passed in, so the listing itself is
+            // immutable. Cache it like a `/bzz` payload to avoid
+            // re-walking the manifest on every page navigation.
+            let mut resp = json_response(StatusCode::OK, &ManifestListing { entries });
+            set_immutable_cache_headers(&mut resp);
+            resp
+        }
         Err(e) => e,
     }
 }
@@ -956,6 +999,7 @@ fn streaming_response(
             resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
         }
     }
+    set_immutable_cache_headers(&mut resp);
     resp
 }
 
@@ -999,6 +1043,7 @@ fn partial_content_response(
             resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
         }
     }
+    set_immutable_cache_headers(&mut resp);
     resp
 }
 

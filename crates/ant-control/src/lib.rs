@@ -14,9 +14,10 @@ mod server;
 
 pub use activity::{ActiveRequestGuard, GatewayActivity, GatewayActivityHandle};
 pub use protocol::{
-    CacheInfo, GatewayRequestInfo, GatewayRequestKind, GetProgress, HandshakeReport, IdentityInfo,
-    PeerConnectionInfo, PeerConnectionState, PeerInfo, PeerPipelineEntry, ProtocolError, Request,
-    Response, RetrievalInfo, RoutingInfo, StatusSnapshot, VersionInfo, PROTOCOL_VERSION,
+    CacheInfo, DiskCacheInfo, GatewayRequestInfo, GatewayRequestKind, GetProgress, HandshakeReport,
+    IdentityInfo, PeerConnectionInfo, PeerConnectionState, PeerInfo, PeerPipelineEntry,
+    ProtocolError, Request, Response, RetrievalInfo, RoutingInfo, StatusSnapshot, VersionInfo,
+    PROTOCOL_VERSION,
 };
 
 #[cfg(unix)]

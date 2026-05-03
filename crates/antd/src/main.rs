@@ -116,6 +116,28 @@ struct Opt {
     #[cfg(debug_assertions)]
     #[arg(long, value_name = "DIR")]
     record_chunks: Option<PathBuf>,
+
+    /// Path to the persistent (SQLite-backed) chunk cache. Defaults to
+    /// `<data-dir>/chunks.sqlite`. Holds the second-tier cache that
+    /// sits between the in-memory LRU and the network retrieval path
+    /// (see PLAN.md § 6.1).
+    #[arg(long)]
+    disk_cache_path: Option<PathBuf>,
+
+    /// Hard upper bound on the persistent chunk cache size, in
+    /// gigabytes. Defaults to 10 GB (matches the `antd` desktop /
+    /// Raspberry Pi default in PLAN.md § 6.1). When the on-disk total
+    /// crosses this cap, the cache evicts oldest-by-`last_access`
+    /// rows down to ~95% of the cap.
+    #[arg(long, default_value_t = 10)]
+    disk_cache_max_gb: u64,
+
+    /// Disable the persistent chunk cache entirely. Retrieval falls
+    /// back to the legacy `memory -> network` lookup order. Useful
+    /// when the disk has no spare capacity for a long-lived cache,
+    /// or when you want every restart to start cold.
+    #[arg(long, default_value_t = false)]
+    no_disk_cache: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -275,6 +297,49 @@ async fn main() -> Result<()> {
         opt.record_chunks.as_deref(),
     )?;
 
+    let disk_cache = if opt.no_disk_cache {
+        tracing::info!(target: "antd", "persistent chunk cache disabled (--no-disk-cache)");
+        None
+    } else {
+        let path = opt
+            .disk_cache_path
+            .clone()
+            .map(|p| expand_tilde(&p))
+            .unwrap_or_else(|| data_dir.join("chunks.sqlite"));
+        // Convert the GB cap to bytes once at startup. Saturating mul
+        // means a hypothetical operator typo of `--disk-cache-max-gb
+        // 18446744073` (a u64 GB count that overflows on multiplication)
+        // produces "as big as we can represent", not a 0-byte cap.
+        let max_bytes = opt
+            .disk_cache_max_gb
+            .saturating_mul(1024 * 1024 * 1024);
+        match ant_retrieval::DiskChunkCache::open(&path, max_bytes) {
+            Ok(c) => {
+                tracing::info!(
+                    target: "antd",
+                    path = %path.display(),
+                    max_gb = opt.disk_cache_max_gb,
+                    used_bytes = c.used_bytes(),
+                    "opened persistent chunk cache",
+                );
+                Some(Arc::new(c))
+            }
+            Err(e) => {
+                // A failed disk-cache open is recoverable: log loudly
+                // and fall back to the in-memory tier alone, rather
+                // than refusing to start the daemon. Operators on a
+                // full disk would otherwise lose remote retrieval
+                // entirely until the disk gets cleared.
+                tracing::warn!(
+                    target: "antd",
+                    path = %path.display(),
+                    "failed to open persistent chunk cache: {e}; falling back to in-memory only",
+                );
+                None
+            }
+        }
+    };
+
     // Single shared registry for in-flight gateway HTTP requests.
     // Built unconditionally so the node loop can read from it; only
     // the gateway side ever writes when `--no-http-api` is set, in
@@ -292,7 +357,8 @@ async fn main() -> Result<()> {
             .with_commands(cmd_rx)
             .with_per_request_chunk_cache(opt.per_request_chunk_cache)
             .with_chunk_record_dir(chunk_record_dir)
-            .with_gateway_activity(Some(gateway_activity.clone())),
+            .with_gateway_activity(Some(gateway_activity.clone()))
+            .with_disk_cache(disk_cache),
     );
 
     let gateway_handle = if opt.no_http_api {

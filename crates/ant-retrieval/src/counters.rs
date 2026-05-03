@@ -22,13 +22,49 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Where a chunk delivery came from — fed into
+/// [`RetrievalCounters::record_chunk`] so the snapshot can split the
+/// "cache hits" gauge into per-tier counts.
+///
+/// Splitting tier 1 (in-memory LRU) from tier 2 (SQLite) matters for
+/// `antctl top`'s diagnostic value: a hot daemon with a large warm
+/// disk cache should show non-zero `disk` even right after restart,
+/// while the same daemon serving repeat requests should drive `mem`
+/// up and leave `disk` flat. Surfacing the two together makes a
+/// disk-cache regression (e.g. validation failing every read so
+/// nothing ever lifts into memory) visible to operators without
+/// needing to enable trace logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkSource {
+    /// Delivered by [`super::retrieve_chunk`] over the wire (or by a
+    /// drained losing hedge that happened to win the race for a
+    /// sibling fetch).
+    Network,
+    /// Served from the in-memory LRU
+    /// ([`super::InMemoryChunkCache`]).
+    Memory,
+    /// Served from the persistent SQLite cache
+    /// ([`super::DiskChunkCache`]). The chunk is also lifted into
+    /// the in-memory tier on a tier-2 hit, but only one source is
+    /// recorded per delivery — the one that actually saved the
+    /// network round-trip.
+    Disk,
+}
+
 /// Cumulative chunk / byte counters shared across every fetcher in
 /// one daemon process.
 #[derive(Debug, Default)]
 pub struct RetrievalCounters {
     chunks_fetched: AtomicU64,
     bytes_fetched: AtomicU64,
-    cache_hits: AtomicU64,
+    /// Tier-1 (in-memory LRU) hits. `mem_hits + disk_hits + network`
+    /// always equals `chunks_fetched`.
+    mem_hits: AtomicU64,
+    /// Tier-2 (persistent SQLite) hits. Bumps the in-memory tier as
+    /// a side effect of [`super::ChunkFetcher::fetch`], so a chunk
+    /// that lands here lifts to memory and the *next* request for
+    /// the same chunk will increment `mem_hits`.
+    disk_hits: AtomicU64,
 }
 
 /// Plain-old-data snapshot of [`RetrievalCounters`]. Cheaper to
@@ -38,7 +74,19 @@ pub struct RetrievalCounters {
 pub struct RetrievalCountersSnapshot {
     pub chunks_fetched: u64,
     pub bytes_fetched: u64,
-    pub cache_hits: u64,
+    /// In-memory LRU hits.
+    pub mem_hits: u64,
+    /// Persistent SQLite cache hits.
+    pub disk_hits: u64,
+}
+
+impl RetrievalCountersSnapshot {
+    /// Total cache hits (memory + disk). Convenience for the
+    /// `antctl top` "x cache hits" overall summary so the renderer
+    /// doesn't have to add the two fields itself everywhere.
+    pub fn cache_hits(&self) -> u64 {
+        self.mem_hits.saturating_add(self.disk_hits)
+    }
 }
 
 impl RetrievalCounters {
@@ -49,16 +97,23 @@ impl RetrievalCounters {
     }
 
     /// Record one chunk delivered to the joiner. `bytes` is the wire
-    /// size (`span (8) || payload`); `from_cache = true` means the
-    /// chunk came out of the in-memory cache rather than from the
-    /// network. Bytes are still counted for cache hits — the caller
-    /// can subtract `cache_hits * avg_size` if they need network-only
-    /// throughput.
-    pub fn record_chunk(&self, bytes: u64, from_cache: bool) {
+    /// size (`span (8) || payload`); `source` tags which tier (or the
+    /// network) actually produced the bytes for this delivery. Bytes
+    /// are counted for every source so the cumulative `bytes_fetched`
+    /// gauge stays aligned with what the joiner saw — callers that
+    /// want network-only throughput can subtract `cache_hits *
+    /// avg_size`.
+    pub fn record_chunk(&self, bytes: u64, source: ChunkSource) {
         self.chunks_fetched.fetch_add(1, Ordering::Relaxed);
         self.bytes_fetched.fetch_add(bytes, Ordering::Relaxed);
-        if from_cache {
-            self.cache_hits.fetch_add(1, Ordering::Relaxed);
+        match source {
+            ChunkSource::Memory => {
+                self.mem_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            ChunkSource::Disk => {
+                self.disk_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            ChunkSource::Network => {}
         }
     }
 
@@ -68,7 +123,8 @@ impl RetrievalCounters {
         RetrievalCountersSnapshot {
             chunks_fetched: self.chunks_fetched.load(Ordering::Relaxed),
             bytes_fetched: self.bytes_fetched.load(Ordering::Relaxed),
-            cache_hits: self.cache_hits.load(Ordering::Relaxed),
+            mem_hits: self.mem_hits.load(Ordering::Relaxed),
+            disk_hits: self.disk_hits.load(Ordering::Relaxed),
         }
     }
 }
@@ -78,14 +134,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn record_chunk_distinguishes_cache_and_network() {
+    fn record_chunk_distinguishes_sources() {
         let c = RetrievalCounters::new();
-        c.record_chunk(4104, false);
-        c.record_chunk(4104, true);
-        c.record_chunk(4104, false);
+        c.record_chunk(4104, ChunkSource::Network);
+        c.record_chunk(4104, ChunkSource::Memory);
+        c.record_chunk(4104, ChunkSource::Disk);
+        c.record_chunk(4104, ChunkSource::Network);
         let s = c.snapshot();
-        assert_eq!(s.chunks_fetched, 3);
-        assert_eq!(s.bytes_fetched, 3 * 4104);
-        assert_eq!(s.cache_hits, 1);
+        assert_eq!(s.chunks_fetched, 4);
+        assert_eq!(s.bytes_fetched, 4 * 4104);
+        assert_eq!(s.mem_hits, 1);
+        assert_eq!(s.disk_hits, 1);
+        assert_eq!(s.cache_hits(), 2);
     }
 }

@@ -1658,27 +1658,49 @@ fn draw_retrieval_page(frame: &mut Frame, area: TuiRect, ctx: &TopFrameContext<'
     let r = &ctx.status.retrieval;
     let [metrics_area, requests_area] = vertical_chunks(
         area,
-        [Constraint::Length(8), Constraint::Min(0)],
+        // 9 rows = top border (1) + 6 panel rows + bottom border (1) +
+        // 1 padding. The two cache rows (Mem / Disk) plus In-flight,
+        // Bandwidth, Totals, Requests give us six.
+        [Constraint::Length(9), Constraint::Min(0)],
     );
     draw_retrieval_metrics(frame, metrics_area, r, ctx.bandwidth);
     draw_gateway_requests(frame, requests_area, r, ctx.now);
 }
 
-/// Top-of-tab metrics readout: cache fill, in-flight count, and
-/// bandwidth. Uses the same `draw_panel` helper as the Status tab so
-/// the colour palette matches.
+/// Top-of-tab metrics readout: per-tier cache fill, in-flight count,
+/// and bandwidth. Uses the same `draw_panel` helper as the Status tab
+/// so the colour palette matches.
+///
+/// The disk-cache row degrades gracefully: when the daemon was
+/// started without a persistent cache (`--no-disk-cache` or open
+/// failure) the row reads `disabled` rather than `0/0 (0.0%)`. That
+/// way operators can tell at a glance whether the second tier is
+/// even wired up — important when diagnosing "I configured a disk
+/// cache and nothing got faster on restart".
 fn draw_retrieval_metrics(
     frame: &mut Frame,
     area: TuiRect,
     r: &RetrievalInfo,
     bandwidth: &BandwidthTracker,
 ) {
-    let cache = format!(
-        "{}/{} chunks ({})",
+    let mem_cache = format!(
+        "{}/{} chunks ({})  · {} hits",
         r.cache.used,
         r.cache.capacity,
         format_percentage(r.cache.used as u64, r.cache.capacity as u64),
+        format_count(r.mem_hits_total),
     );
+    let disk_cache = if r.disk.enabled {
+        format!(
+            "{} / {} ({})  · {} hits",
+            format_bytes(r.disk.used_bytes),
+            format_bytes(r.disk.capacity_bytes),
+            format_percentage(r.disk.used_bytes, r.disk.capacity_bytes),
+            format_count(r.disk.hits_total),
+        )
+    } else {
+        "disabled".to_string()
+    };
     let in_flight = format!("{}/{} chunks", r.in_flight, r.in_flight_capacity);
     let totals = format!(
         "{} fetched · {} ({} cache hits)",
@@ -1698,7 +1720,8 @@ fn draw_retrieval_metrics(
     let bandwidth_row = format!("{bw_now}  (peak {bw_peak})");
 
     let rows = vec![
-        kv("Cache", &cache),
+        kv("Mem cache", &mem_cache),
+        kv("Disk cache", &disk_cache),
         kv("In-flight", &in_flight),
         kv("Bandwidth", &bandwidth_row),
         kv("Totals", &totals),
@@ -2527,5 +2550,178 @@ mod tests {
         assert!(stats.starts_with("[no-cache] "), "got: {stats}");
         assert!(stats.contains("?.?%"), "got: {stats}");
         assert!(stats.contains("1/?ch"), "got: {stats}");
+    }
+
+    /// Render the Retrieval-tab metrics panel against a `TestBackend`
+    /// and assert the disk-cache row reflects the wire snapshot. The
+    /// regression we're guarding against here: a refactor that drops
+    /// the `Disk cache` row, hides the byte / hit gauges, or — most
+    /// subtly — silently uses `cache.used` (chunk slots) instead of
+    /// `disk.used_bytes` when formatting the disk fill. Driving the
+    /// real renderer (rather than a string-only helper) keeps that
+    /// honest because the layout, label, and value formatting all
+    /// live in `draw_retrieval_metrics`.
+    #[test]
+    fn retrieval_metrics_panel_shows_disk_cache_row_when_enabled() {
+        use ant_control::{CacheInfo, DiskCacheInfo, RetrievalInfo};
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let info = RetrievalInfo {
+            cache: CacheInfo {
+                used: 4096,
+                capacity: 8192,
+            },
+            in_flight: 12,
+            in_flight_capacity: 256,
+            chunks_fetched_total: 1_700_000,
+            bytes_fetched_total: 6_800_000_000,
+            cache_hits_total: 1_700_000,
+            mem_hits_total: 1_213_000,
+            disk: DiskCacheInfo {
+                enabled: true,
+                used_bytes: 13_200_000_000,         // ~12.3 GiB
+                capacity_bytes: 107_374_182_400,    // 100 GiB
+                hits_total: 487_000,
+            },
+            gateway_requests: Vec::new(),
+        };
+        let bw = BandwidthTracker::new();
+
+        let backend = TestBackend::new(120, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = TuiRect {
+                    x: 0,
+                    y: 0,
+                    width: 120,
+                    height: 9,
+                };
+                draw_retrieval_metrics(frame, area, &info, &bw);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let rendered: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| {
+                        buf[(x, y)]
+                            .symbol()
+                            .chars()
+                            .next()
+                            .unwrap_or(' ')
+                    })
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Both rows render with their tier-specific labels and values.
+        // We assert on substrings (not exact frames) so the test isn't
+        // brittle against ratatui's whitespace-padding tweaks.
+        assert!(
+            rendered.contains("Mem cache"),
+            "Mem cache row missing in:\n{rendered}",
+        );
+        assert!(
+            rendered.contains("4096/8192 chunks"),
+            "memory fill not rendered correctly in:\n{rendered}",
+        );
+        assert!(
+            rendered.contains("1.2M hits"),
+            "memory hit count not rendered in:\n{rendered}",
+        );
+        assert!(
+            rendered.contains("Disk cache"),
+            "Disk cache row missing in:\n{rendered}",
+        );
+        assert!(
+            rendered.contains("12.3GiB / 100.0GiB"),
+            "disk byte fill not rendered correctly in:\n{rendered}",
+        );
+        assert!(
+            rendered.contains("487.0K hits"),
+            "disk hit count not rendered in:\n{rendered}",
+        );
+        // Sanity: we shouldn't have the disabled label when the
+        // cache is wired up. Catches a regression that flips the
+        // ternary backwards.
+        assert!(
+            !rendered.contains("disabled"),
+            "wired-up cache must not render the disabled label:\n{rendered}",
+        );
+    }
+
+    /// Mirror of the previous test for the `--no-disk-cache` path:
+    /// `enabled = false` must produce a clean `disabled` label rather
+    /// than rendering `0B / 0B (0%)`. This is the operator's "is
+    /// tier 2 wired up at all?" signal.
+    #[test]
+    fn retrieval_metrics_panel_labels_disabled_disk_cache() {
+        use ant_control::{CacheInfo, DiskCacheInfo, RetrievalInfo};
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let info = RetrievalInfo {
+            cache: CacheInfo {
+                used: 0,
+                capacity: 8192,
+            },
+            in_flight: 0,
+            in_flight_capacity: 256,
+            chunks_fetched_total: 0,
+            bytes_fetched_total: 0,
+            cache_hits_total: 0,
+            mem_hits_total: 0,
+            disk: DiskCacheInfo::default(), // enabled = false
+            gateway_requests: Vec::new(),
+        };
+        let bw = BandwidthTracker::new();
+
+        let backend = TestBackend::new(120, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = TuiRect {
+                    x: 0,
+                    y: 0,
+                    width: 120,
+                    height: 9,
+                };
+                draw_retrieval_metrics(frame, area, &info, &bw);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let rendered: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| {
+                        buf[(x, y)]
+                            .symbol()
+                            .chars()
+                            .next()
+                            .unwrap_or(' ')
+                    })
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("Disk cache"),
+            "Disk cache row missing in:\n{rendered}",
+        );
+        assert!(
+            rendered.contains("disabled"),
+            "disabled disk cache must render the 'disabled' label:\n{rendered}",
+        );
+        // The byte gauge must NOT render when the cache is off —
+        // a `0B / 0B` row would mislead operators into thinking
+        // the cache exists but is empty.
+        assert!(
+            !rendered.contains("0B / 0B"),
+            "disabled cache must not render a fake 0B/0B fill:\n{rendered}",
+        );
     }
 }

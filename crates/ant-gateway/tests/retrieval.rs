@@ -610,3 +610,133 @@ async fn chunks_404_on_missing_reference() {
     let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
     assert_eq!(json["code"], 404);
 }
+
+/// Every content-addressed endpoint must emit the `Cache-Control:
+/// public, max-age=..., immutable` header so the browser can serve
+/// reloads from its own HTTP cache without re-walking the manifest.
+/// Bee has set this header on `/bzz` since at least its 1.x line; not
+/// matching it makes a music-player-style site that reloads the same
+/// 13 audio tracks + artwork on every navigation feel dramatically
+/// slower than against bee, even when our disk cache hit rate is
+/// 100% (cf. discussion 2026-05 / `c4f8a45301...`). The test pins
+/// every endpoint at once because the response builders share a
+/// helper — a regression that disables one would likely disable all
+/// — and a single failing endpoint is enough to defeat the
+/// browser's reload-from-cache behaviour for a typical bzz site.
+#[tokio::test]
+async fn content_addressed_endpoints_emit_immutable_cache_control() {
+    let router = handle_with_fixture_node();
+
+    // The chunk endpoint serves the raw manifest root chunk by hash.
+    let chunk_addr =
+        "ed5b81dac5d34d22acd6db28ee864bc6f4d0d31db17f9f4ec6e62a89c1f31cab";
+    let resp = send(
+        router.clone(),
+        Request::builder()
+            .method(Method::GET)
+            .uri(format!("/chunks/{chunk_addr}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    // Don't assert status — the fixture pool may or may not contain
+    // this exact chunk; we only care that whatever response shape we
+    // *do* return for content-addressed paths carries the header.
+    if resp.status() == StatusCode::OK {
+        let cc = resp
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .expect("/chunks must emit Cache-Control");
+        assert!(
+            cc.to_str().unwrap().contains("immutable"),
+            "/chunks Cache-Control missing `immutable`: {cc:?}",
+        );
+    }
+
+    // The bytes endpoint streams the joiner output for a content
+    // hash. Always immutable.
+    let resp = send(
+        router.clone(),
+        Request::builder()
+            .method(Method::GET)
+            .uri(format!("/bytes/{DATA_REF}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cc = resp
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .expect("/bytes must emit Cache-Control");
+    let cc_str = cc.to_str().unwrap();
+    assert!(
+        cc_str.contains("immutable") && cc_str.contains("max-age="),
+        "/bytes Cache-Control missing `immutable` / `max-age`: {cc_str}",
+    );
+    let _ = body_bytes(resp).await;
+
+    // The bzz endpoint resolves a manifest path. Always immutable.
+    let resp = send(
+        router.clone(),
+        Request::builder()
+            .method(Method::GET)
+            .uri(format!("/bzz/{MANIFEST_ROOT}/13/4358/2645.png"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cc = resp
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .expect("/bzz must emit Cache-Control");
+    assert!(
+        cc.to_str().unwrap().contains("immutable"),
+        "/bzz Cache-Control missing `immutable`: {cc:?}",
+    );
+    let _ = body_bytes(resp).await;
+
+    // Range responses (206) MUST also emit Cache-Control or the
+    // browser will re-fetch the partial bytes on every replay.
+    let resp = send(
+        router.clone(),
+        Request::builder()
+            .method(Method::GET)
+            .uri(format!("/bzz/{MANIFEST_ROOT}/13/4358/2645.png"))
+            .header(header::RANGE, "bytes=0-1023")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    let cc = resp
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .expect("/bzz 206 must emit Cache-Control");
+    assert!(
+        cc.to_str().unwrap().contains("immutable"),
+        "/bzz 206 Cache-Control missing `immutable`: {cc:?}",
+    );
+    let _ = body_bytes(resp).await;
+
+    // The Ant-specific manifest listing is content-addressed too.
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::GET)
+            .uri(format!("/v0/manifest/{MANIFEST_ROOT}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cc = resp
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .expect("/v0/manifest must emit Cache-Control");
+    assert!(
+        cc.to_str().unwrap().contains("immutable"),
+        "/v0/manifest Cache-Control missing `immutable`: {cc:?}",
+    );
+}

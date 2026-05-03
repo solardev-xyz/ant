@@ -7,9 +7,9 @@ use crate::peerstore::PeerStore;
 use crate::routing::{Overlay, RoutingTable};
 use crate::sinks;
 use ant_control::{
-    CacheInfo, ControlAck, ControlCommand, GatewayActivity, GetProgress, HandshakeReport,
-    PeerConnectionInfo, PeerConnectionState, PeerPipelineEntry, RetrievalInfo, RoutingInfo,
-    StatusSnapshot, StreamRange,
+    CacheInfo, ControlAck, ControlCommand, DiskCacheInfo, GatewayActivity, GetProgress,
+    HandshakeReport, PeerConnectionInfo, PeerConnectionState, PeerPipelineEntry, RetrievalInfo,
+    RoutingInfo, StatusSnapshot, StreamRange,
 };
 use ant_crypto::{
     ethereum_address_from_public_key, overlay_from_ethereum_address, OVERLAY_NONCE_LEN,
@@ -99,6 +99,15 @@ pub struct RunConfig {
     /// can render the Retrieval tab. `None` when the gateway is
     /// disabled (e.g. `antd --no-http-api`).
     pub gateway_activity: Option<Arc<GatewayActivity>>,
+    /// Optional persistent (SQLite-backed) chunk cache shared with
+    /// every `RoutingFetcher` we build. `Some(cache)` makes the
+    /// retrieval lookup order `memory -> disk -> network`; `None`
+    /// keeps the legacy `memory -> network` behaviour. The disk
+    /// cache is opened in `antd::main` (so the path/cap come from
+    /// CLI config) and threaded through here. Request-level
+    /// `bypass_cache` skips both the memory and disk tiers; see
+    /// `cache_for_request` for the wiring.
+    pub disk_cache: Option<Arc<ant_retrieval::DiskChunkCache>>,
 }
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
@@ -279,6 +288,13 @@ struct SwarmState {
     /// `antctl get` calls start cold). Toggled by
     /// `RunConfig::per_request_chunk_cache`.
     chunk_cache: Option<Arc<ant_retrieval::InMemoryChunkCache>>,
+    /// Process-wide persistent chunk cache. `Some` when the daemon
+    /// has been configured with `--disk-cache-path`; cloned into
+    /// every `RoutingFetcher` we build (modulo `bypass_cache`).
+    /// Lifetime matches the daemon process; the underlying SQLite
+    /// connection is shared via `Arc` so we don't pay a new open
+    /// per request.
+    disk_cache: Option<Arc<ant_retrieval::DiskChunkCache>>,
     /// Optional fixture-capture directory; cloned into every
     /// `RoutingFetcher` we build for a `GetBytes` / `GetBzz` request,
     /// so each chunk fetched (or served from the cache) gets dumped
@@ -341,6 +357,7 @@ impl SwarmState {
         per_request_chunk_cache: bool,
         chunk_record_dir: Option<PathBuf>,
         gateway_activity: Option<Arc<GatewayActivity>>,
+        disk_cache: Option<Arc<ant_retrieval::DiskChunkCache>>,
     ) -> Self {
         let chunk_cache = if per_request_chunk_cache {
             None
@@ -365,6 +382,7 @@ impl SwarmState {
             peer_order: HashMap::new(),
             next_peer_order: 0,
             chunk_cache,
+            disk_cache,
             chunk_record_dir,
             peers_watch: watch::channel(Vec::new()).0,
             retrieval_inflight: Arc::new(Semaphore::new(RETRIEVAL_INFLIGHT_CAP)),
@@ -405,6 +423,23 @@ impl SwarmState {
             Some(c) => c.clone(),
             None => Arc::new(ant_retrieval::InMemoryChunkCache::with_default_capacity()),
         }
+    }
+
+    /// Resolve the *persistent* chunk cache for one user-visible
+    /// request. `bypass_cache` returns `None` so the request neither
+    /// reads from nor writes to the long-lived disk cache — exactly
+    /// the contract `PLAN.md` § 6.1 calls out: "Request-level cache
+    /// bypass must skip both disk reads and disk writes". When the
+    /// daemon was started without a disk cache, this is always
+    /// `None`.
+    fn disk_cache_for_request(
+        &self,
+        bypass_cache: bool,
+    ) -> Option<Arc<ant_retrieval::DiskChunkCache>> {
+        if bypass_cache {
+            return None;
+        }
+        self.disk_cache.clone()
     }
 
     fn peer_set_size(&self) -> usize {
@@ -595,6 +630,21 @@ fn build_retrieval_info(state: &SwarmState) -> RetrievalInfo {
         .as_ref()
         .map(|a| a.snapshot())
         .unwrap_or_default();
+    // Disk cache snapshot. When the daemon was started with
+    // `--no-disk-cache` (or no disk cache at all),
+    // `state.disk_cache` is `None` and `enabled` stays false so
+    // `antctl top` can render a clean `disabled` label. The byte
+    // totals are read directly from the cache's `AtomicU64` mirror,
+    // so we never block the status tick on a SQLite query.
+    let disk = match state.disk_cache.as_ref() {
+        Some(c) => DiskCacheInfo {
+            enabled: true,
+            used_bytes: c.used_bytes(),
+            capacity_bytes: c.capacity_bytes(),
+            hits_total: counters.disk_hits,
+        },
+        None => DiskCacheInfo::default(),
+    };
     RetrievalInfo {
         cache: CacheInfo {
             used: cache_used,
@@ -604,7 +654,9 @@ fn build_retrieval_info(state: &SwarmState) -> RetrievalInfo {
         in_flight_capacity: RETRIEVAL_INFLIGHT_CAP as u32,
         chunks_fetched_total: counters.chunks_fetched,
         bytes_fetched_total: counters.bytes_fetched,
-        cache_hits_total: counters.cache_hits,
+        cache_hits_total: counters.cache_hits(),
+        mem_hits_total: counters.mem_hits,
+        disk,
         gateway_requests,
     }
 }
@@ -695,6 +747,7 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
         cfg.per_request_chunk_cache,
         cfg.chunk_record_dir.clone(),
         cfg.gateway_activity.clone(),
+        cfg.disk_cache.clone(),
     );
 
     // Pseudosettle driver: keeps our per-peer debt below bee's
@@ -983,6 +1036,7 @@ fn handle_control_command(
             }
             let control = control.clone();
             let cache = state.cache_for_request(bypass_cache);
+            let disk_cache = state.disk_cache_for_request(bypass_cache);
             let record_dir = state.chunk_record_dir.clone();
             let inflight_limit = state.retrieval_inflight.clone();
             let payment_notify = state.payment_notify.clone();
@@ -1005,6 +1059,7 @@ fn handle_control_command(
                     control,
                     peers_rx,
                     cache,
+                    disk_cache,
                     record_dir,
                     inflight_limit,
                     payment_notify,
@@ -1041,6 +1096,7 @@ fn handle_control_command(
             }
             let control = control.clone();
             let cache = state.cache_for_request(bypass_cache);
+            let disk_cache = state.disk_cache_for_request(bypass_cache);
             let record_dir = state.chunk_record_dir.clone();
             let inflight_limit = state.retrieval_inflight.clone();
             let payment_notify = state.payment_notify.clone();
@@ -1064,6 +1120,7 @@ fn handle_control_command(
                     control,
                     peers_rx,
                     cache,
+                    disk_cache,
                     record_dir,
                     inflight_limit,
                     payment_notify,
@@ -1102,6 +1159,7 @@ fn handle_control_command(
             }
             let control = control.clone();
             let cache = state.cache_for_request(bypass_cache);
+            let disk_cache = state.disk_cache_for_request(bypass_cache);
             let record_dir = state.chunk_record_dir.clone();
             let inflight_limit = state.retrieval_inflight.clone();
             let payment_notify = state.payment_notify.clone();
@@ -1119,6 +1177,7 @@ fn handle_control_command(
                     control,
                     peers_rx,
                     cache,
+                    disk_cache,
                     record_dir,
                     inflight_limit,
                     payment_notify,
@@ -1159,6 +1218,7 @@ fn handle_control_command(
             }
             let control = control.clone();
             let cache = state.cache_for_request(bypass_cache);
+            let disk_cache = state.disk_cache_for_request(bypass_cache);
             let record_dir = state.chunk_record_dir.clone();
             let inflight_limit = state.retrieval_inflight.clone();
             let payment_notify = state.payment_notify.clone();
@@ -1181,6 +1241,7 @@ fn handle_control_command(
                     control,
                     peers_rx,
                     cache,
+                    disk_cache,
                     record_dir,
                     inflight_limit,
                     payment_notify,
@@ -1216,6 +1277,7 @@ fn handle_control_command(
             }
             let control = control.clone();
             let cache = state.cache_for_request(bypass_cache);
+            let disk_cache = state.disk_cache_for_request(bypass_cache);
             let record_dir = state.chunk_record_dir.clone();
             let inflight_limit = state.retrieval_inflight.clone();
             let payment_notify = state.payment_notify.clone();
@@ -1226,6 +1288,7 @@ fn handle_control_command(
                     control,
                     peers_rx,
                     cache,
+                    disk_cache,
                     record_dir,
                     inflight_limit,
                     payment_notify,
@@ -1245,6 +1308,7 @@ async fn run_stream_bytes(
     control: Control,
     peers_rx: watch::Receiver<Vec<(libp2p::PeerId, [u8; 32])>>,
     cache: Arc<ant_retrieval::InMemoryChunkCache>,
+    disk_cache: Option<Arc<ant_retrieval::DiskChunkCache>>,
     record_dir: Option<PathBuf>,
     inflight_limit: Arc<Semaphore>,
     payment_notify: Option<mpsc::Sender<PeerId>>,
@@ -1266,6 +1330,9 @@ async fn run_stream_bytes(
         .with_inflight_limit(inflight_limit)
         .with_counters(counters)
         .with_request_inflight_limit(RETRIEVAL_REQUEST_INFLIGHT_CAP);
+    if let Some(disk) = disk_cache {
+        builder = builder.with_disk_cache(disk);
+    }
     if let Some(tx) = payment_notify {
         builder = builder.with_payment_notify(tx);
     }
@@ -1321,6 +1388,7 @@ async fn run_stream_bzz(
     control: Control,
     peers_rx: watch::Receiver<Vec<(libp2p::PeerId, [u8; 32])>>,
     cache: Arc<ant_retrieval::InMemoryChunkCache>,
+    disk_cache: Option<Arc<ant_retrieval::DiskChunkCache>>,
     record_dir: Option<PathBuf>,
     inflight_limit: Arc<Semaphore>,
     payment_notify: Option<mpsc::Sender<PeerId>>,
@@ -1359,6 +1427,9 @@ async fn run_stream_bzz(
             .with_inflight_limit(inflight_limit.clone())
             .with_counters(counters.clone())
             .with_request_inflight_limit(RETRIEVAL_REQUEST_INFLIGHT_CAP);
+        if let Some(disk) = disk_cache.clone() {
+            builder = builder.with_disk_cache(disk);
+        }
         if let Some(tx) = payment_notify.clone() {
             builder = builder.with_payment_notify(tx);
         }
@@ -1756,6 +1827,7 @@ async fn run_get_bytes(
     control: Control,
     peers_rx: watch::Receiver<Vec<(libp2p::PeerId, [u8; 32])>>,
     cache: Arc<ant_retrieval::InMemoryChunkCache>,
+    disk_cache: Option<Arc<ant_retrieval::DiskChunkCache>>,
     record_dir: Option<PathBuf>,
     inflight_limit: Arc<Semaphore>,
     payment_notify: Option<mpsc::Sender<PeerId>>,
@@ -1782,6 +1854,9 @@ async fn run_get_bytes(
             .with_inflight_limit(inflight_limit.clone())
             .with_counters(counters.clone())
             .with_request_inflight_limit(RETRIEVAL_REQUEST_INFLIGHT_CAP);
+        if let Some(disk) = disk_cache.clone() {
+            builder = builder.with_disk_cache(disk);
+        }
         if let Some(tx) = payment_notify.clone() {
             builder = builder.with_payment_notify(tx);
         }
@@ -1884,6 +1959,7 @@ async fn run_list_bzz(
     control: Control,
     peers_rx: watch::Receiver<Vec<(libp2p::PeerId, [u8; 32])>>,
     cache: Arc<ant_retrieval::InMemoryChunkCache>,
+    disk_cache: Option<Arc<ant_retrieval::DiskChunkCache>>,
     record_dir: Option<PathBuf>,
     inflight_limit: Arc<Semaphore>,
     payment_notify: Option<mpsc::Sender<PeerId>>,
@@ -1903,6 +1979,9 @@ async fn run_list_bzz(
         .with_inflight_limit(inflight_limit)
         .with_counters(counters)
         .with_request_inflight_limit(RETRIEVAL_REQUEST_INFLIGHT_CAP);
+    if let Some(disk) = disk_cache {
+        builder = builder.with_disk_cache(disk);
+    }
     if let Some(tx) = payment_notify {
         builder = builder.with_payment_notify(tx);
     }
@@ -1955,6 +2034,7 @@ async fn run_get_bzz(
     control: Control,
     peers_rx: watch::Receiver<Vec<(libp2p::PeerId, [u8; 32])>>,
     cache: Arc<ant_retrieval::InMemoryChunkCache>,
+    disk_cache: Option<Arc<ant_retrieval::DiskChunkCache>>,
     record_dir: Option<PathBuf>,
     inflight_limit: Arc<Semaphore>,
     payment_notify: Option<mpsc::Sender<PeerId>>,
@@ -1981,6 +2061,9 @@ async fn run_get_bzz(
             .with_inflight_limit(inflight_limit.clone())
             .with_counters(counters.clone())
             .with_request_inflight_limit(RETRIEVAL_REQUEST_INFLIGHT_CAP);
+        if let Some(disk) = disk_cache.clone() {
+            builder = builder.with_disk_cache(disk);
+        }
         if let Some(tx) = payment_notify.clone() {
             builder = builder.with_payment_notify(tx);
         }
@@ -2878,7 +2961,7 @@ mod tests {
     /// 502s on multi-MiB media files.
     #[test]
     fn publish_peers_reflects_admit_and_forget() {
-        let mut state = SwarmState::new(32, [0u8; 32], false, None, None);
+        let mut state = SwarmState::new(32, [0u8; 32], false, None, None, None);
         let mut rx = state.peers_watch.subscribe();
         // Initial state: empty.
         assert!(rx.borrow_and_update().is_empty());

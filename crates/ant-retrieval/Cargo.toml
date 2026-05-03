@@ -1,6 +1,6 @@
 [package]
 name = "ant-retrieval"
-version = "0.3.2"
+version = "0.3.3"
 edition.workspace = true
 
 [dependencies]
@@ -16,7 +16,9 @@ unsigned-varint.workspace = true
 futures = "0.3.31"
 hex.workspace = true
 lru = "0.17.0"
+rusqlite = { version = "0.39.0", features = ["bundled"] }
 
 [dev-dependencies]
 sha2 = "0.11.0"
 k256.workspace = true
+tempfile = "3.27.0"
