@@ -274,7 +274,7 @@ Each crate owns its data model and exposes a small API. `ant-node` is the only c
 
 - Single-stream protobuf request/response.
 - Verify chunk integrity: `keccak256(span || payload) == reference` for content-addressed chunks; signature verification for single-owner chunks (SOCs).
-- Optional in-memory LRU cache keyed by chunk reference; SQLite-backed persistent cache behind a size cap.
+- Two-tier chunk cache keyed by chunk reference: in-memory LRU first, SQLite-backed persistent cache second, both behind explicit size limits and request-level bypass controls.
 
 ### 5.4 BMT + Chunking
 
@@ -350,7 +350,54 @@ Single SQLite database, versioned migrations. Core tables:
 | `chain_state` | Latest block, nonce, pending tx tracking. |
 | `uploads` | User-level upload jobs with status, reference, manifest metadata. |
 
-Chunks may optionally live on disk (one file per chunk in sharded dirs) if we find SQLite BLOB pressure is significant under load.
+### 6.1 Chunk Cache
+
+The default persistent chunk cache is SQLite, not a sharded file tree. Chunks are small, content-addressed blobs, and the rest of the node already needs a versioned local database. Keeping chunk metadata and payloads in SQLite gives us migrations, atomic writes, LRU metadata, crash recovery, and predictable eviction without inventing a second storage format.
+
+Cache lookup order:
+
+```text
+in-memory LRU -> SQLite disk cache -> network retrieval
+```
+
+The cached value is the exact retrieval wire bytes (`span || payload` for CAC chunks, or SOC wire bytes), keyed by the 32-byte chunk address. Network-fetched chunks are already CAC/SOC-validated before insertion. Disk hits must be validated again before use; if validation fails, delete the row and fall through to the network.
+
+Initial SQLite shape:
+
+```sql
+CREATE TABLE chunks (
+  address BLOB PRIMARY KEY,
+  data BLOB NOT NULL,
+  size INTEGER NOT NULL,
+  last_access INTEGER NOT NULL,
+  inserted_at INTEGER NOT NULL
+);
+
+CREATE INDEX chunks_last_access_idx ON chunks(last_access);
+```
+
+Recommended pragmas:
+
+```sql
+PRAGMA page_size = 8192;        -- before first table creation
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+PRAGMA busy_timeout = 5000;
+```
+
+The persistent tier must have a hard size cap from day one. Evict oldest `last_access` rows in batches once the tracked byte total exceeds the configured maximum, preferably down to a slack target around 90-95% of the cap so writes do not trigger constant single-row eviction. SQLite should comfortably handle tens of GB and is expected to be fine around 100 GB with this schema; revisit the storage layout only if benchmarks show SQLite BLOB pressure at the target cache sizes.
+
+Default sizing guidance:
+
+- Mobile / embedded library: persistent cache disabled by default or capped by host-app config, commonly 512 MB-2 GB.
+- `antd` desktop / Raspberry Pi: 10 GB default.
+- Power-user desktop / server: configurable to 100 GB+.
+
+RAM should not scale with disk-cache size. The current in-memory tier is 8192 chunks, roughly 32 MiB of raw chunk data and about 40-60 MiB after LRU/vector overhead. Add a bounded SQLite page cache (for example 4-16 MiB on mobile and 16-64 MiB on desktop/Pi). Shrink the in-memory tier for constrained embedders rather than coupling memory use to persistent-cache capacity.
+
+Async integration rule: never run blocking SQLite calls directly on Tokio retrieval tasks. Use a dedicated storage worker with hot prepared statements, or `spawn_blocking` for the first implementation if the code stays simple. Request-level cache bypass must skip both disk reads and disk writes; daemon-wide "per request cache" should only control whether the in-memory tier is shared across user-visible requests.
+
+One-file-per-chunk storage remains a fallback, not the default. Only switch to it if measured SQLite BLOB overhead or write amplification becomes the bottleneck at the configured scale; even then SQLite should keep ownership of the metadata and eviction index.
 
 ---
 
@@ -515,7 +562,7 @@ Goal: the node retrieves any reference from mainnet, including multi-chunk files
 
 - `ant-retrieval`: client protocol, protobuf messaging, stream multiplexing over libp2p `request-response`.
 - Chunk verification: BMT root check for content-addressed chunks; signature check for single-owner chunks.
-- Chunk cache (SQLite or sharded file store) with size cap and LRU eviction.
+- Chunk cache with in-memory LRU plus SQLite persistent tier, hard size cap, LRU eviction, corruption handling, and cache-bypass semantics.
 - Retry / alternate-peer selection on failure.
 
 **Exit:** Mobile sample app downloads a known single-chunk and multi-chunk Swarm reference from mainnet.
