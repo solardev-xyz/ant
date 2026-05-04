@@ -34,7 +34,30 @@ and the work breakdown is in [PLAN.md Appendix D][appx-d].
 | `/bytes/{addr}`              | GET / HEAD | A    | Joins the chunk tree; honors a single-range `Range` header.          |
 | `/bzz/{addr}`                | GET / HEAD | A    | Manifest root — resolves `website-index-document` if present.        |
 | `/bzz/{addr}/{*path}`        | GET / HEAD | A    | Walks the manifest, joins data; `Content-Type` from manifest meta.   |
+| `/v0/manifest/{addr}`        | GET        | A+   | Ant extension: JSON listing of mantaray paths + metadata (no body).  |
 | _everything else_            | _any_      | —    | `501 {code:501, message:"not implemented in ant"}`.                  |
+
+### Streaming, HEAD, and ranges
+
+`/bytes`, `/bzz`, and `/chunks` all go through the streaming dispatch
+path — bodies are never fully materialised in the gateway process.
+`Body::from_stream` pulls ordered `BytesChunk`s from the joiner as they
+land, and an HTTP client disconnect cancels the upstream retrieval task.
+
+- **GET, no Range** — full streaming join. Headers go out as soon as the
+  root span and (for `/bzz`) manifest metadata are known; the body
+  follows as the joiner emits ordered subtrees.
+- **HEAD** — streaming dispatch with `head_only = true`, so the daemon
+  resolves manifest + root span but never fetches body chunks. Returns
+  `Content-Type`, `Content-Length`, and `Accept-Ranges: bytes`.
+- **GET, single Range** — streaming dispatch with a clamped interval
+  mapped to the minimum set of Swarm subtrees required. Returns `206
+  Partial Content` with an accurate `Content-Range`. Multi-range
+  (`Range: bytes=a-b,c-d`) is rejected with `416`.
+
+`GATEWAY_MAX_FILE_BYTES` (1 GiB) caps the per-request total size so a
+malicious manifest claiming a multi-terabyte span is refused before any
+allocation. See PLAN.md Appendix E for the full design.
 
 ### What's intentionally not here
 
@@ -43,14 +66,9 @@ and the work breakdown is in [PLAN.md Appendix D][appx-d].
 - Web3 v3 keystore (`keys/swarm.key`) — PLAN.md D.3.2.
 - ENS resolution (`/bzz/<ens>/...` — currently treated as a literal
   reference; bee-js's reachability checks accept the 400 today).
-- Streaming joiner output. The joiner materialises full file bodies
-  in memory before handing them to axum. Per-request body size is
-  capped at `retrieval::GATEWAY_MAX_FILE_BYTES` (1 GiB) — high enough
-  for any realistic web/media payload, low enough that a malicious
-  manifest claiming a multi-terabyte span gets rejected before
-  allocation. The CLI (`antctl get`) keeps the much tighter
-  `ant_retrieval::DEFAULT_MAX_FILE_BYTES` (32 MiB) since its audience
-  is interactive use, not a browser.
+- Reed-Solomon redundancy recovery — PLAN.md Appendix E Phase 8.
+  Files uploaded with non-zero redundancy currently require every data
+  chunk to be reachable.
 - ENS / `resolver-options`, bee-style YAML config, `antd init`, the
   `antd start` subcommand shim. `antd`'s existing CLI is unchanged.
 

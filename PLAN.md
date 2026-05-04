@@ -222,24 +222,25 @@ ant/
 ├── Cargo.toml                  # workspace root
 ├── rust-toolchain.toml         # pinned toolchain
 ├── crates/
+│   # Live crates (shipped in 0.3.x):
 │   ├── ant-crypto/             # secp256k1, keccak, BMT, signatures, overlay derivation
-│   ├── ant-p2p/                # libp2p host, BZZ handshake, Hive hints, peer snapshot
-│   ├── ant-control/            # local daemon control protocol and socket transport
-│   ├── ant-node/               # high-level orchestrator: wires active crates together
-│   ├── antd/                   # standalone daemon: CLI, config loader, signal handling
-│   └── antctl/                 # local control client and live status TUI
+│   ├── ant-p2p/                # libp2p host, BZZ handshake, Hive hints, pseudosettle, peer snapshot
+│   ├── ant-retrieval/          # Retrieval protocol client, joiner, mantaray walker, caches, accounting mirror
+│   ├── ant-gateway/            # Bee-shaped HTTP API (feature-gated, antd only — see Appendix C)
+│   ├── ant-control/            # Local daemon control protocol and socket transport
+│   ├── ant-node/               # High-level orchestrator: wires active crates together
+│   ├── antd/                   # Standalone daemon: CLI, config loader, signal handling
+│   └── antctl/                 # Local control client, live status TUI, `get` download CLI
 │
-│   # Planned after M1.1:
-│   ├── ant-store/              # SQLite schema + migrations + repositories
+│   # Planned for M3 (uploads / stamps / SWAP) or later:
+│   ├── ant-store/              # SQLite schema + migrations + repositories (chunks live in ant-retrieval::disk_cache today)
 │   ├── ant-chunk/              # Chunk types, serialization, content-addressed chunks, SOCs
-│   ├── ant-mantaray/           # Manifest (binary trie) construction + traversal
-│   ├── ant-retrieval/          # Retrieval protocol (client only)
+│   ├── ant-mantaray/           # Manifest construction (traversal already lives in ant-retrieval)
 │   ├── ant-pushsync/           # Pushsync protocol (client only)
-│   ├── ant-accounting/         # Peer debit/credit ledger + threshold logic
+│   ├── ant-accounting/         # Peer debit/credit ledger + threshold logic (bee-parity mirror lives in ant-retrieval today)
 │   ├── ant-chain/              # Gnosis RPC, ABIs, tx signing, nonce mgmt
 │   ├── ant-stamps/             # Batch state, per-chunk signing, bucket tracking
 │   ├── ant-swap/               # Chequebook deploy, cheque issuance, EIP-712 signing
-│   ├── ant-gateway/            # Bee-shaped HTTP API (feature-gated, antd only — see Appendix C)
 │   └── ant-ffi/                # UniFFI bindings: public API surface, error mapping
 ├── uniffi/
 │   └── ant.udl                 # Interface definition consumed by ant-ffi
@@ -247,6 +248,8 @@ ant/
 ├── android/                    # Gradle module that consumes the aar
 └── xtask/                      # cargo xtask for build orchestration
 ```
+
+The mantaray walker and the bee-parity `Accounting` mirror currently live inside `ant-retrieval` rather than in the planned standalone crates (`ant-mantaray`, `ant-accounting`). They'll graduate to their own crates when a second consumer (mobile / uploads) needs them; until then the tighter blast radius is worth more than the crate-split hygiene.
 
 Each crate owns its data model and exposes a small API. `ant-node` is the only crate that knows about everything. `ant-control` is local operator plumbing only and must not leak into protocol crates. `ant-ffi` is the only crate that knows about UniFFI. `antd` is a thin shell around `ant-node` that adds CLI argument parsing, config loading, and signal handling — it must never reach around the core to touch lower crates directly, so that the daemon and the mobile library remain behaviorally identical.
 
@@ -539,13 +542,35 @@ A post-M3 **hardening track** covers UX polish, backgrounding, and beta — with
 
 Each milestone is subdivided into phases that end with a concrete demo.
 
+### 9.0 Current status (snapshot)
+
+Workspace is at **`0.3.4`** across all eight live crates; the same binary is deployed on `vibing.at/ant` as a live bee-compatible gateway against Swarm mainnet.
+
+| Milestone | Status | Notes |
+|---|---|---|
+| **M1.0** — Basic mainnet connection | ✅ shipped | `antd` joins mainnet via `/dnsaddr/mainnet.ethswarm.org`, BZZ handshake on `/swarm/handshake/14.0.0`, holds ~100-peer warm set across restarts. |
+| **M1.1** — Stable neighborhood | ✅ shipped | Hive v2 peer exchange, forwarding-Kademlia routing bins, signed BZZ address verification; persistent `peers.json` snapshot, `antctl top` peer/routing dashboard. 24 h soak clean. |
+| **M2 / Phase 2** — Retrieval | ✅ shipped | `ant-retrieval`: bee-parity fetcher with cancel-tolerant hedging (Appendix G), admission-control mirror (Appendix H), pseudosettle-backed accounting (Appendix F), two-tier chunk cache (in-mem LRU + SQLite-backed `DiskChunkCache`, Appendix §6). |
+| **M2 / Phase 3** — Mantaray + download API | ✅ shipped | Mantaray walker + `/v0/manifest` + `bzz://` path resolution, Swarm-feed dereferencing, ordered streaming joiner with single-range and HEAD support (Appendix E). |
+| **M2 / Phase 4** — Ultra-light packaging | 🚧 partial | Tier-A `ant-gateway` live on 127.0.0.1:1633 with `--api-addr` / `--no-http-api` (Appendix D); bee-js / curl / browser smoke passes. **Mobile artefact (xcframework / aar) not started yet.** `antctl get` streams progress but the download body is still terminal, not byte-streamed (Appendix E Phase 5). |
+| **M3 / Phase 5–9** — Uploads / stamps / SWAP | ⏳ not started | No `ant-chain`, `ant-stamps`, `ant-pushsync`, `ant-swap` crates yet. |
+| **Hardening / Phase 10–11** | ⏳ not started | Mobile suspend/resume, upload resumption, beta. |
+
+Active hardening tracks carried alongside M2:
+
+- Retrieval / accounting polish: F.7 follow-ups (persist pseudosettle budget across restarts, per-peer chunks-per-connection counter, investigate ~30 ms peer churn pattern). Low-impact, untouched.
+- §6.2 disk-cache asymmetries: bee ~2× faster on cold populate and 1.5–3× faster at K ≤ 4 single-threaded reads; ant wins from K ≥ 8 upward. Worth a targeted pragma / prepared-statement pass.
+- Appendix E Phase 5 (CLI streaming) and Phase 8 (Reed-Solomon recovery) remain the two read-path gaps.
+
+Detailed post-facto engineering write-ups of the retrieval/accounting work live in Appendices E (gateway streaming), F (pseudosettle), G (cancel-tolerant hedging + moving window) and H (admission-control mirror). The phase descriptions below remain the original plan — consult the appendices for what actually shipped and how.
+
 ---
 
 ### Milestone 1 — Peer discovery & connection
 
 Goal: the embedded node connects to Swarm mainnet, completes the BZZ handshake with real bee peers, exchanges peers via Hive, and maintains Kademlia routing table bins consistent with the neighborhood of our overlay address. All development at this stage happens against the `antd` binary; mobile packaging is deferred to the end of M2 where it's meaningful to demo.
 
-#### Phase 0 — Foundations + basic mainnet connection — **M1.0**
+#### Phase 0 — Foundations + basic mainnet connection — **M1.0** — ✅ shipped
 
 Keep the workspace tiny: only the crates needed to dial bee peers, survive the BZZ handshake, expose enough operator control to debug a long-running daemon, and gather the peer data needed for M1.1. No SQLite, no UniFFI, no mobile artifacts yet.
 
@@ -572,7 +597,7 @@ INFO ant_p2p: bzz handshake ok overlay=0x2c4a…8e full_node=true
 INFO ant_p2p: peer set size=1
 ```
 
-#### Phase 1 — Stable neighborhood via Hive + Kademlia — **M1.1**
+#### Phase 1 — Stable neighborhood via Hive + Kademlia — **M1.1** — ✅ shipped
 
 - Extend `ant-p2p` with:
   - **Hive v2** peer exchange: keep the current inbound Hive peer broadcast parser, add any missing request path needed to actively ask peers for closer addresses, verify signed BZZ addresses before promotion, and enqueue dials by routing need instead of FIFO only.
@@ -594,7 +619,7 @@ INFO ant_p2p: peer set size=1
 
 Goal: the node retrieves any reference from mainnet, including multi-chunk files and path-addressed content inside a mantaray manifest. No chain interaction, no wallet. This is a complete, shippable read-only product.
 
-#### Phase 2 — Retrieval
+#### Phase 2 — Retrieval — ✅ shipped
 
 - `ant-retrieval`: client protocol, protobuf messaging, stream multiplexing over libp2p `request-response`.
 - Chunk verification: BMT root check for content-addressed chunks; signature check for single-owner chunks.
@@ -603,7 +628,9 @@ Goal: the node retrieves any reference from mainnet, including multi-chunk files
 
 **Exit:** Mobile sample app downloads a known single-chunk and multi-chunk Swarm reference from mainnet.
 
-#### Phase 3 — Mantaray traversal + high-level download API
+**Landed as:** bee-shaped `RoutingFetcher` with admission-control mirror, cancel-tolerant hedging, pseudosettle-backed accounting, two-tier cache (`InMemoryChunkCache` + `DiskChunkCache`), and per-request bypass. Live end-to-end in `antd` and covered by `antctl get <chunk-hex> | bytes://<hex> | bzz://<hex>[/path]`. Mobile demo deferred with the rest of the mobile artefact (Phase 4).
+
+#### Phase 3 — Mantaray traversal + high-level download API — ✅ shipped (non-FFI)
 
 - `ant-mantaray`: binary-trie decoder, path traversal, root-metadata handling.
 - `download(Reference)` → bytes, and `resolve_path(Reference, String)` → Reference, both over FFI.
@@ -611,7 +638,9 @@ Goal: the node retrieves any reference from mainnet, including multi-chunk files
 
 **Exit:** Sample app opens a `bzz://` reference with a path and renders the content (e.g., an image or a JSON file inside a directory manifest).
 
-#### Phase 4 — Ultra-light packaging + release-candidate
+**Landed as:** mantaray walker + path resolution live inside `ant-retrieval` (not yet split out into a standalone `ant-mantaray` crate), exposed through the daemon's control protocol and the Tier-A HTTP gateway (`/bzz/<addr>[/<path>]`, `/v0/manifest`). Streaming joiner emits bytes in file order with single-range and HEAD support (Appendix E Phases 1-3). FFI surface not yet exposed — it will land with the mobile artefact in Phase 4.
+
+#### Phase 4 — Ultra-light packaging + release-candidate — 🚧 partial
 
 - Size budget enforcement in CI (fail PRs that push `.xcframework` / `.aar` past the M2 budget).
 - Foreground + background suspend/resume for reads.
@@ -620,6 +649,10 @@ Goal: the node retrieves any reference from mainnet, including multi-chunk files
 - Internal beta of the download-only build.
 
 **Exit (M2):** Independently shippable ultra-light library. Per-platform artifact ≤ ~5 MB stripped (lighter than the full M3 target because no chain / SWAP / stamps code).
+
+**Landed so far (desktop / server):** Tier-A `ant-gateway` is live on `127.0.0.1:1633` inside `antd` (`--api-addr`, `--no-http-api`) per Appendix D. `beeMode = "ultra-light"`, stub wallet / stamps / chequebook. `bee-js` / `curl` / browser smoke passes against it. Released binary runs on `vibing.at/ant` serving mainnet-hosted sites and media with HEAD + single-range support.
+
+**Still outstanding:** mobile `.xcframework` / `.aar` artefact (blocked on `ant-ffi`), CI size budget, suspend/resume handling, OSLog / logcat bridges, and internal beta. `antctl get` streaming (Appendix E Phase 5) and Reed-Solomon recovery (Appendix E Phase 8) are the last two read-path hardening items before this phase closes.
 
 ---
 
@@ -698,13 +731,13 @@ Not a capability milestone, but required before GA.
 
 ### Milestone summary
 
-| Milestone | Phases | Demo |
-|---|---|---|
-| **M1.0 Basic mainnet connection** | 0 | `antd` connects to mainnet + completes BZZ handshake |
-| **M1.1 Stable neighborhood** | 1 | Stable peer set + correct Kademlia routing bins over 24 h |
-| **M2 Ultra-light (download)** | 2, 3, 4 | Download any reference + path resolution; shippable read-only build |
-| **M3 Light node (upload + stamps + SWAP)** | 5, 6, 7, 8, 9 | Buy batch → upload directory → retrieve by path, all on device |
-| **Hardening** | 10, 11 | Public beta with survived-kill uploads and mainnet interop |
+| Milestone | Phases | Status | Demo |
+|---|---|---|---|
+| **M1.0 Basic mainnet connection** | 0 | ✅ shipped | `antd` connects to mainnet + completes BZZ handshake |
+| **M1.1 Stable neighborhood** | 1 | ✅ shipped | Stable peer set + correct Kademlia routing bins over 24 h |
+| **M2 Ultra-light (download)** | 2, 3, 4 | 🚧 desktop live, mobile pending | Download any reference + path resolution; shippable read-only build |
+| **M3 Light node (upload + stamps + SWAP)** | 5, 6, 7, 8, 9 | ⏳ not started | Buy batch → upload directory → retrieve by path, all on device |
+| **Hardening** | 10, 11 | ⏳ not started | Public beta with survived-kill uploads and mainnet interop |
 
 M1 and M2 can be parallelized by a second engineer starting on chain plumbing in Phase 5. Add buffer for unknowns — Swarm's protocols have undocumented edges, and the first honest interop run against `bee` always surfaces something.
 
