@@ -41,8 +41,12 @@ what's shipped.
 
 - No uploads, no postage stamps, no chequebook / SWAP, no chain plumbing.
   (M3 — not started.)
-- No mobile artefact. `ant-ffi` and the Swift `.xcframework` / Kotlin
-  `.aar` wrappers are planned but not yet built.
+- No polished mobile artefact. A hand-written `extern "C"` slice of
+  `ant-ffi` exists, and an iOS download smoke-test app in
+  [`examples/ios-download/`](examples/ios-download/) links it to
+  shake out iOS-side transport edges (PLAN.md § 9). The UniFFI
+  `.xcframework` / Kotlin `.aar` that meets the Phase-4 size budget
+  and API surface is still not built.
 - No Reed-Solomon recovery. Files uploaded with redundancy can be read
   today only via `--allow-degraded-redundancy`, and only if every data
   chunk is reachable.
@@ -62,6 +66,7 @@ what's shipped.
 | [`ant-gateway`](crates/ant-gateway) | Bee-shaped HTTP API (`/bytes`, `/bzz`, `/chunks`, HEAD, Range, plus Tier-A status / stub endpoints). |
 | [`ant-control`](crates/ant-control) | Wire types for the `antd` ↔ `antctl` Unix-socket control protocol. |
 | [`ant-crypto`](crates/ant-crypto) | secp256k1, keccak256, BMT, CAC/SOC validation, overlay derivation. |
+| [`ant-ffi`](crates/ant-ffi) | Hand-written `extern "C"` surface + `ant.h` for the iOS download smoke test (PLAN.md § 9). Throwaway — replaced by UniFFI in M2 Phase 4. |
 
 Current workspace version: **`0.3.4`** across all crates (the deployment
 bump on each release to `vibing.at/ant`; see `AGENTS.md`).
@@ -159,6 +164,21 @@ curl -fsSr 0-1048575 http://127.0.0.1:1633/bzz/<root>/video.mp4 -o head.bin
 Full endpoint matrix and compatibility notes are in
 [`crates/ant-gateway/README.md`](crates/ant-gateway/README.md), and the
 normative contract is in PLAN.md Appendix C.
+
+## iOS smoke test
+
+Throwaway SwiftUI app that embeds `ant-ffi` and lets you paste a
+Swarm reference into a text field:
+
+```sh
+rustup target add aarch64-apple-ios-sim  # once per machine
+cargo xtask build-ios-sim                # cross-compile libant_ffi.a
+open examples/ios-download/AntDownload.xcodeproj
+```
+
+Pick an iPhone simulator and ⌘R. See
+[`examples/ios-download/README.md`](examples/ios-download/README.md)
+for troubleshooting and the ant / app responsibility split.
 
 ## Further reading
 

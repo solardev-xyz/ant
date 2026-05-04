@@ -3,12 +3,14 @@ resolver = "2"
 members = [
     "crates/ant-control",
     "crates/ant-crypto",
+    "crates/ant-ffi",
     "crates/ant-gateway",
     "crates/ant-p2p",
     "crates/ant-retrieval",
     "crates/ant-node",
     "crates/antd",
     "crates/antctl",
+    "xtask",
 ]
 
 [workspace.package]

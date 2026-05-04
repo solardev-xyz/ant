@@ -1,0 +1,5 @@
+# `cargo xtask <cmd>` dispatches to the xtask crate in this workspace.
+# Kept here (not at user scope) so the convention travels with the
+# repo.
+[alias]
+xtask = "run --quiet --package xtask --"

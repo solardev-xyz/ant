@@ -126,6 +126,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ant-ffi"
+version = "0.3.4"
+dependencies = [
+ "ant-control",
+ "ant-crypto",
+ "ant-node",
+ "ant-p2p",
+ "ant-retrieval",
+ "hex",
+ "k256",
+ "libp2p",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "ant-gateway"
 version = "0.3.4"
 dependencies = [
@@ -5073,6 +5093,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7d8a75eaf6557bb84a65ace8609883db44a29951042ada9b393151532e41fcb"
 dependencies = [
  "xml-rs",
+]
+
+[[package]]
+name = "xtask"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
 ]
 
 [[package]]

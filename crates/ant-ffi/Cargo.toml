@@ -1,0 +1,33 @@
+[package]
+name = "ant-ffi"
+version = "0.3.4"
+edition.workspace = true
+
+# staticlib for the iOS simulator + device slices (linked into the Xcode
+# app) and rlib so other workspace crates can keep using the public
+# Rust API. We deliberately skip `cdylib`: macOS / iOS linkers prefer a
+# dylib over a staticlib when both sit in the library search path, and
+# the dylib would bake an absolute `target/.../libant_ffi.dylib` path
+# into the app's load commands — fine on the build host, dead on the
+# simulator. Desktop consumers that want dynamic loading can re-enable
+# it behind a feature flag when the proper mobile artefact (UniFFI)
+# lands.
+[lib]
+name = "ant_ffi"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+ant-control = { path = "../ant-control" }
+ant-crypto = { path = "../ant-crypto" }
+ant-node = { path = "../ant-node" }
+ant-p2p = { path = "../ant-p2p" }
+ant-retrieval = { path = "../ant-retrieval" }
+hex.workspace = true
+k256.workspace = true
+libp2p.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
