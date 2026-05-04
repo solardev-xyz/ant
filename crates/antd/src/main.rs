@@ -381,6 +381,7 @@ async fn main() -> Result<()> {
         opt.postage_contract.clone(),
         opt.postage_batch.clone(),
         opt.postage_owner_key.clone(),
+        data_dir.clone(),
     )
     .await
     .map_err(|e| anyhow!("upload runtime: {e}"))?;
@@ -620,15 +621,18 @@ fn load_or_create_identity(
 /// On success, fetches `batchOwner / batchDepth / batchBucketDepth /
 /// batchImmutableFlag` from the on-chain PostageStamp contract,
 /// cross-checks the configured signing key against the chain-recorded
-/// owner, and instantiates the local [`StampIssuer`] with bucket
-/// counters reset to zero. A future restart that wants to pick up
-/// stamps mid-batch will need crash-safe persistence (PLAN.md M3
-/// Phase 8); we deliberately don't fake it here.
+/// owner, and opens the persistent [`StampIssuer`] at
+/// `<data_dir>/postage/<batch_id>.bin`. The store is created on first
+/// boot and reloaded thereafter so a restart picks up stamps from
+/// where the previous process left off (M3 Phase 8 — without this, a
+/// restart would reissue indices the network already saw and bee
+/// peers would reject our stamps as double-spends).
 async fn build_upload_runtime(
     cli_rpc: Option<String>,
     postage_contract: String,
     cli_batch: Option<String>,
     cli_key: Option<String>,
+    data_dir: PathBuf,
 ) -> Result<Option<Arc<UploadRuntime>>> {
     let batch_hex = cli_batch
         .or_else(|| std::env::var("STORAGE_STAMP_BATCH_ID").ok())
@@ -674,13 +678,17 @@ async fn build_upload_runtime(
         ));
     }
 
-    let issuer = ant_postage::StampIssuer::new(
+    let postage_dir = data_dir.join("postage");
+    let store_path = postage_dir.join(format!("{}.bin", hex::encode(batch_id)));
+    let issuer = ant_postage::StampIssuer::open_or_new(
+        store_path.clone(),
         batch_id,
         meta.depth,
         meta.bucket_depth,
         meta.immutable,
     )
     .map_err(|e| anyhow!("StampIssuer: {e}"))?;
+    let resumed_count = issuer.issued_count();
     tracing::info!(
         target: "antd",
         batch = %format!("0x{}", hex::encode(batch_id)),
@@ -688,6 +696,8 @@ async fn build_upload_runtime(
         depth = meta.depth,
         bucket_depth = meta.bucket_depth,
         immutable = meta.immutable,
+        store = %store_path.display(),
+        resumed_indices = resumed_count,
         "uploads enabled (postage stamping ready)",
     );
 
