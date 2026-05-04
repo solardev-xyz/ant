@@ -42,6 +42,8 @@
 //! sustained reader would need to honor SWAP debits (M3 territory); we
 //! deliberately don't here.
 
+pub mod pushsync;
+
 pub mod accounting;
 pub mod cache;
 pub mod counters;
@@ -123,7 +125,7 @@ const RETRIEVE_TIMEOUT: Duration = Duration::from_secs(30);
 /// with at most a couple of small tracing headers (current default is
 /// none); 8 KiB is more than enough and matches our existing cap on the
 /// inbound hive/pricing sinks.
-const HEADERS_MAX: usize = 8 * 1024;
+pub(crate) const HEADERS_MAX: usize = 8 * 1024;
 /// Max bytes for a `retrieval.Delivery` message. The data field tops out
 /// at `ChunkSize + SpanSize = 4104`; the postage stamp adds another
 /// ~149 bytes (BatchID 32 + Index 8 + Timestamp 8 + Sig 65 + frame).
@@ -162,13 +164,13 @@ pub enum RetrievalError {
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
-struct PbHeaders {
+pub(crate) struct PbHeaders {
     #[prost(message, repeated, tag = "1")]
     headers: Vec<PbHeader>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
-struct PbHeader {
+pub(crate) struct PbHeader {
     #[prost(string, tag = "1")]
     key: String,
     #[prost(bytes = "vec", tag = "2")]
@@ -320,7 +322,7 @@ async fn retrieve_chunk_inner(
     })
 }
 
-async fn write_delimited<W, M>(w: &mut W, msg: &M) -> Result<(), RetrievalError>
+pub(crate) async fn write_delimited<W, M>(w: &mut W, msg: &M) -> Result<(), RetrievalError>
 where
     W: AsyncWriteExt + Unpin,
     M: Message,
@@ -332,7 +334,7 @@ where
     Ok(())
 }
 
-async fn read_delimited<M: Message + Default>(
+pub(crate) async fn read_delimited<M: Message + Default>(
     r: &mut (impl AsyncReadExt + Unpin),
     cap: usize,
 ) -> Result<M, RetrievalError> {
@@ -345,7 +347,7 @@ async fn read_delimited<M: Message + Default>(
     Ok(M::decode(buf.as_slice())?)
 }
 
-async fn read_varint_len<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<usize, RetrievalError> {
+pub(crate) async fn read_varint_len<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<usize, RetrievalError> {
     let mut byte = [0u8; 1];
     let mut acc: Vec<u8> = Vec::with_capacity(10);
     loop {

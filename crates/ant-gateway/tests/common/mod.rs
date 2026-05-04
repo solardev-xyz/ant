@@ -395,6 +395,31 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
                 message: "ok".to_string(),
             });
         }
+        ControlCommand::PushChunk { wire, ack } => {
+            // Mirror what `ant-p2p`'s `PushChunk` handler does: BMT-hash
+            // the wire bytes and reply with the resulting reference.
+            // Validation lives in the gateway itself; test fixtures
+            // never need to exercise the size-cap branch because that
+            // already short-circuits before the channel send.
+            let reply = if wire.len() < 8 || wire.len() > 8 + 4096 {
+                ControlAck::Error {
+                    message: format!("chunk wire size out of range: {} bytes", wire.len()),
+                }
+            } else {
+                let mut span = [0u8; 8];
+                span.copy_from_slice(&wire[..8]);
+                let payload = &wire[8..];
+                match ant_crypto::bmt::bmt_hash_with_span(&span, payload) {
+                    Some(addr) => ControlAck::ChunkUploaded {
+                        reference: format!("0x{}", hex::encode(addr)),
+                    },
+                    None => ControlAck::Error {
+                        message: "failed to BMT-hash chunk".into(),
+                    },
+                }
+            };
+            let _ = ack.send(reply);
+        }
     }
 }
 

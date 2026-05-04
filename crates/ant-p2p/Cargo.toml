@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 ant-control = { path = "../ant-control" }
 ant-crypto = { path = "../ant-crypto" }
+ant-postage = { path = "../ant-postage" }
 ant-retrieval = { path = "../ant-retrieval" }
 libp2p.workspace = true
 libp2p-stream = "0.4.0-alpha"

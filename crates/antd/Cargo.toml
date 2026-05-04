@@ -8,11 +8,13 @@ name = "antd"
 path = "src/main.rs"
 
 [dependencies]
+ant-chain = { path = "../ant-chain" }
 ant-control = { path = "../ant-control" }
 ant-crypto = { path = "../ant-crypto" }
 ant-gateway = { path = "../ant-gateway" }
 ant-node = { path = "../ant-node" }
 ant-p2p = { path = "../ant-p2p" }
+ant-postage = { path = "../ant-postage" }
 ant-retrieval = { path = "../ant-retrieval" }
 k256.workspace = true
 libp2p.workspace = true

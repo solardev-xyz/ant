@@ -740,3 +740,61 @@ async fn content_addressed_endpoints_emit_immutable_cache_control() {
         "/v0/manifest Cache-Control missing `immutable`: {cc:?}",
     );
 }
+
+/// `POST /chunks` round-trips a stamped CAC chunk via the
+/// `PushChunk` control command and returns bee-shaped
+/// `{"reference": "<lowercase 64-hex>"}` with `201 Created`.
+/// The fixture node responds with the BMT hash of the wire bytes
+/// (mirrors what `ant-p2p::handle_control_command` does locally
+/// before pushsync), so we can lock the wire shape without
+/// standing up libp2p.
+#[tokio::test]
+async fn post_chunks_returns_bee_shaped_reference() {
+    let payload: &[u8] = b"hello swarm";
+    let (addr, wire) = ant_crypto::bmt::cac_new(payload).expect("cac_new");
+
+    let router = handle_with_fixture_node();
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/chunks")
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(Body::from(wire))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert_eq!(
+        json["reference"].as_str().unwrap(),
+        hex::encode(addr),
+        "POST /chunks reference must be bare lowercase 64-hex (no 0x), bee-compatible",
+    );
+}
+
+/// Empty / over-sized bodies must be rejected with a 400 bee-shaped
+/// error before the upload path is even contacted, so a malicious
+/// caller can't burn a postage slot on a bogus chunk.
+#[tokio::test]
+async fn post_chunks_rejects_oversized_body() {
+    let router = handle_with_fixture_node();
+    let too_big = vec![0u8; 8 + 4097];
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/chunks")
+            .body(Body::from(too_big))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert_eq!(json["code"], 400);
+    assert!(
+        json["message"].as_str().unwrap().contains("out of range"),
+        "expected size error message, got {}",
+        json["message"],
+    );
+}

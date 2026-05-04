@@ -11,7 +11,7 @@ use axum::extract::Request;
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::{get, on, MethodFilter, MethodRouter};
+use axum::routing::{get, on, post, MethodFilter, MethodRouter};
 use axum::Router;
 use tracing::Instrument;
 
@@ -38,6 +38,7 @@ pub fn build(handle: GatewayHandle) -> Router {
         .route("/stamps", get(stubs::stamps))
         .route("/chequebook/address", get(stubs::chequebook_address))
         .route("/chequebook/balance", get(stubs::chequebook_balance))
+        .route("/chunks", post(retrieval::upload_chunk))
         .route("/chunks/{addr}", get_or_head(retrieval::chunk))
         .route("/bytes/{addr}", get_or_head(retrieval::bytes))
         // Ant-specific extension (not part of bee Tier-A): list paths in

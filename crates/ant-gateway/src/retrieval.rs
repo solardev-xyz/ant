@@ -189,6 +189,85 @@ pub async fn chunk(
     chunk_response(method, bytes)
 }
 
+/// `POST /chunks` — accept a single content-addressed chunk's wire
+/// bytes (`span(8 LE) || payload`), stamp it locally, and pushsync it
+/// to the closest neighbourhood peer. Body cap matches bee:
+/// `8 + 4096`. Returns bee-shaped `{"reference": "<lowercase 64-hex>"}`
+/// with status 201 on success.
+pub async fn upload_chunk(
+    State(handle): State<GatewayHandle>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if body.len() < 8 || body.len() > 8 + 4096 {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            format!("chunk wire size out of range: {} bytes", body.len()),
+        );
+    }
+
+    let timeout = request_timeout(&headers, CHUNK_REQUEST_TIMEOUT);
+
+    let guard = handle
+        .activity
+        .begin(GatewayRequestKind::Chunk, "upload".to_string());
+
+    let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
+    let cmd = ControlCommand::PushChunk {
+        wire: body.to_vec(),
+        ack: ack_tx,
+    };
+    if handle.commands.send(cmd).await.is_err() {
+        return node_unavailable();
+    }
+    guard.update(0, 1, 1, 0);
+
+    let ack = match tokio::time::timeout(timeout, ack_rx).await {
+        Ok(Ok(ack)) => ack,
+        Ok(Err(_)) => return node_unavailable(),
+        Err(_) => {
+            return json_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("upload timed out after {}s", timeout.as_secs()),
+            );
+        }
+    };
+
+    match ack {
+        ControlAck::ChunkUploaded { reference } => {
+            guard.update(1, 1, 0, body.len() as u64);
+            let stripped = reference
+                .strip_prefix("0x")
+                .or_else(|| reference.strip_prefix("0X"))
+                .unwrap_or(reference.as_str())
+                .to_string();
+            let mut resp = json_response(
+                StatusCode::CREATED,
+                &serde_json::json!({ "reference": stripped }),
+            );
+            set_immutable_cache_headers(&mut resp);
+            resp
+        }
+        ControlAck::Error { message } => {
+            // Bee mirrors not-stamped / out-of-batch failures with 4xx;
+            // map "uploads not configured" to 503 because the operator
+            // can fix it without a code change.
+            let status = if message.starts_with("uploads not configured") {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else if message.starts_with("chunk wire size") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            json_error(status, message)
+        }
+        other => {
+            warn!(target: "ant_gateway", ?other, "unexpected ack from PushChunk");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "unexpected node ack")
+        }
+    }
+}
+
 /// Trim a hex reference to its leading 8 chars (16 if the caller
 /// passed `0x` prefix) so the `antctl top` Retrieval tab column stays
 /// readable. Empty / invalid references just round-trip unchanged.

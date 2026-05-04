@@ -130,6 +130,10 @@ pub enum Response {
     Error {
         message: String,
     },
+    /// Bee `chunkAddressResponse` after `POST /chunks`.
+    ChunkUploaded {
+        reference: String,
+    },
 }
 
 /// One streaming progress sample for an in-flight `Get*` request.

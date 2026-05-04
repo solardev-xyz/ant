@@ -169,6 +169,11 @@ pub enum ControlCommand {
         head_only: bool,
         ack: mpsc::Sender<ControlAck>,
     },
+    /// Gateway `POST /chunks`: stamp locally (postage issuer) then pushsync.
+    PushChunk {
+        wire: Vec<u8>,
+        ack: oneshot::Sender<ControlAck>,
+    },
 }
 
 /// Inclusive byte range used by [`ControlCommand::StreamBytes`] and
@@ -221,6 +226,10 @@ pub enum ControlAck {
         data: Vec<u8>,
     },
     StreamDone,
+    /// Successful `PushChunk`; reference is lowercase `0x` + 64 nibbles (bee-compatible).
+    ChunkUploaded {
+        reference: String,
+    },
     Error {
         message: String,
     },
@@ -575,6 +584,7 @@ fn ack_to_response(ack: ControlAck) -> Response {
         ControlAck::StreamDone => Response::Ok {
             message: "stream complete".to_string(),
         },
+        ControlAck::ChunkUploaded { reference } => Response::ChunkUploaded { reference },
         ControlAck::Error { message } => Response::Error { message },
     }
 }

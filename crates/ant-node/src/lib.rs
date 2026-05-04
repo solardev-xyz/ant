@@ -2,7 +2,7 @@
 
 use ant_control::{ControlCommand, GatewayActivity, StatusSnapshot};
 use ant_crypto::{OVERLAY_NONCE_LEN, SECP256K1_SECRET_LEN};
-use ant_p2p::{run, RunConfig};
+use ant_p2p::{run, RunConfig, UploadRuntime};
 use libp2p::identity::Keypair;
 use libp2p::multiaddr::Multiaddr;
 use std::path::PathBuf;
@@ -64,6 +64,9 @@ pub struct NodeConfig {
     /// computed default in `<data-dir>/chunks.sqlite`); embedders can
     /// disable it by passing `None`.
     pub disk_cache: Option<Arc<ant_retrieval::DiskChunkCache>>,
+    /// Postage stamping + signing runtime for `POST /chunks`. `Some`
+    /// enables uploads; `None` returns "uploads not configured".
+    pub upload: Option<Arc<UploadRuntime>>,
 }
 
 impl NodeConfig {
@@ -88,6 +91,7 @@ impl NodeConfig {
             chunk_record_dir: None,
             gateway_activity: None,
             disk_cache: None,
+            upload: None,
         }
     }
 
@@ -135,6 +139,11 @@ impl NodeConfig {
         self.disk_cache = disk_cache;
         self
     }
+
+    pub fn with_upload(mut self, upload: Option<Arc<UploadRuntime>>) -> Self {
+        self.upload = upload;
+        self
+    }
 }
 
 /// Run the M1.0 node loop until the process is interrupted.
@@ -155,6 +164,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<(), NodeError> {
         chunk_record_dir: cfg.chunk_record_dir,
         gateway_activity: cfg.gateway_activity,
         disk_cache: cfg.disk_cache,
+        upload: cfg.upload,
     })
     .await?;
     Ok(())

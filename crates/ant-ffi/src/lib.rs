@@ -539,7 +539,8 @@ async fn attempt_download(
             | Ok(Some(ControlAck::BytesStreamStart { .. }))
             | Ok(Some(ControlAck::BzzStreamStart { .. }))
             | Ok(Some(ControlAck::BytesChunk { .. }))
-            | Ok(Some(ControlAck::StreamDone)) => continue,
+            | Ok(Some(ControlAck::StreamDone))
+            | Ok(Some(ControlAck::ChunkUploaded { .. })) => continue,
             Ok(None) => {
                 return Err(FfiError::Download(
                     "node dropped the ack channel without a terminal response".to_string(),

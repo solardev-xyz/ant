@@ -48,6 +48,18 @@ pub enum RunError {
     Behaviour(#[from] libp2p::BehaviourBuilderError),
 }
 
+/// Postage stamping + signing key wired at daemon startup for pushsync uploads.
+///
+/// `issuer` lives behind a `Mutex` because each chunk push needs to atomically
+/// pick the next slot in its collision bucket and increment the counter; bee
+/// `stampissuer.go::increment` does the same. `Arc` lets the runtime be cloned
+/// into per-`PushChunk` spawned tasks.
+pub struct UploadRuntime {
+    pub issuer: std::sync::Mutex<ant_postage::StampIssuer>,
+    pub stamp_key: [u8; SECP256K1_SECRET_LEN],
+    pub batch_owner: [u8; 20],
+}
+
 pub struct RunConfig {
     pub signing_secret: [u8; SECP256K1_SECRET_LEN],
     pub overlay_nonce: [u8; OVERLAY_NONCE_LEN],
@@ -108,6 +120,11 @@ pub struct RunConfig {
     /// `bypass_cache` skips both the memory and disk tiers; see
     /// `cache_for_request` for the wiring.
     pub disk_cache: Option<Arc<ant_retrieval::DiskChunkCache>>,
+    /// Optional postage stamping + signing runtime for `POST /chunks`
+    /// (gateway → control socket → swarm). `None` keeps the upload
+    /// command path disabled and `PushChunk` returns a clear "uploads
+    /// not configured" error instead of silently doing nothing.
+    pub upload: Option<Arc<UploadRuntime>>,
 }
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
@@ -888,7 +905,7 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
                 // live during gateway-only / fully-idle periods.
             }
             Some(cmd) = recv_command(commands.as_mut()) => {
-                handle_control_command(&mut state, &mut peerstore, &control, cmd);
+                handle_control_command(&mut state, &mut peerstore, &control, cfg.upload.clone(), cmd);
             }
             _ = &mut shutdown => {
                 info!(target: "ant_p2p", "shutdown signal; flushing peerstore");
@@ -919,6 +936,7 @@ fn handle_control_command(
     state: &mut SwarmState,
     peerstore: &mut PeerStore,
     control: &Control,
+    upload: Option<Arc<UploadRuntime>>,
     cmd: ControlCommand,
 ) {
     match cmd {
@@ -969,6 +987,74 @@ fn handle_control_command(
                             message: format!("retrieval from {peer}: {e}"),
                         }
                     }
+                };
+                let _ = ack.send(reply);
+            });
+        }
+        ControlCommand::PushChunk { wire, ack } => {
+            let Some(upload) = upload.clone() else {
+                let _ = ack.send(ControlAck::Error {
+                    message: "uploads not configured: pass --postage-batch and --wallet-key (or set the env vars) at startup".into(),
+                });
+                return;
+            };
+
+            // Validate wire bytes locally before paying for a stamp,
+            // so a malformed `POST /chunks` body is rejected up-front
+            // instead of burning a postage slot and then being told to
+            // retry by every neighbourhood peer.
+            if wire.len() < 8 || wire.len() > 8 + 4096 {
+                let _ = ack.send(ControlAck::Error {
+                    message: format!("chunk wire size out of range: {} bytes", wire.len()),
+                });
+                return;
+            }
+            let mut span = [0u8; 8];
+            span.copy_from_slice(&wire[..8]);
+            let payload = wire[8..].to_vec();
+            let Some(addr) = ant_crypto::bmt::bmt_hash_with_span(&span, &payload) else {
+                let _ = ack.send(ControlAck::Error {
+                    message: "failed to BMT-hash chunk".into(),
+                });
+                return;
+            };
+
+            // Stamp under the issuer mutex so concurrent pushes can't
+            // collide on the same bucket index — bee's `stampissuer`
+            // does exactly this.
+            let stamp = {
+                let mut issuer = match upload.issuer.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                match ant_postage::sign_stamp_bytes(&upload.stamp_key, &mut issuer, &addr) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = ack.send(ControlAck::Error {
+                            message: format!("stamp issue failed: {e}"),
+                        });
+                        return;
+                    }
+                }
+            };
+
+            let peers_rx = state.peers_watch.subscribe();
+            if peers_rx.borrow().is_empty() {
+                let _ = ack.send(ControlAck::Error {
+                    message: "no peers available; wait for handshakes to complete".into(),
+                });
+                return;
+            }
+            let control = control.clone();
+            tokio::spawn(async move {
+                let fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx);
+                let reply = match fetcher.push_stamped_cac(addr, wire, stamp).await {
+                    Ok(()) => ControlAck::ChunkUploaded {
+                        reference: format!("0x{}", hex::encode(addr)),
+                    },
+                    Err(e) => ControlAck::Error {
+                        message: format!("pushsync: {e}"),
+                    },
                 };
                 let _ = ack.send(reply);
             });

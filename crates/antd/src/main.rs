@@ -9,6 +9,7 @@ use ant_crypto::{
 };
 use ant_gateway::{Gateway, GatewayHandle, GatewayIdentity};
 use ant_node::{run_node, NodeConfig};
+use ant_p2p::UploadRuntime;
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use fs4::{FileExt, TryLockError};
@@ -138,6 +139,33 @@ struct Opt {
     /// or when you want every restart to start cold.
     #[arg(long, default_value_t = false)]
     no_disk_cache: bool,
+
+    /// Gnosis Chain JSON-RPC endpoint used to read the postage batch
+    /// metadata at startup (depth, bucket depth, immutability flag).
+    /// Falls back to `GNOSIS_RPC_URL` env var. Required when
+    /// `--postage-batch` is set.
+    #[arg(long)]
+    gnosis_rpc_url: Option<String>,
+
+    /// PostageStamp contract address (mainnet default keeps matching
+    /// upstream bee). Override only when running against a fork.
+    #[arg(long, default_value = "0x45a1502382541Cd610CC9068e88727426b696293")]
+    postage_contract: String,
+
+    /// 32-byte postage batch id (`0x` + 64 hex). Enables uploads
+    /// (`POST /chunks`, gateway `/bytes`) by binding stamps to this
+    /// batch on the chain. Falls back to `STORAGE_STAMP_BATCH_ID` env.
+    #[arg(long)]
+    postage_batch: Option<String>,
+
+    /// 32-byte secp256k1 secret of the batch owner (the address
+    /// returned by `batchOwner(batch_id)` on the PostageStamp
+    /// contract). Required to sign stamps. Falls back to
+    /// `STORAGE_STAMP_PRIVATE_KEY` env. The bee node mnemonic at
+    /// derivation path `m/44'/60'/0'/0/1` produces this key for the
+    /// default Ant test setup.
+    #[arg(long)]
+    postage_owner_key: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -348,6 +376,15 @@ async fn main() -> Result<()> {
     // a `Mutex<HashMap>` — well below a rounding error.
     let gateway_activity: Arc<GatewayActivity> = GatewayActivity::new();
 
+    let upload = build_upload_runtime(
+        opt.gnosis_rpc_url.clone(),
+        opt.postage_contract.clone(),
+        opt.postage_batch.clone(),
+        opt.postage_owner_key.clone(),
+    )
+    .await
+    .map_err(|e| anyhow!("upload runtime: {e}"))?;
+
     let node_fut = run_node(
         NodeConfig::mainnet_default(signing_secret, overlay_nonce, bootnodes, libp2p_keypair)
             .with_status(status_tx)
@@ -358,7 +395,8 @@ async fn main() -> Result<()> {
             .with_per_request_chunk_cache(opt.per_request_chunk_cache)
             .with_chunk_record_dir(chunk_record_dir)
             .with_gateway_activity(Some(gateway_activity.clone()))
-            .with_disk_cache(disk_cache),
+            .with_disk_cache(disk_cache)
+            .with_upload(upload),
     );
 
     let gateway_handle = if opt.no_http_api {
@@ -573,6 +611,95 @@ fn load_or_create_identity(
     let _ = std::fs::write(key_path, hex::encode(signing_secret));
 
     Ok((signing_secret, overlay_nonce, kp))
+}
+
+/// Build a [`UploadRuntime`] from CLI flags + env. Returns `Ok(None)`
+/// when the operator opts out of uploads (no `--postage-batch` /
+/// `STORAGE_STAMP_BATCH_ID`), so `antd` keeps booting in read-only mode.
+///
+/// On success, fetches `batchOwner / batchDepth / batchBucketDepth /
+/// batchImmutableFlag` from the on-chain PostageStamp contract,
+/// cross-checks the configured signing key against the chain-recorded
+/// owner, and instantiates the local [`StampIssuer`] with bucket
+/// counters reset to zero. A future restart that wants to pick up
+/// stamps mid-batch will need crash-safe persistence (PLAN.md M3
+/// Phase 8); we deliberately don't fake it here.
+async fn build_upload_runtime(
+    cli_rpc: Option<String>,
+    postage_contract: String,
+    cli_batch: Option<String>,
+    cli_key: Option<String>,
+) -> Result<Option<Arc<UploadRuntime>>> {
+    let batch_hex = cli_batch
+        .or_else(|| std::env::var("STORAGE_STAMP_BATCH_ID").ok())
+        .map(|s| s.trim().to_string());
+    let Some(batch_hex) = batch_hex.filter(|s| !s.is_empty()) else {
+        tracing::info!(
+            target: "antd",
+            "uploads disabled: pass --postage-batch (or set STORAGE_STAMP_BATCH_ID) to enable POST /chunks",
+        );
+        return Ok(None);
+    };
+    let key_hex = cli_key
+        .or_else(|| std::env::var("STORAGE_STAMP_PRIVATE_KEY").ok())
+        .ok_or_else(|| anyhow!("--postage-batch set but --postage-owner-key / STORAGE_STAMP_PRIVATE_KEY missing"))?;
+    let rpc_url = cli_rpc
+        .or_else(|| std::env::var("GNOSIS_RPC_URL").ok())
+        .ok_or_else(|| anyhow!("--postage-batch set but --gnosis-rpc-url / GNOSIS_RPC_URL missing"))?;
+
+    let mut batch_id = [0u8; 32];
+    hex::decode_to_slice(strip_0x(&batch_hex), &mut batch_id)
+        .with_context(|| format!("decode batch id {batch_hex}"))?;
+    let mut stamp_key = [0u8; SECP256K1_SECRET_LEN];
+    hex::decode_to_slice(strip_0x(&key_hex), &mut stamp_key)
+        .context("decode postage owner key")?;
+
+    let signer_eth = {
+        let sk =
+            SigningKey::from_bytes((&stamp_key).into()).context("postage owner key invalid")?;
+        ethereum_address_from_public_key(sk.verifying_key())
+    };
+
+    let chain = ant_chain::ChainClient::new(rpc_url);
+    let meta = ant_chain::fetch_postage_batch_meta(&chain, &postage_contract, &batch_id)
+        .await
+        .with_context(|| format!("fetch postage batch meta from {postage_contract}"))?;
+
+    if signer_eth != meta.batch_owner_eth {
+        return Err(anyhow!(
+            "postage owner key 0x{} does not match on-chain batchOwner 0x{} for batch {}",
+            hex::encode(signer_eth),
+            hex::encode(meta.batch_owner_eth),
+            batch_hex,
+        ));
+    }
+
+    let issuer = ant_postage::StampIssuer::new(
+        batch_id,
+        meta.depth,
+        meta.bucket_depth,
+        meta.immutable,
+    )
+    .map_err(|e| anyhow!("StampIssuer: {e}"))?;
+    tracing::info!(
+        target: "antd",
+        batch = %format!("0x{}", hex::encode(batch_id)),
+        owner = %format!("0x{}", hex::encode(meta.batch_owner_eth)),
+        depth = meta.depth,
+        bucket_depth = meta.bucket_depth,
+        immutable = meta.immutable,
+        "uploads enabled (postage stamping ready)",
+    );
+
+    Ok(Some(Arc::new(UploadRuntime {
+        issuer: std::sync::Mutex::new(issuer),
+        stamp_key,
+        batch_owner: meta.batch_owner_eth,
+    })))
+}
+
+fn strip_0x(s: &str) -> &str {
+    s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s)
 }
 
 fn secp256k1_keypair_from_signing_secret(secret: &[u8; SECP256K1_SECRET_LEN]) -> Result<Keypair> {

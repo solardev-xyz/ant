@@ -355,8 +355,72 @@ impl RoutingFetcher {
             .expect("blacklist mutex poisoned")
             .push(peer);
     }
-}
 
+    const MAX_PUSH_ERRORS: usize = 24;
+
+    /// Try pushsync against up to [`MAX_PUSH_ERRORS`] peers, closest-first.
+    ///
+    /// Does **not** mutate the retrieval blacklist; push uses its own
+    /// skip list because a peer that rejects a stamped write may still
+    /// serve retrieval traffic.
+    pub async fn push_stamped_cac(
+        &self,
+        chunk_addr: [u8; 32],
+        wire: Vec<u8>,
+        stamp: [u8; ant_postage::STAMP_SIZE],
+    ) -> Result<(), crate::pushsync::PushSyncError> {
+        use crate::pushsync::push_chunk_to_peer;
+        let mut control = self.control.clone();
+        let mut skipped = Vec::<PeerId>::new();
+        for _ in 0..Self::MAX_PUSH_ERRORS {
+            let live = self.peers_rx.borrow().clone();
+            let mut ranked: Vec<(PeerId, Overlay)> = live
+                .into_iter()
+                .filter(|(p, _)| !skipped.contains(p))
+                .collect();
+            ranked.sort_by(|(_, a), (_, b)| {
+                for i in 0..32 {
+                    let da = a[i] ^ chunk_addr[i];
+                    let db = b[i] ^ chunk_addr[i];
+                    match da.cmp(&db) {
+                        Ordering::Equal => continue,
+                        other => return other,
+                    }
+                }
+                Ordering::Equal
+            });
+            let Some((peer, _)) = ranked.first().copied() else {
+                return Err(crate::pushsync::PushSyncError::Remote(
+                    "no peers".into(),
+                ));
+            };
+
+            match push_chunk_to_peer(
+                &mut control,
+                peer,
+                chunk_addr,
+                wire.as_slice(),
+                &stamp,
+            )
+            .await
+            {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    warn!(
+                        target: "ant_retrieval::fetcher",
+                        %peer,
+                        err=%e,
+                        "pushsync attempt failed",
+                    );
+                    skipped.push(peer);
+                }
+            }
+        }
+        Err(crate::pushsync::PushSyncError::Remote(
+            "exhausted pushsync peers".into(),
+        ))
+    }
+}
 #[async_trait]
 impl ChunkFetcher for RoutingFetcher {
     async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
