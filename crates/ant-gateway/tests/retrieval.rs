@@ -798,3 +798,158 @@ async fn post_chunks_rejects_oversized_body() {
         json["message"],
     );
 }
+
+/// `POST /bzz?name=hello.txt` chunks the request body, builds a
+/// single-file mantaray, pushes every chunk via `PushChunk`, then
+/// returns a Bee-shaped 201 with the manifest root. Reusing the fake
+/// node loop's BMT-only PushChunk handler means we only assert
+/// reference shape + chunk count here; the production smoke test
+/// covers the live pushsync handshake.
+#[tokio::test]
+async fn post_bzz_single_file_returns_manifest_reference() {
+    let payload = b"uploaded via ant\n".to_vec();
+    let pushed_chunks = Arc::new(Mutex::new(Vec::<[u8; 32]>::new()));
+    let pushed = pushed_chunks.clone();
+    let router = router_with_dispatcher(move |cmd| {
+        let pushed = pushed.clone();
+        async move {
+            if let ControlCommand::PushChunk { wire, ack } = cmd {
+                let mut span = [0u8; 8];
+                span.copy_from_slice(&wire[..8]);
+                let payload = &wire[8..];
+                let addr = ant_crypto::bmt::bmt_hash_with_span(&span, payload).unwrap();
+                pushed.lock().await.push(addr);
+                let _ = ack.send(ControlAck::ChunkUploaded {
+                    reference: format!("0x{}", hex::encode(addr)),
+                });
+            }
+        }
+    });
+
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/bzz?name=hello.txt")
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(Body::from(payload.clone()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    let reference = json["reference"].as_str().unwrap().to_string();
+    assert_eq!(reference.len(), 64, "reference must be bare 64-hex");
+
+    // Single-file manifest = data leaf (1) + slash stub + file leaf + root = 4 chunks.
+    let pushed = pushed_chunks.lock().await;
+    assert_eq!(
+        pushed.len(),
+        4,
+        "expected 4 chunks (data + slash stub + file leaf + manifest root), got {}: {:?}",
+        pushed.len(),
+        pushed.iter().map(hex::encode).collect::<Vec<_>>(),
+    );
+    // The last chunk pushed isn't strictly the root (stream::buffer_unordered
+    // doesn't guarantee order), but the manifest root *must* be in the set.
+    let mut want = [0u8; 32];
+    hex::decode_to_slice(&reference, &mut want).unwrap();
+    assert!(
+        pushed.iter().any(|a| a == &want),
+        "manifest root {reference} not among pushed chunks",
+    );
+}
+
+/// `POST /bzz` with `swarm-collection: true` and a tar archive should
+/// produce a multi-file manifest. The returned reference must be
+/// retrievable as a manifest with each archive entry's path resolving
+/// to its own data ref. We don't have round-trip retrieval for the
+/// just-uploaded chunks here (the dispatcher only handles PushChunk),
+/// but we do verify the chunk count makes sense and the response
+/// shape is bee-compatible.
+#[tokio::test]
+async fn post_bzz_collection_uploads_tar_archive() {
+    // Build a tiny tar archive with two files.
+    let mut tar_bytes = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_bytes);
+        for (path, body) in [
+            ("index.html", &b"<h1>hi</h1>"[..]),
+            ("style.css", &b"body{color:red}"[..]),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(path).unwrap();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, body).unwrap();
+        }
+        builder.finish().unwrap();
+    }
+
+    let pushed_chunks = Arc::new(Mutex::new(Vec::<[u8; 32]>::new()));
+    let pushed = pushed_chunks.clone();
+    let router = router_with_dispatcher(move |cmd| {
+        let pushed = pushed.clone();
+        async move {
+            if let ControlCommand::PushChunk { wire, ack } = cmd {
+                let mut span = [0u8; 8];
+                span.copy_from_slice(&wire[..8]);
+                let payload = &wire[8..];
+                let addr = ant_crypto::bmt::bmt_hash_with_span(&span, payload).unwrap();
+                pushed.lock().await.push(addr);
+                let _ = ack.send(ControlAck::ChunkUploaded {
+                    reference: format!("0x{}", hex::encode(addr)),
+                });
+            }
+        }
+    });
+
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/bzz")
+            .header("swarm-collection", "true")
+            .body(Body::from(tar_bytes))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    let reference = json["reference"].as_str().unwrap().to_string();
+    assert_eq!(reference.len(), 64);
+
+    // 2 file data chunks (each ≤ CHUNK_SIZE = 1 leaf each) + 2 manifest
+    // file leaves + slash stub for index-doc + root = 6 chunks.
+    let pushed = pushed_chunks.lock().await;
+    assert!(
+        pushed.len() >= 5,
+        "expected ≥5 chunks for 2-file collection, got {}",
+        pushed.len(),
+    );
+    let mut want = [0u8; 32];
+    hex::decode_to_slice(&reference, &mut want).unwrap();
+    assert!(
+        pushed.iter().any(|a| a == &want),
+        "collection manifest root {reference} not among pushed chunks",
+    );
+}
+
+/// Oversized body must be rejected with 413 before chunking begins.
+#[tokio::test]
+async fn post_bzz_rejects_oversized_body() {
+    let router = handle_with_fixture_node();
+    // GATEWAY_MAX_UPLOAD_BYTES is 64 MiB; build something just over.
+    let too_big = vec![0u8; 64 * 1024 * 1024 + 1];
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/bzz")
+            .body(Body::from(too_big))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}

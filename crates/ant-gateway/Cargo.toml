@@ -18,6 +18,11 @@ async-trait.workspace = true
 hex.workspace = true
 bytes = "1.11.1"
 futures = "0.3.31"
+# Tar reader for `POST /bzz` collection uploads. Pure-Rust, no compression
+# support; we only need to enumerate (header, body) pairs from an
+# uncompressed archive (`tar -cf out.tar dir/`). Bee accepts the same
+# format on its own /bzz collection endpoint.
+tar = "0.4.45"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

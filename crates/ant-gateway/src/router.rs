@@ -40,6 +40,7 @@ pub fn build(handle: GatewayHandle) -> Router {
         .route("/chequebook/balance", get(stubs::chequebook_balance))
         .route("/chunks", post(retrieval::upload_chunk))
         .route("/chunks/{addr}", get_or_head(retrieval::chunk))
+        .route("/bzz", post(retrieval::upload_bzz))
         .route("/bytes/{addr}", get_or_head(retrieval::bytes))
         // Ant-specific extension (not part of bee Tier-A): list paths in
         // a mantaray manifest. Namespaced under `/v0/` so the bee compat

@@ -51,8 +51,10 @@ pub mod disk_cache;
 pub mod feed;
 pub mod fetcher;
 pub mod joiner;
+pub mod manifest_writer;
 pub mod mantaray;
 pub mod progress;
+pub mod splitter;
 
 pub use accounting::{Accounting, DebitGuard, HotHint, OVERDRAFT_REFRESH};
 pub use cache::{InMemoryChunkCache, DEFAULT_CAPACITY as DEFAULT_CACHE_CAPACITY};
@@ -67,11 +69,16 @@ pub use joiner::{
     join, join_to_sender, join_to_sender_range, join_with_options, ByteRange, JoinError,
     JoinOptions, DEFAULT_MAX_FILE_BYTES,
 };
+pub use manifest_writer::{
+    build_collection_manifest, build_single_file_manifest, ManifestFile, ManifestWriteResult,
+    MAX_FILENAME_BYTES,
+};
 pub use mantaray::{
     list_manifest, lookup_path, resolve_feed_root, LookupResult, ManifestEntry, ManifestError,
     MANTARAY_CONTENT_TYPE_KEY, MANTARAY_ERROR_DOC_KEY, MANTARAY_INDEX_DOC_KEY,
 };
 pub use progress::{estimate_total_chunks, ProgressSample, ProgressTracker};
+pub use splitter::{split_bytes, SplitChunk, SplitResult, BRANCHES};
 
 use ant_crypto::{cac_valid, soc_valid, CHUNK_SIZE, SOC_HEADER_SIZE, SPAN_SIZE};
 use async_trait::async_trait;

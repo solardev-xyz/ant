@@ -39,15 +39,19 @@ use std::time::Duration;
 use ant_control::{
     ActiveRequestGuard, ControlAck, ControlCommand, GatewayRequestKind, StreamRange,
 };
+use ant_retrieval::{
+    build_collection_manifest, build_single_file_manifest, split_bytes, ManifestFile, SplitChunk,
+};
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use bytes::Bytes;
 use futures::stream;
+use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::error::json_error;
 use crate::handle::GatewayHandle;
@@ -58,6 +62,29 @@ use crate::handle::GatewayHandle;
 /// channel is deferred (PLAN.md D.2.3 explicitly allows this scope).
 const SWARM_CHUNK_RETRIEVAL_TIMEOUT: HeaderName =
     HeaderName::from_static("swarm-chunk-retrieval-timeout");
+/// Bee request header: when `true`, treat the body as a tar archive and
+/// build a multi-file manifest. Default `false` (single-file upload).
+const SWARM_COLLECTION: HeaderName = HeaderName::from_static("swarm-collection");
+/// Bee request header: name of the manifest entry that should resolve
+/// when the user requests `bzz://<root>/` (no path). Mirrored on the
+/// root manifest's `/` fork as `website-index-document` metadata.
+const SWARM_INDEX_DOCUMENT: HeaderName = HeaderName::from_static("swarm-index-document");
+
+/// Concurrency cap on outbound `PushChunk` commands during a `POST /bzz`
+/// upload. Each command opens (potentially) one libp2p stream into the
+/// chunk's neighbourhood; a 1 K-chunk file at unbounded fan-out would
+/// queue 1 K simultaneous streams against the same daemon and starve
+/// other handlers. 32 matches the daemon's `RETRIEVAL_INFLIGHT_CAP` so
+/// retrieval and pushsync share roughly the same worst-case fan-out.
+const MAX_PUSH_CONCURRENCY: usize = 32;
+
+/// Hard cap on a single `POST /bzz` request body. Sized to comfortably
+/// hold a small website or media payload while keeping the in-memory
+/// buffering of the body and split chunks bounded — the gateway holds
+/// the entire upload + every assembled chunk in memory until pushsync
+/// finishes. 64 MiB covers a typical photo album or short audio file
+/// without letting one bad client tip the daemon over.
+pub(crate) const GATEWAY_MAX_UPLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
 /// `Cache-Control` value emitted on every content-addressed response
 /// (`/chunks`, `/bytes`, `/bzz`, `/v0/manifest`). All four endpoints
@@ -266,6 +293,360 @@ pub async fn upload_chunk(
             json_error(StatusCode::INTERNAL_SERVER_ERROR, "unexpected node ack")
         }
     }
+}
+
+/// `POST /bzz` — single-file or collection upload. Bee-shaped: the
+/// gateway splits the body into a chunk tree (4 KiB leaves +
+/// intermediate join chunks), wraps it in a Mantaray manifest with
+/// the right per-file metadata, then pushes every chunk to the
+/// network's pushsync neighbourhood. Returns
+/// `{"reference":"<root manifest hash>"}` with status 201.
+///
+/// Body interpretation depends on the `swarm-collection` request
+/// header (Bee compat) — defaults to `false`:
+///
+/// - `swarm-collection: false`: the body is one file. The filename
+///   comes from the `?name=` query parameter (bee uses the same
+///   knob); if absent, the manifest entry is `index.html`. The MIME
+///   type comes from the `Content-Type` request header (default
+///   `application/octet-stream`).
+/// - `swarm-collection: true`: the body is an uncompressed tar
+///   archive. Each regular file becomes a manifest entry under its
+///   archive path. `swarm-index-document` selects the file that
+///   `bzz://<root>/` resolves to (default: `index.html` if present).
+///
+/// Cap: [`GATEWAY_MAX_UPLOAD_BYTES`] on the overall body. The
+/// manifest itself today has to fit in one CAC chunk (≤ ~30 entries
+/// with average filename length); collections that exceed that
+/// return 413 with a message pointing at the future multi-chunk
+/// manifest work.
+pub async fn upload_bzz(
+    State(handle): State<GatewayHandle>,
+    Query(query): Query<UploadBzzQuery>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if body.len() as u64 > GATEWAY_MAX_UPLOAD_BYTES {
+        return json_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "request body {} bytes exceeds upload cap {} bytes",
+                body.len(),
+                GATEWAY_MAX_UPLOAD_BYTES
+            ),
+        );
+    }
+
+    let collection = headers
+        .get(SWARM_COLLECTION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false);
+
+    let timeout = request_timeout(&headers, DEFAULT_REQUEST_TIMEOUT);
+
+    let activity_label = match (collection, query.name()) {
+        (true, _) => "upload-bzz-collection".to_string(),
+        (false, Some(name)) => format!("upload-bzz {name}"),
+        (false, None) => "upload-bzz".to_string(),
+    };
+    let guard = handle
+        .activity
+        .begin(GatewayRequestKind::Bzz, activity_label);
+
+    let assembled = match assemble_bzz(&query, &headers, &body, collection) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let total_chunks = assembled.chunks.len();
+    debug!(
+        target: "ant_gateway",
+        collection,
+        body_len = body.len(),
+        chunks = total_chunks,
+        manifest_root = %hex::encode(assembled.root),
+        "bzz upload assembled"
+    );
+    guard.update(0, total_chunks as u64, total_chunks as u32, 0);
+
+    if let Err(err_resp) = push_chunks(&handle, &assembled.chunks, timeout, &guard).await {
+        return err_resp;
+    }
+
+    let reference_hex = hex::encode(assembled.root);
+    let mut resp = json_response(
+        StatusCode::CREATED,
+        &serde_json::json!({ "reference": reference_hex }),
+    );
+    set_immutable_cache_headers(&mut resp);
+    resp
+}
+
+/// Plan: address of the manifest root + every chunk that has to be
+/// pushed for the upload to be retrievable (data leaves +
+/// intermediate join chunks + manifest chunks).
+struct AssembledUpload {
+    root: [u8; 32],
+    chunks: Vec<SplitChunk>,
+}
+
+#[allow(clippy::result_large_err)]
+fn assemble_bzz(
+    query: &UploadBzzQuery,
+    headers: &HeaderMap,
+    body: &Bytes,
+    collection: bool,
+) -> Result<AssembledUpload, Response> {
+    if collection {
+        let index_doc = headers
+            .get(SWARM_INDEX_DOCUMENT)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().trim_start_matches('/').to_string())
+            .filter(|s| !s.is_empty());
+        assemble_collection(body, index_doc.as_deref())
+    } else {
+        let filename = query
+            .name()
+            .map(|s| s.trim().trim_start_matches('/').to_string())
+            .or_else(|| {
+                headers
+                    .get(SWARM_INDEX_DOCUMENT)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.trim().trim_start_matches('/').to_string())
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "index.html".to_string());
+
+        let content_type = headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && s != "application/octet-stream");
+
+        assemble_single_file(body, &filename, content_type.as_deref())
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn assemble_single_file(
+    body: &Bytes,
+    filename: &str,
+    content_type: Option<&str>,
+) -> Result<AssembledUpload, Response> {
+    let split = split_bytes(body);
+    let manifest = match build_single_file_manifest(filename, content_type, split.root) {
+        Ok(m) => m,
+        Err(e) => return Err(map_manifest_error(e)),
+    };
+    let mut chunks = split.chunks;
+    chunks.extend(manifest.chunks);
+    Ok(AssembledUpload {
+        root: manifest.root,
+        chunks,
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn assemble_collection(
+    body: &Bytes,
+    index_doc: Option<&str>,
+) -> Result<AssembledUpload, Response> {
+    let mut archive = tar::Archive::new(std::io::Cursor::new(body.as_ref()));
+    let mut files: Vec<ManifestFile> = Vec::new();
+    let mut data_chunks: Vec<SplitChunk> = Vec::new();
+
+    let entries = match archive.entries() {
+        Ok(e) => e,
+        Err(e) => {
+            return Err(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("invalid tar archive: {e}"),
+            ));
+        }
+    };
+    for entry in entries {
+        let mut entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                return Err(json_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("malformed tar entry: {e}"),
+                ));
+            }
+        };
+        // Only regular files become manifest entries. Directories,
+        // symlinks, hardlinks, longlink/longname pax extensions etc. are
+        // silently skipped — bee's collection upload does the same.
+        if entry.header().entry_type() != tar::EntryType::Regular {
+            continue;
+        }
+        let path_owned = match entry.path() {
+            Ok(p) => p.to_path_buf(),
+            Err(e) => {
+                return Err(json_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("tar entry has bad path: {e}"),
+                ));
+            }
+        };
+        let path_str = match path_owned.to_str() {
+            Some(s) => s.trim_start_matches("./").trim_start_matches('/').to_string(),
+            None => {
+                return Err(json_error(
+                    StatusCode::BAD_REQUEST,
+                    "tar entry path is not valid UTF-8",
+                ));
+            }
+        };
+        if path_str.is_empty() {
+            continue;
+        }
+
+        let mut buf = Vec::with_capacity(entry.header().size().unwrap_or(0) as usize);
+        if let Err(e) = std::io::Read::read_to_end(&mut entry, &mut buf) {
+            return Err(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("tar entry {path_str}: read failed: {e}"),
+            ));
+        }
+        let split = split_bytes(&buf);
+        data_chunks.extend(split.chunks);
+        let ct = content_type_from_extension(&path_str).map(|s| s.to_string());
+        files.push(ManifestFile {
+            path: path_str,
+            content_type: ct,
+            data_ref: split.root,
+        });
+    }
+    if files.is_empty() {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "tar archive contains no regular files",
+        ));
+    }
+
+    // Default index doc: `index.html` if it's present and the caller
+    // didn't override. Bee's `Bee.UploadCollection` uses the same heuristic.
+    let resolved_index = index_doc
+        .map(str::to_string)
+        .or_else(|| {
+            files
+                .iter()
+                .find(|f| f.path == "index.html")
+                .map(|f| f.path.clone())
+        });
+    let manifest = match build_collection_manifest(&files, resolved_index.as_deref()) {
+        Ok(m) => m,
+        Err(e) => return Err(map_manifest_error(e)),
+    };
+
+    let mut chunks = data_chunks;
+    chunks.extend(manifest.chunks);
+    Ok(AssembledUpload {
+        root: manifest.root,
+        chunks,
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn map_manifest_error(e: ant_retrieval::manifest_writer::ManifestWriteError) -> Response {
+    use ant_retrieval::manifest_writer::ManifestWriteError;
+    match e {
+        ManifestWriteError::SegmentTooLong { .. } | ManifestWriteError::EmptyPath => {
+            json_error(StatusCode::BAD_REQUEST, e.to_string())
+        }
+        ManifestWriteError::ManifestTooBig { .. } => {
+            json_error(StatusCode::PAYLOAD_TOO_LARGE, e.to_string())
+        }
+    }
+}
+
+/// Push `chunks` to the network in parallel via `PushChunk` control
+/// commands. Bounded by `MAX_PUSH_CONCURRENCY` so a 1 K-chunk file
+/// doesn't open 1 K simultaneous outbound libp2p streams. Returns an
+/// HTTP error response on the first chunk that fails to push.
+#[allow(clippy::result_large_err)]
+async fn push_chunks(
+    handle: &GatewayHandle,
+    chunks: &[SplitChunk],
+    timeout: std::time::Duration,
+    guard: &ActiveRequestGuard,
+) -> Result<(), Response> {
+    let total = chunks.len() as u64;
+    let pushed = std::sync::atomic::AtomicU64::new(0);
+    let bytes_done = std::sync::atomic::AtomicU64::new(0);
+    let push_one = |chunk: SplitChunk| {
+        let handle = handle.clone();
+        let pushed = &pushed;
+        let bytes_done = &bytes_done;
+        async move {
+            let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
+            let cmd = ControlCommand::PushChunk {
+                wire: chunk.wire.clone(),
+                ack: ack_tx,
+            };
+            if handle.commands.send(cmd).await.is_err() {
+                return Err(node_unavailable());
+            }
+            match tokio::time::timeout(timeout, ack_rx).await {
+                Ok(Ok(ControlAck::ChunkUploaded { reference })) => {
+                    let stripped = reference
+                        .strip_prefix("0x")
+                        .or_else(|| reference.strip_prefix("0X"))
+                        .unwrap_or(reference.as_str())
+                        .to_string();
+                    let want = hex::encode(chunk.address);
+                    if stripped != want {
+                        return Err(json_error(
+                            StatusCode::BAD_GATEWAY,
+                            format!(
+                                "node reference {stripped} != local {want} (BMT mismatch)"
+                            ),
+                        ));
+                    }
+                    pushed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    bytes_done.fetch_add(
+                        chunk.wire.len() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    Ok(())
+                }
+                Ok(Ok(ControlAck::Error { message })) => {
+                    let status = if message.starts_with("uploads not configured") {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        StatusCode::BAD_GATEWAY
+                    };
+                    Err(json_error(status, format!("push chunk failed: {message}")))
+                }
+                Ok(Ok(other)) => {
+                    warn!(target: "ant_gateway", ?other, "unexpected ack from PushChunk");
+                    Err(json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "unexpected node ack",
+                    ))
+                }
+                Ok(Err(_)) => Err(node_unavailable()),
+                Err(_) => Err(json_error(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    format!("upload timed out after {}s", timeout.as_secs()),
+                )),
+            }
+        }
+    };
+
+    let mut stream = stream::iter(chunks.iter().cloned())
+        .map(push_one)
+        .buffer_unordered(MAX_PUSH_CONCURRENCY);
+
+    while let Some(result) = stream.next().await {
+        result?;
+        let p = pushed.load(std::sync::atomic::Ordering::Relaxed);
+        let b = bytes_done.load(std::sync::atomic::Ordering::Relaxed);
+        let in_flight = (total - p).min(u32::MAX as u64) as u32;
+        guard.update(p, total, in_flight, b);
+    }
+    Ok(())
 }
 
 /// Trim a hex reference to its leading 8 chars (16 if the caller
@@ -638,6 +1019,24 @@ pub(crate) struct BytesQuery {
 impl BytesQuery {
     fn filename(&self) -> Option<&str> {
         self.filename
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+}
+
+/// `?name=<filename>` for `POST /bzz` single-file mode. Bee accepts the
+/// same query parameter on its `/bzz` upload endpoint to override the
+/// manifest entry name without requiring a multipart body.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct UploadBzzQuery {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+impl UploadBzzQuery {
+    fn name(&self) -> Option<&str> {
+        self.name
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
