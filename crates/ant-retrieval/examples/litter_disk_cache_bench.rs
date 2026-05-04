@@ -84,7 +84,7 @@ async fn main() {
     let addr_only: Vec<[u8; 32]> = addrs.iter().map(|(a, _)| *a).collect();
     drop(addrs);
 
-    for k in [1usize, 4, 8, 16, 32] {
+    for k in [1usize, 2, 4, 8, 16, 32, 64] {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let hits = Arc::new(AtomicU64::new(0));
         let mut tasks = Vec::with_capacity(k);

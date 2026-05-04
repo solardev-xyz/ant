@@ -399,6 +399,42 @@ Async integration rule: never run blocking SQLite calls directly on Tokio retrie
 
 One-file-per-chunk storage remains a fallback, not the default. Only switch to it if measured SQLite BLOB overhead or write amplification becomes the bottleneck at the configured scale; even then SQLite should keep ownership of the metadata and eviction index.
 
+### 6.2 Disk cache throughput vs bee (litter-ally.eth harness)
+
+Head-to-head microbenchmarks isolate the **persistent disk chunk path** only: real files from a **litter-ally.eth** asset tree (images, CSS, WAV masters) chunked into bee-style CAC segments (≤4 KiB payload), written with batched commits, then loaded under configurable concurrency. They do **not** include HTTP, libp2p, or joiner overhead — they answer how fast the backing store serves random chunk lookups once data is on disk.
+
+**Dataset (example checkout under `LITTER_BENCH_DIR`, default `/tmp/litter_bench`):** 8 files, ~215 MiB of chunk wire bytes, **54_946** CAC chunks.
+
+**Ant:** `crates/ant-retrieval/examples/litter_disk_cache_bench.rs` — [`DiskChunkCache`](crates/ant-retrieval/src/disk_cache.rs) in SQLite, populate via `put_batch` with **8192** chunks per transaction, read phase uses **K** concurrent Tokio tasks each hot-looping `get(addr)` for 3 s. Run:  
+`cargo build --release --example litter_disk_cache_bench -p ant-retrieval` then `target/release/examples/litter_disk_cache_bench`.
+
+**Bee:** `scripts/bee_sharky_litter_bench/main.go` is copied into a bee **v2.7.1** tree as `pkg/storer/cmd/litterbench` — same file walk and CAC chunking, populate via `transaction.Storage.Run` batches of **8192** `Put`s (Sharky blob layer + LevelDB retrieval index), read phase **K** goroutines calling `ChunkStore.Get` for 3 s. Helper: `scripts/run_bee_sharky_litter_bench.sh` (clone/patch), full comparison: `scripts/compare_litter_disk_cache.sh` (keeps the Go source in sync with the repo copy before `go run`).
+
+**Findings (two full runs on the same machine; absolute ops/s vary run-to-run, ordering is stable):**
+
+- **Cold populate:** bee remains **~2× faster** (~2.3–2.4 s vs ~4–7 s). Ant’s SQLite fill cost is sensitive to I/O scheduling; bee’s LevelDB + Sharky batch path is cheaper for this workload.
+- **Sustained reads:** bee wins at **low K**; ant overtakes as **K** grows.
+
+| K (parallel readers) | Typical winner | Comment |
+|---|---|---|
+| 1, 2, 4 | **bee** | ~1.5–3× higher ops/s; single-threaded store access favours bee’s in-process path |
+| 8 | **ant** | Crossover band; ant’s read pool amortises per-request overhead |
+| 16, 32, 64 | **ant** | ant scales up; bee throughput **plateaus** (~125–155k ops/s on this host) while ant reaches **~320–460k ops/s** at K=16–64 |
+
+Approximate **second run** snapshot (ops/s, same dataset):
+
+| K | bee | ant |
+|---|-----|-----|
+| 1 | ~51k | ~16k |
+| 2 | ~116k | ~41k |
+| 4 | ~152k | ~101k |
+| 8 | ~132k | ~182k |
+| 16 | ~126k | ~319k |
+| 32 | ~130k | ~425k |
+| 64 | ~137k | ~463k |
+
+**Interpretation:** gateway-scale streaming often issues **many concurrent chunk reads**; this harness suggests the SQLite-backed disk tier can **out-run bee’s chunkstore** once concurrency is high enough, at the cost of **slower cold fill** and **weaker single-threaded read latency**. Production behaviour still depends on the full stack (LRU, fetcher hedging, SQLite pragmas, and filesystem).
+
 ---
 
 ## 7. Public API (FFI Surface)

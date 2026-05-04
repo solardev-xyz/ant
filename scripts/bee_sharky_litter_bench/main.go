@@ -178,7 +178,7 @@ func main() {
 	avgData := float64(dataBytes) / float64(n)
 	var sink atomic.Uint64
 
-	for _, k := range []int{1, 4, 8, 16, 32} {
+	for _, k := range []int{1, 2, 4, 8, 16, 32, 64} {
 		var stop atomic.Bool
 		var ops atomic.Uint64
 		start := time.Now()

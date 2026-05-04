@@ -20,10 +20,13 @@ echo "=== ant (DiskChunkCache) ==="
 echo
 echo "=== bee (chunkstore) ==="
 BEE_SRC="${BEE_SRC:-/tmp/bee}"
-if [[ ! -f "${BEE_SRC}/pkg/storer/cmd/litterbench/main.go" ]]; then
-	echo "run scripts/run_bee_sharky_litter_bench.sh once to install litterbench into bee tree" >&2
+BENCH_GO="${ROOT}/scripts/bee_sharky_litter_bench/main.go"
+if [[ ! -f "${BEE_SRC}/go.mod" ]]; then
+	echo "run scripts/run_bee_sharky_litter_bench.sh once to clone bee into ${BEE_SRC}" >&2
 	exit 1
 fi
+mkdir -p "${BEE_SRC}/pkg/storer/cmd/litterbench"
+cp "${BENCH_GO}" "${BEE_SRC}/pkg/storer/cmd/litterbench/main.go"
 if ! command -v go >/dev/null 2>&1; then
 	echo "go not on PATH" >&2
 	exit 1
