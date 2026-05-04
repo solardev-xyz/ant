@@ -816,6 +816,73 @@ In-repo from day one, not a separate repo: while the FFI is churning, every brea
 
 The proper M2 Phase 4 deliverable is still a UniFFI-based `.xcframework` that meets the size budget in §12, the FFI shape in §7, OSLog + lifecycle wiring per §8.4 / §11, and Keychain key storage per §5.10. The smoke test exists to prove the *transport* (Rust + libp2p inside iOS dialing mainnet) works end-to-end; it explicitly does not stand in for that artifact and is expected to be deleted when Phase 4 lands.
 
+### iOS `bzz://` browser — architecture note
+
+Non-committed design note captured while building the § 9 smoke test. Records how a native iOS browser can serve `bzz://` links straight from libant **without** a localhost HTTP gateway, so we don't re-derive this from scratch when Phase 4 closes. Not a milestone, not on the critical path — here so the option stays visible.
+
+#### Why this is feasible at all
+
+Because `ant-ffi` is **statically linked into the app process**, there is no IPC hop between the Swift side and the retrieval pipeline. That same property makes it straightforward to wire a `WKWebView` directly to libant through `WKURLSchemeHandler`: the scheme handler runs in-process, already holds an `AntHandle`, and fulfils each `WKURLSchemeTask` by calling the FFI's download / stream APIs. No embedded HTTP server, no TCP listener, no `http://localhost:<port>` proxy, no ATS exemption for loopback traffic.
+
+The two OS-level knobs that make this work are already within reach:
+
+1. **`CFBundleURLTypes`** in `Info.plist` registers `bzz` as a scheme the app handles, so a tap on `bzz://…` from Mail / iMessage / other apps opens your browser via `UIApplication.open`.
+2. **`WKURLSchemeHandler`** (iOS 11+) intercepts `bzz://` loads *inside* the web view and answers them from your code. WebKit can't be taught to recognise a new scheme for built-in ones (`http`, `https`, `file`, …) but `bzz` is unconstrained.
+
+#### Request flow
+
+```
+Mail / iMessage / Safari                          Browser app
+      │ tap bzz://<root>/page                           │
+      └── UIApplication.open(URL) ─────────────────────▶│
+                                               ┌────────┴──────────┐
+                                               │  BrowserVC        │
+                                               │   WKWebView       │
+                                               │    │ bzz://<root>/page
+                                               │    ▼              │
+                                               │  BzzSchemeHandler │
+                                               │    │ ant_download_stream(…)
+                                               │    ▼              │
+                                               │  libant_ffi       │── libp2p → Swarm
+                                               └───────────────────┘
+                                                (all in-process)
+```
+
+Sub-resources (`<img>`, `<link>`, `<script>`, `fetch()`) re-enter the same handler as further `bzz://<root>/…` requests. They share the node's chunk cache, so repeat loads don't re-hit the network.
+
+#### What already works with the current FFI
+
+The § 9 FFI surface (`ant_init` / `ant_download` / `ant_peer_count` / `ant_download_progress` / `ant_cancel_download` / `ant_shutdown`) is enough to serve **static bzz:// sites end-to-end**: HTML + CSS + JS + images resolved through the mantaray walker, same-origin policy honoured per `bzz://<root>` pair, user cancel mapped onto `WKURLSchemeTask.stop()`. The smoke test already exercises every primitive this path needs; wiring the scheme handler on top is ~80 lines of Swift.
+
+#### Gaps that must be filled before shipping a real browser
+
+The node already supports all of these via `ControlCommand::{StreamBytes, StreamBzz}` and the `BzzStreamStart` / `BzzChunk` / `StreamDone` acks (§ C.4, Appendix E). The smoke-test FFI collapses them into a single blocking call; a browser-grade FFI needs to expose the streaming shape:
+
+| Missing FFI | Browser need | Node support |
+|---|---|---|
+| Streaming body (`ant_download_stream` → `pull` events for `Start(content_type, total_bytes)`, `Chunk(data)`, `Done`) | Video / audio playback, progressive HTML rendering, large downloads | Yes (`StreamBzz`) |
+| HTTP `Range` forwarding | Video seeking, partial loads | Yes (`range` on stream commands) |
+| HEAD requests | Some content-type sniffers preflight | Yes (`head_only`) |
+| Content-type + filename surfaced across FFI | `WKURLSchemeTask.didReceive(response)` needs a correct `URLResponse` | Yes (`BzzStreamStart { content_type, filename, total_bytes }`) |
+
+Estimated surface growth: ~3-4 new entry points on `ant.h`, ~200 lines in `ant-ffi/src/lib.rs`. This is the natural direction for the M2 Phase 4 UniFFI crate (§ 7) anyway — a browser would consume a superset of the read-only API already budgeted.
+
+#### iOS-specific caveats to design for
+
+- **Mobile Safari cannot render `bzz://` content.** `CFBundleURLTypes` only causes Safari to *hand off* to the registered app; WebKit inside Safari does not gain a new scheme handler. The browser has to ship as its own app.
+- **Secure-context gating.** WebKit treats `bzz://` as non-secure by default, so `navigator.mediaDevices`, Service Workers, `SubtleCrypto.importKey` with `extractable: false` on some paths, and similar "secure context only" Web APIs will be denied. Apple exposes `WKWebpagePreferences.preferredHTTPSFirstPolicy` and the unofficial `WKPreferences.secureContextForCustomSchemes` route — needs validation against a current iOS release before we promise it works.
+- **CORS between `bzz://` and `https://`.** bzz:// pages that fetch `https://` resources will be blocked by default cross-origin policy unless the remote server sends permissive CORS headers. Site authors who fully self-host on bzz:// don't hit this; mixed sites do.
+- **No TLS identity.** Inherent to content addressing — each root `bzz://<hex>` *is* its own origin. Same-origin separation still works; there's just no CA-signed identity story. UX should make that legible ("content-addressed, not host-addressed").
+- **Keyboard + URL bar UX.** A `bzz://` address is 64 hex characters; without ENS-style short names, users will paste rather than type. Future work: pinned-site home screen + bzz-over-feed hostname resolution (see § 5.5) once feeds land.
+
+#### Where this sits in the roadmap
+
+- **Prerequisite:** Phase 4 UniFFI artefact (§ 9 Phase 4) plus the streaming FFI extensions above. Neither is on the critical path for M2's Tier-A read-only story.
+- **Delivery shape:** separate app repo that depends on the published `libant-ios.xcframework`, not a new crate in this workspace. The browser is a *consumer* of ant, like `antd` / `antctl`.
+- **Minimum viable browser** once the streaming FFI lands: single `WKWebView`, URL bar, back/forward, history persisted to SQLite, `CFBundleURLTypes` registration, optional Share extension so any app's "Share → Open in Ant" routes a pasted bzz:// reference. Everything else (tabs, bookmarks, search, ENS names, Swarm feeds) is incremental.
+
+Worth revisiting at the start of Phase 4 to decide whether to widen the § 7 UniFFI sketch to include the streaming shape, so a browser project can start the moment the `.xcframework` ships.
+
 ---
 
 ## 10. Testing Strategy

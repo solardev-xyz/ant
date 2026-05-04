@@ -23,7 +23,7 @@ temp/
 tarpaulin-report.html
 
 # Xcode / iOS smoke-test build artefacts
-examples/ios-download/build/
+examples/ios-download/build*/
 xcuserdata/
 *.xcworkspace/xcuserdata/
 DerivedData/

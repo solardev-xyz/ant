@@ -131,3 +131,12 @@ Rule of thumb: removing this example app must not break the Rust
 test suite, and removing ant must not break the example app. If
 something you need here isn't provided by the public FFI, it belongs
 in `crates/ant-ffi/`.
+
+## See also
+
+- **`bzz://` browser sketch** — the static-link architecture here
+  generalises cleanly to a native iOS browser that serves `bzz://`
+  content directly through `WKURLSchemeHandler`, with no localhost
+  HTTP gateway. Design note (gap list, iOS caveats, where it sits in
+  the roadmap) lives in [PLAN.md § 9 → "iOS `bzz://` browser —
+  architecture note"](../../PLAN.md).
