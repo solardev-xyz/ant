@@ -1,6 +1,11 @@
 //! Minimal Gnosis JSON-RPC helpers for postage batch reads (`PLAN.md` M3 / Phase 5)
 //! and writes (Phase 8: createBatch / topUp / increaseDepth via [`tx`]).
+//!
+//! [`chequebook`] provides the SWAP / cheque primitives (Phase 7):
+//! EIP-712 signing of off-chain cheques plus calldata builders for
+//! `deployChequebook` and `cashChequeBeneficiary`.
 
+pub mod chequebook;
 pub mod tx;
 
 use serde::Deserialize;
