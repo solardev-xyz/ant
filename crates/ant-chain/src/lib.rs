@@ -1,4 +1,7 @@
-//! Minimal Gnosis JSON-RPC helpers for postage batch reads (`PLAN.md` M3 / Phase 5).
+//! Minimal Gnosis JSON-RPC helpers for postage batch reads (`PLAN.md` M3 / Phase 5)
+//! and writes (Phase 8: createBatch / topUp / increaseDepth via [`tx`]).
+
+pub mod tx;
 
 use serde::Deserialize;
 use serde_json::json;
@@ -46,6 +49,19 @@ impl ChainClient {
                 .build()
                 .expect("reqwest client"),
         }
+    }
+
+    /// Underlying reqwest client. Crate-private — exposed to the
+    /// `tx` submodule so its write-side helpers can reuse the same
+    /// pooled connection without each handler instantiating its own
+    /// client.
+    pub(crate) fn http(&self) -> &reqwest::Client {
+        &self.http
+    }
+
+    /// Configured RPC endpoint URL. Crate-private; see [`Self::http`].
+    pub(crate) fn url(&self) -> &str {
+        &self.url
     }
 
     pub async fn eth_call(&self, to: &str, data: &str) -> Result<Vec<u8>, RpcError> {

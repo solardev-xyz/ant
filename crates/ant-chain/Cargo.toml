@@ -3,7 +3,16 @@ name = "ant-chain"
 version = "0.3.4"
 edition.workspace = true
 
+[[example]]
+name = "dry_run_wallet"
+path = "examples/dry_run_wallet.rs"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+primitive-types = { version = "0.14.0", default-features = false }
+
 [dependencies]
+ant-crypto = { path = "../ant-crypto" }
 hex.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -11,3 +20,19 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls"] }
+# secp256k1 transaction signing. Bee uses go-ethereum's `crypto.Sign`,
+# which produces a 65-byte (r ‖ s ‖ v) signature with `v ∈ {0, 1}` —
+# the same shape `ant_crypto::sign_handshake_data` already emits, so we
+# don't need a second dependency.
+sha3 = "0.11.0"
+# RLP encoding for raw transactions; tiny no_std-friendly crate so we
+# don't pull in the whole alloy / ethers stack just for one struct.
+rlp = "0.6.1"
+# Big-int math for amount-per-chunk × 2^depth and BZZ approval values
+# that overflow u128 (a 17-decimal BZZ token + 24-bit depth combo
+# routinely lands in u256 territory).
+primitive-types = { version = "0.14.0", default-features = false }
+# Used for ECDSA signing keys via the `Wallet` helper. Already a
+# transitive dep through ant-crypto, brought in directly here so the
+# module's signing path stays explicit.
+k256 = { version = "0.13.4", default-features = false, features = ["ecdsa"] }
