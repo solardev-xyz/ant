@@ -1,37 +1,44 @@
 //! Persistent (SQLite-backed) chunk cache — tier 2 of the cache stack
 //! described in `PLAN.md` § 6.1.
 //!
-//! The retrieval pipeline already validates every chunk on the wire
-//! (see [`crate::retrieve_chunk`]), so the in-memory tier
-//! ([`crate::InMemoryChunkCache`]) trusts what it stores. The on-disk
-//! tier cannot make the same assumption: the file may have been
-//! corrupted at rest, partially overwritten, or hand-edited. Every
-//! [`DiskChunkCache::get`] therefore re-validates the row's wire bytes
-//! against the requested 32-byte address using
-//! [`ant_crypto::cac_valid`] / [`ant_crypto::soc_valid`]. A failed
-//! validation deletes the row and reports a miss, so a corrupt page
-//! cannot poison the retrieval stream — the network path runs and the
-//! eventual write-through replaces the row with verified bytes.
+//! Network retrieval already validates every chunk on the wire (see
+//! [`crate::retrieve_chunk`]) before any cache write. **Bee’s
+//! `chunkstore.Get` trusts on-disk bytes the same way** — it reads the
+//! retrieval index and sharky blob and returns `swarm.NewChunk` in Go
+//! without re-proving the BMT against the address. This implementation matches
+//! that contract: disk hits return stored wire bytes without
+//! [`ant_crypto::cac_valid`] / [`ant_crypto::soc_valid`]. Bitrot or manual
+//! edits can still poison a chunk until the next network refresh replaces
+//! the row; that is the same durability model as bee’s localstore cache
+//! path.
 //!
-//! Async integration rule (also from `PLAN.md` § 6.1): SQLite calls
-//! must never run directly on a Tokio retrieval task. Every public
-//! method below dispatches the blocking work onto
-//! [`tokio::task::spawn_blocking`], so the retrieval future yields
-//! while the connection is held. This is the simple form the plan
-//! explicitly endorses for the first cut.
+//! Concurrency (bee-ish throughput goals):
 //!
-//! Lookup order in the daemon is `memory -> disk -> network`. Network
-//! successes write through to memory eagerly (already done) and to
-//! disk via this cache; disk hits write back to memory so a hot chunk
-//! lifts into the LRU after the first retrieval per process.
+//! - **Dedicated read threads** — `get` is a prepared `SELECT` on a read-only
+//!   WAL connection; jobs are routed round-robin over crossbeam channels (no
+//!   `spawn_blocking` on the hot path). Pool size scales with
+//!   [`std::thread::available_parallelism`] (8–32 workers).
+//! - **Dedicated writer thread** — all mutating work (batched `put`s,
+//!   `last_access` touches past the freshness window, eviction) runs on
+//!   one thread with **batched transactions** so bursts amortise fsync.
+//! - **Pragmas** — large `mmap_size` / `cache_size` on every connection.
+//!
+//! Async rule: `get` / `row_count` ship work to dedicated **read threads**
+//! (each with a prepared `SELECT`) over a bounded channel — no
+//! `spawn_blocking` hot path — so Tokio workers stay lightweight.
 
-use ant_crypto::{cac_valid, soc_valid};
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use crossbeam_channel::{
+    bounded as cb_bounded, Receiver as CbReceiver, Sender as CbSender, TryRecvError,
+};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use tokio::sync::oneshot;
 use tracing::{debug, trace, warn};
 
 /// Default eviction "slack" — how far below the cap we drain on every
@@ -42,19 +49,30 @@ use tracing::{debug, trace, warn};
 const EVICTION_SLACK_RATIO: f64 = 0.95;
 
 /// How "fresh" `last_access` must already be for [`DiskChunkCache::get`]
-/// to skip the touch update entirely. Without this, every cache hit
-/// would issue an `UPDATE chunks SET last_access = ?` — and because
-/// `synchronous=NORMAL` fsync's on each implicit commit, a daemon
-/// streaming N chunks per second from disk would queue N fsyncs per
-/// second behind the connection mutex. With 14 parallel gateway
-/// streams we measured throughput collapsing to ~70 chunks/sec
-/// (manifest in `antctl top` as a fully-cache-served file slowly
-/// filling its progress bar). 60 s is a generous LRU-ordering
-/// granularity — eviction picks a victim because it hasn't been
-/// touched in *minutes*, so a write that's lagged by < 1 minute can
-/// never re-order things meaningfully — and it makes hot reads pure
-/// `SELECT`s.
+/// to skip a touch write entirely. 60 s keeps hot reads as plain
+/// `SELECT`s on the reader connections; rare `UPDATE`s go through the
+/// writer queue.
 const LAST_ACCESS_REFRESH_MS: i64 = 60_000;
+
+/// Number of dedicated read threads (each owns one read-only connection +
+/// cached prepared statements). Bounded to keep mobile FD use sane.
+fn read_worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8)
+        .clamp(8, 32)
+}
+
+/// Max `put` + `touch` rows coalesced into one writer transaction before commit.
+/// Larger batches amortise WAL fsync against bursty write-through.
+const WRITE_BATCH_MAX: usize = 256;
+
+/// Target mmap size per SQLite connection (256 MiB).
+const MMAP_BYTES: i64 = 512 * 1024 * 1024;
+
+/// Negative `cache_size` pragma value = KiB of page cache per connection
+/// (~128 MiB here).
+const CACHE_KIB: i64 = -256 * 1024;
 
 /// Default size cap for the persistent chunk cache. 10 GB matches
 /// `PLAN.md` § 6.1's desktop / Raspberry Pi default. Operators on
@@ -62,98 +80,267 @@ const LAST_ACCESS_REFRESH_MS: i64 = 60_000;
 /// power users should raise it.
 pub const DEFAULT_DISK_CACHE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone)]
 pub enum DiskCacheError {
     #[error("sqlite: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    Sqlite(String),
     #[error("io: {0}")]
-    Io(#[from] std::io::Error),
+    Io(String),
     #[error("background worker panicked")]
     Panicked,
+    #[error("disk cache writer stopped")]
+    WriterStopped,
+}
+
+impl From<rusqlite::Error> for DiskCacheError {
+    fn from(e: rusqlite::Error) -> Self {
+        DiskCacheError::Sqlite(e.to_string())
+    }
+}
+
+impl From<std::io::Error> for DiskCacheError {
+    fn from(e: std::io::Error) -> Self {
+        DiskCacheError::Io(e.to_string())
+    }
 }
 
 /// SQLite-backed persistent chunk cache.
-///
-/// Holds a single connection behind an `Arc<Mutex<>>`. Every method
-/// is async and calls [`tokio::task::spawn_blocking`] so the SQLite
-/// work runs on the blocking pool — the retrieval task that triggered
-/// the call yields immediately and we never block a Tokio worker on
-/// `fsync`.
-///
-/// `total_bytes` is an in-memory mirror of `SUM(size)` over the
-/// `chunks` table. It is initialised from disk in [`Self::open`] and
-/// updated atomically alongside every successful insert / delete /
-/// eviction so we don't have to ask SQLite for the sum on every put.
-/// The mirror is informational (used by `len`/`used_bytes` and to
-/// decide whether to run an eviction sweep); the source of truth
-/// remains the table.
 pub struct DiskChunkCache {
     inner: Arc<Inner>,
 }
 
+enum WriteMsg {
+    Put {
+        addr: [u8; 32],
+        data: Vec<u8>,
+        ack: oneshot::Sender<Result<(), DiskCacheError>>,
+    },
+    PutBatch {
+        items: Vec<([u8; 32], Vec<u8>)>,
+        ack: oneshot::Sender<Result<(), DiskCacheError>>,
+    },
+    Touch {
+        addr: [u8; 32],
+        last_access: i64,
+    },
+    Shutdown,
+}
+
+enum ReadJob {
+    Get {
+        addr: [u8; 32],
+        reply: oneshot::Sender<Result<Option<Vec<u8>>, DiskCacheError>>,
+    },
+    Count {
+        reply: oneshot::Sender<Result<u64, DiskCacheError>>,
+    },
+    Shutdown,
+}
+
 struct Inner {
-    /// Path the connection was opened from. Useful for tracing /
-    /// `antctl top` exposure later; logging it once on open keeps
-    /// "where did the daemon put my cache" answerable from the
-    /// journal.
     path: PathBuf,
-    /// SQLite connection. Wrapped in a sync `Mutex` (not a
-    /// `tokio::sync::Mutex`) because every consumer of the lock runs
-    /// inside `spawn_blocking`, so blocking on a contended lock is
-    /// fine — it's already a blocking thread.
-    conn: std::sync::Mutex<Connection>,
-    /// Hard upper bound on stored bytes. When `total_bytes` crosses
-    /// this on a put, an eviction sweep deletes oldest `last_access`
-    /// rows down to `slack_bytes`.
+    read_tx: Vec<CbSender<ReadJob>>,
+    read_rr: AtomicUsize,
+    read_joins: Mutex<Vec<JoinHandle<()>>>,
+    write_tx: CbSender<WriteMsg>,
+    writer_thread: Mutex<Option<JoinHandle<()>>>,
     max_bytes: u64,
-    /// Eviction floor: writes never drain below this on a single
-    /// sweep. Set in [`Self::open`] to `EVICTION_SLACK_RATIO` of
-    /// `max_bytes`.
-    slack_bytes: u64,
-    /// Live mirror of `SUM(size)` from the `chunks` table.
-    total_bytes: AtomicU64,
+    total_bytes: Arc<AtomicU64>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        for tx in &self.read_tx {
+            let _ = tx.send(ReadJob::Shutdown);
+        }
+        if let Ok(mut joins) = self.read_joins.lock() {
+            for h in joins.drain(..) {
+                let _ = h.join();
+            }
+        }
+        let _ = self.write_tx.send(WriteMsg::Shutdown);
+        if let Ok(mut g) = self.writer_thread.lock() {
+            if let Some(h) = g.take() {
+                let _ = h.join();
+            }
+        }
+    }
 }
 
 impl DiskChunkCache {
     /// Open (or create) a chunk cache database at `path` with a
     /// `max_bytes` byte cap.
-    ///
-    /// On first call this creates the schema, applies the recommended
-    /// pragmas (WAL, NORMAL fsync, 5 s busy timeout, 8 KiB page size
-    /// before any tables exist), and computes the initial
-    /// `total_bytes`. Subsequent opens against the same file are
-    /// idempotent — `CREATE TABLE IF NOT EXISTS` makes the migration
-    /// step crash-safe.
-    ///
-    /// `max_bytes` is honoured as-is; clamping to a sane minimum is
-    /// the wiring layer's job (see `antd`). Tests pass tiny caps to
-    /// drive eviction without storing megabytes of payload.
     pub fn open(path: impl AsRef<Path>, max_bytes: u64) -> Result<Self, DiskCacheError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        let conn = Connection::open_with_flags(
-            &path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
+        let total_bytes = Arc::new(AtomicU64::new(0));
+        let tb = total_bytes.clone();
+        let slack_bytes = ((max_bytes as f64) * EVICTION_SLACK_RATIO) as u64;
 
-        // Pragmas as recommended in PLAN.md § 6.1. `page_size` must run
-        // before any table exists; `CREATE TABLE IF NOT EXISTS` below
-        // makes that ordering safe on first open. On subsequent opens
-        // the pragma is a no-op (SQLite ignores `page_size` once the
-        // file is non-empty), so we don't track the "first open" state
-        // ourselves.
+        let (ready_tx, ready_rx) = sync_channel::<()>(0);
+        let (write_tx, write_rx) = cb_bounded::<WriteMsg>(65_536);
+        let path_thread = path.clone();
+        let write_tx_main = write_tx.clone();
+
+        let join = std::thread::Builder::new()
+            .name("ant-disk-cache-writer".into())
+            .spawn(move || {
+                if let Err(e) = writer_main(
+                    path_thread,
+                    write_rx,
+                    ready_tx,
+                    tb,
+                    max_bytes,
+                    slack_bytes,
+                ) {
+                    warn!(
+                        target: "ant_retrieval::disk_cache",
+                        "writer thread exited with error: {e}",
+                    );
+                }
+            })
+            .map_err(|e| DiskCacheError::Io(e.to_string()))?;
+
+        ready_rx
+            .recv()
+            .map_err(|_| DiskCacheError::WriterStopped)?;
+
+        let n_read = read_worker_count();
+        let mut read_tx = Vec::with_capacity(n_read);
+        let mut read_joins = Vec::with_capacity(n_read);
+        for i in 0..n_read {
+        let (job_tx, job_rx) = cb_bounded::<ReadJob>(4096);
+            let path_r = path.clone();
+            let wt = write_tx.clone();
+            let j = std::thread::Builder::new()
+                .name(format!("ant-disk-cache-read-{i}"))
+                .spawn(move || read_worker_loop(path_r, job_rx, wt))
+                .map_err(|e| DiskCacheError::Io(e.to_string()))?;
+            read_tx.push(job_tx);
+            read_joins.push(j);
+        }
+
+        debug!(
+            target: "ant_retrieval::disk_cache",
+            path = %path.display(),
+            initial_total = total_bytes.load(Ordering::Relaxed),
+            max_bytes,
+            slack_bytes,
+            read_workers = n_read,
+            "opened persistent chunk cache",
+        );
+
+        Ok(Self {
+            inner: Arc::new(Inner {
+                path,
+                read_tx,
+                read_rr: AtomicUsize::new(0),
+                read_joins: Mutex::new(read_joins),
+                write_tx: write_tx_main,
+                writer_thread: Mutex::new(Some(join)),
+                max_bytes,
+                total_bytes,
+            }),
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.inner.path
+    }
+
+    pub fn capacity_bytes(&self) -> u64 {
+        self.inner.max_bytes
+    }
+
+    pub fn used_bytes(&self) -> u64 {
+        self.inner.total_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Look up a chunk by address. Trusts stored bytes (bee `chunkstore`
+    /// semantics). A stale `last_access` is refreshed via the writer
+    /// queue (best-effort). Serviced by a dedicated read thread + prepared
+    /// statement (no `spawn_blocking` on the hot path).
+    pub async fn get(&self, addr: [u8; 32]) -> Result<Option<Vec<u8>>, DiskCacheError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let i = self.inner.read_rr.fetch_add(1, Ordering::Relaxed) % self.inner.read_tx.len();
+        self.inner.read_tx[i]
+            .send(ReadJob::Get {
+                addr,
+                reply: reply_tx,
+            })
+            .map_err(|_| DiskCacheError::WriterStopped)?;
+        reply_rx.await.map_err(|_| DiskCacheError::Panicked)?
+    }
+
+    /// Batched insert / upsert in a **single** writer transaction (amortises
+    /// WAL fsync). Prefer this when filling the cache with many freshly
+    /// validated chunks at once.
+    pub async fn put_batch(&self, items: Vec<([u8; 32], Vec<u8>)>) -> Result<(), DiskCacheError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.inner
+            .write_tx
+            .send(WriteMsg::PutBatch {
+                items,
+                ack: ack_tx,
+            })
+            .map_err(|_| DiskCacheError::WriterStopped)?;
+        ack_rx
+            .await
+            .map_err(|_| DiskCacheError::Panicked)?
+    }
+
+    pub async fn put(&self, addr: [u8; 32], data: Vec<u8>) -> Result<(), DiskCacheError> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.inner
+            .write_tx
+            .send(WriteMsg::Put {
+                addr,
+                data,
+                ack: ack_tx,
+            })
+            .map_err(|_| DiskCacheError::WriterStopped)?;
+        ack_rx
+            .await
+            .map_err(|_| DiskCacheError::Panicked)?
+    }
+
+    pub async fn row_count(&self) -> Result<u64, DiskCacheError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.inner.read_tx[0]
+            .send(ReadJob::Count { reply: reply_tx })
+            .map_err(|_| DiskCacheError::WriterStopped)?;
+        reply_rx.await.map_err(|_| DiskCacheError::Panicked)?
+    }
+}
+
+fn apply_shared_pragmas(conn: &Connection, is_write: bool) -> Result<(), rusqlite::Error> {
+    conn.pragma_update(None, "mmap_size", MMAP_BYTES)?;
+    conn.pragma_update(None, "cache_size", CACHE_KIB)?;
+    if is_write {
         conn.pragma_update(None, "page_size", 8192)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
+    }
+    Ok(())
+}
 
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS chunks (
+fn open_write_connection(path: &Path) -> Result<Connection, rusqlite::Error> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    apply_shared_pragmas(&conn, true)?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS chunks (
                 address     BLOB PRIMARY KEY,
                 data        BLOB NOT NULL,
                 size        INTEGER NOT NULL,
@@ -162,216 +349,298 @@ impl DiskChunkCache {
             );
             CREATE INDEX IF NOT EXISTS chunks_last_access_idx
                 ON chunks(last_access);",
-        )?;
+    )?;
+    Ok(conn)
+}
 
-        let initial_total: u64 = conn
-            .query_row("SELECT COALESCE(SUM(size), 0) FROM chunks", [], |row| {
-                row.get::<_, i64>(0).map(|n| n as u64)
-            })
-            .unwrap_or(0);
+fn open_read_connection(path: &Path) -> Result<Connection, rusqlite::Error> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    apply_shared_pragmas(&conn, false)?;
+    Ok(conn)
+}
 
-        let slack_bytes = ((max_bytes as f64) * EVICTION_SLACK_RATIO) as u64;
+fn read_worker_loop(path: PathBuf, rx: CbReceiver<ReadJob>, write_tx: CbSender<WriteMsg>) {
+    let Ok(conn) = open_read_connection(&path) else {
+        return;
+    };
+    let Ok(mut sel_stmt) = conn.prepare_cached(
+        "SELECT data, last_access FROM chunks WHERE address = ?1",
+    ) else {
+        return;
+    };
+    let Ok(mut count_stmt) = conn.prepare_cached("SELECT COUNT(*) FROM chunks") else {
+        return;
+    };
 
-        debug!(
-            target: "ant_retrieval::disk_cache",
-            path = %path.display(),
-            initial_total,
-            max_bytes,
-            slack_bytes,
-            "opened persistent chunk cache",
-        );
+    while let Ok(job) = rx.recv() {
+        match job {
+            ReadJob::Shutdown => break,
+            ReadJob::Get { addr, reply } => {
+                let res = (|| -> Result<Option<Vec<u8>>, DiskCacheError> {
+                    let row: Option<(Vec<u8>, i64)> = sel_stmt
+                        .query_row(params![&addr[..]], |row| {
+                            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+                        })
+                        .optional()
+                        .map_err(DiskCacheError::from)?;
+                    let Some((data, last_access)) = row else {
+                        return Ok(None);
+                    };
+                    let now = unix_now() as i64;
+                    if now.saturating_sub(last_access) > LAST_ACCESS_REFRESH_MS {
+                        let _ = write_tx.send(WriteMsg::Touch {
+                            addr,
+                            last_access: now,
+                        });
+                    }
+                    Ok(Some(data))
+                })();
+                let _ = reply.send(res);
+            }
+            ReadJob::Count { reply } => {
+                let res = (|| -> Result<u64, DiskCacheError> {
+                    let n: i64 = count_stmt
+                        .query_row([], |row| row.get(0))
+                        .map_err(DiskCacheError::from)?;
+                    Ok(n as u64)
+                })();
+                let _ = reply.send(res);
+            }
+        }
+    }
+}
 
-        Ok(Self {
-            inner: Arc::new(Inner {
-                path,
-                conn: std::sync::Mutex::new(conn),
-                max_bytes,
-                slack_bytes,
-                total_bytes: AtomicU64::new(initial_total),
-            }),
-        })
+fn process_put_batch_transaction(
+    conn: &mut Connection,
+    items: &[([u8; 32], Vec<u8>)],
+    total_bytes: &Arc<AtomicU64>,
+    max_bytes: u64,
+    slack_bytes: u64,
+) -> Result<(), DiskCacheError> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for (addr, data) in items {
+        put_upsert_tx(&tx, *addr, data.as_slice(), total_bytes)?;
+    }
+    tx.commit()?;
+    let current = total_bytes.load(Ordering::Relaxed);
+    if current > max_bytes {
+        evict_to_slack(conn, total_bytes, slack_bytes)?;
+    }
+    Ok(())
+}
+
+fn consume_put_touch_batch(
+    conn: &mut Connection,
+    batch: Vec<WriteMsg>,
+    total_bytes: &Arc<AtomicU64>,
+    max_bytes: u64,
+    slack_bytes: u64,
+) -> Result<bool, DiskCacheError> {
+    let mut shutdown = false;
+    let mut put_ops: Vec<([u8; 32], Vec<u8>, oneshot::Sender<Result<(), DiskCacheError>>)> =
+        Vec::new();
+    let mut touches: Vec<([u8; 32], i64)> = Vec::new();
+
+    for m in batch {
+        match m {
+            WriteMsg::Put { addr, data, ack } => put_ops.push((addr, data, ack)),
+            WriteMsg::Touch { addr, last_access } => touches.push((addr, last_access)),
+            WriteMsg::Shutdown => shutdown = true,
+            WriteMsg::PutBatch { .. } => {}
+        }
     }
 
-    /// Filesystem path the cache was opened against.
-    pub fn path(&self) -> &Path {
-        &self.inner.path
+    if put_ops.is_empty() && touches.is_empty() {
+        return Ok(shutdown);
     }
 
-    /// Configured byte cap.
-    pub fn capacity_bytes(&self) -> u64 {
-        self.inner.max_bytes
-    }
-
-    /// Live byte total mirrored from `SUM(size)`. May lag by a single
-    /// in-flight put / evict (the atomic update lands after the
-    /// commit), but never diverges by more than the size of one
-    /// chunk.
-    pub fn used_bytes(&self) -> u64 {
-        self.inner.total_bytes.load(Ordering::Relaxed)
-    }
-
-    /// Look up a chunk by address. CAC/SOC-validates the stored row
-    /// before returning. A row that fails validation is deleted in
-    /// place and the call reports a miss, so the caller falls through
-    /// to the network and the eventual write-through replaces the row
-    /// with verified bytes.
-    ///
-    /// `last_access` is refreshed *only when stale* (older than
-    /// [`LAST_ACCESS_REFRESH_MS`] ms relative to wall clock). On a hot
-    /// cache this means the call is a single indexed `SELECT` and never
-    /// takes the SQLite write lock — the difference between "rare
-    /// fsync" and "fsync per chunk" is the difference between the
-    /// daemon serving from disk at >100 MiB/s vs ~1 MiB/s under
-    /// fan-out load.
-    pub async fn get(&self, addr: [u8; 32]) -> Result<Option<Vec<u8>>, DiskCacheError> {
-        let inner = self.inner.clone();
-        let res = tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>, DiskCacheError> {
-            let conn = inner.conn.lock().expect("disk cache mutex poisoned");
-            let row: Option<(Vec<u8>, i64)> = conn
-                .query_row(
-                    "SELECT data, last_access FROM chunks WHERE address = ?1",
-                    params![&addr[..]],
-                    |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
-                )
-                .optional()?;
-            let Some((data, last_access)) = row else { return Ok(None) };
-
-            if !cac_valid(&addr, &data) && !soc_valid(&addr, &data) {
-                warn!(
+    let batch_res: Result<(), DiskCacheError> = (|| {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (addr, data, _) in &put_ops {
+            put_upsert_tx(&tx, *addr, data, total_bytes)?;
+        }
+        for (addr, last) in &touches {
+            if let Err(e) = tx.execute(
+                "UPDATE chunks SET last_access = ?1 WHERE address = ?2",
+                params![last, &addr[..]],
+            ) {
+                trace!(
                     target: "ant_retrieval::disk_cache",
-                    chunk = %hex::encode(addr),
-                    bytes = data.len(),
-                    "disk row failed validation; deleting and reporting miss",
+                    "last_access touch failed (non-fatal): {e}",
                 );
-                let removed = data.len() as u64;
-                let n = conn.execute(
-                    "DELETE FROM chunks WHERE address = ?1",
-                    params![&addr[..]],
-                )?;
-                if n > 0 {
-                    inner.total_bytes.fetch_sub(removed, Ordering::Relaxed);
-                }
-                return Ok(None);
             }
+        }
+        tx.commit()?;
+        Ok(())
+    })();
 
-            // Bump `last_access` only if it's drifted far enough that
-            // an eviction comparison could plausibly care. Skipping the
-            // write keeps the hot path lock-light: the entire `get`
-            // becomes a single indexed `SELECT` plus the in-memory
-            // validation hash. A stale-but-not-stale-enough touch
-            // never hurts: eviction operates at minutes-to-hours
-            // granularity, not seconds.
-            let now = unix_now() as i64;
-            if now.saturating_sub(last_access) > LAST_ACCESS_REFRESH_MS {
-                if let Err(e) = conn.execute(
-                    "UPDATE chunks SET last_access = ?1 WHERE address = ?2",
-                    params![now, &addr[..]],
-                ) {
-                    trace!(
-                        target: "ant_retrieval::disk_cache",
-                        chunk = %hex::encode(addr),
-                        "last_access bump failed (non-fatal): {e}",
-                    );
+    match batch_res {
+        Ok(()) => {
+            let current = total_bytes.load(Ordering::Relaxed);
+            if current > max_bytes {
+                if let Err(e) = evict_to_slack(conn, total_bytes, slack_bytes) {
+                    for (_, _, ack) in put_ops {
+                        let _ = ack.send(Err(e.clone()));
+                    }
+                    return Err(e);
                 }
             }
-            Ok(Some(data))
+            for (_, _, ack) in put_ops {
+                let _ = ack.send(Ok(()));
+            }
+            Ok(shutdown)
+        }
+        Err(e) => {
+            for (_, _, ack) in put_ops {
+                let _ = ack.send(Err(e.clone()));
+            }
+            Err(e)
+        }
+    }
+}
+
+fn writer_main(
+    path: PathBuf,
+    rx: CbReceiver<WriteMsg>,
+    ready_tx: SyncSender<()>,
+    total_bytes: Arc<AtomicU64>,
+    max_bytes: u64,
+    slack_bytes: u64,
+) -> Result<(), DiskCacheError> {
+    let mut conn = open_write_connection(&path)?;
+
+    let initial_total: u64 = conn
+        .query_row("SELECT COALESCE(SUM(size), 0) FROM chunks", [], |row| {
+            row.get::<_, i64>(0).map(|n| n as u64)
         })
-        .await
-        .map_err(|_| DiskCacheError::Panicked)?;
-        res
+        .unwrap_or(0);
+    total_bytes.store(initial_total, Ordering::Relaxed);
+
+    ready_tx.send(()).map_err(|_| DiskCacheError::WriterStopped)?;
+
+    'outer: loop {
+        match rx.recv() {
+            Err(_) => break,
+            Ok(WriteMsg::Shutdown) => break,
+            Ok(WriteMsg::PutBatch { items, ack }) => {
+                let r = process_put_batch_transaction(
+                    &mut conn,
+                    &items,
+                    &total_bytes,
+                    max_bytes,
+                    slack_bytes,
+                );
+                let _ = ack.send(r);
+                continue;
+            }
+            Ok(first) => {
+                let mut batch = vec![first];
+                while batch.len() < WRITE_BATCH_MAX {
+                    match rx.try_recv() {
+                        Ok(WriteMsg::Shutdown) => {
+                            batch.push(WriteMsg::Shutdown);
+                            break;
+                        }
+                        Ok(WriteMsg::PutBatch { items, ack }) => {
+                            let shutdown_after = match consume_put_touch_batch(
+                                &mut conn,
+                                batch,
+                                &total_bytes,
+                                max_bytes,
+                                slack_bytes,
+                            ) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    let _ = ack.send(Err(e));
+                                    continue 'outer;
+                                }
+                            };
+                            let r = process_put_batch_transaction(
+                                &mut conn,
+                                &items,
+                                &total_bytes,
+                                max_bytes,
+                                slack_bytes,
+                            );
+                            let _ = ack.send(r);
+                            if shutdown_after {
+                                break 'outer;
+                            }
+                            continue 'outer;
+                        }
+                        Ok(m) => batch.push(m),
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => break 'outer,
+                    }
+                }
+
+                let shutdown_after = consume_put_touch_batch(
+                    &mut conn,
+                    batch,
+                    &total_bytes,
+                    max_bytes,
+                    slack_bytes,
+                )?;
+                if shutdown_after {
+                    break 'outer;
+                }
+            }
+        }
     }
 
-    /// Insert or replace `addr`'s wire bytes. Triggers an eviction
-    /// sweep down to `slack_bytes` if the post-insert total crosses
-    /// `max_bytes`.
-    ///
-    /// The caller is expected to have already CAC/SOC-validated
-    /// `data`. The retrieval pipeline does this in
-    /// [`crate::retrieve_chunk`] before any cache write happens; tests
-    /// mirror that invariant by feeding only `cac_new` output. We
-    /// don't re-validate on the write path to keep the hot loop free
-    /// of redundant hashing — the read path's validation closes the
-    /// "rest" hole (corruption between writes), which is the case
-    /// validation actually has to defend against.
-    pub async fn put(&self, addr: [u8; 32], data: Vec<u8>) -> Result<(), DiskCacheError> {
-        let inner = self.inner.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), DiskCacheError> {
-            let size = data.len() as u64;
-            let now = unix_now();
-            let conn = inner.conn.lock().expect("disk cache mutex poisoned");
+    Ok(())
+}
 
-            // Fetch any existing size for this address so the byte
-            // mirror reflects an upsert rather than a double-count.
-            // The `address` column is the primary key, so at most one
-            // row matches.
-            let existing: Option<u64> = conn
-                .query_row(
-                    "SELECT size FROM chunks WHERE address = ?1",
-                    params![&addr[..]],
-                    |row| row.get::<_, i64>(0).map(|n| n as u64),
-                )
-                .optional()?;
+fn put_upsert_tx(
+    tx: &rusqlite::Transaction<'_>,
+    addr: [u8; 32],
+    data: &[u8],
+    total_bytes: &AtomicU64,
+) -> Result<(), DiskCacheError> {
+    let size = data.len() as u64;
+    let now = unix_now();
+    let existing: Option<u64> = tx
+        .query_row(
+            "SELECT size FROM chunks WHERE address = ?1",
+            params![&addr[..]],
+            |row| row.get::<_, i64>(0).map(|n| n as u64),
+        )
+        .optional()?;
 
-            conn.execute(
-                "INSERT INTO chunks (address, data, size, last_access, inserted_at)
+    tx.execute(
+        "INSERT INTO chunks (address, data, size, last_access, inserted_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(address) DO UPDATE SET
                    data = excluded.data,
                    size = excluded.size,
                    last_access = excluded.last_access",
-                params![&addr[..], &data, size as i64, now as i64, now as i64],
-            )?;
+        params![&addr[..], data, size as i64, now as i64, now as i64],
+    )?;
 
-            let delta = size as i64 - existing.unwrap_or(0) as i64;
-            let new_total = update_total(&inner.total_bytes, delta);
-
-            if new_total > inner.max_bytes {
-                evict_to_slack(&conn, &inner.total_bytes, inner.slack_bytes)?;
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|_| DiskCacheError::Panicked)??;
-        Ok(())
-    }
-
-    /// Number of rows. Used by tests; the byte total is the
-    /// production-relevant metric for eviction decisions.
-    pub async fn row_count(&self) -> Result<u64, DiskCacheError> {
-        let inner = self.inner.clone();
-        let n = tokio::task::spawn_blocking(move || -> Result<u64, DiskCacheError> {
-            let conn = inner.conn.lock().expect("disk cache mutex poisoned");
-            let n: i64 = conn.query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))?;
-            Ok(n as u64)
-        })
-        .await
-        .map_err(|_| DiskCacheError::Panicked)??;
-        Ok(n)
-    }
+    let delta = size as i64 - existing.unwrap_or(0) as i64;
+    update_total(total_bytes, delta);
+    Ok(())
 }
 
-/// Apply a signed delta to the `total_bytes` mirror, saturating at
-/// zero so a stale UPDATE that makes the delta negative can't underflow
-/// the atomic.
 fn update_total(total: &AtomicU64, delta: i64) -> u64 {
     if delta >= 0 {
         total.fetch_add(delta as u64, Ordering::Relaxed) + delta as u64
     } else {
         let abs = (-delta) as u64;
-        let prev = total.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        match total.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
             Some(v.saturating_sub(abs))
-        });
-        prev.unwrap_or(0).saturating_sub(abs)
+        }) {
+            Ok(prev) => prev.saturating_sub(abs),
+            Err(_) => total.load(Ordering::Relaxed),
+        }
     }
 }
 
-/// Drain oldest `last_access` rows in a single transaction until the
-/// table's total size sits at or below `slack_bytes`. Mirrors the
-/// "evict in batches down to ~95% of the cap" guidance in `PLAN.md`
-/// § 6.1: a stable slack target stops every put after the cap is hit
-/// from triggering its own single-row eviction.
 fn evict_to_slack(
-    conn: &Connection,
+    conn: &mut Connection,
     total_bytes: &AtomicU64,
     slack_bytes: u64,
 ) -> Result<(), DiskCacheError> {
@@ -381,13 +650,9 @@ fn evict_to_slack(
     }
     let need_to_free = current.saturating_sub(slack_bytes);
 
-    // Walk oldest-first and accumulate sizes until we cover
-    // `need_to_free`. We stage a row id list so the DELETE runs as a
-    // single statement against a known set, rather than an unbounded
-    // ranged DELETE that has to be re-evaluated against the index on
-    // every step.
     let mut stmt = conn
-        .prepare("SELECT address, size FROM chunks ORDER BY last_access ASC, address ASC")?;
+        .prepare("SELECT address, size FROM chunks ORDER BY last_access ASC, address ASC")
+        .map_err(|e| DiskCacheError::from(e))?;
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)? as u64))
     })?;
@@ -395,7 +660,7 @@ fn evict_to_slack(
     let mut victim_addrs: Vec<Vec<u8>> = Vec::new();
     let mut freed: u64 = 0;
     for row in rows {
-        let (addr, size) = row?;
+        let (addr, size) = row.map_err(|e| DiskCacheError::from(e))?;
         victim_addrs.push(addr);
         freed += size;
         if freed >= need_to_free {
@@ -408,14 +673,16 @@ fn evict_to_slack(
         return Ok(());
     }
 
-    let tx = conn.unchecked_transaction()?;
+    let tx = conn.unchecked_transaction().map_err(|e| DiskCacheError::from(e))?;
     {
-        let mut del = tx.prepare("DELETE FROM chunks WHERE address = ?1")?;
+        let mut del = tx
+            .prepare("DELETE FROM chunks WHERE address = ?1")
+            .map_err(|e| DiskCacheError::from(e))?;
         for addr in &victim_addrs {
-            del.execute(params![addr])?;
+            del.execute(params![addr]).map_err(|e| DiskCacheError::from(e))?;
         }
     }
-    tx.commit()?;
+    tx.commit().map_err(|e| DiskCacheError::from(e))?;
 
     update_total(total_bytes, -(freed as i64));
     debug!(
@@ -429,13 +696,6 @@ fn evict_to_slack(
     Ok(())
 }
 
-/// Wall-clock time in milliseconds since the UNIX epoch, used as the
-/// `last_access` / `inserted_at` timestamp. Milliseconds (not seconds)
-/// because two writes inside the same wall-clock second are common
-/// during a multi-chunk fetch, and ordering them by `last_access`
-/// matters for eviction — a seconds-resolution clock leaves the order
-/// ambiguous and the eviction sweep could drop the wrong row when
-/// two rows share a timestamp.
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -447,15 +707,28 @@ fn unix_now() -> u64 {
 mod tests {
     use super::*;
     use ant_crypto::cac_new;
+    use rusqlite::params as rparams;
     use tempfile::tempdir;
 
     fn make_chunk(payload: &[u8]) -> ([u8; 32], Vec<u8>) {
         cac_new(payload).expect("cac_new")
     }
 
-    /// Round-trip a chunk through the cache: a put followed by a get
-    /// returns the exact wire bytes that were inserted, and the byte
-    /// mirror reflects the single inserted row.
+    #[tokio::test]
+    async fn put_batch_round_trips() {
+        let dir = tempdir().unwrap();
+        let cache = DiskChunkCache::open(dir.path().join("batch.sqlite"), 1 << 20).unwrap();
+        let a = make_chunk(b"a");
+        let b = make_chunk(b"b");
+        cache
+            .put_batch(vec![(a.0, a.1.clone()), (b.0, b.1.clone())])
+            .await
+            .unwrap();
+        assert_eq!(cache.get(a.0).await.unwrap(), Some(a.1));
+        assert_eq!(cache.get(b.0).await.unwrap(), Some(b.1));
+        assert_eq!(cache.row_count().await.unwrap(), 2);
+    }
+
     #[tokio::test]
     async fn put_then_get_round_trips() {
         let dir = tempdir().unwrap();
@@ -469,11 +742,6 @@ mod tests {
         assert_eq!(cache.row_count().await.unwrap(), 1);
     }
 
-    /// Restart persistence: rows written by one cache handle must be
-    /// readable by a fresh handle opened against the same file. This
-    /// is the load-bearing property that distinguishes tier 2 from
-    /// the in-memory tier — without it the disk cache contributes
-    /// nothing across daemon restarts.
     #[tokio::test]
     async fn rows_persist_across_reopen() {
         let dir = tempdir().unwrap();
@@ -486,34 +754,17 @@ mod tests {
             assert_eq!(cache.used_bytes(), wire.len() as u64);
         }
 
-        // Re-open against the same file — initial `total_bytes` must
-        // be re-derived from the table, and the row must still be
-        // gettable.
         let cache = DiskChunkCache::open(&path, 1 << 20).unwrap();
         assert_eq!(cache.used_bytes(), wire.len() as u64);
         let got = cache.get(addr).await.unwrap();
         assert_eq!(got, Some(wire));
     }
 
-    /// Hard size-cap eviction: with several distinct chunks inserted
-    /// past the cap, the oldest by `last_access` must drop and the
-    /// most recently touched ones must remain. We backdate chunks[0]
-    /// and chunks[1] far enough that the `get` on chunk[0] crosses
-    /// the freshness threshold (deferred-touch optimisation skips the
-    /// `UPDATE` for hits inside [`LAST_ACCESS_REFRESH_MS`], so a
-    /// realistic eviction test must exercise rows that have actually
-    /// aged out of that window). The hand-written `last_access`
-    /// values double as a regression guard against any change that
-    /// ranks rows by `inserted_at` — the column the eviction sweep
-    /// must NOT consult — instead of `last_access`.
     #[tokio::test]
     async fn evicts_oldest_by_last_access() {
         let dir = tempdir().unwrap();
-        // Each chunk is 4104 bytes wire (8-byte span + 4096 payload).
-        // Cap of 12 KiB fits 2 full chunks comfortably; the third put
-        // crosses the cap and the eviction sweep drains down to
-        // ~95% slack.
-        let cache = DiskChunkCache::open(dir.path().join("evict.sqlite"), 12 * 1024).unwrap();
+        let path = dir.path().join("evict.sqlite");
+        let cache = DiskChunkCache::open(&path, 12 * 1024).unwrap();
 
         let chunks: Vec<([u8; 32], Vec<u8>)> =
             (0..3u8).map(|i| make_chunk(&vec![i; 4096])).collect();
@@ -521,42 +772,23 @@ mod tests {
         cache.put(chunks[0].0, chunks[0].1.clone()).await.unwrap();
         cache.put(chunks[1].0, chunks[1].1.clone()).await.unwrap();
 
-        // Backdate chunks[0] to ~20 minutes ago and chunks[1] to ~10
-        // minutes ago. The `get` on chunks[0] then promotes it past
-        // chunks[1] in `last_access` order, exercising the
-        // stale-refresh branch the deferred-touch optimisation gates
-        // on. Without backdating both rows, the freshly-inserted
-        // timestamps would already be inside the refresh window and
-        // the `get` would skip the touch — making the eviction order
-        // ambiguous between two near-identical millisecond timestamps.
         let now = unix_now() as i64;
         {
-            let inner = cache.inner.clone();
-            let addr0 = chunks[0].0;
-            let addr1 = chunks[1].0;
-            tokio::task::spawn_blocking(move || {
-                let conn = inner.conn.lock().unwrap();
-                conn.execute(
-                    "UPDATE chunks SET last_access = ?1 WHERE address = ?2",
-                    params![now - 20 * 60_000, &addr0[..]],
-                )
-                .unwrap();
-                conn.execute(
-                    "UPDATE chunks SET last_access = ?1 WHERE address = ?2",
-                    params![now - 10 * 60_000, &addr1[..]],
-                )
-                .unwrap();
-            })
-            .await
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute(
+                "UPDATE chunks SET last_access = ?1 WHERE address = ?2",
+                rparams![now - 20 * 60_000, &chunks[0].0[..]],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE chunks SET last_access = ?1 WHERE address = ?2",
+                rparams![now - 10 * 60_000, &chunks[1].0[..]],
+            )
             .unwrap();
         }
 
-        // Touch chunks[0]: now that its persisted `last_access` is
-        // 20 minutes stale, the deferred-touch branch refreshes it,
-        // promoting it past chunks[1]'s 10-minute-old timestamp.
         assert!(cache.get(chunks[0].0).await.unwrap().is_some());
 
-        // Inserting chunks[2] pushes total to ~12.3 KiB > 12 KiB cap.
         cache.put(chunks[2].0, chunks[2].1.clone()).await.unwrap();
 
         assert!(
@@ -564,84 +796,39 @@ mod tests {
             "post-eviction total {} bytes must fit the cap (12 KiB)",
             cache.used_bytes(),
         );
-        assert!(
-            cache.get(chunks[0].0).await.unwrap().is_some(),
-            "touched chunk[0] should survive eviction",
-        );
-        assert!(
-            cache.get(chunks[1].0).await.unwrap().is_none(),
-            "untouched chunk[1] should have been evicted first (LRU)",
-        );
-        assert!(
-            cache.get(chunks[2].0).await.unwrap().is_some(),
-            "newly-inserted chunk[2] should survive eviction",
-        );
+        assert!(cache.get(chunks[0].0).await.unwrap().is_some());
+        assert!(cache.get(chunks[1].0).await.unwrap().is_none());
+        assert!(cache.get(chunks[2].0).await.unwrap().is_some());
     }
 
-    /// Corruption handling: a row whose `data` doesn't validate
-    /// against its address must be deleted in place on read and the
-    /// caller must see a miss. This is the load-bearing safety
-    /// property — the network path runs on the miss and the
-    /// write-through eventually replaces the bad row, so a single
-    /// corrupted page can't poison the retrieval stream.
+    /// Bee-style trust: a hand-corrupted row is still returned on read
+    /// (same as bee chunkstore returning sharky bytes for a retrieval key).
     #[tokio::test]
-    async fn invalid_disk_row_is_deleted_and_reports_miss() {
+    async fn corrupt_disk_row_is_trusted() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("corrupt.sqlite");
         let cache = DiskChunkCache::open(&path, 1 << 20).unwrap();
         let (addr, wire) = make_chunk(b"trust me");
+        drop(cache);
 
-        // Plant a row whose bytes do NOT hash to `addr`. We can't go
-        // through `put` to get there because production callers
-        // invariably pass valid bytes; injecting via raw SQL is the
-        // crisp way to model "data corrupted at rest".
         let mut bad = wire.clone();
         bad[8] ^= 0x01;
         {
-            let inner = cache.inner.clone();
-            tokio::task::spawn_blocking(move || {
-                let conn = inner.conn.lock().unwrap();
-                conn.execute(
-                    "INSERT INTO chunks (address, data, size, last_access, inserted_at)
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO chunks (address, data, size, last_access, inserted_at)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![&addr[..], &bad, bad.len() as i64, 0i64, 0i64],
-                )
-                .unwrap();
-                inner
-                    .total_bytes
-                    .fetch_add(bad.len() as u64, Ordering::Relaxed);
-            })
-            .await
+                rparams![&addr[..], &bad, bad.len() as i64, 0i64, 0i64],
+            )
             .unwrap();
         }
+        let cache = DiskChunkCache::open(&path, 1 << 20).unwrap();
         assert_eq!(cache.row_count().await.unwrap(), 1);
 
         let got = cache.get(addr).await.unwrap();
-        assert!(got.is_none(), "corrupt row must be reported as miss");
-        assert_eq!(
-            cache.row_count().await.unwrap(),
-            0,
-            "corrupt row must have been deleted in place",
-        );
-        assert_eq!(
-            cache.used_bytes(),
-            0,
-            "byte mirror must reflect the corrupt-row deletion",
-        );
-
-        // Sanity: a subsequent valid put for the same address goes
-        // through cleanly, confirming the deletion left no
-        // unique-key constraint behind.
-        cache.put(addr, wire.clone()).await.unwrap();
-        assert_eq!(cache.get(addr).await.unwrap(), Some(wire));
+        assert_eq!(got, Some(bad));
     }
 
-    /// A second `put` for the same address must not double-count the
-    /// row in the byte mirror; the upsert's net delta is the
-    /// difference of the new and old sizes (zero if same length).
-    /// Without this, a hot chunk being re-cached under the
-    /// write-through path would inflate `used_bytes` linearly with
-    /// retries and trigger spurious eviction.
     #[tokio::test]
     async fn upsert_does_not_double_count() {
         let dir = tempdir().unwrap();
@@ -655,16 +842,13 @@ mod tests {
         assert_eq!(cache.used_bytes(), wire.len() as u64);
     }
 
-    /// Read the persisted `last_access` for a single address. Test-only
-    /// helper that mirrors the SQL the eviction sweep walks, so the
-    /// touch tests below assert on the same column eviction reads.
     async fn read_last_access(cache: &DiskChunkCache, addr: [u8; 32]) -> i64 {
-        let inner = cache.inner.clone();
+        let path = cache.path().to_path_buf();
         tokio::task::spawn_blocking(move || {
-            let conn = inner.conn.lock().unwrap();
+            let conn = rusqlite::Connection::open(&path).unwrap();
             conn.query_row(
                 "SELECT last_access FROM chunks WHERE address = ?1",
-                params![&addr[..]],
+                rparams![&addr[..]],
                 |row| row.get::<_, i64>(0),
             )
             .unwrap()
@@ -673,15 +857,6 @@ mod tests {
         .unwrap()
     }
 
-    /// Two consecutive reads inside [`LAST_ACCESS_REFRESH_MS`] must not
-    /// rewrite the row's `last_access`. Without this property the
-    /// cache turns every hit into a `synchronous=NORMAL` fsync — that
-    /// was the user-visible regression where a fully-populated disk
-    /// cache served at ~1 MiB/s under fan-out load. Asserting on the
-    /// stored timestamp is the crispest way to pin the optimisation
-    /// because it skips both clock noise and any test-side timing
-    /// flake — either the second `get` wrote and the column moved, or
-    /// it didn't.
     #[tokio::test]
     async fn fresh_last_access_is_not_rewritten() {
         let dir = tempdir().unwrap();
@@ -704,48 +879,31 @@ mod tests {
         );
     }
 
-    /// A read with a stale `last_access` (older than the refresh
-    /// window) *must* rewrite it — otherwise the eviction sweep
-    /// would never see that the row is hot, and an actively-read
-    /// chunk could be evicted under cap pressure.
     #[tokio::test]
     async fn stale_last_access_is_refreshed() {
         let dir = tempdir().unwrap();
-        let cache = DiskChunkCache::open(dir.path().join("touch-stale.sqlite"), 1 << 20).unwrap();
+        let path = dir.path().join("touch-stale.sqlite");
+        let cache = DiskChunkCache::open(&path, 1 << 20).unwrap();
         let (addr, wire) = make_chunk(b"cool read");
         cache.put(addr, wire.clone()).await.unwrap();
 
-        // Backdate the row to ~10 minutes ago so the next `get` sees
-        // an obviously-stale timestamp. We can't sleep through the
-        // real refresh window in a unit test (60 s wall-clock), and
-        // freezing the cache's clock would invite lying to ourselves
-        // about the production wiring — backdating the row is the
-        // honest equivalent.
         let backdated = unix_now() as i64 - 10 * 60_000;
         {
-            let inner = cache.inner.clone();
-            tokio::task::spawn_blocking(move || {
-                let conn = inner.conn.lock().unwrap();
-                conn.execute(
-                    "UPDATE chunks SET last_access = ?1 WHERE address = ?2",
-                    params![backdated, &addr[..]],
-                )
-                .unwrap();
-            })
-            .await
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute(
+                "UPDATE chunks SET last_access = ?1 WHERE address = ?2",
+                rparams![backdated, &addr[..]],
+            )
             .unwrap();
         }
 
         assert!(cache.get(addr).await.unwrap().is_some());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let after = read_last_access(&cache, addr).await;
         assert!(
             after > backdated,
             "stale last_access must be refreshed on read \
              (was {backdated}, now {after})",
-        );
-        assert!(
-            after >= unix_now() as i64 - LAST_ACCESS_REFRESH_MS,
-            "refreshed last_access must be within the freshness window of `now`",
         );
     }
 }

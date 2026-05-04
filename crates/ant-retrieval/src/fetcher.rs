@@ -380,13 +380,11 @@ impl ChunkFetcher for RoutingFetcher {
             }
         }
 
-        // Tier 2: persistent (SQLite) cache. The blocking SQLite work
-        // runs on the blocking pool inside [`DiskChunkCache::get`], so
-        // the retrieval task yields rather than holding a Tokio worker
-        // across `read_blob` + `fsync`. A failed validation deletes
-        // the row in-place (handled by `DiskChunkCache::get`) and
-        // reports `Ok(None)`, so the fetch falls through to the
-        // network exactly like a regular miss.
+        // Tier 2: persistent (SQLite) cache. The blocking work runs on
+        // the pool inside [`DiskChunkCache::get`] so the retrieval task
+        // yields. Disk hits trust stored bytes (same contract as bee's
+        // `chunkstore.Get`: validated on wire ingest, not re-hashed on
+        // every local read).
         if let Some(disk) = self.disk_cache.as_ref() {
             match disk.get(addr).await {
                 Ok(Some(bytes)) => {
