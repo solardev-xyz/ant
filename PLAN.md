@@ -749,6 +749,73 @@ The milestone structure deliberately supports three pre-GA checkpoints, each use
 - **End of M1.1:** **internal "Ant Probe" dev tool.** Still no user-facing value, but now provides a stable mainnet-connected node that retrieval work (M2) can be built on top of with confidence. Good point to onboard additional engineers.
 - **End of M2:** **shippable public "Ant Reader" app / SDK.** Lets you learn UX and distribution without having to solve the xDAI/xBZZ/chequebook problem yet. Highly recommended — de-risks the hardest *product* problems before you finish the hardest *protocol* problems.
 
+### iOS download smoke test (pre-FFI)
+
+Throwaway exploratory track, runnable any time after Phase 2 lands retrieval against mainnet. Goal: prove that our libp2p stack can dial mainnet bee peers and complete a chunk download from a Rust library running inside an iOS app, **before** we commit to the full UniFFI surface in §7 or the polished mobile artifact in Phase 4. De-risks the iOS-specific edges (ATS / cleartext TCP, simulator vs. device sockets, cellular vs. Wi-Fi, OSLog wiring, Tokio inside a UIKit lifecycle) on a thin slice of code that's cheap to delete.
+
+It is **not** a substitute for the M2 Phase 4 deliverable and does not change any milestone gate. It exists to surface iOS-specific surprises early, while the FFI is still soft.
+
+#### Scope
+
+In:
+
+- `aarch64-apple-ios-sim` static lib only — no device slice, no `lipo`, no `.xcframework`.
+- Three hand-written `extern "C"` functions: `ant_init(data_dir)`, `ant_download(handle, ref_hex, …)`, `ant_free`. No UniFFI, no `.udl`, no codegen.
+- Hardcoded mainnet bootnodes; throwaway libp2p identity persisted under the app sandbox; in-memory chunk cache only (`disk_cache: None`).
+- One SwiftUI screen: tap a button → "got N bytes" plus a hex prefix.
+
+Out (deferred to the proper M2/M3 mobile track):
+
+- UniFFI-generated Swift bindings.
+- `KeyProvider` callback / Keychain / Secure Enclave plumbing.
+- `BGProcessingTask` / `BGAppRefreshTask` / suspend-resume / lifecycle wiring.
+- SQLite disk cache, size-budget release profile, code signing, notarization.
+- Device-slice `.xcframework` packaging, CI gating.
+
+#### Responsibility split — the FFI surface is the boundary
+
+Anything any iOS app would need lives in `vibing/ant`; anything specific to this demo lives in the app. Useful test: imagine a third party writes their own iOS app against the FFI tomorrow — anything they would have to reinvent themselves is in the wrong place.
+
+| Concern | Owner |
+|---|---|
+| `extern "C"` API + `crates/ant-ffi/include/ant.h` (cbindgen output, checked in) | ant |
+| Tokio runtime, libp2p host, retrieval, joiner, mantaray | ant |
+| Mainnet bootnode + `network_id = 1` defaults | ant — app calls `ant_init(data_dir)`, never `ant_init(data_dir, bootnodes, network_id, …)` |
+| Auto-generated libp2p identity persisted under `<data_dir>/identity.json` | ant (replaced by `KeyProvider` callback later, see §5.10) |
+| `tracing` → `OSLog` bridge, behind `#[cfg(target_os = "ios")]` | ant (replaced by `set_log_sink` callback per §11) |
+| `cargo xtask build-ios-sim` cross-compile recipe | ant |
+| Sandbox path (`Application Support/`) chosen and passed in to `ant_init` | app |
+| `Info.plist`, `NSAppTransportSecurity / NSAllowsArbitraryLoads = true` (Noise XX is not TLS) | app |
+| SwiftUI views, the hardcoded test reference, code signing, provisioning | app |
+
+Rule of thumb for future "where does this go" calls: **removing the example app should not break the Rust test suite, and removing ant should not break the example app.**
+
+#### Workspace placement
+
+```
+vibing/ant/
+├── crates/
+│   └── ant-ffi/                # staticlib + cbindgen + extern "C"
+│       └── include/ant.h       # checked in; bridging-header points here
+├── xtask/                      # build-ios-sim, later build-ios-xcframework
+└── examples/
+    └── ios-download/           # SwiftUI smoke-test app, Xcode project
+```
+
+The example app sits under `examples/` (not `ios/`) to flag *experimental*. When the proper download-only mobile artifact lands at the end of Phase 4, promote or replace it with the reference `ios/` project from §4.
+
+In-repo from day one, not a separate repo: while the FFI is churning, every breaking change is one PR that touches both `crates/ant-ffi/src/lib.rs` and `examples/ios-download/AntDownload/ContentView.swift` — no version-skew matrix to manage. Same CI run can cross-compile the static lib and invoke `xcodebuild -scheme AntDownload -destination 'platform=iOS Simulator,name=iPhone 16'` against it.
+
+#### Exit
+
+- iOS Simulator on a Mac connects to live mainnet bee peers, completes the BZZ handshake, fetches a known small CAC root chunk via `RoutingFetcher::fetch` + `joiner::join`, and renders the byte length + hex prefix in the SwiftUI view.
+- Stretch: same flow on a real iPhone over Wi-Fi (requires the device slice + a development provisioning profile).
+- Stretch: same flow against a multi-chunk reference, end-to-end through the joiner.
+
+#### What this does not solve
+
+The proper M2 Phase 4 deliverable is still a UniFFI-based `.xcframework` that meets the size budget in §12, the FFI shape in §7, OSLog + lifecycle wiring per §8.4 / §11, and Keychain key storage per §5.10. The smoke test exists to prove the *transport* (Rust + libp2p inside iOS dialing mainnet) works end-to-end; it explicitly does not stand in for that artifact and is expected to be deleted when Phase 4 lands.
+
 ---
 
 ## 10. Testing Strategy
