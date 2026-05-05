@@ -26,12 +26,14 @@ and the work breakdown is in [PLAN.md Appendix D][appx-d].
 | `/addresses`                 | GET        | A    | Static identity — overlay (bare hex), ethereum (`0x…`), publicKey.   |
 | `/peers`                     | GET        | A    | BZZ-handshaked peers by overlay; pre-handshake peers omitted.        |
 | `/topology`                  | GET        | A    | Bee `kademlia.Snapshot`-shaped: 32-bin map plus summary fields.      |
-| `/wallet`                    | GET        | A    | Stubbed zero balances on Gnosis (chain ID 100).                      |
-| `/stamps`                    | GET        | A    | Stubbed empty list — no postage in Tier A.                           |
-| `/chequebook/address`        | GET        | A    | All-zero address — bee's "feature absent" sentinel.                  |
+| `/wallet`                    | GET        | A    | Stubbed zero balances on Gnosis (chain ID 100); upgrades to live values once `antd` learns to read its own wallet (M3 Phase 7 polish). |
+| `/stamps`                    | GET        | A    | Stubbed empty list — postage is managed via `antctl postage` for now. |
+| `/chequebook/address`        | GET        | A    | All-zero address — bee's "feature absent" sentinel; flips to the configured chequebook once Phase 7 auto-settlement lands. |
 | `/chequebook/balance`        | GET        | A    | Stubbed zero `totalBalance` / `availableBalance`.                    |
+| `/chunks`                    | POST       | B    | Stamps + pushsyncs a single 32-byte content-addressed chunk.         |
 | `/chunks/{addr}`             | GET / HEAD | A    | Returns wire bytes (`span ‖ payload`), matching `chunkstore.Get`.    |
 | `/bytes/{addr}`              | GET / HEAD | A    | Joins the chunk tree; honors a single-range `Range` header.          |
+| `/bzz`                       | POST       | B    | Single-file (`?name=…`) or tar-collection upload → Mantaray ref.     |
 | `/bzz/{addr}`                | GET / HEAD | A    | Manifest root — resolves `website-index-document` if present.        |
 | `/bzz/{addr}/{*path}`        | GET / HEAD | A    | Walks the manifest, joins data; `Content-Type` from manifest meta.   |
 | `/v0/manifest/{addr}`        | GET        | A+   | Ant extension: JSON listing of mantaray paths + metadata (no body).  |
@@ -59,10 +61,55 @@ land, and an HTTP client disconnect cancels the upstream retrieval task.
 malicious manifest claiming a multi-terabyte span is refused before any
 allocation. See PLAN.md Appendix E for the full design.
 
+### Upload endpoints (Tier B)
+
+`POST /chunks` and `POST /bzz` are live and bee-shaped — `bee-js`'s
+upload helpers and the official `swarm-cli` work against them
+unchanged. Both endpoints require the `swarm-postage-batch-id`
+header (32-byte hex; create one with `antctl postage create`) and
+both demand that `antd` was started with a postage batch and the
+batch owner's signing key:
+
+```sh
+antd \
+  --gnosis-rpc-url      https://gnosis-mainnet.g.alchemy.com/v2/<key> \
+  --postage-batch       0x<32-byte batch id> \
+  --postage-owner-key   0x<32-byte secret>
+```
+
+`POST /chunks` accepts the wire form (`span ‖ payload`, ≤ 4104
+bytes), stamps it locally with the configured `StampIssuer`, and
+pushsyncs to the closest BZZ peer.
+
+`POST /bzz` accepts either:
+
+- A single file body — controlled by `?name=<filename>` and the
+  `swarm-collection: false` header (the default). The gateway
+  splits, stamps, and pushes every leaf + intermediate, then builds
+  a one-entry Mantaray manifest pointing at the file root.
+- A tar archive body — `swarm-collection: true` plus
+  `content-type: application/x-tar`. The gateway iterates the tar
+  members, splits + pushes every file, then builds a recursive
+  Mantaray manifest. `swarm-index-document: <path>` and
+  `swarm-error-document: <path>` set the `website-index-document` /
+  `website-error-document` metadata on the root.
+
+Response in both cases is `201 Created` with
+`{"reference":"<32-byte hex>"}`. SWAP cheques are not yet emitted
+when forwarders accept our pushes (see Phase 7 polish in PLAN.md
+§9.0); peers tolerate this for the small volumes our upload tests
+generate, but a sustained 1 GB+ upload would eventually trip
+their disconnect threshold.
+
 ### What's intentionally not here
 
-- Tier-B writes (`POST /bytes`, `POST /bzz`, `POST /chunks`, real
-  stamps / SWAP / wallet / feeds / SOCs / tags / pins).
+- Tier-B writes other than `POST /bzz` and `POST /chunks` —
+  specifically `POST /bytes`, real stamps writes
+  (`/stamps/{batch}/topup`, `/stamps/{batch}/dilute`),
+  `/chequebook/{deposit,withdraw,cashout}`, `/wallet/withdraw`,
+  feeds / SOCs / tags / pins / stewardship / envelopes.
+  `antctl postage` covers the stamps writes from the CLI side
+  today; the rest is on the M3 polish track in PLAN.md §9.0.
 - Web3 v3 keystore (`keys/swarm.key`) — PLAN.md D.3.2.
 - ENS resolution (`/bzz/<ens>/...` — currently treated as a literal
   reference; bee-js's reachability checks accept the 400 today).
@@ -82,7 +129,7 @@ clients work without configuration:
 # build
 cargo build --release -p antd
 
-# run with the gateway on the default address
+# run with the gateway on the default address (read-only)
 ./target/release/antd --data-dir /tmp/ant-smoke
 
 # or pick a different port — pass through to bee-js as $BEE_API_URL
@@ -90,6 +137,12 @@ cargo build --release -p antd
 
 # headless deployments (no HTTP, only the antctl UDS)
 ./target/release/antd --data-dir /tmp/ant-smoke --no-http-api
+
+# enable upload endpoints (POST /chunks, POST /bzz)
+./target/release/antd --data-dir /tmp/ant-smoke \
+  --gnosis-rpc-url    https://gnosis-mainnet.g.alchemy.com/v2/<key> \
+  --postage-batch     0x<32-byte batch id> \
+  --postage-owner-key 0x<32-byte secret>
 ```
 
 Smoke tests once peers are connected:
@@ -99,6 +152,12 @@ curl -fsS  http://127.0.0.1:1633/health
 curl -fsS  http://127.0.0.1:1633/peers | jq '.peers | length'
 curl -fsSI http://127.0.0.1:1633/bzz/<root>/<path>
 curl -i    http://127.0.0.1:1633/transactions   # 501, not implemented
+
+# upload (requires --postage-batch + --postage-owner-key)
+curl -fsS -X POST -H 'content-type: text/plain' \
+     -H "swarm-postage-batch-id: $BATCH" \
+     --data-binary 'uploaded via ant' \
+     'http://127.0.0.1:1633/bzz?name=hello.txt'
 ```
 
 ## Embedding

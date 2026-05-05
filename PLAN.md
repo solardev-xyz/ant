@@ -544,7 +544,7 @@ Each milestone is subdivided into phases that end with a concrete demo.
 
 ### 9.0 Current status (snapshot)
 
-Workspace is at **`0.3.4`** across all eight live crates; the same binary is deployed on `vibing.at/ant` as a live bee-compatible gateway against Swarm mainnet.
+Workspace is at **`0.3.4`** across all live crates (`antd`, `antctl`, `ant-control`, `ant-crypto`, `ant-gateway`, `ant-node`, `ant-p2p`, `ant-retrieval`, plus the M3 additions `ant-chain` and `ant-postage`). The same binary is deployed on `vibing.at/ant` as a live bee-compatible gateway against Swarm mainnet.
 
 | Milestone | Status | Notes |
 |---|---|---|
@@ -553,16 +553,21 @@ Workspace is at **`0.3.4`** across all eight live crates; the same binary is dep
 | **M2 / Phase 2** — Retrieval | ✅ shipped | `ant-retrieval`: bee-parity fetcher with cancel-tolerant hedging (Appendix G), admission-control mirror (Appendix H), pseudosettle-backed accounting (Appendix F), two-tier chunk cache (in-mem LRU + SQLite-backed `DiskChunkCache`, Appendix §6). |
 | **M2 / Phase 3** — Mantaray + download API | ✅ shipped | Mantaray walker + `/v0/manifest` + `bzz://` path resolution, Swarm-feed dereferencing, ordered streaming joiner with single-range and HEAD support (Appendix E). |
 | **M2 / Phase 4** — Ultra-light packaging | 🚧 partial | Tier-A `ant-gateway` live on 127.0.0.1:1633 with `--api-addr` / `--no-http-api` (Appendix D); bee-js / curl / browser smoke passes. **Mobile artefact (xcframework / aar) not started yet.** `antctl get` streams progress but the download body is still terminal, not byte-streamed (Appendix E Phase 5). |
-| **M3 / Phase 5–9** — Uploads / stamps / SWAP | ⏳ not started | No `ant-chain`, `ant-stamps`, `ant-pushsync`, `ant-swap` crates yet. |
+| **M3 / Phase 5** — Chain plumbing (reads + writes) | ✅ shipped | New `ant-chain` crate. JSON-RPC client (`eth_call`, `eth_getLogs`, `eth_getBalance`, `eth_estimateGas`, `eth_sendRawTransaction`, `eth_getTransactionReceipt`). ABI calldata builders for ERC-20 (`balanceOf`, `approve`), `PostageStamp` (`createBatch`, `topUp`, `increaseDepth`, `batchOwner`, `batchDepth`, `batchBucketDepth`, `batchImmutableFlag`), and `SimpleSwap` chequebook (`issuer`, `balance`, `liquidBalance`, `totalPaidOut`, `cashChequeBeneficiary`). EIP-155 legacy tx signing with `ant_crypto::sign_prehash`. Receipt polling. `dry_run_wallet` example. |
+| **M3 / Phase 6** — First uploads (pre-provisioned batch) | ✅ shipped | New `ant-postage` (`StampIssuer`, EIP-191 stamp signing, bucket counters with crash-safe `write tmp + fsync + rename` persistence) + new `ant-retrieval::pushsync` (`/swarm/pushsync/1.3.1/pushsync` client, receipt verification, storer-signature recovery). Wired through `antd` → `UploadRuntime` → gateway `POST /chunks`. Live mainnet smoke: single-chunk push + retrieve via fresh fetcher. |
+| **M3 / Phase 7** — SWAP / payment | 🚧 partial | EIP-712 cheque signing + verification primitives (`ant-chain::chequebook`), with the chequebook EIP-712 domain matching bee's `EIP712DomainType` (`name / version / chainId`, no `verifyingContract`). Bee-compatible `/swarm/swap/1.0.0/swap` listener + dialer (`ant-p2p::swap`) — JSON-encoded `SignedCheque` inside protobuf `EmitCheque`, signature verified, monotonic, sticky issuer-EOA pinning, crash-safe on-disk credit ledger. BZZ handshake now exposes the peer's Ethereum EOA + welcome string in `HandshakeInfo` (and a new `handshake_outbound_with_role` lets the smoke binary advertise as a full node). Outbound `OutboundLedger` + `issue_and_emit` helpers in place. **Tier-1 on-chain cheque round-trip ✅** — `antctl chequebook cash-self --submit` proves bit-exact bee compatibility on Gnosis mainnet (block `46019699`, tx `0x643bb08e…e308`); the chequebook contract recovered our issuer from our EIP-712 cheque and debited 1 PLUR. **Outstanding:** automatic settlement trigger from `ant-retrieval::accounting`; re-run the live `cheque_smoke` mainnet binary now that the digest is fixed (the previous "cold-peer rejection" diagnosis is currently unconfirmed — bee may have just been rejecting our broken EIP-712 digest); automatic chequebook factory deploy. |
+| **M3 / Phase 8** — Stamp lifecycle | ✅ shipped | `antctl postage create / top-up / dilute / show / balance` subcommands talk straight to Gnosis (no daemon required). Bucket counters persisted per batch at `<data_dir>/postage/<batch_id>.bin`, reloaded on restart so we don't reissue indices. Approve-then-create flow handled automatically. **Outstanding:** expiry monitoring + app-level events, on-device dilute/topup orchestration with per-batch budgets. |
+| **M3 / Phase 9** — Streaming uploads + Mantaray construction | ✅ shipped | `ant-retrieval::splitter` (bytes → balanced k-ary chunk tree, inverse of the joiner) + recursive `ant-retrieval::manifest_writer` (Mantaray v0.2 radix trie that fits one CAC chunk per node, deepens the tree as collections grow, and chains 30-byte forks for long path segments). Gateway `POST /bzz?name=…` (single file) and `POST /bzz` (tar collection) live. Live mainnet smoke: single-file + tar collection upload, fresh-fetcher round-trip. **`beeMode`** still reports `"ultra-light"` until the auto-settlement trigger lands. |
 | **Hardening / Phase 10–11** | ⏳ not started | Mobile suspend/resume, upload resumption, beta. |
 
-Active hardening tracks carried alongside M2:
+Active hardening tracks carried alongside M2 and M3:
 
 - Retrieval / accounting polish: F.7 follow-ups (persist pseudosettle budget across restarts, per-peer chunks-per-connection counter, investigate ~30 ms peer churn pattern). Low-impact, untouched.
 - §6.2 disk-cache asymmetries: bee ~2× faster on cold populate and 1.5–3× faster at K ≤ 4 single-threaded reads; ant wins from K ≥ 8 upward. Worth a targeted pragma / prepared-statement pass.
 - Appendix E Phase 5 (CLI streaming) and Phase 8 (Reed-Solomon recovery) remain the two read-path gaps.
+- M3 Phase 7 polish: auto-settlement trigger from `accounting` ↔ `swap::issue_and_emit`, re-run the `cheque_smoke` mainnet binary with the fixed EIP-712 digest (rung B), `antctl chequebook deploy` subcommand. Tier-1 cash-self interop is done — see `antctl chequebook cash-self`.
 
-Detailed post-facto engineering write-ups of the retrieval/accounting work live in Appendices E (gateway streaming), F (pseudosettle), G (cancel-tolerant hedging + moving window) and H (admission-control mirror). The phase descriptions below remain the original plan — consult the appendices for what actually shipped and how.
+Detailed post-facto engineering write-ups of the retrieval/accounting work live in Appendices E (gateway streaming), F (pseudosettle), G (cancel-tolerant hedging + moving window) and H (admission-control mirror). The phase descriptions below remain the original plan — consult the appendices and the per-phase "Landed as" notes for what actually shipped and how.
 
 ---
 
@@ -660,7 +665,7 @@ Goal: the node retrieves any reference from mainnet, including multi-chunk files
 
 Goal: everything in M2, plus honest on-device uploading with on-chain postage-stamp management and SWAP-based payment to forwarders.
 
-#### Phase 5 — Chain plumbing, reads first
+#### Phase 5 — Chain plumbing, reads first — ✅ shipped
 
 - `ant-chain`: alloy-based RPC client, ABIs for `ERC20`, `PostageStamp`, `ChequebookFactory`, `Chequebook`.
 - Nonce manager, confirmation waiter, fee-bumping scaffolding (not yet exercised).
@@ -669,7 +674,9 @@ Goal: everything in M2, plus honest on-device uploading with on-chain postage-st
 
 **Exit:** Mobile app reads and displays an on-chain batch and chequebook for the embedded wallet. No writes yet.
 
-#### Phase 6 — Single-chunk upload with pre-provisioned stamps
+**Landed as:** new `ant-chain` crate built on the existing `reqwest` JSON-RPC dependency rather than `alloy-*` (kept the dependency graph thin to protect the §12 size budget). Exposes `ChainClient` with `eth_call`, `eth_get_logs`, `eth_get_balance_lower128`, `eth_estimate_gas`, `eth_get_transaction_count`, `eth_send_raw_transaction`, and a receipt poller. ABI calldata builders for ERC-20 (`balanceOf`, `approve`), `PostageStamp` (`createBatch`, `topUp`, `increaseDepth`, plus the `batchOwner / batchDepth / batchBucketDepth / batchImmutableFlag` view selectors), and `SimpleSwap` chequebook (`issuer`, `balance`, `liquidBalance`, `totalPaidOut`, `cashChequeBeneficiary`). EIP-155 legacy tx signing via `ant_crypto::sign_prehash` (RLP using the `rlp` crate; `v = chain_id*2 + 35 + recid`). High-level `Wallet` struct chains nonce-fetch + estimate + sign + submit + receipt-poll. `examples/dry_run_wallet.rs` exercises the signer against a live RPC without submitting. The `KeyProvider` FFI contract is **not yet** finalised — keys today are loaded from CLI flags / `.env`; mobile-grade Keychain/Keystore wiring lands with the M2 Phase 4 mobile artefact.
+
+#### Phase 6 — Single-chunk upload with pre-provisioned stamps — ✅ shipped
 
 - `ant-pushsync`: client protocol, receipt verification.
 - `ant-stamps`: per-chunk signing, bucket counters, atomic persistence. Batch injected via configuration — no on-chain purchase yet.
@@ -677,7 +684,9 @@ Goal: everything in M2, plus honest on-device uploading with on-chain postage-st
 
 **Exit:** Upload a single chunk to mainnet with a pre-provisioned batch. End-to-end roundtrip: upload → reference → download via the same embedded node.
 
-#### Phase 7 — SWAP
+**Landed as:** new `ant-postage` crate (rather than `ant-stamps`) carrying `StampIssuer` with EIP-191 stamp signing per chunk, depth/bucket-depth-aware bucket counters, and crash-safe JSON persistence (atomic `write tmp + fsync + rename`). `StampIssuer::open_or_new` reloads the previous indices on restart so we don't reissue stamps that the network has already seen. Pushsync client lives in `ant-retrieval::pushsync` (kept inside `ant-retrieval` to share the libp2p stream plumbing with the existing fetcher, rather than starting a fourth network crate). Wired through `antd` → `UploadRuntime` → `ant-control::ControlCommand::PushChunk` → gateway `POST /chunks`. Live mainnet smoke: single-chunk push followed by retrieval via a brand-new fetcher process. The "accounting stub" remains stubbed — outbound debits are not yet recorded into a per-peer ledger; that lands with the auto-settlement trigger in the open Phase 7 polish.
+
+#### Phase 7 — SWAP — 🚧 partial
 
 - `ant-accounting`: per-peer ledger, payment / disconnect thresholds, early-payment logic.
 - `ant-swap`: chequebook deploy via factory, EIP-712 cheque signing, cheque issuance on threshold, re-issue on reconnect.
@@ -685,7 +694,17 @@ Goal: everything in M2, plus honest on-device uploading with on-chain postage-st
 
 **Exit:** Upload ~1 GB of chunks via pushsync while paying peers; peers never disconnect us for non-payment.
 
-#### Phase 8 — On-device stamp lifecycle
+**Landed so far:** EIP-712 cheque sign/verify primitives + `cashChequeBeneficiary` / `cash_cheque_beneficiary` calldata + ABI in `ant-chain::chequebook`. New `ant-p2p::swap` module implementing the bee-compatible `/swarm/swap/1.0.0/swap` protocol — JSON-encoded `SignedCheque` wrapped in the protobuf `EmitCheque` message, byte-for-byte matching bee's `encoding/json` output (hex addresses, decimal `U256`, base64 signature). Inbound listener verifies signature, pins the chequebook contract to its initial issuer EOA on first sight (sticky — replay-safe), enforces strict monotonicity on `cumulative_payout`, and persists every accepted credit to `<data_dir>/swap_credits.json` with the same atomic-write pattern as `ant-postage`. Outbound side: `OutboundLedger` tracks the last cumulative payout per peer, `issue_cheque` builds + signs the next cheque, `issue_and_emit` opens the swap stream and sends. The BZZ handshake was extended to recover the peer's Ethereum EOA from the BZZ address signature (and to surface their welcome string), so callers know which beneficiary address belongs to a given libp2p peer. The listener is registered in `ant-p2p::Behaviour` even when SWAP isn't fully configured, so peers don't see a libp2p disconnect when they emit cheques at us.
+
+**Tier-1 on-chain cheque round-trip — ✅ shipped.** New `antctl chequebook show` (read `issuer / balance / totalPaidOut / liquidBalance / paidOut(beneficiary)`) and `antctl chequebook cash-self` (sign a tiny EIP-712 cheque with the issuer key, eth_call `cashChequeBeneficiary` from the beneficiary's EOA, optionally `--submit` for the full state transition). First live run on Gnosis mainnet (block `46019699`, tx `0x643bb08e4485042024604a8ac223a7ea89c594d1a22a27cbba01b4bc9982e308`): chequebook `0xfEecbb9a…20D` debited 1 PLUR, `paidOut[WALLET_ADDRESS] = 1`, `total_paid_out = 1`. **Side-effect: caught a real bug in our EIP-712 implementation** — the chequebook domain is `EIP712Domain(string name,string version,uint256 chainId)` (3 fields, NO `verifyingContract`) per bee's `pkg/crypto/eip712/EIP712DomainType`, but our previous `eip712_domain_separator` was hashing the 4-field OpenZeppelin-default shape and sticking the chequebook address into the domain. The on-chain dry-run reverted with `invalid issuer signature`; the fix lives in `ant-chain::chequebook::eip712_domain_type_hash` + `eip712_domain_separator`. **This invalidates the rung-B "cold-peer rejection" diagnosis** — the immediate stream Reset we observed against bee bootnodes was almost certainly bee's chequebook-side EIP-712 verifier rejecting our (then-broken) digest, not bee's accounting Addressbook. Re-running the smoke binary with the fixed digest is now the natural next step; until then we treat the cold-peer hypothesis as *unconfirmed*.
+
+**Outstanding (Phase 7 polish):**
+
+- Hook into `ant-retrieval::accounting` so that crossing the per-peer payment threshold automatically calls `swap::issue_and_emit` with a fresh cheque (the helper exists; the trigger doesn't). This is the production path that actually drives the swap state machine end-to-end.
+- Re-run the live `cheque_smoke` mainnet binary now that the EIP-712 digest is bee-compatible (Tier-1 proved it on-chain). If bee accepts the cheque this time, the cold-peer hypothesis was wrong and rung B is closed. If bee still Resets the stream, the cold-peer hypothesis stands and we proceed to the auto-settlement trigger above.
+- `antctl chequebook deploy` (factory deploy). Cash-out (`cash-self`) shipped with Tier 1.
+
+#### Phase 8 — On-device stamp lifecycle — ✅ shipped
 
 - On-chain batch purchase, top-up, dilute.
 - Expiry monitoring and app-level events.
@@ -693,7 +712,9 @@ Goal: everything in M2, plus honest on-device uploading with on-chain postage-st
 
 **Exit:** End-to-end user flow: buy a batch, upload files, top it up, dilute it — all initiated from the device.
 
-#### Phase 9 — Streaming uploads + mantaray construction
+**Landed as:** `antctl postage create | top-up | dilute | show | balance` subcommands talking directly to Gnosis (no daemon required, so operators can manage stamps from a workstation that doesn't run the daemon). `create` does the BZZ approve-if-needed dance before submitting `createBatch`. Bucket-counter hardening is live: every issued index is flushed to `<data_dir>/postage/<batch_id>.bin` *before* the chunk goes on the wire, and the file is reloaded on restart so we never reissue a stamp index. **Outstanding:** in-process expiry monitoring + app-level events (a daemon-side watcher that fires when a batch's TTL drops below a configurable threshold), and orchestration helpers that automatically dilute / top-up against a per-batch budget. The on-chain plumbing is in place; only the policy layer is missing.
+
+#### Phase 9 — Streaming uploads + mantaray construction — ✅ shipped
 
 - Streaming chunker with on-the-fly BMT tree construction.
 - `ant-mantaray` construction path (previously we only traversed).
@@ -701,6 +722,8 @@ Goal: everything in M2, plus honest on-device uploading with on-chain postage-st
 - Tier-B `ant-gateway` endpoints (Appendix C) come online incrementally with the underlying capability: `/wallet`, `/chequebook/*` real after Phase 7; `/stamps` writes after Phase 8; `/bzz` POST, `/bytes` POST, `/chunks*`, `/tags*`, `/feeds/*`, `/soc/*`, `/stewardship/*`, `/envelope/*` after Phase 9. `beeMode` flips to `"light"` once `swap-enable` is honored end-to-end.
 
 **Exit (M3):** Upload a multi-file directory as a single mantaray manifest and retrieve files by path — full read/write parity with a `bee` light node for the supported protocol subset.
+
+**Landed as:** `ant-retrieval::splitter` produces a balanced k-ary chunk tree (the inverse of the existing joiner) and emits leaf + intermediate CAC chunks. `ant-retrieval::manifest_writer` was rewritten as a recursive Mantaray v0.2 radix trie that fits one CAC chunk per node, deepens the tree as a collection grows beyond a single root chunk, and chains 30-byte forks for path segments longer than `MAX_FILENAME_BYTES`. `build_single_file_manifest` wraps `build_collection_manifest` so the gateway has one entry point. Gateway `POST /bzz` accepts both `?name=…` single-file uploads and tar-archive collections (per the bee-shaped contract), parallel-pushes every leaf + intermediate + manifest chunk through the existing `PushChunk` control verb, and answers with `{"reference":"<hex>"}`. Live mainnet smoke: single-file upload (`"uploaded via ant"`) and tar collection upload, both retrieved fresh through `bzz://<root>[/path]`. **`beeMode` is still `"ultra-light"`** in the `/node` response and flips to `"light"` once the auto-settlement trigger lands and `swap-enable` is honored end-to-end. The Tier-B `/wallet`, `/chequebook/*`, `/stamps` writes, `/tags*`, `/feeds/*`, `/soc/*`, `/stewardship/*`, `/envelope/*` endpoints are still on the catch-all 501.
 
 ---
 
@@ -736,7 +759,7 @@ Not a capability milestone, but required before GA.
 | **M1.0 Basic mainnet connection** | 0 | ✅ shipped | `antd` connects to mainnet + completes BZZ handshake |
 | **M1.1 Stable neighborhood** | 1 | ✅ shipped | Stable peer set + correct Kademlia routing bins over 24 h |
 | **M2 Ultra-light (download)** | 2, 3, 4 | 🚧 desktop live, mobile pending | Download any reference + path resolution; shippable read-only build |
-| **M3 Light node (upload + stamps + SWAP)** | 5, 6, 7, 8, 9 | ⏳ not started | Buy batch → upload directory → retrieve by path, all on device |
+| **M3 Light node (upload + stamps + SWAP)** | 5, 6, 7, 8, 9 | 🚧 mostly shipped | Phases 5, 6, 8, 9 ✅; Phase 7 ✅ wire / verify / persistence + ✅ Tier-1 on-chain `cashChequeBeneficiary` round-trip (block `46019699`, tx `0x643bb08e…e308` — proves bee bit-compatibility), ⏳ auto-settlement trigger + re-run live outbound `cheque_smoke` against bee bootnodes (the previous "cold-peer" diagnosis is now in question — bee may have been rejecting our broken EIP-712 digest, fixed in the same Tier-1 work). End-to-end: `antctl postage create` → `POST /bzz` (single file or tar) → `bzz://<ref>/path` retrieval all working live on Swarm mainnet. |
 | **Hardening** | 10, 11 | ⏳ not started | Public beta with survived-kill uploads and mainnet interop |
 
 M1 and M2 can be parallelized by a second engineer starting on chain plumbing in Phase 5. Add buffer for unknowns — Swarm's protocols have undocumented edges, and the first honest interop run against `bee` always surfaces something.
