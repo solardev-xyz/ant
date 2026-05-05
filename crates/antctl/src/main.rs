@@ -92,6 +92,20 @@ Examples:
   antctl get bzz://<root>/index.html          # website index
   antctl get bzz://<root>/images/logo.png     # nested file
   antctl get bzz://<root>/13/4358/2645.png    # tile pyramid leaf")]
+    /// Postage batch lifecycle on Gnosis: createBatch, topUp,
+    /// increaseDepth, list (read-only). All variants talk directly to
+    /// the chain — `antd` does not need to be running.
+    Postage {
+        #[command(subcommand)]
+        command: PostageCommand,
+    },
+    /// Chequebook contract diagnostics on Gnosis: read state,
+    /// dry-run / submit `cashChequeBeneficiary`. Talks directly to
+    /// the chain — `antd` does not need to be running.
+    Chequebook {
+        #[command(subcommand)]
+        command: ChequebookCommand,
+    },
     Get {
         /// Reference. See above for accepted forms.
         reference: String,
@@ -172,6 +186,220 @@ enum PeersCommand {
     Reset,
 }
 
+/// Common chain-write flags shared by every `postage` write subcommand.
+/// All can be supplied via env so the operator doesn't have to repeat
+/// secrets on every invocation: `GNOSIS_RPC_URL`, `POSTAGE_OWNER_KEY`
+/// (or the bee-shaped alias `STORAGE_STAMP_PRIVATE_KEY`),
+/// `POSTAGE_CONTRACT`. Any flag passed on the command line wins over
+/// the env var.
+#[derive(clap::Args, Debug)]
+struct PostageChainArgs {
+    /// Gnosis RPC URL. Reads `GNOSIS_RPC_URL` if absent.
+    #[arg(long, env = "GNOSIS_RPC_URL")]
+    gnosis_rpc_url: String,
+    /// Owner private key (32-byte hex, optional `0x` prefix). Reads
+    /// `POSTAGE_OWNER_KEY` or `STORAGE_STAMP_PRIVATE_KEY` if absent.
+    /// Used to sign the on-chain transaction.
+    #[arg(long, env = "POSTAGE_OWNER_KEY")]
+    owner_key: String,
+    /// Address of the deployed PostageStamp contract on Gnosis. Reads
+    /// `POSTAGE_CONTRACT` if absent. Default is the Swarm mainnet
+    /// stamp contract.
+    #[arg(
+        long,
+        env = "POSTAGE_CONTRACT",
+        default_value = "0x45a1502382541Cd610CC9068e88727426b696293"
+    )]
+    postage_contract: String,
+    /// Address of the BZZ ERC-20 token on Gnosis. Reads
+    /// `BZZ_TOKEN_CONTRACT` if absent. Default is mainnet xBZZ.
+    #[arg(
+        long,
+        env = "BZZ_TOKEN_CONTRACT",
+        default_value = "0xdBF3Ea6F5beE45c02255B2c26a16F300502F68da"
+    )]
+    bzz_token: String,
+    /// Per-tx confirmation timeout in seconds. Gnosis blocks land
+    /// every ~5 s; 90 s comfortably covers a busy-mempool wait.
+    #[arg(long, default_value_t = 90)]
+    wait_secs: u64,
+    /// Gas price override in gwei. Defaults to 2 gwei (above the
+    /// current Gnosis floor) — bump for congestion.
+    #[arg(long)]
+    gas_price_gwei: Option<u64>,
+}
+
+#[derive(Subcommand, Debug)]
+enum PostageCommand {
+    /// Create a new postage batch. Approves BZZ for the PostageStamp
+    /// contract first, then issues `createBatch`. Prints the new
+    /// batch id (extracted from the BatchCreated event) on success.
+    Create {
+        #[command(flatten)]
+        chain: PostageChainArgs,
+        /// Batch depth. The batch can stamp 2^depth chunks total
+        /// before the buckets fill (or wrap around, if mutable).
+        /// Bee's minimum is 17; 22 is a sensible default for a
+        /// small site (~16 M chunks ≈ 64 GiB).
+        #[arg(long)]
+        depth: u8,
+        /// Bucket depth. Bee fixes this at 16 in practice; leave at
+        /// the default unless you know why you're changing it.
+        #[arg(long, default_value_t = 16)]
+        bucket_depth: u8,
+        /// Initial balance per chunk, in PLUR (BZZ wei, 1 BZZ = 1e16
+        /// PLUR). Bee uses cumulative-paid-out semantics — this is
+        /// what each of the 2^depth buckets is funded with.
+        #[arg(long)]
+        amount_per_chunk: u128,
+        /// Mark the batch immutable. Immutable batches refuse new
+        /// stamps once a bucket fills (instead of wrapping around
+        /// and overwriting old indices); pick this for archival
+        /// uploads, not for ephemeral content.
+        #[arg(long)]
+        immutable: bool,
+        /// Random 32-byte salt used to derive the batch id. Defaults
+        /// to a fresh random value; pass an explicit hex string for
+        /// reproducible test deployments.
+        #[arg(long)]
+        salt: Option<String>,
+    },
+    /// Top up an existing batch by adding `amount_per_chunk` more
+    /// PLUR per bucket — extends the batch's lifetime without
+    /// changing its capacity.
+    TopUp {
+        #[command(flatten)]
+        chain: PostageChainArgs,
+        /// Batch id (32-byte hex, optional `0x` prefix).
+        #[arg(long)]
+        batch_id: String,
+        /// Per-chunk top-up amount in PLUR. Total cost =
+        /// `amount_per_chunk × 2^depth`.
+        #[arg(long)]
+        amount_per_chunk: u128,
+    },
+    /// Dilute an existing batch by raising its depth. Doubles
+    /// capacity per +1 of `new_depth` and halves the per-chunk
+    /// balance accordingly. The batch id stays the same — every
+    /// stamp issued so far remains valid.
+    Dilute {
+        #[command(flatten)]
+        chain: PostageChainArgs,
+        /// Batch id (32-byte hex, optional `0x` prefix).
+        #[arg(long)]
+        batch_id: String,
+        /// New batch depth. Must be > current depth.
+        #[arg(long)]
+        new_depth: u8,
+    },
+    /// Read-only: show on-chain metadata for a batch (depth, bucket
+    /// depth, immutable flag, owner address). Doesn't require a key.
+    Show {
+        /// Gnosis RPC URL.
+        #[arg(long, env = "GNOSIS_RPC_URL")]
+        gnosis_rpc_url: String,
+        /// PostageStamp contract address.
+        #[arg(
+            long,
+            env = "POSTAGE_CONTRACT",
+            default_value = "0x45a1502382541Cd610CC9068e88727426b696293"
+        )]
+        postage_contract: String,
+        /// Batch id (32-byte hex, optional `0x` prefix).
+        #[arg(long)]
+        batch_id: String,
+    },
+    /// Read-only: print the wallet's xDAI and BZZ balances. Useful as
+    /// a pre-flight sanity check before `create` / `topup`.
+    Balance {
+        /// Gnosis RPC URL.
+        #[arg(long, env = "GNOSIS_RPC_URL")]
+        gnosis_rpc_url: String,
+        /// Wallet to check. If omitted, derives from
+        /// `POSTAGE_OWNER_KEY`. At least one of `--address` or
+        /// `POSTAGE_OWNER_KEY` env must be set.
+        #[arg(long)]
+        address: Option<String>,
+        /// BZZ token contract.
+        #[arg(
+            long,
+            env = "BZZ_TOKEN_CONTRACT",
+            default_value = "0xdBF3Ea6F5beE45c02255B2c26a16F300502F68da"
+        )]
+        bzz_token: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ChequebookCommand {
+    /// Read-only: print the chequebook's `issuer()`, `balance()`,
+    /// `totalPaidOut()`, `liquidBalance()`, and `paidOut(<beneficiary>)`
+    /// snapshots — useful as a pre-flight before `cash-self`.
+    Show {
+        /// Gnosis RPC URL.
+        #[arg(long, env = "GNOSIS_RPC_URL")]
+        gnosis_rpc_url: String,
+        /// Chequebook contract address.
+        #[arg(long, env = "CHEQUEBOOK_ADDRESS")]
+        chequebook: String,
+        /// Beneficiary address to read `paidOut(...)` for. Optional;
+        /// defaults to `WALLET_ADDRESS` env if set.
+        #[arg(long, env = "WALLET_ADDRESS")]
+        beneficiary: Option<String>,
+    },
+    /// Tier-1 SWAP self-test: sign a tiny EIP-712 cheque with the
+    /// chequebook's issuer key, beneficiary = our own
+    /// `WALLET_PRIVATE_KEY` address, then either eth_call (default)
+    /// or eth_sendRawTransaction (`--submit`) `cashChequeBeneficiary`
+    /// against the chequebook contract.
+    ///
+    /// Proves end-to-end that our EIP-712 digest, ECDSA recid, and
+    /// signature shape are bit-compatible with bee's chequebook
+    /// contract: a passing call → recover yields exactly `issuer()`.
+    /// Costs ~$0.0001 in xDAI gas at `--submit`; the dry-run is free.
+    CashSelf {
+        /// Gnosis RPC URL.
+        #[arg(long, env = "GNOSIS_RPC_URL")]
+        gnosis_rpc_url: String,
+        /// Chequebook contract address.
+        #[arg(long, env = "CHEQUEBOOK_ADDRESS")]
+        chequebook: String,
+        /// Issuer private key (32-byte hex). Must derive to the
+        /// address `chequebook.issuer()` returns. Reads
+        /// `STORAGE_STAMP_PRIVATE_KEY` if absent.
+        #[arg(long, env = "STORAGE_STAMP_PRIVATE_KEY")]
+        issuer_key: String,
+        /// Beneficiary private key (32-byte hex). Must derive to an
+        /// EOA we control, because the chequebook contract bakes
+        /// `msg.sender` (the submitter) into the EIP-712 digest as
+        /// the beneficiary. Reads `WALLET_PRIVATE_KEY` if absent.
+        #[arg(long, env = "WALLET_PRIVATE_KEY")]
+        beneficiary_key: String,
+        /// Optional recipient address (where the tiny BZZ payout
+        /// would land). Defaults to the beneficiary itself.
+        #[arg(long)]
+        recipient: Option<String>,
+        /// Cumulative payout to claim, in PLUR (1 BZZ = 1e16 PLUR).
+        /// Default `1` is the smallest possible cheque. `cash-self`
+        /// auto-bumps this to `paidOut[beneficiary] + 1` so the
+        /// chequebook never rejects the cheque as already-cashed.
+        #[arg(long, default_value_t = 1u128)]
+        payout_plur: u128,
+        /// Submit the signed tx instead of just `eth_call`-ing.
+        /// `eth_call` is enough to prove signature correctness; only
+        /// pass `--submit` to also exercise on-chain state changes.
+        #[arg(long)]
+        submit: bool,
+        /// Per-tx confirmation timeout (seconds), only meaningful
+        /// with `--submit`.
+        #[arg(long, default_value_t = 90)]
+        wait_secs: u64,
+        /// Gas price override (gwei). Defaults to 2 gwei.
+        #[arg(long)]
+        gas_price_gwei: Option<u64>,
+    },
+}
+
 fn main() -> Result<()> {
     let opt = Opt::parse();
     let socket = resolve_socket(&opt)?;
@@ -227,6 +455,12 @@ fn main() -> Result<()> {
                 Response::Error { message } => bail!("antd: {message}"),
                 other => bail!("unexpected response: {other:?}"),
             }
+        }
+        Command::Postage { command } => {
+            run_postage(command, opt.json)?;
+        }
+        Command::Chequebook { command } => {
+            run_chequebook(command, opt.json)?;
         }
         Command::Get {
             reference,
@@ -335,6 +569,725 @@ fn write_output(
     }
     io::stdout().lock().write_all(data)?;
     Ok(None)
+}
+
+/// Run a `postage` subcommand. We construct a fresh tokio runtime here
+/// rather than threading async through `main` because every other
+/// antctl command is synchronous; postage is the lone async path
+/// today.
+fn run_postage(cmd: PostageCommand, json: bool) -> Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build postage runtime")?;
+    rt.block_on(async move { run_postage_async(cmd, json).await })
+}
+
+/// Sibling of [`run_postage`] for the `chequebook` subcommand. Same
+/// rationale: a fresh single-thread runtime is cheaper than threading
+/// async through every antctl call site.
+fn run_chequebook(cmd: ChequebookCommand, json: bool) -> Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build chequebook runtime")?;
+    rt.block_on(async move { run_chequebook_async(cmd, json).await })
+}
+
+async fn run_chequebook_async(cmd: ChequebookCommand, json: bool) -> Result<()> {
+    use ant_chain::chequebook::{
+        cash_cheque_beneficiary_calldata, cheque_digest, chequebook_balance_selector,
+        chequebook_issuer_selector, chequebook_liquid_balance_selector,
+        chequebook_paid_out_calldata, chequebook_total_paid_out_selector, sign_cheque, Cheque,
+    };
+    use ant_chain::tx::{Wallet, GNOSIS_CHAIN_ID};
+    use ant_chain::ChainClient;
+    use primitive_types::U256;
+    use std::time::Duration;
+
+    match cmd {
+        ChequebookCommand::Show {
+            gnosis_rpc_url,
+            chequebook,
+            beneficiary,
+        } => {
+            let cb = parse_addr(&chequebook)?;
+            let client = ChainClient::new(gnosis_rpc_url);
+            let issuer = read_address(&client, &cb, &chequebook_issuer_selector()).await?;
+            let balance = read_u256(&client, &cb, &chequebook_balance_selector()).await?;
+            let total_paid_out =
+                read_u256(&client, &cb, &chequebook_total_paid_out_selector()).await?;
+            let liquid = read_u256(&client, &cb, &chequebook_liquid_balance_selector()).await?;
+            let (paid_out, beneficiary_addr) = match beneficiary {
+                Some(b) => {
+                    let addr = parse_addr(&b)?;
+                    let calldata = chequebook_paid_out_calldata(&addr);
+                    let v = client
+                        .eth_call(&format!("0x{}", hex::encode(cb)), &format!("0x{}", hex::encode(&calldata)))
+                        .await
+                        .context("paidOut")?;
+                    let w = ant_chain_padded_last_word(&v)?;
+                    (Some(U256::from_big_endian(&w)), Some(addr))
+                }
+                None => (None, None),
+            };
+
+            if json {
+                let mut obj = serde_json::Map::new();
+                obj.insert("chequebook".into(), serde_json::Value::String(hex_addr(&cb)));
+                obj.insert("issuer".into(), serde_json::Value::String(hex_addr(&issuer)));
+                obj.insert(
+                    "balance_plur".into(),
+                    serde_json::Value::String(balance.to_string()),
+                );
+                obj.insert(
+                    "total_paid_out_plur".into(),
+                    serde_json::Value::String(total_paid_out.to_string()),
+                );
+                obj.insert(
+                    "liquid_balance_plur".into(),
+                    serde_json::Value::String(liquid.to_string()),
+                );
+                if let Some(addr) = beneficiary_addr {
+                    obj.insert("beneficiary".into(), serde_json::Value::String(hex_addr(&addr)));
+                    obj.insert(
+                        "paid_out_plur".into(),
+                        serde_json::Value::String(paid_out.unwrap().to_string()),
+                    );
+                }
+                println!("{}", serde_json::Value::Object(obj));
+            } else {
+                println!("chequebook         {}", hex_addr(&cb));
+                println!("  issuer           {}", hex_addr(&issuer));
+                println!("  balance          {} PLUR", balance);
+                println!("  total_paid_out   {} PLUR", total_paid_out);
+                println!("  liquid_balance   {} PLUR", liquid);
+                if let Some(addr) = beneficiary_addr {
+                    println!("  beneficiary      {}", hex_addr(&addr));
+                    println!("  paid_out         {} PLUR", paid_out.unwrap());
+                }
+            }
+        }
+        ChequebookCommand::CashSelf {
+            gnosis_rpc_url,
+            chequebook,
+            issuer_key,
+            beneficiary_key,
+            recipient,
+            payout_plur,
+            submit,
+            wait_secs,
+            gas_price_gwei,
+        } => {
+            let cb = parse_addr(&chequebook)?;
+            let issuer_secret = parse_secret(&issuer_key)?;
+            let beneficiary_secret = parse_secret(&beneficiary_key)?;
+
+            let client = ChainClient::new(gnosis_rpc_url);
+
+            let issuer_wallet = Wallet::new(issuer_secret, GNOSIS_CHAIN_ID)
+                .context("derive issuer wallet")?;
+            let issuer_addr = *issuer_wallet.address();
+
+            let mut beneficiary_wallet = Wallet::new(beneficiary_secret, GNOSIS_CHAIN_ID)
+                .context("derive beneficiary wallet")?
+                .wait_for(Duration::from_secs(wait_secs));
+            if let Some(g) = gas_price_gwei {
+                beneficiary_wallet.default_gas_price_wei = g.saturating_mul(1_000_000_000);
+            }
+            let beneficiary_addr = *beneficiary_wallet.address();
+            let recipient_addr = match recipient {
+                Some(s) => parse_addr(&s)?,
+                None => beneficiary_addr,
+            };
+
+            // Verify on-chain state matches what we expect: issuer
+            // key derives to chequebook.issuer(), and we know the
+            // current paidOut[beneficiary] so we can build a cheque
+            // the contract won't reject as already-cashed.
+            let onchain_issuer =
+                read_address(&client, &cb, &chequebook_issuer_selector()).await?;
+            if onchain_issuer != issuer_addr {
+                bail!(
+                    "issuer mismatch: chequebook.issuer() = {}, but --issuer-key derives to {}",
+                    hex_addr(&onchain_issuer),
+                    hex_addr(&issuer_addr),
+                );
+            }
+            let liquid =
+                read_u256(&client, &cb, &chequebook_liquid_balance_selector()).await?;
+            let paid_calldata = chequebook_paid_out_calldata(&beneficiary_addr);
+            let v = client
+                .eth_call(
+                    &format!("0x{}", hex::encode(cb)),
+                    &format!("0x{}", hex::encode(&paid_calldata)),
+                )
+                .await
+                .context("paidOut")?;
+            let already_paid = U256::from_big_endian(&ant_chain_padded_last_word(&v)?);
+
+            // Make the cumulative_payout strictly greater than what
+            // the contract has already paid this beneficiary, so
+            // `payout = cumulative - paidOut > 0`. User picks the
+            // step size; default `1 PLUR` for the cheapest possible
+            // cheque.
+            let cumulative = already_paid + U256::from(payout_plur);
+
+            let cheque = Cheque {
+                chequebook: cb,
+                beneficiary: beneficiary_addr,
+                cumulative_payout: cumulative,
+            };
+            let signed = sign_cheque(&issuer_secret, &cheque, GNOSIS_CHAIN_ID)
+                .context("sign cheque")?;
+            let signature = signed.signature;
+
+            let local_digest = cheque_digest(&cheque, GNOSIS_CHAIN_ID);
+            eprintln!(
+                "chequebook        {}\n\
+                 issuer            {} (matches on-chain)\n\
+                 beneficiary       {}\n\
+                 recipient         {}\n\
+                 paid_out (now)    {} PLUR\n\
+                 cumulative_payout {} PLUR  (cheque diff = {} PLUR)\n\
+                 liquid_balance    {} PLUR\n\
+                 local digest      0x{}",
+                hex_addr(&cb),
+                hex_addr(&issuer_addr),
+                hex_addr(&beneficiary_addr),
+                hex_addr(&recipient_addr),
+                already_paid,
+                cumulative,
+                payout_plur,
+                liquid,
+                hex::encode(local_digest),
+            );
+
+            // Dry-run via eth_call. Distinguishes "invalid signature"
+            // (our wire format is wrong) from "liquid balance not
+            // sufficient" (signature OK, the chequebook just hasn't
+            // got the BZZ on-hand to actually pay out).
+            let calldata = cash_cheque_beneficiary_calldata(
+                &recipient_addr,
+                cumulative,
+                &signature,
+            );
+            let dry_run = client
+                .eth_call_from(&beneficiary_addr, &cb, &calldata)
+                .await;
+
+            let dry_status = match dry_run {
+                Ok(_) => "ok".to_string(),
+                Err(e) => format!("revert: {e}"),
+            };
+
+            let signature_ok = !dry_status.contains("invalid issuer signature")
+                && !dry_status.contains("invalid signature");
+            eprintln!(
+                "dry-run           {}\n\
+                 signature         {}",
+                if dry_status == "ok" {
+                    "ok (eth_call returned without revert)".to_string()
+                } else {
+                    dry_status.clone()
+                },
+                if signature_ok {
+                    "✓ accepted by chequebook contract"
+                } else {
+                    "✗ contract rejected with `invalid issuer signature`"
+                },
+            );
+
+            let mut tx_hash: Option<[u8; 32]> = None;
+            let mut block_number: Option<u64> = None;
+            if submit {
+                if !signature_ok {
+                    bail!("refusing to --submit a cheque the dry-run already rejected");
+                }
+                eprintln!("submitting cashChequeBeneficiary…");
+                let rcpt = beneficiary_wallet
+                    .cash_cheque_beneficiary(&client, &cb, &recipient_addr, cumulative, &signature)
+                    .await
+                    .context("cashChequeBeneficiary")?;
+                eprintln!(
+                    "tx confirmed in block {} (hash 0x{})",
+                    rcpt.block_number,
+                    hex::encode(rcpt.tx_hash),
+                );
+                tx_hash = Some(rcpt.tx_hash);
+                block_number = Some(rcpt.block_number);
+            }
+
+            if json {
+                let mut obj = serde_json::Map::new();
+                obj.insert("chequebook".into(), serde_json::Value::String(hex_addr(&cb)));
+                obj.insert("issuer".into(), serde_json::Value::String(hex_addr(&issuer_addr)));
+                obj.insert("beneficiary".into(), serde_json::Value::String(hex_addr(&beneficiary_addr)));
+                obj.insert("recipient".into(), serde_json::Value::String(hex_addr(&recipient_addr)));
+                obj.insert("cumulative_payout_plur".into(), serde_json::Value::String(cumulative.to_string()));
+                obj.insert("paid_out_before_plur".into(), serde_json::Value::String(already_paid.to_string()));
+                obj.insert("dry_run".into(), serde_json::Value::String(dry_status));
+                obj.insert("signature_accepted".into(), serde_json::Value::Bool(signature_ok));
+                if let Some(h) = tx_hash {
+                    obj.insert("tx".into(), serde_json::Value::String(format!("0x{}", hex::encode(h))));
+                }
+                if let Some(b) = block_number {
+                    obj.insert("block".into(), serde_json::Value::Number(b.into()));
+                }
+                println!("{}", serde_json::Value::Object(obj));
+            } else {
+                println!(
+                    "result: {}",
+                    if signature_ok {
+                        "PASS — chequebook contract recovered the issuer from our EIP-712 cheque"
+                    } else {
+                        "FAIL — see `dry-run` line above"
+                    },
+                );
+                if let Some(h) = tx_hash {
+                    println!("on-chain tx: 0x{}", hex::encode(h));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn read_address(
+    client: &ant_chain::ChainClient,
+    contract: &[u8; 20],
+    selector: &[u8; 4],
+) -> Result<[u8; 20]> {
+    let v = client
+        .eth_call(
+            &format!("0x{}", hex::encode(contract)),
+            &format!("0x{}", hex::encode(selector)),
+        )
+        .await
+        .with_context(|| format!("eth_call selector 0x{}", hex::encode(selector)))?;
+    let word = ant_chain_padded_last_word(&v)?;
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&word[12..32]);
+    Ok(out)
+}
+
+async fn read_u256(
+    client: &ant_chain::ChainClient,
+    contract: &[u8; 20],
+    selector: &[u8; 4],
+) -> Result<primitive_types::U256> {
+    let v = client
+        .eth_call(
+            &format!("0x{}", hex::encode(contract)),
+            &format!("0x{}", hex::encode(selector)),
+        )
+        .await
+        .with_context(|| format!("eth_call selector 0x{}", hex::encode(selector)))?;
+    let word = ant_chain_padded_last_word(&v)?;
+    Ok(primitive_types::U256::from_big_endian(&word))
+}
+
+/// Local copy of `padded_last_word` — `ant_chain` keeps its version
+/// crate-private. Same shape: pad/extract the trailing 32-byte word
+/// from an `eth_call` ABI return blob.
+fn ant_chain_padded_last_word(data: &[u8]) -> Result<[u8; 32]> {
+    if data.len() < 32 {
+        bail!("ABI return shorter than 32 bytes");
+    }
+    let mut w = [0u8; 32];
+    w.copy_from_slice(&data[data.len() - 32..]);
+    Ok(w)
+}
+
+async fn run_postage_async(cmd: PostageCommand, json: bool) -> Result<()> {
+    use ant_chain::tx::{
+        extract_created_batch_id, Wallet, GNOSIS_CHAIN_ID,
+    };
+    use ant_chain::{fetch_postage_batch_meta, ChainClient};
+    use primitive_types::U256;
+    use std::time::Duration;
+
+    match cmd {
+        PostageCommand::Create {
+            chain,
+            depth,
+            bucket_depth,
+            amount_per_chunk,
+            immutable,
+            salt,
+        } => {
+            if depth <= bucket_depth {
+                bail!(
+                    "depth ({depth}) must be > bucket_depth ({bucket_depth}); \
+                     2^(depth-bucket_depth) is the per-bucket capacity",
+                );
+            }
+            let secret = parse_secret(&chain.owner_key)?;
+            let postage = parse_addr(&chain.postage_contract)?;
+            let token = parse_addr(&chain.bzz_token)?;
+            let salt_bytes = match salt {
+                Some(h) => parse_word32(&h)?,
+                None => random_word32(),
+            };
+
+            let client = ChainClient::new(chain.gnosis_rpc_url);
+            let mut wallet = Wallet::new(secret, GNOSIS_CHAIN_ID)
+                .context("derive wallet")?
+                .wait_for(Duration::from_secs(chain.wait_secs));
+            if let Some(g) = chain.gas_price_gwei {
+                wallet.default_gas_price_wei = g.saturating_mul(1_000_000_000);
+            }
+            let owner = *wallet.address();
+
+            // Total cost = amount_per_chunk * 2^depth.
+            let total = U256::from(amount_per_chunk)
+                .checked_mul(U256::from(1u128) << depth)
+                .ok_or_else(|| anyhow::anyhow!("amount_per_chunk * 2^depth overflows U256"))?;
+
+            eprintln!(
+                "owner={} depth={} bucket_depth={} amount/chunk={} total={} immutable={}",
+                hex_addr(&owner),
+                depth,
+                bucket_depth,
+                amount_per_chunk,
+                total,
+                immutable,
+            );
+
+            eprintln!("approving BZZ for postage contract {}…", hex_addr(&postage));
+            let approve_rcpt = wallet
+                .approve_bzz(&client, &token, &postage, total)
+                .await
+                .context("approve BZZ")?;
+            eprintln!(
+                "approve confirmed in block {} (tx {})",
+                approve_rcpt.block_number,
+                hex::encode(approve_rcpt.tx_hash),
+            );
+
+            eprintln!("calling createBatch…");
+            let create_rcpt = wallet
+                .create_batch(
+                    &client,
+                    &postage,
+                    &owner,
+                    U256::from(amount_per_chunk),
+                    depth,
+                    bucket_depth,
+                    &salt_bytes,
+                    immutable,
+                )
+                .await
+                .context("createBatch")?;
+            let batch_id = extract_created_batch_id(&create_rcpt).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "createBatch confirmed (tx {}) but no BatchCreated event found in receipt",
+                    hex::encode(create_rcpt.tx_hash),
+                )
+            })?;
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "batch_id": format!("0x{}", hex::encode(batch_id)),
+                        "owner": hex_addr(&owner),
+                        "depth": depth,
+                        "bucket_depth": bucket_depth,
+                        "amount_per_chunk": amount_per_chunk.to_string(),
+                        "total": total.to_string(),
+                        "immutable": immutable,
+                        "approve_tx": format!("0x{}", hex::encode(approve_rcpt.tx_hash)),
+                        "create_tx": format!("0x{}", hex::encode(create_rcpt.tx_hash)),
+                        "block": create_rcpt.block_number,
+                    }),
+                );
+            } else {
+                println!("batch created: 0x{}", hex::encode(batch_id));
+                println!("  approve tx: 0x{}", hex::encode(approve_rcpt.tx_hash));
+                println!("  create  tx: 0x{}", hex::encode(create_rcpt.tx_hash));
+                println!("  block:      {}", create_rcpt.block_number);
+            }
+        }
+        PostageCommand::TopUp {
+            chain,
+            batch_id,
+            amount_per_chunk,
+        } => {
+            let secret = parse_secret(&chain.owner_key)?;
+            let postage = parse_addr(&chain.postage_contract)?;
+            let token = parse_addr(&chain.bzz_token)?;
+            let id = parse_word32(&batch_id)?;
+
+            let client = ChainClient::new(chain.gnosis_rpc_url);
+            let mut wallet = Wallet::new(secret, GNOSIS_CHAIN_ID)
+                .context("derive wallet")?
+                .wait_for(Duration::from_secs(chain.wait_secs));
+            if let Some(g) = chain.gas_price_gwei {
+                wallet.default_gas_price_wei = g.saturating_mul(1_000_000_000);
+            }
+
+            // Need to know the depth to compute `total` for the approve.
+            let meta = fetch_postage_batch_meta(&client, &chain.postage_contract, &id)
+                .await
+                .context("fetch batch meta")?;
+            let total = U256::from(amount_per_chunk)
+                .checked_mul(U256::from(1u128) << meta.depth)
+                .ok_or_else(|| anyhow::anyhow!("amount_per_chunk * 2^depth overflows U256"))?;
+
+            eprintln!(
+                "topup batch=0x{} depth={} amount/chunk={} total={}",
+                hex::encode(id),
+                meta.depth,
+                amount_per_chunk,
+                total,
+            );
+
+            eprintln!("approving BZZ…");
+            let approve_rcpt = wallet
+                .approve_bzz(&client, &token, &postage, total)
+                .await
+                .context("approve BZZ")?;
+            eprintln!("calling topUp…");
+            let rcpt = wallet
+                .top_up(&client, &postage, &id, U256::from(amount_per_chunk))
+                .await
+                .context("topUp")?;
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "batch_id": format!("0x{}", hex::encode(id)),
+                        "amount_per_chunk": amount_per_chunk.to_string(),
+                        "total": total.to_string(),
+                        "approve_tx": format!("0x{}", hex::encode(approve_rcpt.tx_hash)),
+                        "topup_tx": format!("0x{}", hex::encode(rcpt.tx_hash)),
+                        "block": rcpt.block_number,
+                    }),
+                );
+            } else {
+                println!("topUp confirmed: 0x{}", hex::encode(rcpt.tx_hash));
+                println!("  approve tx: 0x{}", hex::encode(approve_rcpt.tx_hash));
+                println!("  block:      {}", rcpt.block_number);
+            }
+        }
+        PostageCommand::Dilute {
+            chain,
+            batch_id,
+            new_depth,
+        } => {
+            let secret = parse_secret(&chain.owner_key)?;
+            let postage = parse_addr(&chain.postage_contract)?;
+            let id = parse_word32(&batch_id)?;
+
+            let client = ChainClient::new(chain.gnosis_rpc_url);
+            let meta = fetch_postage_batch_meta(&client, &chain.postage_contract, &id)
+                .await
+                .context("fetch batch meta")?;
+            if new_depth <= meta.depth {
+                bail!(
+                    "new_depth ({new_depth}) must be > current depth ({})",
+                    meta.depth,
+                );
+            }
+
+            let mut wallet = Wallet::new(secret, GNOSIS_CHAIN_ID)
+                .context("derive wallet")?
+                .wait_for(Duration::from_secs(chain.wait_secs));
+            if let Some(g) = chain.gas_price_gwei {
+                wallet.default_gas_price_wei = g.saturating_mul(1_000_000_000);
+            }
+
+            eprintln!(
+                "dilute batch=0x{} {}→{}",
+                hex::encode(id),
+                meta.depth,
+                new_depth,
+            );
+
+            let rcpt = wallet
+                .increase_depth(&client, &postage, &id, new_depth)
+                .await
+                .context("increaseDepth")?;
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "batch_id": format!("0x{}", hex::encode(id)),
+                        "old_depth": meta.depth,
+                        "new_depth": new_depth,
+                        "tx": format!("0x{}", hex::encode(rcpt.tx_hash)),
+                        "block": rcpt.block_number,
+                    }),
+                );
+            } else {
+                println!("increaseDepth confirmed: 0x{}", hex::encode(rcpt.tx_hash));
+                println!("  block: {}", rcpt.block_number);
+            }
+        }
+        PostageCommand::Show {
+            gnosis_rpc_url,
+            postage_contract,
+            batch_id,
+        } => {
+            let id = parse_word32(&batch_id)?;
+            let client = ChainClient::new(gnosis_rpc_url);
+            let meta = fetch_postage_batch_meta(&client, &postage_contract, &id)
+                .await
+                .context("fetch batch meta")?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "batch_id": format!("0x{}", hex::encode(id)),
+                        "depth": meta.depth,
+                        "bucket_depth": meta.bucket_depth,
+                        "immutable": meta.immutable,
+                        "owner": hex_addr(&meta.batch_owner_eth),
+                    }),
+                );
+            } else {
+                println!("batch     0x{}", hex::encode(id));
+                println!("  depth        {}", meta.depth);
+                println!("  bucket_depth {}", meta.bucket_depth);
+                println!("  immutable    {}", meta.immutable);
+                println!("  owner        {}", hex_addr(&meta.batch_owner_eth));
+            }
+        }
+        PostageCommand::Balance {
+            gnosis_rpc_url,
+            address,
+            bzz_token,
+        } => {
+            let addr = match address {
+                Some(s) => parse_addr(&s)?,
+                None => {
+                    let key = std::env::var("POSTAGE_OWNER_KEY")
+                        .or_else(|_| std::env::var("STORAGE_STAMP_PRIVATE_KEY"))
+                        .context(
+                            "no --address and POSTAGE_OWNER_KEY / STORAGE_STAMP_PRIVATE_KEY \
+                             not set",
+                        )?;
+                    let secret = parse_secret(&key)?;
+                    let wallet = Wallet::new(secret, GNOSIS_CHAIN_ID)
+                        .context("derive wallet")?;
+                    *wallet.address()
+                }
+            };
+            let client = ChainClient::new(gnosis_rpc_url);
+            let xdai = client
+                .eth_get_balance_lower128(&addr)
+                .await
+                .context("eth_getBalance")?;
+            let bzz = client
+                .erc20_balance_of_lower128(&bzz_token, &addr)
+                .await
+                .context("balanceOf BZZ")?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "address": hex_addr(&addr),
+                        "xdai_wei": xdai.to_string(),
+                        "bzz_plur": bzz.to_string(),
+                    }),
+                );
+            } else {
+                println!("address  {}", hex_addr(&addr));
+                println!("  xDAI   {} wei  ({})", xdai, format_eth_18(xdai));
+                println!("  BZZ    {} PLUR ({})", bzz, format_eth_16(bzz));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_addr(s: &str) -> Result<[u8; 20]> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(s).with_context(|| format!("address hex: {s}"))?;
+    if bytes.len() != 20 {
+        bail!("address must be 20 bytes (40 hex chars); got {}", bytes.len());
+    }
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+fn parse_word32(s: &str) -> Result<[u8; 32]> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(s).with_context(|| format!("word32 hex: {s}"))?;
+    if bytes.len() != 32 {
+        bail!("expected 32 bytes (64 hex chars), got {}", bytes.len());
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+fn parse_secret(s: &str) -> Result<[u8; 32]> {
+    let s = s.trim();
+    parse_word32(s).context("invalid private key")
+}
+
+fn random_word32() -> [u8; 32] {
+    use std::time::SystemTime;
+    let mut out = [0u8; 32];
+    // Mix nanoseconds + a fresh OS-random tail so two `create`
+    // calls in the same second still produce distinct salts.
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    out[..16].copy_from_slice(&nanos.to_be_bytes()[..16]);
+    if let Ok(_) = getrandom_fill(&mut out[16..]) {
+        // ok
+    }
+    out
+}
+
+fn getrandom_fill(buf: &mut [u8]) -> std::io::Result<()> {
+    use std::fs::File;
+    use std::io::Read;
+    let mut f = File::open("/dev/urandom")?;
+    f.read_exact(buf)?;
+    Ok(())
+}
+
+fn hex_addr(a: &[u8; 20]) -> String {
+    format!("0x{}", hex::encode(a))
+}
+
+/// Format an 18-decimal token amount (xDAI / ETH) with up to 6
+/// fractional digits, trimming trailing zeros.
+fn format_eth_18(plur: u128) -> String {
+    let denom: u128 = 1_000_000_000_000_000_000; // 1e18
+    let whole = plur / denom;
+    let frac = plur % denom;
+    if frac == 0 {
+        format!("{whole} xDAI")
+    } else {
+        let frac_str = format!("{:018}", frac);
+        let trimmed = frac_str.trim_end_matches('0');
+        let trimmed = if trimmed.len() > 6 { &trimmed[..6] } else { trimmed };
+        format!("{whole}.{trimmed} xDAI")
+    }
+}
+
+/// Format a 16-decimal BZZ amount (1 BZZ = 1e16 PLUR).
+fn format_eth_16(plur: u128) -> String {
+    let denom: u128 = 10_000_000_000_000_000; // 1e16
+    let whole = plur / denom;
+    let frac = plur % denom;
+    if frac == 0 {
+        format!("{whole} BZZ")
+    } else {
+        let frac_str = format!("{:016}", frac);
+        let trimmed = frac_str.trim_end_matches('0');
+        let trimmed = if trimmed.len() > 6 { &trimmed[..6] } else { trimmed };
+        format!("{whole}.{trimmed} BZZ")
+    }
 }
 
 /// Resolve a CLI reference + mode into the daemon-side `Request`. URL
@@ -2722,6 +3675,62 @@ mod tests {
         assert!(
             !rendered.contains("0B / 0B"),
             "disabled cache must not render a fake 0B/0B fill:\n{rendered}",
+        );
+    }
+
+    #[test]
+    fn parse_addr_round_trip() {
+        let want = [0xab; 20];
+        let s = format!("0x{}", hex::encode(want));
+        assert_eq!(super::parse_addr(&s).unwrap(), want);
+        // No-prefix variant.
+        assert_eq!(super::parse_addr(&hex::encode(want)).unwrap(), want);
+    }
+
+    #[test]
+    fn parse_addr_rejects_short_input() {
+        assert!(super::parse_addr("0x1234").is_err());
+    }
+
+    #[test]
+    fn parse_word32_round_trip() {
+        let want = [0xcd; 32];
+        let s = format!("0x{}", hex::encode(want));
+        assert_eq!(super::parse_word32(&s).unwrap(), want);
+    }
+
+    #[test]
+    fn random_word32_is_unique() {
+        let a = super::random_word32();
+        let b = super::random_word32();
+        assert_ne!(a, b, "random_word32 collisions imply both nanos+urandom failed");
+    }
+
+    #[test]
+    fn format_eth_18_handles_round_amounts() {
+        // 1 xDAI exactly.
+        assert_eq!(super::format_eth_18(1_000_000_000_000_000_000), "1 xDAI");
+        // 0.5 xDAI.
+        assert_eq!(
+            super::format_eth_18(500_000_000_000_000_000),
+            "0.5 xDAI",
+        );
+        // Truncates to 6 fractional digits, no rounding.
+        assert_eq!(
+            super::format_eth_18(123_456_789_012_345_678),
+            "0.123456 xDAI",
+        );
+    }
+
+    #[test]
+    fn format_eth_16_handles_bzz() {
+        // 1 BZZ.
+        assert_eq!(super::format_eth_16(10_000_000_000_000_000), "1 BZZ");
+        // The live storage-stamp wallet had 42_849_794_328_341_404 PLUR.
+        // Expected display: 4.284979 BZZ (truncated, no rounding).
+        assert_eq!(
+            super::format_eth_16(42_849_794_328_341_404),
+            "4.284979 BZZ",
         );
     }
 }

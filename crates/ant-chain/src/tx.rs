@@ -54,6 +54,10 @@ pub const ERC20_APPROVE_GAS: u64 = 100_000;
 pub const POSTAGE_CREATE_BATCH_GAS: u64 = 800_000;
 pub const POSTAGE_TOP_UP_GAS: u64 = 600_000;
 pub const POSTAGE_INCREASE_DEPTH_GAS: u64 = 800_000;
+/// `Chequebook.cashChequeBeneficiary` gas limit — bee uses ~115k in
+/// production; we round up to 200k so a cold paidOut slot or a
+/// 0-balance fail still has runway.
+pub const CHEQUEBOOK_CASH_GAS: u64 = 200_000;
 
 #[derive(Debug, Error)]
 pub enum TxError {
@@ -586,6 +590,30 @@ impl Wallet {
     ) -> Result<TxReceipt, TxError> {
         let data = postage_increase_depth_calldata(batch_id, new_depth);
         self.send_signed(client, *postage, data, POSTAGE_INCREASE_DEPTH_GAS)
+            .await
+    }
+
+    /// `Chequebook.cashChequeBeneficiary(recipient, cumulativePayout, sig)`.
+    ///
+    /// Submitter (`self.address`) **must equal** the beneficiary in
+    /// the EIP-712 cheque digest, because the chequebook contract
+    /// recomputes that digest with `msg.sender` as the beneficiary
+    /// before recovering the issuer. Mismatch → `invalid signature`
+    /// revert.
+    pub async fn cash_cheque_beneficiary(
+        &self,
+        client: &ChainClient,
+        chequebook: &[u8; 20],
+        recipient: &[u8; 20],
+        cumulative_payout: U256,
+        signature: &[u8; 65],
+    ) -> Result<TxReceipt, TxError> {
+        let data = crate::chequebook::cash_cheque_beneficiary_calldata(
+            recipient,
+            cumulative_payout,
+            signature,
+        );
+        self.send_signed(client, *chequebook, data, CHEQUEBOOK_CASH_GAS)
             .await
     }
 

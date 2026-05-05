@@ -40,10 +40,18 @@ pub fn cheque_type_hash() -> [u8; 32] {
     keccak(b"Cheque(address chequebook,address beneficiary,uint256 cumulativePayout)")
 }
 
-/// EIP-712 type hash for the `EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)`
+/// EIP-712 type hash for the `EIP712Domain(string name,string version,uint256 chainId)`
 /// domain bee uses on the chequebook contract.
+///
+/// Note: bee's chequebook domain deliberately omits `verifyingContract`
+/// — see `pkg/crypto/eip712/EIP712DomainType` in the bee source.
+/// The chequebook address still binds the digest, but via the
+/// `Cheque.chequebook` field in the struct hash, not via the domain
+/// separator. Adding a `verifyingContract` here produces a digest
+/// that bee's `cashChequeBeneficiary` view rejects with
+/// `invalid issuer signature`.
 pub fn eip712_domain_type_hash() -> [u8; 32] {
-    keccak(b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
+    keccak(b"EIP712Domain(string name,string version,uint256 chainId)")
 }
 
 /// Domain name + version bee writes into the chequebook EIP-712 domain.
@@ -81,9 +89,11 @@ pub struct SignedCheque {
 /// Compute the EIP-712 digest a chequebook signer will sign.
 ///
 /// `chain_id` is the chain the chequebook contract lives on (100 for
-/// Gnosis).
+/// Gnosis). The chequebook address is *not* part of the domain
+/// separator — it enters the digest through the `Cheque.chequebook`
+/// field of the struct hash. See [`eip712_domain_type_hash`].
 pub fn cheque_digest(cheque: &Cheque, chain_id: u64) -> [u8; 32] {
-    let domain_sep = eip712_domain_separator(chain_id, &cheque.chequebook);
+    let domain_sep = eip712_domain_separator(chain_id);
     let struct_hash = cheque_struct_hash(cheque);
     let mut h = Keccak256::default();
     h.update([0x19, 0x01]);
@@ -124,13 +134,12 @@ pub fn recover_cheque_signer(
     Ok(ethereum_address_from_public_key(&vk))
 }
 
-fn eip712_domain_separator(chain_id: u64, verifying_contract: &[u8; 20]) -> [u8; 32] {
+fn eip712_domain_separator(chain_id: u64) -> [u8; 32] {
     let mut h = Keccak256::default();
     h.update(eip712_domain_type_hash());
     h.update(keccak(CHEQUEBOOK_DOMAIN_NAME.as_bytes()));
     h.update(keccak(CHEQUEBOOK_DOMAIN_VERSION.as_bytes()));
     h.update(u256_be_word(&U256::from(chain_id)));
-    h.update(pad_word_address(verifying_contract));
     let out = h.finalize();
     let mut sep = [0u8; 32];
     sep.copy_from_slice(&out);
@@ -201,12 +210,47 @@ pub fn chequebook_issuer_selector() -> [u8; 4] {
     [h[0], h[1], h[2], h[3]]
 }
 
-/// `Chequebook.totalIssued()` selector — the cumulative amount the
-/// issuer has ever committed across all beneficiaries. Useful as a
-/// sanity check before accepting a cheque.
-pub fn chequebook_total_issued_selector() -> [u8; 4] {
-    let h = keccak(b"totalIssued()");
+/// `Chequebook.totalPaidOut()` selector — the cumulative amount
+/// already cashed by **all** beneficiaries combined. Subtract from
+/// `totalbalance()` to learn how much BZZ the chequebook still has on
+/// its books to honour outstanding cheques.
+///
+/// (Bee's chequebook contract does *not* have a `totalIssued()` view
+/// — issuance is purely an off-chain accounting concept; the contract
+/// only sees what's been cashed.)
+pub fn chequebook_total_paid_out_selector() -> [u8; 4] {
+    let h = keccak(b"totalPaidOut()");
     [h[0], h[1], h[2], h[3]]
+}
+
+/// `Chequebook.balance()` selector — full BZZ holdings of the
+/// chequebook contract, equivalent to `BZZ.balanceOf(chequebook)`.
+/// `liquidBalance()` is what's available *right now* (i.e. after
+/// subtracting any pending hard deposits) — prefer `liquidBalance()`
+/// when checking that a cheque can actually be cashed.
+pub fn chequebook_balance_selector() -> [u8; 4] {
+    let h = keccak(b"balance()");
+    [h[0], h[1], h[2], h[3]]
+}
+
+/// `Chequebook.chequeHash(address chequebook, address beneficiary, uint256 cumulativePayout)`
+/// view — recomputes the EIP-712 digest exactly the way the contract
+/// does internally before recovering the issuer in
+/// `cashChequeBeneficiary`. eth_call this and compare to
+/// [`cheque_digest`] to debug any signature-rejection: a mismatch
+/// proves our digest is wrong, a match proves the bug is on the
+/// signature side (recid byte, secret key wrong, etc.).
+pub fn chequebook_cheque_hash_calldata(
+    chequebook: &[u8; 20],
+    beneficiary: &[u8; 20],
+    cumulative_payout: U256,
+) -> Vec<u8> {
+    let mut data = Vec::with_capacity(4 + 32 * 3);
+    data.extend_from_slice(&keccak(b"chequeHash(address,address,uint256)")[0..4]);
+    data.extend_from_slice(&pad_word_address(chequebook));
+    data.extend_from_slice(&pad_word_address(beneficiary));
+    data.extend_from_slice(&u256_be_word(&cumulative_payout));
+    data
 }
 
 /// `Chequebook.paidOut(address beneficiary)` selector — how much of
@@ -216,6 +260,23 @@ pub fn chequebook_total_issued_selector() -> [u8; 4] {
 pub fn chequebook_paid_out_selector() -> [u8; 4] {
     let h = keccak(b"paidOut(address)");
     [h[0], h[1], h[2], h[3]]
+}
+
+/// `Chequebook.liquidBalance()` selector — BZZ available to pay out
+/// right now (`balance` minus the sum of all open hard deposits).
+/// `cashChequeBeneficiary` reverts with `liquid balance not
+/// sufficient` when the requested cheque diff exceeds this.
+pub fn chequebook_liquid_balance_selector() -> [u8; 4] {
+    let h = keccak(b"liquidBalance()");
+    [h[0], h[1], h[2], h[3]]
+}
+
+/// Encode a `paidOut(beneficiary)` call's full calldata.
+pub fn chequebook_paid_out_calldata(beneficiary: &[u8; 20]) -> Vec<u8> {
+    let mut data = Vec::with_capacity(4 + 32);
+    data.extend_from_slice(&chequebook_paid_out_selector());
+    data.extend_from_slice(&pad_word_address(beneficiary));
+    data
 }
 
 fn pad_word_address(addr: &[u8; 20]) -> [u8; 32] {
@@ -262,12 +323,13 @@ mod tests {
         assert_eq!(recovered, want_addr);
     }
 
-    /// Different chequebook contract → different domain separator →
-    /// different digest → recovered signer must change. Guards against
-    /// a bug where the verifying contract field gets dropped from the
-    /// domain separator.
+    /// Different chequebook contract → different `Cheque.chequebook`
+    /// field in the struct hash → different digest → recovered signer
+    /// must change. Bee's chequebook EIP-712 domain deliberately
+    /// omits `verifyingContract`, so the chequebook address binds the
+    /// digest through the struct hash, not the domain separator.
     #[test]
-    fn domain_separator_binds_chequebook_address() {
+    fn struct_hash_binds_chequebook_address() {
         let secret = random_secp256k1_secret();
         let cheque1 = Cheque {
             chequebook: [0x11u8; 20],
@@ -286,8 +348,6 @@ mod tests {
         let signed1 = sign_cheque(&secret, &cheque1, 100).unwrap();
         let mut signed_with_swapped_meta = signed1.clone();
         signed_with_swapped_meta.cheque.chequebook = [0x33u8; 20];
-        // The signature is over cheque1; if we ask the verifier to
-        // recover under the cheque2 domain, the answer must differ.
         let recover1 = recover_cheque_signer(&signed1, 100).unwrap();
         let recover2 = recover_cheque_signer(&signed_with_swapped_meta, 100).unwrap();
         assert_ne!(recover1, recover2);
@@ -319,10 +379,12 @@ mod tests {
                 b"Cheque(address chequebook,address beneficiary,uint256 cumulativePayout)"
             )),
         );
+        // Bee's chequebook domain has only 3 fields — see
+        // `pkg/crypto/eip712/EIP712DomainType` upstream.
         assert_eq!(
             hex::encode(domain_th),
             hex::encode(keccak(
-                b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+                b"EIP712Domain(string name,string version,uint256 chainId)"
             )),
         );
     }
@@ -359,13 +421,24 @@ mod tests {
         assert_eq!(calldata.len(), 4 + 32 * 3);
     }
 
-    /// Read-method selectors round-trip through keccak.
+    /// Read-method selectors round-trip through keccak. Each
+    /// selector matches a real public view on bee's mainnet
+    /// chequebook contract — checked off-chain by inspecting bee's
+    /// `pkg/settlement/swap/chequebook` ABI bindings.
     #[test]
     fn chequebook_read_selectors() {
         assert_eq!(chequebook_issuer_selector().to_vec(), keccak(b"issuer()")[0..4].to_vec());
         assert_eq!(
-            chequebook_total_issued_selector().to_vec(),
-            keccak(b"totalIssued()")[0..4].to_vec()
+            chequebook_total_paid_out_selector().to_vec(),
+            keccak(b"totalPaidOut()")[0..4].to_vec()
+        );
+        assert_eq!(
+            chequebook_balance_selector().to_vec(),
+            keccak(b"balance()")[0..4].to_vec()
+        );
+        assert_eq!(
+            chequebook_liquid_balance_selector().to_vec(),
+            keccak(b"liquidBalance()")[0..4].to_vec()
         );
         assert_eq!(
             chequebook_paid_out_selector().to_vec(),

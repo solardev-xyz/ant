@@ -95,6 +95,76 @@ impl ChainClient {
             .map_err(|e| RpcError::Decode(e.to_string()))
     }
 
+    /// `eth_call` with an explicit `from` address — required for any
+    /// view that reads `msg.sender` (e.g. chequebook
+    /// `cashChequeBeneficiary`, where `msg.sender` is baked into the
+    /// EIP-712 cheque digest the contract recomputes locally).
+    ///
+    /// On a revert this returns the **full** RPC error JSON in
+    /// [`RpcError::Rpc`] (message + `data` field). Callers care
+    /// about distinguishing `invalid signature` from
+    /// `liquid balance not sufficient` — both arrive here, the
+    /// caller decides which one is the test result.
+    pub async fn eth_call_from(
+        &self,
+        from: &[u8; 20],
+        to: &[u8; 20],
+        data: &[u8],
+    ) -> Result<Vec<u8>, RpcError> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1u64,
+            "method": "eth_call",
+            "params": [
+                {
+                    "from": format!("0x{}", hex::encode(from)),
+                    "to":   format!("0x{}", hex::encode(to)),
+                    "data": format!("0x{}", hex::encode(data)),
+                },
+                "latest",
+            ],
+        });
+
+        let v: serde_json::Value =
+            self.http.post(&self.url).json(&body).send().await?.json().await?;
+        if let Some(err) = v.get("error") {
+            return Err(RpcError::Rpc(err.to_string()));
+        }
+        let result = v
+            .get("result")
+            .and_then(|r| r.as_str())
+            .ok_or_else(|| RpcError::Rpc("missing result".into()))?;
+        decode_hex_prefixed_bytes(result).map_err(|e| RpcError::Decode(e.to_string()))
+    }
+
+    /// Native xDAI balance for `addr` (lower 128 bits — that's
+    /// 2^128 ≈ 3.4 × 10^38 wei, well above any reasonable wallet).
+    pub async fn eth_get_balance_lower128(
+        &self,
+        addr: &[u8; 20],
+    ) -> Result<u128, RpcError> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1u64,
+            "method": "eth_getBalance",
+            "params": [format!("0x{}", hex::encode(addr)), "latest"],
+        });
+        let v: RpcResp<'_> = self.http.post(&self.url).json(&body).send().await?.json().await?;
+        if let Some(e) = v.error {
+            return Err(RpcError::Rpc(
+                e.message.unwrap_or_else(|| "unknown RPC error".to_string()),
+            ));
+        }
+        let s = v
+            .result
+            .ok_or_else(|| RpcError::Rpc("missing result".into()))?;
+        let s = s.strip_prefix("0x").unwrap_or(&s);
+        let s = if s.is_empty() { "0" } else { s };
+        let n = u128::from_str_radix(s, 16)
+            .map_err(|e| RpcError::Decode(format!("eth_getBalance hex: {e}")))?;
+        Ok(n)
+    }
+
     /// ERC-20 balance (lower 128 bits — enough for sane BZZ amounts).
     pub async fn erc20_balance_of_lower128(
         &self,
