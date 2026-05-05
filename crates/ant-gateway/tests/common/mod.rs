@@ -150,6 +150,7 @@ pub fn snapshot_with_one_peer() -> StatusSnapshot {
             },
         },
         listeners: vec!["/ip4/127.0.0.1/tcp/1634".to_string()],
+        external_addresses: Vec::new(),
         control_socket: "/tmp/antd.sock".to_string(),
         retrieval: Default::default(),
     }

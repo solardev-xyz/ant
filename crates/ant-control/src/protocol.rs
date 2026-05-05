@@ -201,6 +201,15 @@ pub struct StatusSnapshot {
     pub identity: IdentityInfo,
     pub peers: PeerInfo,
     pub listeners: Vec<String>,
+    /// Externally-advertised multiaddrs the daemon has registered with
+    /// libp2p-identify, with the source that produced each one
+    /// (operator-supplied, listener auto-promotion, observed-from-peer,
+    /// or UPnP). Older daemons leave this at the `#[serde(default)]`
+    /// empty value; new clients should fall back to `listeners` when it
+    /// is empty. Order is insertion-stable so the UI can show a
+    /// deterministic history.
+    #[serde(default)]
+    pub external_addresses: Vec<ExternalAddressInfo>,
     pub control_socket: String,
     /// Data-plane snapshot: chunk cache fill, in-flight retrievals,
     /// cumulative download counters, and the list of currently active
@@ -216,6 +225,28 @@ pub struct IdentityInfo {
     pub eth_address: String,
     pub overlay: String,
     pub peer_id: String,
+}
+
+/// One externally-advertised multiaddr, with metadata about how the
+/// daemon learned it. UIs typically render the `source` column verbatim
+/// so operators can tell at a glance whether their address came from a
+/// CLI flag, listener auto-promotion, a peer's identify push, or the
+/// UPnP behaviour talking to a home router.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExternalAddressInfo {
+    /// Multiaddr we advertise via libp2p-identify (e.g.
+    /// `/ip4/203.0.113.42/tcp/1634`).
+    pub addr: String,
+    /// Free-form source identifier. Stable values produced by `antd`:
+    /// `manual` (`--external-address`), `listener` (auto-promoted
+    /// non-loopback listener), `observed` (from a remote's identify
+    /// `observed_addr`), `upnp` (mapped via libp2p-upnp / IGD). Future
+    /// daemons may add new sources, so UIs should treat unknown values
+    /// as opaque labels.
+    pub source: String,
+    /// Wall-clock unix timestamp at which the address was registered.
+    /// Useful for "added 12 s ago" rendering.
+    pub added_at_unix: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

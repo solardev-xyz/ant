@@ -262,6 +262,7 @@ async fn main() -> Result<()> {
             ..PeerInfo::default()
         },
         listeners: Vec::new(),
+        external_addresses: Vec::new(),
         control_socket: control_socket.display().to_string(),
         retrieval: Default::default(),
     };

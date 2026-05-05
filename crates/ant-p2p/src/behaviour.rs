@@ -7,9 +7,9 @@ use crate::peerstore::PeerStore;
 use crate::routing::{Overlay, RoutingTable};
 use crate::sinks;
 use ant_control::{
-    CacheInfo, ControlAck, ControlCommand, DiskCacheInfo, GatewayActivity, GetProgress,
-    HandshakeReport, PeerConnectionInfo, PeerConnectionState, PeerPipelineEntry, RetrievalInfo,
-    RoutingInfo, StatusSnapshot, StreamRange,
+    CacheInfo, ControlAck, ControlCommand, DiskCacheInfo, ExternalAddressInfo, GatewayActivity,
+    GetProgress, HandshakeReport, PeerConnectionInfo, PeerConnectionState, PeerPipelineEntry,
+    RetrievalInfo, RoutingInfo, StatusSnapshot, StreamRange,
 };
 use ant_crypto::{
     ethereum_address_from_public_key, overlay_from_ethereum_address, OVERLAY_NONCE_LEN,
@@ -159,6 +159,16 @@ pub struct AntBehaviour {
     stream: libp2p_stream::Behaviour,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
+    /// UPnP/IGD-based external-port discovery. Watches `NewListenAddr`
+    /// events, talks to the local home router via SSDP, and (on success)
+    /// emits [`libp2p::upnp::Event::NewExternalAddr`] with our public
+    /// `/ip4/<wan>/tcp/<port>` multiaddr. Treated as opportunistic: on
+    /// hosts without an IGD-capable router (cloud VMs, corporate NAT,
+    /// CGNAT) the behaviour just emits `GatewayNotFound` /
+    /// `NonRoutableGateway` and stays quiet, so leaving it always-on is
+    /// safe — handlers in `apply_event` only ever *add* addresses, never
+    /// reject existing ones.
+    upnp: libp2p::upnp::tokio::Behaviour,
 }
 
 const MIN_BACKOFF: Duration = Duration::from_secs(2);
@@ -168,6 +178,13 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// identify has round-tripped makes bee stall for the full 10 s, then disconnect.
 /// This cap is the longest we'll wait before opening the BZZ stream anyway.
 const HANDSHAKE_IDENTIFY_WAIT: Duration = Duration::from_secs(3);
+/// Grace window we give libp2p-identify auto-promotion and the UPnP behaviour
+/// to settle before warning the operator that no globally-routable external
+/// address has been registered. UPnP's SSDP search round-trip is typically
+/// ~1 s on a cooperative router and up to a few seconds on slower ones; 10 s
+/// is enough for both UPnP and the first inbound `NewExternalAddrCandidate`
+/// from a bootnode without being so long that the warning misses the operator.
+const EXTERNAL_ADDRESS_CHECK_DELAY: Duration = Duration::from_secs(10);
 /// Hive sinks → swarm-loop channel depth. Bee sends Peers messages with up to
 /// 30 entries per stream, and multiple bootnodes gossip concurrently; a few
 /// hundred slots is enough to avoid backpressure without being wasteful.
@@ -218,6 +235,9 @@ fn is_loopback_multiaddr(addr: &Multiaddr) -> bool {
 /// RFC1918, link-local) when the peer is connected over a public transport.
 /// Before we promote an observed address to external we need it to pass the
 /// same filter, otherwise we just re-publish what bee will throw away.
+///
+/// Also used as the ground truth for "would our libp2p-identify push help
+/// bee's peerstore" — see [`our_identify_useful_for_bee`].
 fn is_globally_routable_multiaddr(addr: &Multiaddr) -> bool {
     use libp2p::multiaddr::Protocol;
     let mut has_ip = false;
@@ -238,6 +258,224 @@ fn is_globally_routable_multiaddr(addr: &Multiaddr) -> bool {
         _ => true,
     });
     has_ip && ok
+}
+
+/// Where we learned an externally-advertised multiaddr from. Kept tiny
+/// and `Copy` so it can be passed around without ceremony; rendered as a
+/// stable lower-case ASCII tag via [`Self::as_str`] for log lines and the
+/// `StatusSnapshot::external_addresses` field. Adding a new source means
+/// (a) adding a variant here, (b) wiring the variant through
+/// [`record_external_address`] at the relevant call site, and (c)
+/// optionally teaching `antctl top` to render it differently — but
+/// unknown sources already round-trip fine since the on-the-wire type
+/// is `String`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalAddrSource {
+    /// User-supplied via `--external-address` (i.e. `RunConfig::external_addrs`).
+    Manual,
+    /// Auto-promoted from a non-loopback `NewListenAddr`. Useful on
+    /// public-IP hosts where the listener address is itself dialable.
+    Listener,
+    /// Promoted from a remote peer's libp2p-identify `observed_addr`.
+    /// Catches NAT-punched IPv6 / full-cone IPv4 cases where outside
+    /// peers see us at a routable address even without UPnP.
+    Observed,
+    /// Mapped via `libp2p-upnp` talking to a local IGD gateway. Most
+    /// common on home routers.
+    Upnp,
+}
+
+impl ExternalAddrSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            ExternalAddrSource::Manual => "manual",
+            ExternalAddrSource::Listener => "listener",
+            ExternalAddrSource::Observed => "observed",
+            ExternalAddrSource::Upnp => "upnp",
+        }
+    }
+}
+
+/// Centralized add: registers `addr` as an external on the swarm, tracks
+/// the source + insertion time in `state`, emits a single attributed
+/// `info!` line, and pushes the new set into the status snapshot. No-op
+/// when the address is already known — UPnP renews mappings every 30 min
+/// and we don't want flapping log lines, and re-promoting an address
+/// should not silently change its recorded source.
+fn record_external_address(
+    state: &mut SwarmState,
+    swarm: &mut Swarm<AntBehaviour>,
+    status: &Option<watch::Sender<StatusSnapshot>>,
+    addr: Multiaddr,
+    source: ExternalAddrSource,
+) {
+    if state.external_addresses.contains_key(&addr) {
+        return;
+    }
+    info!(
+        target: "ant_p2p",
+        %addr,
+        source = source.as_str(),
+        "advertising external address",
+    );
+    swarm.add_external_address(addr.clone());
+    let added_at_unix = unix_now();
+    state
+        .external_addresses
+        .insert(addr.clone(), (source, added_at_unix));
+    state.external_addresses_order.push(addr);
+    sync_external_addresses_status(status, state);
+}
+
+/// Centralized remove: drops `addr` from the swarm + the tracker, emits
+/// a single `info!` line, and pushes the new set into the status
+/// snapshot. No-op when the address isn't tracked (e.g. a UPnP expiry
+/// for a mapping we never accepted because it failed the public-IP filter).
+fn forget_external_address(
+    state: &mut SwarmState,
+    swarm: &mut Swarm<AntBehaviour>,
+    status: &Option<watch::Sender<StatusSnapshot>>,
+    addr: &Multiaddr,
+) {
+    if state.external_addresses.remove(addr).is_none() {
+        return;
+    }
+    state.external_addresses_order.retain(|a| a != addr);
+    info!(
+        target: "ant_p2p",
+        %addr,
+        "retracting external address",
+    );
+    swarm.remove_external_address(addr);
+    sync_external_addresses_status(status, state);
+}
+
+/// Mirror the live external-address set into the status snapshot. Cheap
+/// (a handful of entries even on long-running daemons) so we recompute
+/// from scratch on every change rather than try to track deltas.
+fn sync_external_addresses_status(
+    status: &Option<watch::Sender<StatusSnapshot>>,
+    state: &SwarmState,
+) {
+    let Some(tx) = status else { return };
+    let snapshot: Vec<ExternalAddressInfo> = state
+        .external_addresses_order
+        .iter()
+        .filter_map(|addr| {
+            state
+                .external_addresses
+                .get(addr)
+                .map(|(source, added_at_unix)| ExternalAddressInfo {
+                    addr: addr.to_string(),
+                    source: source.as_str().to_string(),
+                    added_at_unix: *added_at_unix,
+                })
+        })
+        .collect();
+    tx.send_modify(|st| st.external_addresses = snapshot);
+}
+
+/// Heuristic: will our next libp2p-identify push give bee anything its
+/// peerstore will accept? Bee's libp2p-go filters inbound addresses with
+/// the same public-IP rules [`is_globally_routable_multiaddr`] enforces, so
+/// if none of our advertised externals pass that filter, waiting on
+/// `IdentifySent` before opening the BZZ stream is pointless — bee's
+/// `peerMultiaddrs` will sit out its 10 s window regardless. We use this
+/// to gate [`HANDSHAKE_IDENTIFY_WAIT`] inside [`spawn_handshake_driver`]:
+/// when it returns `false` we open the stream immediately and let bee
+/// burn the 10 s on its own clock instead of stacking another 3 s of our
+/// own on top.
+fn our_identify_useful_for_bee(swarm: &Swarm<AntBehaviour>) -> bool {
+    swarm
+        .external_addresses()
+        .any(is_globally_routable_multiaddr)
+}
+
+/// One-shot operator nudge: ~10 s into the run, if neither
+/// `cfg.external_addrs`, `NewListenAddr` auto-promotion, nor UPnP have
+/// produced a globally-routable external address, warn that bee will burn
+/// its 10 s `peerMultiaddrs` window on every handshake. We wait the grace
+/// period rather than warning eagerly because UPnP's SSDP search and
+/// listener auto-promotion both happen asynchronously after `run` starts
+/// — an eager check would always fire on home networks where things work
+/// out a moment later.
+fn maybe_warn_no_external_address(swarm: &Swarm<AntBehaviour>, configured: &[Multiaddr]) {
+    if our_identify_useful_for_bee(swarm) {
+        return;
+    }
+    if configured.is_empty() {
+        warn!(
+            target: "ant_p2p",
+            "no globally-routable external address after \
+             {EXTERNAL_ADDRESS_CHECK_DELAY:?}: UPnP found no IGD gateway and \
+             no listener auto-promoted. If this node is behind NAT, bee \
+             bootnodes will stall the BZZ handshake by ~10 s waiting for \
+             our public multiaddr via libp2p-identify. Pass \
+             --external-address /ip4/<public-ip>/tcp/<public-port> to fix.",
+        );
+    } else {
+        // The operator did set `--external-address`, but the values we
+        // were given don't pass the public-IP filter (e.g. they typo'd a
+        // private IP). Bee will silently drop them on its side; flag it
+        // here so the operator notices.
+        warn!(
+            target: "ant_p2p",
+            configured = ?configured,
+            "configured --external-address values are not globally \
+             routable; bee will reject them via its identify-go filter \
+             and the BZZ handshake will still stall ~10 s. Use a public \
+             IP and the dialable port that maps to this node.",
+        );
+    }
+}
+
+/// React to events from the bundled UPnP behaviour. Successful mappings
+/// get promoted to confirmed external addresses (subject to the same
+/// public-IP filter bee uses), so the very first outbound identify push
+/// after bootstrap already carries our public multiaddr. Renewal failures
+/// retract the address. Gateway-search failures are routine on hosts
+/// without UPnP (most cloud VMs, corporate NAT, CGNAT) and we log them at
+/// `debug` rather than nagging the operator.
+fn handle_upnp_event(
+    state: &mut SwarmState,
+    swarm: &mut Swarm<AntBehaviour>,
+    status: &Option<watch::Sender<StatusSnapshot>>,
+    ev: libp2p::upnp::Event,
+) {
+    use libp2p::upnp::Event;
+    match ev {
+        Event::NewExternalAddr(addr) => {
+            if is_globally_routable_multiaddr(&addr) {
+                record_external_address(state, swarm, status, addr, ExternalAddrSource::Upnp);
+            } else {
+                debug!(
+                    target: "ant_p2p",
+                    %addr,
+                    "upnp returned a non-globally-routable address; \
+                     bee's identify-go would filter it, ignoring",
+                );
+            }
+        }
+        Event::ExpiredExternalAddr(addr) => {
+            forget_external_address(state, swarm, status, &addr);
+        }
+        Event::GatewayNotFound => {
+            debug!(
+                target: "ant_p2p",
+                "upnp: no IGD gateway found on this network. \
+                 Set --external-address or rely on inbound identify if \
+                 this node is behind NAT.",
+            );
+        }
+        Event::NonRoutableGateway => {
+            warn!(
+                target: "ant_p2p",
+                "upnp: gateway is itself behind NAT (likely carrier-grade \
+                 NAT). UPnP cannot help here; you'll need a relay or a \
+                 routable external address to be reachable from bee peers.",
+            );
+        }
+    }
 }
 
 /// Everything `drive_handshake` needs, lifted out of `RunConfig` so it can be
@@ -408,6 +646,26 @@ struct SwarmState {
     /// gateway is wired up. Read by the status publisher for the
     /// Retrieval tab in `antctl top`.
     gateway_activity: Option<Arc<GatewayActivity>>,
+    /// One-shot guard for the "slow handshake = bee peerstore stall"
+    /// `warn!` we emit on the first handshake whose timing matches the
+    /// pattern (`handshake_ms` ≥ 5 s, `identifying_ms` < 200 ms). Without
+    /// the guard the warning would fire on every slow peer until the
+    /// operator fixes the cause. The flag is intentionally not reset on
+    /// `RunConfig` reload — once an operator has been told, we don't keep
+    /// nagging.
+    bee_peerstore_stall_warning_emitted: bool,
+    /// Live set of externally-advertised multiaddrs and how each was
+    /// learned. Maintained in lockstep with `swarm.external_addresses()`
+    /// via [`record_external_address`] / [`forget_external_address`] so
+    /// the status snapshot can attribute each address to a source.
+    /// Indexed by multiaddr for O(1) duplicate suppression; insertion
+    /// order is tracked separately in [`Self::external_addresses_order`]
+    /// so the on-wire snapshot stays deterministic.
+    external_addresses: HashMap<Multiaddr, (ExternalAddrSource, u64)>,
+    /// Insertion order for `external_addresses` so renders are stable.
+    /// Wide enough to keep one slot per address ever advertised in this
+    /// process; UPnP / listener churn keeps this very small in practice.
+    external_addresses_order: Vec<Multiaddr>,
 }
 
 impl SwarmState {
@@ -450,6 +708,9 @@ impl SwarmState {
             accounting: None,
             retrieval_counters: Arc::new(RetrievalCounters::new()),
             gateway_activity,
+            bee_peerstore_stall_warning_emitted: false,
+            external_addresses: HashMap::new(),
+            external_addresses_order: Vec::new(),
         }
     }
 
@@ -772,13 +1033,16 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
         .listen_on(listen)
         .map_err(|e| std::io::Error::other(format!("listen_on: {e}")))?;
 
-    // Advertise any user-supplied external addresses so bee's peerstore sees
-    // a public multiaddr for us. Without this bee's inbound handshake handler
-    // waits 10 s in `peerMultiaddrs` because libp2p-go filters out the RFC1918
-    // listener addresses we'd otherwise publish via identify.
-    for addr in &cfg.external_addrs {
-        swarm.add_external_address(addr.clone());
-    }
+    // Deferred operator warning: if neither user-supplied externals, listener
+    // auto-promotion, nor UPnP have produced a globally-routable address by
+    // this deadline, surface a `warn!` pointing at `--external-address`.
+    // We can't run the check eagerly because UPnP's SSDP search takes a few
+    // seconds and listener-address auto-promotion happens in the run loop —
+    // an eager check would always fire on home routers where UPnP would have
+    // succeeded a moment later. The deadline is checked from the main loop
+    // after every event so we don't need a separate timer.
+    let mut external_address_check_deadline =
+        Some(Instant::now() + EXTERNAL_ADDRESS_CHECK_DELAY);
 
     let mut control = swarm.behaviour().stream.new_control();
     let mut peer_agents: HashMap<PeerId, String> = HashMap::new();
@@ -816,6 +1080,25 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
         cfg.gateway_activity.clone(),
         cfg.disk_cache.clone(),
     );
+
+    // Advertise any user-supplied external addresses so bee's peerstore sees
+    // a public multiaddr for us. Without this bee's inbound handshake handler
+    // waits 10 s in `peerMultiaddrs` because libp2p-go filters out the RFC1918
+    // listener addresses we'd otherwise publish via identify. We route this
+    // through `record_external_address` (rather than calling
+    // `swarm.add_external_address` directly) so the operator-supplied set
+    // shows up in `StatusSnapshot::external_addresses` with `source = manual`
+    // and an `info!` log on each registration, matching how listener
+    // auto-promotion / observed / UPnP sources are surfaced.
+    for addr in cfg.external_addrs.clone() {
+        record_external_address(
+            &mut state,
+            &mut swarm,
+            &cfg.status,
+            addr,
+            ExternalAddrSource::Manual,
+        );
+    }
 
     // Pseudosettle driver: keeps our per-peer debt below bee's
     // light-mode `disconnectLimit` by periodically opening
@@ -916,6 +1199,12 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
             sync_peer_pipeline(&cfg.status, &mut state);
             last_pipeline_sync = Instant::now();
         }
+        if let Some(deadline) = external_address_check_deadline {
+            if Instant::now() >= deadline {
+                maybe_warn_no_external_address(&swarm, &cfg.external_addrs);
+                external_address_check_deadline = None;
+            }
+        }
 
         tokio::select! {
             ev = swarm.select_next_some() => {
@@ -923,6 +1212,7 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
                 handle_swarm_event(
                     &mut swarm,
                     &mut state,
+                    &cfg.status,
                     &mut control,
                     &hs_params,
                     &result_tx,
@@ -2413,6 +2703,7 @@ fn bump_backoff(backoff: Duration) -> Duration {
 fn handle_swarm_event(
     swarm: &mut Swarm<AntBehaviour>,
     state: &mut SwarmState,
+    status: &Option<watch::Sender<StatusSnapshot>>,
     control: &mut Control,
     hs_params: &HandshakeParams,
     result_tx: &mpsc::Sender<(PeerId, DriveOutcome)>,
@@ -2425,7 +2716,13 @@ fn handle_swarm_event(
             // our identify message carries usable `listen_addrs`. Without this
             // bee's inbound handshake handler waits 10 s in `peerMultiaddrs`
             // for our peerstore entry to populate.
-            swarm.add_external_address(address);
+            record_external_address(
+                state,
+                swarm,
+                status,
+                address,
+                ExternalAddrSource::Listener,
+            );
         }
         // rust-libp2p's identify surfaces each remote's `observed_addr` as
         // a candidate here. Promote globally-routable ones to confirmed
@@ -2434,12 +2731,13 @@ fn handle_swarm_event(
         SwarmEvent::NewExternalAddrCandidate { address }
             if is_globally_routable_multiaddr(&address) =>
         {
-            debug!(
-                target: "ant_p2p",
-                %address,
-                "promoting observed addr to external",
+            record_external_address(
+                state,
+                swarm,
+                status,
+                address,
+                ExternalAddrSource::Observed,
             );
-            swarm.add_external_address(address);
         }
         SwarmEvent::ConnectionEstablished {
             peer_id, endpoint, ..
@@ -2473,6 +2771,7 @@ fn handle_swarm_event(
                 },
             );
             let listen_addrs: Vec<Multiaddr> = swarm.listeners().cloned().collect();
+            let our_identify_useful = our_identify_useful_for_bee(swarm);
             spawn_handshake_driver(
                 peer_id,
                 address,
@@ -2481,6 +2780,7 @@ fn handle_swarm_event(
                 hs_params.clone(),
                 rx,
                 result_tx.clone(),
+                our_identify_useful,
             );
         }
         SwarmEvent::Behaviour(AntBehaviourEvent::Identify(identify::Event::Sent {
@@ -2581,6 +2881,9 @@ fn handle_swarm_event(
                 debug!(target: "ant_p2p", peer = ?peer_id, "dial error: {error}");
             }
         }
+        SwarmEvent::Behaviour(AntBehaviourEvent::Upnp(ev)) => {
+            handle_upnp_event(state, swarm, status, ev);
+        }
         _ => {}
     }
 }
@@ -2624,6 +2927,7 @@ fn handle_drive_outcome(
             if let Some(p) = pipeline_ms.as_ref() {
                 let total = p.dial_ms.unwrap_or(0) + p.identifying_ms + p.handshake_ms;
                 state.ready_in_ms.insert(peer, total);
+                maybe_warn_bee_peerstore_stall(state, peer, p);
             }
             // The remote_overlay was just verified by `handshake_outbound`
             // (signature recovers to an Ethereum address whose overlay
@@ -2679,6 +2983,13 @@ fn mark_for_disconnect(state: &mut SwarmState, swarm: &mut Swarm<AntBehaviour>, 
 /// Drive one peer end-to-end on a spawned tokio task. Keeping this out of
 /// the main loop lets us handshake `target_peers` in parallel while the loop
 /// is free to accept new events, hive hints, and result messages.
+///
+/// `our_identify_useful` toggles whether the identify round-trip is worth
+/// waiting for: see [`our_identify_useful_for_bee`]. When `false` we still
+/// poll the signal once (so we capture `identifying_ms` if `IdentifySent`
+/// already fired before the spawn), but we don't block on it — bee's
+/// peerstore stall is going to fire either way and adding our 3 s wait on
+/// top would just stack another 3 s on every cold-start handshake.
 fn spawn_handshake_driver(
     peer_id: PeerId,
     dial_addr: Multiaddr,
@@ -2687,13 +2998,15 @@ fn spawn_handshake_driver(
     params: HandshakeParams,
     identify_signal: oneshot::Receiver<()>,
     result_tx: mpsc::Sender<(PeerId, DriveOutcome)>,
+    our_identify_useful: bool,
 ) {
     tokio::spawn(async move {
-        // Wait for identify to round-trip, but cap the wait so a broken peer
-        // can't hold the slot forever. On timeout we open anyway — bee's
-        // 10 s peerstore wait is a lot more tolerant than our 3 s cap, so the
-        // handshake will still usually succeed.
-        let _ = tokio::time::timeout(HANDSHAKE_IDENTIFY_WAIT, identify_signal).await;
+        let wait_budget = if our_identify_useful {
+            HANDSHAKE_IDENTIFY_WAIT
+        } else {
+            Duration::ZERO
+        };
+        let _ = tokio::time::timeout(wait_budget, identify_signal).await;
 
         let proto = StreamProtocol::new(PROTOCOL_HANDSHAKE);
         let stream = match control.open_stream(peer_id, proto).await {
@@ -2931,6 +3244,41 @@ struct OutboundPipelineMs {
     handshake_ms: u64,
 }
 
+/// `handshake_ms` and `identifying_ms` thresholds that together identify the
+/// "bee burned its `peerMultiaddrs` window" case. We send identify quickly
+/// (`identifying_ms < FAST_IDENTIFY_MS`) but the BZZ exchange itself drags
+/// on past `SLOW_HANDSHAKE_MS`, which on bee can only happen if its inbound
+/// handshake handler sat out its 10 s peerstore wait. The numbers are
+/// deliberately conservative on both ends so we don't fire on the occasional
+/// fast-identify-slow-link peer.
+const SLOW_HANDSHAKE_MS: u64 = 5000;
+const FAST_IDENTIFY_MS: u64 = 200;
+
+/// Surface a one-shot `warn!` the first time we see a handshake whose
+/// timing matches bee's peerstore-stall pattern (see `SLOW_HANDSHAKE_MS` /
+/// `FAST_IDENTIFY_MS`). The cure is almost always `--external-address`,
+/// but operators don't necessarily know that, so we point at it directly.
+/// Only fires once per process — repeated nags are noise.
+fn maybe_warn_bee_peerstore_stall(state: &mut SwarmState, peer: PeerId, p: &OutboundPipelineMs) {
+    if state.bee_peerstore_stall_warning_emitted {
+        return;
+    }
+    if p.handshake_ms < SLOW_HANDSHAKE_MS || p.identifying_ms >= FAST_IDENTIFY_MS {
+        return;
+    }
+    warn!(
+        target: "ant_p2p",
+        %peer,
+        handshake_ms = p.handshake_ms,
+        identifying_ms = p.identifying_ms,
+        "slow BZZ handshake suggests the remote bee waited ~10 s for our \
+         public multiaddr via libp2p-identify. If this node is behind NAT, \
+         pass --external-address /ip4/<public-ip>/tcp/<public-port> to \
+         shorten future handshakes.",
+    );
+    state.bee_peerstore_stall_warning_emitted = true;
+}
+
 fn log_handshake_ok(
     info: &HandshakeInfo,
     peer_set_size: usize,
@@ -3061,6 +3409,7 @@ fn build_swarm(keypair: Keypair) -> Result<Swarm<AntBehaviour>, RunError> {
         stream: libp2p_stream::Behaviour::default(),
         identify: identify::Behaviour::new(id_cfg),
         ping: ping::Behaviour::new(ping::Config::new()),
+        upnp: libp2p::upnp::tokio::Behaviour::default(),
     };
 
     let swarm = SwarmBuilder::with_existing_identity(keypair)
@@ -3124,5 +3473,146 @@ mod tests {
         let v = rx.borrow_and_update().clone();
         assert_eq!(v.len(), 1, "only the un-forgotten peer remains");
         assert_eq!(v[0], (p2, o2));
+    }
+
+    /// Pin the contract that the "bee peerstore stall" warning fires
+    /// exactly once for the first matching handshake and never again,
+    /// regardless of how many slow peers follow. Operators get told,
+    /// then we shut up.
+    #[test]
+    fn bee_peerstore_stall_warning_is_one_shot() {
+        let mut state = SwarmState::new(32, [0u8; 32], false, None, None, None);
+        let stall = OutboundPipelineMs {
+            dial_ms: Some(50),
+            identifying_ms: 50,
+            handshake_ms: 8_000,
+        };
+        assert!(!state.bee_peerstore_stall_warning_emitted);
+        maybe_warn_bee_peerstore_stall(&mut state, pid(), &stall);
+        assert!(
+            state.bee_peerstore_stall_warning_emitted,
+            "first matching handshake must arm the flag",
+        );
+        // Reset the flag manually to verify it only flips on a match;
+        // a second call shouldn't flip it back without the threshold.
+        state.bee_peerstore_stall_warning_emitted = false;
+        let healthy = OutboundPipelineMs {
+            dial_ms: Some(50),
+            identifying_ms: 50,
+            handshake_ms: 200,
+        };
+        maybe_warn_bee_peerstore_stall(&mut state, pid(), &healthy);
+        assert!(
+            !state.bee_peerstore_stall_warning_emitted,
+            "fast handshake must not arm the flag",
+        );
+    }
+
+    /// Pin the contract that `sync_external_addresses_status` projects
+    /// `state.external_addresses` into the snapshot in insertion order
+    /// and tags each entry with the right source string. Older clients
+    /// match on the `source` field literally (no enum on the wire), so
+    /// changing one of these strings is a breaking-API event.
+    #[test]
+    fn external_addresses_status_attributes_source_in_order() {
+        let mut state = SwarmState::new(32, [0u8; 32], false, None, None, None);
+        let (tx, rx) = watch::channel(StatusSnapshot::default());
+
+        let manual: Multiaddr = "/ip4/203.0.113.10/tcp/1634".parse().unwrap();
+        let upnp: Multiaddr = "/ip4/203.0.113.20/tcp/1634".parse().unwrap();
+        let listener: Multiaddr = "/ip4/198.51.100.30/tcp/1634".parse().unwrap();
+        let observed: Multiaddr = "/ip4/198.51.100.40/tcp/1634".parse().unwrap();
+
+        for (addr, src, ts) in [
+            (manual.clone(), ExternalAddrSource::Manual, 1000),
+            (upnp.clone(), ExternalAddrSource::Upnp, 1100),
+            (listener.clone(), ExternalAddrSource::Listener, 1200),
+            (observed.clone(), ExternalAddrSource::Observed, 1300),
+        ] {
+            state.external_addresses.insert(addr.clone(), (src, ts));
+            state.external_addresses_order.push(addr);
+        }
+
+        sync_external_addresses_status(&Some(tx), &state);
+
+        let snap = rx.borrow().external_addresses.clone();
+        let actual: Vec<(String, String, u64)> = snap
+            .into_iter()
+            .map(|e| (e.addr, e.source, e.added_at_unix))
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                (manual.to_string(), "manual".into(), 1000),
+                (upnp.to_string(), "upnp".into(), 1100),
+                (listener.to_string(), "listener".into(), 1200),
+                (observed.to_string(), "observed".into(), 1300),
+            ],
+        );
+    }
+
+    /// Drop one entry and verify the snapshot reflects it without disturbing
+    /// the ordering of the remaining ones. This is the path UPnP renewal
+    /// failures take (`Event::ExpiredExternalAddr` →
+    /// `forget_external_address`); regressing it would silently keep stale
+    /// addresses on display long after the mapping is gone.
+    #[test]
+    fn external_addresses_status_drops_retracted_entry() {
+        let mut state = SwarmState::new(32, [0u8; 32], false, None, None, None);
+        let (tx, rx) = watch::channel(StatusSnapshot::default());
+
+        let a: Multiaddr = "/ip4/203.0.113.10/tcp/1634".parse().unwrap();
+        let b: Multiaddr = "/ip4/203.0.113.20/tcp/1634".parse().unwrap();
+        let c: Multiaddr = "/ip4/203.0.113.30/tcp/1634".parse().unwrap();
+        for addr in [&a, &b, &c] {
+            state
+                .external_addresses
+                .insert(addr.clone(), (ExternalAddrSource::Upnp, 1));
+            state.external_addresses_order.push(addr.clone());
+        }
+
+        state.external_addresses.remove(&b);
+        state.external_addresses_order.retain(|x| x != &b);
+        sync_external_addresses_status(&Some(tx), &state);
+
+        let snap_addrs: Vec<String> = rx
+            .borrow()
+            .external_addresses
+            .iter()
+            .map(|e| e.addr.clone())
+            .collect();
+        assert_eq!(snap_addrs, vec![a.to_string(), c.to_string()]);
+    }
+
+    /// Pin the wire-stable source strings. Operators (and `antctl top`)
+    /// match these literally; renaming a variant is a breaking change to
+    /// the on-the-wire `StatusSnapshot::external_addresses[i].source`
+    /// field.
+    #[test]
+    fn external_addr_source_strings_are_stable() {
+        assert_eq!(ExternalAddrSource::Manual.as_str(), "manual");
+        assert_eq!(ExternalAddrSource::Listener.as_str(), "listener");
+        assert_eq!(ExternalAddrSource::Observed.as_str(), "observed");
+        assert_eq!(ExternalAddrSource::Upnp.as_str(), "upnp");
+    }
+
+    /// A handshake that's slow because *our* identify itself was slow
+    /// (e.g. local event-loop pressure) is not the bee-peerstore case
+    /// and the warning would point at the wrong fix. Pin that we don't
+    /// fire when `identifying_ms` itself is past the threshold.
+    #[test]
+    fn bee_peerstore_stall_warning_skips_slow_identify() {
+        let mut state = SwarmState::new(32, [0u8; 32], false, None, None, None);
+        let p = OutboundPipelineMs {
+            dial_ms: Some(50),
+            identifying_ms: 3_000,
+            handshake_ms: 8_000,
+        };
+        maybe_warn_bee_peerstore_stall(&mut state, pid(), &p);
+        assert!(
+            !state.bee_peerstore_stall_warning_emitted,
+            "slow identify means our side, not bee's peerstore — don't \
+             nag the operator about --external-address",
+        );
     }
 }

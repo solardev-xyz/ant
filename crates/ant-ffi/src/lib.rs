@@ -248,6 +248,7 @@ fn init_inner(data_dir: &Path) -> Result<AntHandle, FfiError> {
             ..PeerInfo::default()
         },
         listeners: Vec::new(),
+        external_addresses: Vec::new(),
         control_socket: String::new(),
         retrieval: Default::default(),
     };

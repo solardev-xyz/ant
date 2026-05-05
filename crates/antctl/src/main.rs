@@ -2306,6 +2306,20 @@ fn print_status(s: &StatusSnapshot) {
             println!("    - {l}");
         }
     }
+    if s.external_addresses.is_empty() {
+        println!("  Externals:   (none yet)");
+    } else {
+        println!("  Externals:");
+        for e in &s.external_addresses {
+            let age = now.saturating_sub(e.added_at_unix);
+            println!(
+                "    - {} (source: {}, {} ago)",
+                e.addr,
+                e.source,
+                format_duration(age),
+            );
+        }
+    }
     println!();
     println!("Peers:");
     println!("  Connected:   {}", s.peers.connected);
@@ -2429,7 +2443,7 @@ fn draw_top_frame(frame: &mut Frame, ctx: &TopFrameContext<'_>) {
             draw_retrieval_page(frame, body, ctx);
         }
         TopPage::Status => {
-            let rows = vec![
+            let mut rows = vec![
                 kv("Process", ""),
                 kv("Agent", &ctx.status.agent),
                 kv("PID", &ctx.status.pid.to_string()),
@@ -2444,12 +2458,30 @@ fn draw_top_frame(frame: &mut Frame, ctx: &TopFrameContext<'_>) {
                 kv("Peer ID", &ctx.status.identity.peer_id),
                 kv("Connected", &ctx.status.peers.connected.to_string()),
                 kv("Listeners", &ctx.status.listeners.len().to_string()),
+            ];
+            // One row per advertised external address, attributed to its
+            // source. Operators debugging a 10 s handshake stall use this
+            // panel to confirm whether their `--external-address` /
+            // listener / UPnP path actually produced something. Empty
+            // collection means we have nothing advertised yet, which is
+            // a useful (and bad) signal in itself.
+            if ctx.status.external_addresses.is_empty() {
+                rows.push(kv("Externals", "none"));
+            } else {
+                rows.push(kv("Externals", ""));
+                for e in &ctx.status.external_addresses {
+                    let age = ctx.now.saturating_sub(e.added_at_unix);
+                    let value = format!("{} [{}, {} ago]", e.addr, e.source, format_duration(age));
+                    rows.push(kv("  Addr", &value));
+                }
+            }
+            rows.extend([
                 kv("", ""),
                 kv("Control", ""),
                 kv("Socket", &ctx.status.control_socket),
                 kv("Requested", &ctx.socket.display().to_string()),
                 kv("Protocol", &format!("v{}", ctx.status.protocol_version)),
-            ];
+            ]);
             draw_panel(frame, body, ctx.page.title(), &rows);
         }
     }

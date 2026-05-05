@@ -213,7 +213,10 @@ cargo run -p antd -- \
 
 - `--external-address` advertises a publicly routable multiaddr via
   libp2p-identify. Strongly recommended behind NAT — without it, bee
-  bootnodes stall the handshake by ~10 s.
+  bootnodes stall the handshake by ~10 s. `antd` also tries to discover
+  one automatically via UPnP/IGD on the local home router; when that
+  succeeds the flag is unnecessary, but corporate / cloud / CGNAT
+  environments will need it set explicitly.
 - `--no-http-api` disables the HTTP gateway for headless deployments.
 - `--no-disk-cache` falls back to memory-only caching.
 - `--no-peerstore` / `--reset-peerstore` control the warm-restart peer
