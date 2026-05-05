@@ -134,6 +134,16 @@ the still-open items.
   body still arrives as one terminal response over the control
   socket; browsers hitting the HTTP gateway get true byte streaming
   (Appendix E Phase 5 is the last read-path gap).
+- **HTTP-API drop-in coverage.** The gateway covers bee's read path
+  end-to-end and the upload primitives (`POST /chunks`,
+  `POST /bzz`); the long tail bee-js touches —
+  `/wallet` / `/balances` / `/settlements` / `/chequebook/*` reads,
+  `/stamps` reads + writes, `/tags`, `/feeds`, `/soc`,
+  `/stewardship`, `/envelope` — still answers `501`. The
+  prioritised order to close that gap lives in
+  [`PLAN.md` §9.0 "Drop-in light-node gap"](PLAN.md), and the
+  per-endpoint matrix is in
+  [`crates/ant-gateway/README.md`](crates/ant-gateway/README.md).
 
 ## Workspace
 

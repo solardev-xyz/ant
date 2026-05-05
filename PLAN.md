@@ -764,6 +764,56 @@ Not a capability milestone, but required before GA.
 
 M1 and M2 can be parallelized by a second engineer starting on chain plumbing in Phase 5. Add buffer for unknowns — Swarm's protocols have undocumented edges, and the first honest interop run against `bee` always surfaces something.
 
+### Drop-in light-node gap — prioritised follow-on
+
+The "M3 mostly shipped" row above understates how much surface area is
+still needed for `antd` to be a literal **drop-in replacement** for
+`bee --bee-mode=light` against an unmodified bee-js / `swarm-cli` /
+browser-uploader client. The libp2p protocol surface and the
+on-chain plumbing are at parity (or near it). What's missing is the
+long tail of HTTP endpoints bee-js touches, plus one real protocol
+gap (auto-settlement) and one real read-path gap (Reed-Solomon
+recovery).
+
+This is the working order to close it, fastest-payoff first:
+
+| # | Item                                                                    | Effort  | Why first                                                                                                              |
+| - | ----------------------------------------------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------- |
+| 1 | Auto-settlement trigger from `accounting` ↔ `swap::issue_and_emit`      | ~1 day  | Closes Phase 7. Peers stop disconnecting us under sustained fetch. Flips `/node` → `beeMode: "light"`.                 |
+| 2 | `/wallet`, `/chequebook/{address,balance,cheque[,/{peer}]}`, `/balances`, `/settlements`, `/timesettlements` reads | ~1 day  | All read-only, all backed by data we already have on disk or one `eth_call` away. Big perceived-coverage win.          |
+| 3 | `/stamps` reads + `POST /stamps/{amount}/{depth}` + `PATCH /stamps/{topup,dilute}/...` | ~1 day  | Wraps the same `Wallet` calls `antctl postage` already makes. Lets bee-js apps buy + manage stamps without antctl.     |
+| 4 | `/tags` GET/POST + `/tags/{id}` GET/DELETE/PATCH                        | ~½ day  | Every bee uploader UI shows progress via tags. The `SplitterFan` already counts the chunks we'd report.                |
+| 5 | `antctl chequebook deploy` + first-run auto-deploy in `antd`            | ~½ day  | `deploy_chequebook_calldata` is already in `ant-chain`; just needs the `Wallet::send_to` plumbing + bootstrap branch.  |
+| 6 | `/feeds/{owner}/{topic}` GET/POST + `/soc/{owner}/{id}` POST            | ~2-3 d  | Feeds are time-indexed SOCs; build SOC first, feeds on top. Largest single item but unblocks ENS + mutable-resource apps. |
+| 7 | `/stewardship/{ref}` GET/PUT, `/envelope/{addr}` POST                   | ~½-1 d  | Pure re-stamp + pushsync of an existing tree; envelopes are the same, scoped to one chunk.                             |
+| 8 | Reed-Solomon erasure decoding (`--swarm-redundancy=1..3` interop)       | ~2-3 d  | Required before sites uploaded with redundancy round-trip cleanly under any churn. Real read-path protocol work.       |
+
+After (1)–(7) an unmodified bee-js script doing
+`bee.uploadFile / downloadFile / createTag / createPostageBatch /
+getChequebookBalance / feed read+write` works against `antd` with
+no config changes. After (8) gateway-uploaded sites that opted into
+RS recovery decode correctly under partial-graph conditions. That
+is the "drop-in" line.
+
+What stays out of scope for the drop-in claim:
+
+- `/pinning/*`, `/pss/*`, `/gsoc/*`, `/transactions[/{hash}]`,
+  `/auth`, `/refresh`, `/chequebook/cashout/{peer}` — permanently
+  `501` by design (Appendix B + §5.8 + D.2.4). bee returns these
+  too on a `bee-mode=light` install with the relevant subsystems
+  disabled, so unmodified consumers don't trip on them.
+- `POST /bytes` (split-without-manifest) — bee accepts this, ant
+  returns 501; bee-js's `uploadFile` always uses `POST /bzz`, so
+  the gap doesn't actually hit consumers in practice. Worth fixing
+  when convenient but not gating drop-in.
+- Web3 v3 keystore portability, `bee init` / `bee dev` UX,
+  Prometheus metrics, OpenAPI 3.0 spec — operator quality-of-life
+  items that don't change protocol or HTTP-API behaviour.
+
+Mobile artefact (UniFFI `.xcframework` / Kotlin `.aar`) is a
+parallel M2 track — orthogonal to the bee drop-in question, since
+bee itself doesn't ship mobile binaries.
+
 ### Optional early releases
 
 The milestone structure deliberately supports three pre-GA checkpoints, each useful in its own right:

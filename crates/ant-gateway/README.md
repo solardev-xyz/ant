@@ -101,23 +101,70 @@ when forwarders accept our pushes (see Phase 7 polish in PLAN.md
 generate, but a sustained 1 GB+ upload would eventually trip
 their disconnect threshold.
 
-### What's intentionally not here
+### Bee-API drop-in gap
 
-- Tier-B writes other than `POST /bzz` and `POST /chunks` —
-  specifically `POST /bytes`, real stamps writes
-  (`/stamps/{batch}/topup`, `/stamps/{batch}/dilute`),
-  `/chequebook/{deposit,withdraw,cashout}`, `/wallet/withdraw`,
-  feeds / SOCs / tags / pins / stewardship / envelopes.
-  `antctl postage` covers the stamps writes from the CLI side
-  today; the rest is on the M3 polish track in PLAN.md §9.0.
-- Web3 v3 keystore (`keys/swarm.key`) — PLAN.md D.3.2.
-- ENS resolution (`/bzz/<ens>/...` — currently treated as a literal
-  reference; bee-js's reachability checks accept the 400 today).
-- Reed-Solomon redundancy recovery — PLAN.md Appendix E Phase 8.
-  Files uploaded with non-zero redundancy currently require every data
-  chunk to be reachable.
-- ENS / `resolver-options`, bee-style YAML config, `antd init`, the
-  `antd start` subcommand shim. `antd`'s existing CLI is unchanged.
+The HTTP surface above gets bee-js's read path working unchanged.
+The remaining bee endpoints fall into three buckets — the prioritised
+order to close the **drop-in** gap is in [PLAN.md §9.0 "Drop-in
+light-node gap — prioritised follow-on"][drop-in].
+
+[drop-in]: ../../PLAN.md
+
+| Path                               | Method     | Status today        | Gap class    |
+| ---------------------------------- | ---------- | ------------------- | ------------ |
+| `/wallet`                          | GET        | stub zeros          | drop-in #2   |
+| `/balances`, `/balances/{addr}`    | GET        | 501                 | drop-in #2   |
+| `/settlements`, `/settlements/{addr}` | GET     | 501                 | drop-in #2   |
+| `/timesettlements`                 | GET        | 501                 | drop-in #2   |
+| `/chequebook/address`              | GET        | stub `0x000…`       | drop-in #2   |
+| `/chequebook/balance`              | GET        | stub zeros          | drop-in #2   |
+| `/chequebook/cheque[/{peer}]`      | GET        | 501                 | drop-in #2   |
+| `/chequebook/deposit/{amount}`     | POST       | 501                 | drop-in #2   |
+| `/chequebook/withdraw/{amount}`    | POST       | 501                 | drop-in #2   |
+| `/stamps`                          | GET        | stub `{stamps:[]}`  | drop-in #3   |
+| `/stamps/{batch-id}`               | GET        | 501                 | drop-in #3   |
+| `/stamps/{amount}/{depth}`         | POST       | 501 (`antctl postage create`) | drop-in #3 |
+| `/stamps/topup/{batch-id}/{amount}` | PATCH     | 501 (`antctl postage top-up`) | drop-in #3 |
+| `/stamps/dilute/{batch-id}/{depth}` | PATCH     | 501 (`antctl postage dilute`) | drop-in #3 |
+| `/tags`, `/tags/{id}`              | GET/POST/DELETE/PATCH | 501       | drop-in #4   |
+| `/feeds/{owner}/{topic}`           | GET/POST   | 501                 | drop-in #6   |
+| `/soc/{owner}/{id}`                | POST       | 501                 | drop-in #6   |
+| `/stewardship/{ref}`               | GET/PUT    | 501                 | drop-in #7   |
+| `/envelope/{addr}`                 | POST       | 501                 | drop-in #7   |
+| `POST /bytes` (split, no manifest) | POST       | 501                 | nice-to-have (bee-js never calls it) |
+| `/pss/*`, `/gsoc/*`                | any        | 501 (permanent)     | by design — Appendix B |
+| `/transactions[/{hash}]`           | any        | 501 (permanent)     | by design — admin/restricted API |
+| `/auth`, `/refresh`                | any        | 501 (permanent)     | by design — restricted-API auth |
+| `/chequebook/cashout/{peer}`       | GET/POST   | 501 (permanent)     | by design — light nodes don't cash, §5.8 |
+| `/pinning/*`                       | any        | 501 (permanent)     | by design — light nodes don't pin |
+
+**One real protocol gap** holds the rest of the surface in stub
+mode: auto-settlement (drop-in #1 in the PLAN). Until SWAP cheques
+are auto-emitted on per-peer debt threshold crossings, `GET /node`
+correctly reports `beeMode: "ultra-light"`,
+`chequebookEnabled: false`, `swapEnabled: false`. Once that lands
+the stub responses for `/wallet`, `/chequebook/{address,balance}`,
+and `/stamps` need to flip to real values *and* `/node` flips to
+`beeMode: "light"` — that's a single coordinated change.
+
+**One real read-path gap:** Reed-Solomon erasure decoding (drop-in
+#8). Files uploaded with `--swarm-redundancy={1,2,3}` need RS
+decoding when individual data chunks are unreachable. Today every
+data chunk must be reachable; clients can opt in via the daemon's
+`--allow-degraded-redundancy` flag.
+
+### Other intentional non-features
+
+- Web3 v3 keystore (`keys/swarm.key`) — PLAN.md D.3.2. Operators
+  with an existing bee keystore have to convert to `signing.key`
+  (32 raw hex bytes) by hand for now.
+- ENS resolution (`/bzz/<ens>/...`) — currently treated as a literal
+  reference; bee-js's reachability checks accept the resulting `400`.
+- bee-style YAML config, `antd init`, `antd start` subcommand
+  shim — `antd`'s existing CLI is unchanged.
+- Prometheus metrics endpoint on `:1635` and OpenAPI 3.0 spec —
+  bee ships both, ant ships neither. Operator quality-of-life
+  items, not part of the drop-in claim.
 
 ## How to run
 
