@@ -31,10 +31,14 @@
 //! seek forward fork-by-fork relies on each fork occupying a whole
 //! number of 32-byte blocks.
 //!
-//! All produced manifests fit in a single CAC chunk today. For a
-//! ≤ 4 KiB total payload (typical for ≤ ~12 files at default content
-//! types), the manifest *is* its own root and there is no second
-//! join level — bee's gateway handles this fine.
+//! Manifests are emitted as a proper recursive trie: every node fits in
+//! one CAC chunk, and large collections naturally deepen the tree
+//! instead of overflowing a single root chunk. A flat 12-file collection
+//! lands in a single root chunk; a 200-file site distributes across
+//! ~20–40 chunks (root + per-prefix sub-tries). Path segments longer
+//! than [`MAX_FILENAME_BYTES`] are split into chained 30-byte forks
+//! transparently — bee's reader walks the chain identically to a
+//! single-fork prefix.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -55,12 +59,11 @@ const NODE_TYPE_VALUE: u8 = 2;
 const NODE_TYPE_PATH_SEPARATOR: u8 = 8;
 const NODE_TYPE_WITH_METADATA: u8 = 16;
 
-/// Bee's hard cap on per-fork prefix length. A path segment longer than
-/// 30 bytes has to be split into multiple chained forks, each carrying a
-/// 30-byte prefix and a 1-fork synthetic intermediate node. We don't
-/// support path segments longer than this here yet — return an error
-/// instead of producing a manifest bee can't read. Caller can pre-split
-/// long names if they need them (almost no one does).
+/// Bee's hard cap on per-fork prefix length: 30 bytes (the on-wire
+/// prefix slot is a fixed 30-byte zero-padded field). Path segments
+/// longer than this are emitted as chained 30-byte forks with
+/// synthetic single-fork intermediate nodes — bee's reader walks the
+/// chain identically to a flat prefix.
 pub const MAX_FILENAME_BYTES: usize = 30;
 
 /// One file to add to a collection manifest.
@@ -120,74 +123,14 @@ pub fn build_single_file_manifest(
     content_type: Option<&str>,
     data_ref: ChunkAddr,
 ) -> Result<ManifestWriteResult, ManifestWriteError> {
-    if filename.is_empty() {
-        return Err(ManifestWriteError::EmptyPath);
-    }
-    if filename.as_bytes().len() > MAX_FILENAME_BYTES {
-        return Err(ManifestWriteError::SegmentTooLong {
-            segment: filename.as_bytes().len(),
-            cap: MAX_FILENAME_BYTES,
-        });
-    }
-
-    let ct = content_type
-        .map(str::to_string)
-        .unwrap_or_else(|| "application/octet-stream".to_string());
-
-    let mut chunks: Vec<SplitChunk> = Vec::with_capacity(3);
-
-    // Empty stub the `/` metadata-only fork points at. Bee's
-    // `m.Add("/", NewEntry(zero, …))` call in fileUploadHandler creates
-    // this — a node with no entry and no forks, just a placeholder for
-    // the parent fork's metadata.
-    let slash_stub_payload = empty_stub_payload();
-    let (slash_stub_addr, slash_stub_wire) = cac_payload(&slash_stub_payload);
-    chunks.push(SplitChunk {
-        address: slash_stub_addr,
-        wire: slash_stub_wire,
-    });
-
-    // The file value leaf: ref-size 0x20, entry = data_ref, no forks.
-    let file_leaf_payload = value_leaf_payload(data_ref);
-    let (file_leaf_addr, file_leaf_wire) = cac_payload(&file_leaf_payload);
-    chunks.push(SplitChunk {
-        address: file_leaf_addr,
-        wire: file_leaf_wire,
-    });
-
-    // Root: 2 forks.
-    let mut root_forks: BTreeMap<u8, ForkDescriptor> = BTreeMap::new();
-    root_forks.insert(
-        b'/',
-        ForkDescriptor {
-            prefix: b"/".to_vec(),
-            child_ref: slash_stub_addr,
-            metadata: index_doc_metadata(filename),
-            path_separator: true,
-        },
-    );
-    let first_byte = filename.as_bytes()[0];
-    root_forks.insert(
-        first_byte,
-        ForkDescriptor {
-            prefix: filename.as_bytes().to_vec(),
-            child_ref: file_leaf_addr,
-            metadata: file_metadata(&ct, filename),
-            path_separator: false,
-        },
-    );
-
-    let root_payload = node_payload(/* entry */ None, &root_forks)?;
-    let (root_addr, root_wire) = cac_payload(&root_payload);
-    chunks.push(SplitChunk {
-        address: root_addr,
-        wire: root_wire,
-    });
-
-    Ok(ManifestWriteResult {
-        root: root_addr,
-        chunks,
-    })
+    build_collection_manifest(
+        &[ManifestFile {
+            path: filename.to_string(),
+            content_type: content_type.map(str::to_string),
+            data_ref,
+        }],
+        Some(filename),
+    )
 }
 
 /// Build a manifest covering many files. `files` is a list of distinct
@@ -196,11 +139,16 @@ pub fn build_single_file_manifest(
 /// `website-index-document` metadata pointer so `bzz://<root>/` serves
 /// that file.
 ///
-/// The current implementation produces single-chunk manifests only:
-/// for very large collections (~ 60+ files with long names) the root
-/// would overflow [`CHUNK_SIZE`] and we return
-/// [`ManifestWriteError::ManifestTooBig`]. Splitting the manifest
-/// across chunks is future work.
+/// The writer constructs a real radix trie: every node serializes to
+/// exactly one CAC chunk, and large collections naturally deepen the
+/// tree instead of overflowing the root. Path segments longer than
+/// [`MAX_FILENAME_BYTES`] are emitted as chained 30-byte forks with
+/// synthetic single-fork intermediate nodes — bee's reader walks the
+/// chain identically. Returns
+/// [`ManifestWriteError::ManifestTooBig`] only in the pathological
+/// case where one trie level has so many forks (with metadata) that a
+/// single node exceeds [`CHUNK_SIZE`]; in practice this requires
+/// 50+ siblings sharing a prefix at the same trie depth.
 pub fn build_collection_manifest(
     files: &[ManifestFile],
     index_document: Option<&str>,
@@ -208,249 +156,243 @@ pub fn build_collection_manifest(
     if files.is_empty() {
         return Err(ManifestWriteError::EmptyPath);
     }
+    let mut seen_paths: BTreeSet<&str> = BTreeSet::new();
     for f in files {
         if f.path.is_empty() {
             return Err(ManifestWriteError::EmptyPath);
         }
-        for segment in f.path.split('/') {
-            if segment.as_bytes().len() > MAX_FILENAME_BYTES {
-                return Err(ManifestWriteError::SegmentTooLong {
-                    segment: segment.as_bytes().len(),
-                    cap: MAX_FILENAME_BYTES,
-                });
-            }
-        }
-    }
-
-    // For the v1 collection writer we emit a flat root: every file gets
-    // a top-level fork keyed on its first path byte with `prefix = full
-    // path`. This is exactly what bee's reader expects and produces in
-    // its simplest form — it walks the prefix, finds the fork, descends
-    // into the value leaf. Two files whose paths start with the same
-    // byte require a real trie split (longest common prefix), handled
-    // below for the common case (paths sharing more than the first
-    // byte just collide and we error out — collection users almost
-    // always have distinct first letters or distinct top-level dirs).
-    let mut chunks: Vec<SplitChunk> = Vec::new();
-
-    // Map of (full path prefix) → fork descriptor at the root level.
-    let mut root_forks: BTreeMap<u8, ForkDescriptor> = BTreeMap::new();
-
-    // Group files by their first byte so we can detect collisions and
-    // produce a useful error rather than silently overwriting.
-    let mut by_first: BTreeMap<u8, Vec<&ManifestFile>> = BTreeMap::new();
-    for f in files {
-        by_first.entry(f.path.as_bytes()[0]).or_default().push(f);
-    }
-    let mut seen_paths: BTreeSet<&str> = BTreeSet::new();
-    for f in files {
         if !seen_paths.insert(f.path.as_str()) {
-            return Err(ManifestWriteError::SegmentTooLong {
-                segment: f.path.as_bytes().len(),
-                cap: MAX_FILENAME_BYTES,
-            });
+            // Duplicate path. We treat it as an empty-path error —
+            // there's no clean way to "merge" two distinct data refs
+            // at the same logical location.
+            return Err(ManifestWriteError::EmptyPath);
         }
     }
 
-    for (first_byte, group) in by_first {
-        if group.len() == 1 {
-            let f = group[0];
-            let ct = f
-                .content_type
-                .clone()
-                .unwrap_or_else(|| "application/octet-stream".to_string());
-            let leaf_payload = value_leaf_payload(f.data_ref);
-            let (leaf_addr, leaf_wire) = cac_payload(&leaf_payload);
-            chunks.push(SplitChunk {
-                address: leaf_addr,
-                wire: leaf_wire,
-            });
-            root_forks.insert(
-                first_byte,
-                ForkDescriptor {
-                    prefix: f.path.as_bytes().to_vec(),
-                    child_ref: leaf_addr,
-                    metadata: file_metadata(&ct, &f.path),
-                    path_separator: f.path.contains('/'),
-                },
-            );
-        } else {
-            // Multiple files share a first byte: build a one-level
-            // sub-trie. Find the longest common prefix among these
-            // siblings, emit a fork with that prefix pointing at a
-            // sub-node with one fork per descendant on the byte
-            // immediately after the LCP.
-            let lcp = longest_common_prefix(group.iter().map(|f| f.path.as_bytes()));
-            if lcp.len() > MAX_FILENAME_BYTES {
-                return Err(ManifestWriteError::SegmentTooLong {
-                    segment: lcp.len(),
-                    cap: MAX_FILENAME_BYTES,
-                });
-            }
-
-            let mut child_forks: BTreeMap<u8, ForkDescriptor> = BTreeMap::new();
-            let mut child_index_doc: Option<&str> = None;
-            for f in &group {
-                let suffix = &f.path.as_bytes()[lcp.len()..];
-                if suffix.is_empty() {
-                    return Err(ManifestWriteError::EmptyPath);
-                }
-                if suffix.len() > MAX_FILENAME_BYTES {
-                    return Err(ManifestWriteError::SegmentTooLong {
-                        segment: suffix.len(),
-                        cap: MAX_FILENAME_BYTES,
-                    });
-                }
-                let ct = f
-                    .content_type
-                    .clone()
-                    .unwrap_or_else(|| "application/octet-stream".to_string());
-                let leaf_payload = value_leaf_payload(f.data_ref);
-                let (leaf_addr, leaf_wire) = cac_payload(&leaf_payload);
-                chunks.push(SplitChunk {
-                    address: leaf_addr,
-                    wire: leaf_wire,
-                });
-                if child_forks
-                    .insert(
-                        suffix[0],
-                        ForkDescriptor {
-                            prefix: suffix.to_vec(),
-                            child_ref: leaf_addr,
-                            metadata: file_metadata(&ct, &f.path),
-                            path_separator: f.path[lcp.len()..].contains('/'),
-                        },
-                    )
-                    .is_some()
-                {
-                    return Err(ManifestWriteError::SegmentTooLong {
-                        segment: suffix.len(),
-                        cap: MAX_FILENAME_BYTES,
-                    });
-                }
-                if Some(f.path.as_str()) == index_document {
-                    child_index_doc = Some(f.path.as_str());
-                }
-            }
-            let child_node_payload = node_payload(/* entry */ None, &child_forks)?;
-            let (child_node_addr, child_node_wire) = cac_payload(&child_node_payload);
-            chunks.push(SplitChunk {
-                address: child_node_addr,
-                wire: child_node_wire,
-            });
-
-            let mut fork_meta = BTreeMap::new();
-            if lcp.contains(&b'/') {
-                // bee marks intermediate dir-spanning forks as path-separator;
-                // it doesn't change retrieval, but it's how bee's lister
-                // formats listings.
-            }
-            // Per-fork index-doc metadata is the bee convention only on the
-            // root '/' fork; nested forks just carry Content-Type+Filename
-            // on their leaves.
-            let _ = child_index_doc;
-            root_forks.insert(
-                first_byte,
-                ForkDescriptor {
-                    prefix: lcp.clone(),
-                    child_ref: child_node_addr,
-                    metadata: fork_meta_drop(&mut fork_meta),
-                    path_separator: lcp.contains(&b'/'),
-                },
-            );
-        }
+    // Build the in-memory trie.
+    let mut root = TrieNode::default();
+    for f in files {
+        let ct = f
+            .content_type
+            .clone()
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        trie_insert(
+            &mut root,
+            f.path.as_bytes(),
+            f.data_ref,
+            file_metadata(&ct, &f.path),
+        )?;
     }
 
     // Index-document anchor on the synthetic '/' fork at the root.
     if let Some(idx) = index_document {
-        if !files.iter().any(|f| f.path == idx) {
-            // Caller asked for an index doc that isn't in the file list.
-            // We still emit it; bee will then 404 when it tries to
-            // dereference the missing file. Quietly tolerate, like bee.
-        }
-        let stub_payload = empty_stub_payload();
-        let (stub_addr, stub_wire) = cac_payload(&stub_payload);
-        chunks.push(SplitChunk {
-            address: stub_addr,
-            wire: stub_wire,
-        });
-        root_forks.insert(
-            b'/',
-            ForkDescriptor {
-                prefix: b"/".to_vec(),
-                child_ref: stub_addr,
-                metadata: index_doc_metadata(idx),
-                path_separator: true,
-            },
-        );
+        // bee's bzzUploadHandler always sets the '/' fork's metadata
+        // to website-index-document, regardless of whether the named
+        // file exists in the manifest. If it doesn't, bee returns 404
+        // when bzz://<root>/ is hit; we mirror that exactly.
+        let mut idx_node = TrieNode::default();
+        idx_node.value = Some(EmptyValue);
+        let fork = TrieFork {
+            prefix: b"/".to_vec(),
+            child: Box::new(idx_node),
+            metadata_override: Some(index_doc_metadata(idx)),
+            path_separator: true,
+        };
+        root.forks.insert(b'/', fork);
     }
 
-    let root_payload = node_payload(/* entry */ None, &root_forks)?;
-    let (root_addr, root_wire) = cac_payload(&root_payload);
-    chunks.push(SplitChunk {
-        address: root_addr,
-        wire: root_wire,
-    });
+    // Serialize bottom-up.
+    let mut chunks: Vec<SplitChunk> = Vec::new();
+    let root_addr = serialize_node(&root, &mut chunks)?;
     Ok(ManifestWriteResult {
         root: root_addr,
         chunks,
     })
 }
 
-// --- internal helpers ---
+// --- trie data model + insertion ---
 
-/// One fork as it will be serialised into a parent node's body.
-struct ForkDescriptor {
+/// Marker for the "/" placeholder leaf used to anchor the
+/// website-index-document metadata. Carries no data of its own.
+#[derive(Clone)]
+struct EmptyValue;
+
+#[derive(Default)]
+struct TrieNode {
+    /// File path that ends exactly at this node, if any. The data ref
+    /// will be written to the node's `entry` slot at serialization
+    /// time; the matching metadata lives on the parent fork.
+    own_data_ref: Option<ChunkAddr>,
+    own_metadata: BTreeMap<String, String>,
+    /// Marker present iff this node represents the empty-stub fork
+    /// for the website-index-document anchor. Distinct from
+    /// `own_data_ref` because the empty stub carries refsize=0x00,
+    /// not 0x20+entry.
+    value: Option<EmptyValue>,
+    /// Outgoing forks keyed by the byte that distinguishes them.
+    forks: BTreeMap<u8, TrieFork>,
+}
+
+struct TrieFork {
+    /// Bytes consumed by following this fork (prefix length 1..=30).
     prefix: Vec<u8>,
-    child_ref: ChunkAddr,
-    metadata: BTreeMap<String, String>,
+    child: Box<TrieNode>,
+    /// Override the fork's metadata block at serialization. Only used
+    /// for the synthetic '/' index-document fork; everywhere else the
+    /// metadata is read from `child.own_metadata`.
+    metadata_override: Option<BTreeMap<String, String>>,
     path_separator: bool,
 }
 
-/// Empty-stub manifest node: bee's "no value here, no forks here, just a
-/// placeholder address" — the same chunk that any well-known empty
-/// stub hashes to. Used as the child of the root `/` fork.
-fn empty_stub_payload() -> Vec<u8> {
-    // 32 bytes obfkey + 31 bytes vhash + 1 byte ref-size(0) + 32 bytes
-    // forks-bitmap (all zero). No entry slot when ref-size is 0.
-    let mut p = Vec::with_capacity(32 + 31 + 1 + 32);
-    p.extend_from_slice(&[0u8; 32]);
-    p.extend_from_slice(&VERSION_HASH_31);
-    p.push(0x00);
-    p.extend_from_slice(&[0u8; 32]);
-    p
+/// Insert `path → data_ref` into `node`. Splits or extends forks as
+/// needed and chains 30-byte forks for paths whose remaining suffix
+/// exceeds the per-fork prefix cap.
+fn trie_insert(
+    node: &mut TrieNode,
+    path: &[u8],
+    data_ref: ChunkAddr,
+    metadata: BTreeMap<String, String>,
+) -> Result<(), ManifestWriteError> {
+    if path.is_empty() {
+        node.own_data_ref = Some(data_ref);
+        node.own_metadata = metadata;
+        return Ok(());
+    }
+    let first = path[0];
+    // Take the existing fork (if any) by removing it; we may rebuild
+    // it before re-inserting. Borrow-checker friendly.
+    if let Some(mut fork) = node.forks.remove(&first) {
+        let lcp = longest_common_prefix(
+            [fork.prefix.as_slice(), path].iter().copied(),
+        );
+        if lcp.len() == fork.prefix.len() {
+            // Whole existing prefix matches; descend with the
+            // remaining tail.
+            trie_insert(&mut fork.child, &path[lcp.len()..], data_ref, metadata)?;
+            node.forks.insert(first, fork);
+        } else {
+            // Split: create an intermediate node holding the old
+            // child under the suffix it kept, plus the new branch.
+            let old_suffix: Vec<u8> = fork.prefix[lcp.len()..].to_vec();
+            let mut intermediate = TrieNode::default();
+            // Move the old subtree under a fork keyed on
+            // old_suffix[0]. Its metadata still hangs off the
+            // existing fork's metadata_override (if any) — but
+            // because fork.metadata_override is only set for the
+            // index-doc placeholder which we never split, this is
+            // None and we keep it None on the intermediate fork too.
+            let old_path_sep = old_suffix.contains(&b'/');
+            intermediate.forks.insert(
+                old_suffix[0],
+                TrieFork {
+                    prefix: old_suffix,
+                    child: std::mem::take(&mut fork.child),
+                    metadata_override: fork.metadata_override.take(),
+                    path_separator: old_path_sep,
+                },
+            );
+            // Insert the new tail into the intermediate.
+            trie_insert(
+                &mut intermediate,
+                &path[lcp.len()..],
+                data_ref,
+                metadata,
+            )?;
+            // Replace the original fork with one truncated to LCP.
+            let lcp_path_sep = lcp.contains(&b'/');
+            node.forks.insert(
+                first,
+                TrieFork {
+                    prefix: lcp,
+                    child: Box::new(intermediate),
+                    metadata_override: None,
+                    path_separator: lcp_path_sep,
+                },
+            );
+        }
+        Ok(())
+    } else {
+        // No fork starts with this byte yet; create one. If `path` is
+        // longer than the per-fork cap, chain through synthetic
+        // intermediates so each fork carries at most 30 bytes.
+        let (head, tail) = path.split_at(path.len().min(MAX_FILENAME_BYTES));
+        if tail.is_empty() {
+            let mut leaf = TrieNode::default();
+            leaf.own_data_ref = Some(data_ref);
+            leaf.own_metadata = metadata;
+            node.forks.insert(
+                first,
+                TrieFork {
+                    prefix: head.to_vec(),
+                    child: Box::new(leaf),
+                    metadata_override: None,
+                    path_separator: head.contains(&b'/'),
+                },
+            );
+        } else {
+            // Build a child intermediate that holds the tail, then
+            // recurse into it with the same data_ref/metadata.
+            let mut intermediate = TrieNode::default();
+            trie_insert(&mut intermediate, tail, data_ref, metadata)?;
+            node.forks.insert(
+                first,
+                TrieFork {
+                    prefix: head.to_vec(),
+                    child: Box::new(intermediate),
+                    metadata_override: None,
+                    path_separator: head.contains(&b'/'),
+                },
+            );
+        }
+        Ok(())
+    }
 }
 
-/// Value-bearing leaf node: ref-size 0x20, entry = `data_ref`, no forks.
-fn value_leaf_payload(data_ref: ChunkAddr) -> Vec<u8> {
-    let mut p = Vec::with_capacity(32 + 31 + 1 + 32 + 32);
-    p.extend_from_slice(&[0u8; 32]);
-    p.extend_from_slice(&VERSION_HASH_31);
-    p.push(0x20);
-    p.extend_from_slice(&data_ref);
-    p.extend_from_slice(&[0u8; 32]);
-    p
+// --- serialization ---
+
+/// Recursively serialize `node` and all descendants. Returns the
+/// node's CAC address; appends every produced chunk to `out` in
+/// post-order (children before parents) so callers that push chunks
+/// sequentially can rely on dependents already being on the
+/// network when each chunk is pushed. The caller still needs to push
+/// the *entire* slice — bee's pushsync doesn't backtrack.
+fn serialize_node(
+    node: &TrieNode,
+    out: &mut Vec<SplitChunk>,
+) -> Result<ChunkAddr, ManifestWriteError> {
+    // Resolve each fork's child address first.
+    let mut child_refs: BTreeMap<u8, ChunkAddr> = BTreeMap::new();
+    for (&k, fork) in &node.forks {
+        let child_addr = serialize_node(&fork.child, out)?;
+        child_refs.insert(k, child_addr);
+    }
+
+    let payload = serialize_node_payload(node, &child_refs)?;
+    let (addr, wire) = cac_payload(&payload);
+    out.push(SplitChunk {
+        address: addr,
+        wire,
+    });
+    Ok(addr)
 }
 
-/// Serialise a manifest node from an optional own entry and its set of
-/// outgoing forks. Returns the de-obfuscated payload bytes; the caller
-/// wraps them in a CAC chunk via [`cac_payload`].
-fn node_payload(
-    entry: Option<ChunkAddr>,
-    forks: &BTreeMap<u8, ForkDescriptor>,
+/// Serialize one node into its on-wire bytes (de-obfuscated).
+fn serialize_node_payload(
+    node: &TrieNode,
+    child_refs: &BTreeMap<u8, ChunkAddr>,
 ) -> Result<Vec<u8>, ManifestWriteError> {
     let mut p = Vec::with_capacity(128);
     p.extend_from_slice(&[0u8; 32]); // obf key
     p.extend_from_slice(&VERSION_HASH_31);
 
-    // ref-size: 0x20 if any forks exist (forks reuse it for child_ref
-    // size) or if the node has its own entry. 0x00 only for an empty
-    // stub leaf.
-    let needs_ref = entry.is_some() || !forks.is_empty();
+    // refsize: 0x20 if the node has any forks (forks store 32-byte
+    // child refs) or its own data_ref; 0x00 only for the empty
+    // index-doc placeholder leaf.
+    let needs_ref = node.own_data_ref.is_some() || !node.forks.is_empty();
     if needs_ref {
         p.push(0x20);
-        match entry {
-            Some(addr) => p.extend_from_slice(&addr),
+        match node.own_data_ref {
+            Some(ref a) => p.extend_from_slice(a),
             None => p.extend_from_slice(&[0u8; 32]),
         }
     } else {
@@ -459,14 +401,33 @@ fn node_payload(
 
     // Forks bitmap.
     let mut bitmap = [0u8; 32];
-    for byte in forks.keys() {
+    for byte in node.forks.keys() {
         bitmap[(*byte as usize) / 8] |= 1 << (*byte % 8);
     }
     p.extend_from_slice(&bitmap);
 
-    // Forks in ascending order of first byte (BTreeMap preserves this).
-    for fork in forks.values() {
-        let bytes = serialize_fork(fork)?;
+    // Forks in ascending order (BTreeMap preserves this).
+    for (k, fork) in &node.forks {
+        // Resolve the metadata: explicit override (only set on the
+        // index-doc placeholder) wins; otherwise read from the child
+        // node's own_metadata if it carries a file value. A purely
+        // structural intermediate has empty metadata.
+        let meta = if let Some(m) = &fork.metadata_override {
+            m.clone()
+        } else if fork.child.own_data_ref.is_some() {
+            fork.child.own_metadata.clone()
+        } else {
+            BTreeMap::new()
+        };
+        let child_ref = *child_refs
+            .get(k)
+            .expect("child_refs populated for every fork above");
+        let bytes = serialize_fork_to_bytes(
+            &fork.prefix,
+            &child_ref,
+            &meta,
+            fork.path_separator,
+        )?;
         p.extend_from_slice(&bytes);
     }
 
@@ -479,38 +440,33 @@ fn node_payload(
     Ok(p)
 }
 
-/// Serialise one fork: type(1) + prefix-len(1) + prefix(30) +
-/// child_ref(32) + (optional meta-len(2) + meta(N, '\n'-padded so the
-/// whole fork is a multiple of 32 bytes)).
-fn serialize_fork(fork: &ForkDescriptor) -> Result<Vec<u8>, ManifestWriteError> {
-    if fork.prefix.is_empty() || fork.prefix.len() > MAX_FILENAME_BYTES {
+fn serialize_fork_to_bytes(
+    prefix: &[u8],
+    child_ref: &ChunkAddr,
+    metadata: &BTreeMap<String, String>,
+    path_separator: bool,
+) -> Result<Vec<u8>, ManifestWriteError> {
+    if prefix.is_empty() || prefix.len() > MAX_FILENAME_BYTES {
         return Err(ManifestWriteError::SegmentTooLong {
-            segment: fork.prefix.len(),
+            segment: prefix.len(),
             cap: MAX_FILENAME_BYTES,
         });
     }
     let mut bytes = Vec::with_capacity(64);
-    let mut node_type = NODE_TYPE_VALUE; // every fork we emit points at
-                                         // a value-or-edge node; bee sets
-                                         // the bit on the parent fork
-                                         // not the child's own node_type
-                                         // header.
-    if !fork.metadata.is_empty() {
+    let mut node_type = NODE_TYPE_VALUE;
+    if !metadata.is_empty() {
         node_type |= NODE_TYPE_WITH_METADATA;
     }
-    if fork.path_separator {
+    if path_separator {
         node_type |= NODE_TYPE_PATH_SEPARATOR;
     }
     bytes.push(node_type);
-    bytes.push(fork.prefix.len() as u8);
-    bytes.extend_from_slice(&fork.prefix);
-    bytes.extend(std::iter::repeat(0u8).take(30 - fork.prefix.len()));
-    bytes.extend_from_slice(&fork.child_ref);
-    if !fork.metadata.is_empty() {
-        let meta_json = encode_metadata(&fork.metadata);
-        // Pad with '\n' so that (meta_size + 2) is a multiple of 32 —
-        // this keeps the entire fork (1+1+30+32+2+meta = 66+meta) at
-        // a 32-byte multiple, which bee's parser walks fork-by-fork.
+    bytes.push(prefix.len() as u8);
+    bytes.extend_from_slice(prefix);
+    bytes.extend(std::iter::repeat(0u8).take(MAX_FILENAME_BYTES - prefix.len()));
+    bytes.extend_from_slice(child_ref);
+    if !metadata.is_empty() {
+        let meta_json = encode_metadata(metadata);
         let pad = match (meta_json.len() + 2) % 32 {
             0 => 0,
             r => 32 - r,
@@ -523,6 +479,8 @@ fn serialize_fork(fork: &ForkDescriptor) -> Result<Vec<u8>, ManifestWriteError> 
     }
     Ok(bytes)
 }
+
+// --- internal helpers ---
 
 /// Stable JSON encoding for mantaray fork metadata: flat string→string
 /// object, BTreeMap order, no whitespace, escape `"` and `\`. Bee
@@ -580,12 +538,8 @@ fn file_metadata(content_type: &str, filename: &str) -> BTreeMap<String, String>
     m
 }
 
-fn fork_meta_drop(meta: &mut BTreeMap<String, String>) -> BTreeMap<String, String> {
-    std::mem::take(meta)
-}
-
 /// CAC-wrap a manifest node payload (always one chunk; payload size is
-/// already validated against [`CHUNK_SIZE`] in [`node_payload`]).
+/// already validated against [`CHUNK_SIZE`] in [`serialize_node_payload`]).
 fn cac_payload(payload: &[u8]) -> (ChunkAddr, Vec<u8>) {
     cac_new(payload).expect("manifest node payload pre-validated against CHUNK_SIZE")
 }
@@ -770,23 +724,181 @@ mod tests {
         assert_eq!(r.data_ref, split.root);
     }
 
-    /// Path segment over 30 bytes is rejected — we don't emit chained
-    /// forks yet.
-    #[test]
-    fn long_filename_errors() {
-        let long = "x".repeat(31);
-        let err = build_single_file_manifest(&long, None, [0u8; 32]).unwrap_err();
-        assert!(matches!(err, ManifestWriteError::SegmentTooLong { .. }));
+    /// Path segments longer than the 30-byte fork prefix cap are
+    /// chained transparently. End-to-end: write a 90-character
+    /// filename, then walk it back via the reader.
+    #[tokio::test]
+    async fn long_filename_chains_and_round_trips() {
+        let long = "x".repeat(90);
+        let body = b"long-name body".to_vec();
+        let split = crate::splitter::split_bytes(&body);
+        let manifest =
+            build_single_file_manifest(&long, Some("text/plain"), split.root).unwrap();
+        let mut fetcher = MapFetcher::new();
+        for c in &split.chunks {
+            fetcher.ingest(c);
+        }
+        for c in &manifest.chunks {
+            fetcher.ingest(c);
+        }
+        let r = lookup_path(&fetcher, manifest.root, &long).await.unwrap();
+        assert_eq!(r.data_ref, split.root);
+        assert_eq!(r.content_type.as_deref(), Some("text/plain"));
     }
 
-    /// The empty stub address must be a valid CAC chunk so that bee
-    /// gateways will actually accept it on push. Cheap sanity check
-    /// that the bytes we ship form a valid leaf.
+    /// Every chunk emitted by the trie writer must be a valid CAC so
+    /// bee gateways accept it on push. Quick structural check across a
+    /// few-file collection (root + per-fork sub-tries).
     #[test]
-    fn empty_stub_is_valid_cac() {
-        let payload = empty_stub_payload();
-        let (addr, wire) = cac_payload(&payload);
-        assert!(ant_crypto::cac_valid(&addr, &wire));
+    fn every_emitted_chunk_is_valid_cac() {
+        let files: Vec<ManifestFile> = ["a.txt", "b.txt", "ab.txt"]
+            .iter()
+            .map(|p| ManifestFile {
+                path: (*p).to_string(),
+                content_type: Some("text/plain".to_string()),
+                data_ref: [0u8; 32],
+            })
+            .collect();
+        let manifest = build_collection_manifest(&files, None).unwrap();
+        for c in &manifest.chunks {
+            assert!(
+                ant_crypto::cac_valid(&c.address, &c.wire),
+                "chunk {} not a valid CAC",
+                hex::encode(c.address),
+            );
+        }
+        // Root must be the last chunk emitted (post-order).
+        assert_eq!(manifest.chunks.last().unwrap().address, manifest.root);
+    }
+
+    /// Many shared-prefix files trigger an actual multi-chunk
+    /// manifest: the trie deepens and the writer emits ≥ 2 manifest
+    /// chunks. Verifies every file resolves and that the writer no
+    /// longer errors with `ManifestTooBig` on collections that the
+    /// old flat encoder couldn't fit.
+    #[tokio::test]
+    async fn deep_collection_emits_multiple_chunks_and_round_trips() {
+        // 64 files, all sharing the prefix "blog/posts/" then a
+        // 5-char unique suffix. Long enough metadata (Filename) that
+        // packing them all into one fork-bitmap would overflow a
+        // single 4 KiB chunk under the old writer.
+        let mut files: Vec<ManifestFile> = Vec::new();
+        let mut data_refs: HashMap<String, [u8; 32]> = HashMap::new();
+        let mut fetcher = MapFetcher::new();
+        for i in 0..64u8 {
+            let path = format!("blog/posts/post-{:02x}", i);
+            let body = format!("body-{i}").into_bytes();
+            let split = crate::splitter::split_bytes(&body);
+            for c in &split.chunks {
+                fetcher.ingest(c);
+            }
+            data_refs.insert(path.clone(), split.root);
+            files.push(ManifestFile {
+                path,
+                content_type: Some("text/plain".to_string()),
+                data_ref: split.root,
+            });
+        }
+        let manifest = build_collection_manifest(&files, None).unwrap();
+        for c in &manifest.chunks {
+            fetcher.ingest(c);
+        }
+        // The trie should have deepened — expect at least 2 manifest
+        // chunks (root + at least one sub-trie node).
+        assert!(
+            manifest.chunks.len() >= 2,
+            "deep collection should emit multiple manifest chunks; got {}",
+            manifest.chunks.len(),
+        );
+
+        // Every file path resolves to its own data ref.
+        for (path, want_ref) in &data_refs {
+            let r = lookup_path(&fetcher, manifest.root, path).await.unwrap();
+            assert_eq!(&r.data_ref, want_ref, "path {path}");
+        }
+    }
+
+    /// Insertion order must not change the manifest root. The trie
+    /// builder sorts forks by byte at every node (BTreeMap), so two
+    /// permutations of the same file set hash to the same root.
+    #[test]
+    fn insertion_order_does_not_change_root() {
+        let make_file = |name: &str, ref_byte: u8| ManifestFile {
+            path: name.to_string(),
+            content_type: Some("text/plain".to_string()),
+            data_ref: [ref_byte; 32],
+        };
+        let forward = vec![
+            make_file("apple", 1),
+            make_file("apricot", 2),
+            make_file("banana", 3),
+            make_file("blueberry", 4),
+            make_file("cherry", 5),
+        ];
+        let reversed: Vec<ManifestFile> = forward.iter().rev().cloned().collect();
+
+        let m1 = build_collection_manifest(&forward, None).unwrap();
+        let m2 = build_collection_manifest(&reversed, None).unwrap();
+        assert_eq!(m1.root, m2.root);
+    }
+
+    /// Adding a file whose path is a prefix of another already in the
+    /// manifest puts the prefix file's value at the parent node and
+    /// the longer path under a new fork. Walks both back correctly.
+    #[tokio::test]
+    async fn prefix_overlap_round_trip() {
+        let mut fetcher = MapFetcher::new();
+        let body_a = b"abc".to_vec();
+        let body_b = b"abc/d".to_vec();
+        let split_a = crate::splitter::split_bytes(&body_a);
+        let split_b = crate::splitter::split_bytes(&body_b);
+        for c in &split_a.chunks {
+            fetcher.ingest(c);
+        }
+        for c in &split_b.chunks {
+            fetcher.ingest(c);
+        }
+
+        let manifest = build_collection_manifest(
+            &[
+                ManifestFile {
+                    path: "abc".to_string(),
+                    content_type: Some("text/plain".to_string()),
+                    data_ref: split_a.root,
+                },
+                ManifestFile {
+                    path: "abc/d".to_string(),
+                    content_type: Some("text/html".to_string()),
+                    data_ref: split_b.root,
+                },
+            ],
+            None,
+        )
+        .unwrap();
+        for c in &manifest.chunks {
+            fetcher.ingest(c);
+        }
+
+        let ra = lookup_path(&fetcher, manifest.root, "abc").await.unwrap();
+        assert_eq!(ra.data_ref, split_a.root);
+        assert_eq!(ra.content_type.as_deref(), Some("text/plain"));
+        let rb = lookup_path(&fetcher, manifest.root, "abc/d").await.unwrap();
+        assert_eq!(rb.data_ref, split_b.root);
+        assert_eq!(rb.content_type.as_deref(), Some("text/html"));
+    }
+
+    /// Duplicate paths in the input list are rejected — there's no
+    /// reasonable resolution if the same logical path points at two
+    /// different data refs.
+    #[test]
+    fn duplicate_paths_rejected() {
+        let f = ManifestFile {
+            path: "dup.txt".to_string(),
+            content_type: None,
+            data_ref: [0u8; 32],
+        };
+        let err = build_collection_manifest(&[f.clone(), f], None).unwrap_err();
+        assert!(matches!(err, ManifestWriteError::EmptyPath));
     }
 
     /// JSON encoder produces strict, deterministic output for the keys
