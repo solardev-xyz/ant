@@ -2,7 +2,7 @@
 
 use ant_control::{ControlCommand, GatewayActivity, StatusSnapshot};
 use ant_crypto::{OVERLAY_NONCE_LEN, SECP256K1_SECRET_LEN};
-use ant_p2p::{run, RunConfig, UploadRuntime};
+use ant_p2p::{run, RunConfig, SwapConfig, UploadRuntime};
 use libp2p::identity::Keypair;
 use libp2p::multiaddr::Multiaddr;
 use std::path::PathBuf;
@@ -67,6 +67,13 @@ pub struct NodeConfig {
     /// Postage stamping + signing runtime for `POST /chunks`. `Some`
     /// enables uploads; `None` returns "uploads not configured".
     pub upload: Option<Arc<UploadRuntime>>,
+    /// SWAP / chequebook configuration. When `Some`, the node
+    /// participates in `/swarm/swap/1.0.0/swap` exchanges with peers
+    /// — accepting their cheques (signature-verified, monotonic,
+    /// pinned to chequebook) into a persistent ledger. When `None`,
+    /// the protocol is still negotiated but every received cheque is
+    /// dropped silently.
+    pub swap: Option<SwapConfig>,
 }
 
 impl NodeConfig {
@@ -92,6 +99,7 @@ impl NodeConfig {
             gateway_activity: None,
             disk_cache: None,
             upload: None,
+            swap: None,
         }
     }
 
@@ -144,6 +152,11 @@ impl NodeConfig {
         self.upload = upload;
         self
     }
+
+    pub fn with_swap(mut self, swap: Option<SwapConfig>) -> Self {
+        self.swap = swap;
+        self
+    }
 }
 
 /// Run the M1.0 node loop until the process is interrupted.
@@ -165,6 +178,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<(), NodeError> {
         gateway_activity: cfg.gateway_activity,
         disk_cache: cfg.disk_cache,
         upload: cfg.upload,
+        swap: cfg.swap,
     })
     .await?;
     Ok(())

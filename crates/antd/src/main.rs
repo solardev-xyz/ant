@@ -386,6 +386,20 @@ async fn main() -> Result<()> {
     .await
     .map_err(|e| anyhow!("upload runtime: {e}"))?;
 
+    // SWAP listener always-on. Inbound cheques don't require us to own
+    // a chequebook (we're the beneficiary, not the issuer), so the
+    // only inputs we need are our EOA and the chain id. Outbound
+    // emission is a separate concern: it requires a chequebook the
+    // operator controls — added via a future `--chequebook` flag.
+    // The ledger persists at `<data-dir>/swap_credits.json`; cheque
+    // monotonicity survives restarts.
+    let swap_cfg = ant_p2p::SwapConfig {
+        our_beneficiary: eth,
+        chain_id: ant_chain::tx::GNOSIS_CHAIN_ID,
+        ledger_path: data_dir.join("swap_credits.json"),
+        events_tx: None,
+    };
+
     let node_fut = run_node(
         NodeConfig::mainnet_default(signing_secret, overlay_nonce, bootnodes, libp2p_keypair)
             .with_status(status_tx)
@@ -397,7 +411,8 @@ async fn main() -> Result<()> {
             .with_chunk_record_dir(chunk_record_dir)
             .with_gateway_activity(Some(gateway_activity.clone()))
             .with_disk_cache(disk_cache)
-            .with_upload(upload),
+            .with_upload(upload)
+            .with_swap(Some(swap_cfg)),
     );
 
     let gateway_handle = if opt.no_http_api {

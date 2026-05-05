@@ -125,6 +125,32 @@ pub struct RunConfig {
     /// command path disabled and `PushChunk` returns a clear "uploads
     /// not configured" error instead of silently doing nothing.
     pub upload: Option<Arc<UploadRuntime>>,
+    /// Optional SWAP / chequebook configuration. When `Some`, the
+    /// `/swarm/swap/1.0.0/swap` listener is wired to a credit ledger
+    /// pinned at `our_beneficiary` (typically the same EOA that
+    /// signs the BZZ handshake) and inbound cheques are
+    /// signature-verified, monotonicity-checked, and persisted to
+    /// `ledger_path`. When `None`, the protocol is still registered
+    /// — so peers don't see a libp2p disconnect when they emit a
+    /// cheque — but every received cheque is silently dropped.
+    pub swap: Option<SwapConfig>,
+}
+
+/// Inputs needed to spin up the SWAP inbound listener.
+#[derive(Clone)]
+pub struct SwapConfig {
+    /// Our node's EOA (20 bytes) — the address every accepted cheque
+    /// must list as its `Beneficiary`.
+    pub our_beneficiary: [u8; 20],
+    /// Chain id used for EIP-712 cheque digest reconstruction (100
+    /// for Gnosis mainnet).
+    pub chain_id: u64,
+    /// Where the ledger snapshot lives on disk; e.g. `<data_dir>/swap_credits.json`.
+    pub ledger_path: PathBuf,
+    /// Channel that accepted cheques will be published to. `None`
+    /// keeps the listener self-contained (operator just reads the
+    /// ledger snapshot when they want to inspect inbound payments).
+    pub events_tx: Option<mpsc::Sender<crate::swap::InboundCheque>>,
 }
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
@@ -161,6 +187,23 @@ pub const DEFAULT_TARGET_PEERS: usize = 100;
 /// peer churn. 30 s strikes a balance: a fresh restart still warms within
 /// seconds even if the last 30 s of additions are gone.
 const PEERSTORE_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Build the [`sinks::SwapWiring`] from `RunConfig::swap` (if set).
+/// Returns `None` when SWAP is unconfigured — sinks::spawn then
+/// installs a drain-only handler so the protocol is still
+/// negotiated.
+fn build_swap_wiring(cfg: &RunConfig) -> Option<sinks::SwapWiring> {
+    let swap = cfg.swap.as_ref()?;
+    let ledger = std::sync::Arc::new(crate::swap::CreditLedger::open(
+        Some(swap.ledger_path.clone()),
+        swap.chain_id,
+        swap.our_beneficiary,
+    ));
+    Some(sinks::SwapWiring {
+        ledger,
+        events: swap.events_tx.clone(),
+    })
+}
 
 fn is_loopback_multiaddr(addr: &Multiaddr) -> bool {
     use libp2p::multiaddr::Protocol;
@@ -746,7 +789,14 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     // `/swarm/hive/1.1.0/peers` immediately after BZZ handshake; rejecting
     // either triggers an instant `Disconnect`.
     let (hint_tx, mut hint_rx) = mpsc::channel::<sinks::PeerHint>(HINT_CHAN_CAP);
-    sinks::spawn(sinks::register(&mut control, hint_tx));
+    let registrations = sinks::register(&mut control, hint_tx);
+    // Hook the swap listener to a credit ledger if the operator
+    // configured both a chequebook beneficiary and a persistence
+    // directory; otherwise we register the protocol but throw away
+    // every cheque we receive (no on-chain identity to credit
+    // against).
+    let swap_wiring = build_swap_wiring(&cfg);
+    sinks::spawn(registrations, swap_wiring);
 
     let target_peers = if cfg.target_peers == 0 {
         DEFAULT_TARGET_PEERS

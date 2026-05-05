@@ -117,6 +117,7 @@ pub struct Registrations {
     pricing: IncomingStreams,
     hive: IncomingStreams,
     pseudosettle: IncomingStreams,
+    swap: IncomingStreams,
     hint_tx: mpsc::Sender<PeerHint>,
 }
 
@@ -134,19 +135,47 @@ pub fn register(control: &mut Control, hint_tx: mpsc::Sender<PeerHint>) -> Regis
     let pseudosettle = control
         .accept(StreamProtocol::new(crate::pseudosettle::PROTOCOL_PSEUDOSETTLE))
         .expect("pseudosettle protocol registered exactly once");
+    let swap = control
+        .accept(StreamProtocol::new(crate::swap::PROTOCOL_SWAP))
+        .expect("swap protocol registered exactly once");
     Registrations {
         pricing,
         hive,
         pseudosettle,
+        swap,
         hint_tx,
     }
 }
 
-/// Drive both sinks forever on the current runtime.
-pub fn spawn(reg: Registrations) {
+/// Drive every long-lived sink task spawned by [`register`].
+///
+/// The swap listener is wired to a [`SwapWiring`] when the operator
+/// configured a chequebook (we know our beneficiary EOA + chain id);
+/// without that wiring we still register the protocol — silently
+/// draining cheques and rejecting them as "no chequebook configured"
+/// — so peers that emit one don't see an unsupported-protocol
+/// disconnect on the libp2p layer.
+pub fn spawn(reg: Registrations, swap: Option<SwapWiring>) {
     tokio::spawn(run_pricing(reg.pricing));
     tokio::spawn(run_hive(reg.hive, reg.hint_tx));
     tokio::spawn(crate::pseudosettle::run_inbound(reg.pseudosettle));
+    match swap {
+        Some(s) => {
+            tokio::spawn(crate::swap::run_inbound(reg.swap, s.ledger, s.events));
+        }
+        None => {
+            tokio::spawn(crate::swap::drain_inbound_unconfigured(reg.swap));
+        }
+    }
+}
+
+/// Configuration for the inbound swap listener spawned by [`spawn`].
+/// The operator hands in the credit ledger (already loaded with any
+/// previously-accepted cheques), and an optional event channel that
+/// the listener publishes accepted cheques to.
+pub struct SwapWiring {
+    pub ledger: std::sync::Arc<crate::swap::CreditLedger>,
+    pub events: Option<mpsc::Sender<crate::swap::InboundCheque>>,
 }
 
 async fn run_pricing(mut incoming: IncomingStreams) {

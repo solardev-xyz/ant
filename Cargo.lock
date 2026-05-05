@@ -206,10 +206,12 @@ dependencies = [
 name = "ant-p2p"
 version = "0.3.4"
 dependencies = [
+ "ant-chain",
  "ant-control",
  "ant-crypto",
  "ant-postage",
  "ant-retrieval",
+ "base64",
  "futures",
  "hex",
  "hickory-resolver",
@@ -217,6 +219,7 @@ dependencies = [
  "libp2p",
  "libp2p-stream",
  "libp2p-swarm",
+ "primitive-types",
  "prost",
  "serde",
  "serde_json",
@@ -224,6 +227,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "unsigned-varint 0.8.0",
 ]
 
@@ -266,14 +270,17 @@ dependencies = [
 name = "antctl"
 version = "0.3.4"
 dependencies = [
+ "ant-chain",
  "ant-control",
  "anyhow",
  "clap",
  "crossterm",
  "dirs",
  "hex",
+ "primitive-types",
  "ratatui",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

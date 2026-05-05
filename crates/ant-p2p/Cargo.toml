@@ -4,10 +4,13 @@ version = "0.3.4"
 edition.workspace = true
 
 [dependencies]
+ant-chain = { path = "../ant-chain" }
 ant-control = { path = "../ant-control" }
 ant-crypto = { path = "../ant-crypto" }
 ant-postage = { path = "../ant-postage" }
 ant-retrieval = { path = "../ant-retrieval" }
+base64 = "0.22.1"
+primitive-types = { version = "0.14.0", default-features = false }
 libp2p.workspace = true
 libp2p-stream = "0.4.0-alpha"
 libp2p-swarm = "0.47.1"
@@ -25,3 +28,8 @@ serde_json.workspace = true
 
 [dev-dependencies]
 tempfile = "3.27.0"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+
+[[example]]
+name = "cheque_smoke"
+path = "examples/cheque_smoke.rs"

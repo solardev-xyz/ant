@@ -54,6 +54,18 @@ pub enum HandshakeError {
 pub struct HandshakeInfo {
     pub remote_overlay: [u8; 32],
     pub remote_full_node: bool,
+    /// Ethereum address (20 bytes) of the peer's node identity. Bee's
+    /// SWAP layer uses this as the **beneficiary** of cheques: when we
+    /// owe a peer, the cheque we emit has `beneficiary = this`. We
+    /// recover it here by re-deriving the secp256k1 verifying key
+    /// from the BzzAddress signature against the same digest the
+    /// peer signed during handshake.
+    pub remote_eth_address: [u8; 20],
+    /// Welcome message string the remote sent in its handshake Ack.
+    /// Bee uses this as a free-form node banner; we surface it so
+    /// callers can log / display it without re-parsing the
+    /// protobuf. Empty when the remote opted out.
+    pub remote_welcome: String,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -150,6 +162,39 @@ async fn read_varint_len(r: &mut (impl AsyncReadExt + Unpin)) -> Result<usize, H
 /// Outbound handshake (we are the dialer). `remote_peer_addrs` are dial addresses for the **remote** peer.
 #[allow(clippy::too_many_arguments)]
 pub async fn handshake_outbound<S>(
+    stream: S,
+    local_peer_id: PeerId,
+    remote_peer_id: PeerId,
+    signing_secret: &[u8; SECP256K1_SECRET_LEN],
+    overlay_nonce: &[u8; OVERLAY_NONCE_LEN],
+    network_id: u64,
+    remote_peer_addrs: &[Multiaddr],
+    local_listen_addrs: Vec<Multiaddr>,
+) -> Result<HandshakeInfo, HandshakeError>
+where
+    S: AsyncReadExt + AsyncWriteExt + Send + Unpin,
+{
+    handshake_outbound_with_role(
+        stream,
+        local_peer_id,
+        remote_peer_id,
+        signing_secret,
+        overlay_nonce,
+        network_id,
+        remote_peer_addrs,
+        local_listen_addrs,
+        false,
+    )
+    .await
+}
+
+/// Like [`handshake_outbound`] but lets the caller pick the
+/// `full_node` flag advertised in our `Ack`. The default
+/// [`handshake_outbound`] declares `false` (we're a light node);
+/// flipping this is only useful for the SWAP interop smoke test
+/// where bee's swap handler refuses cheques from light peers.
+#[allow(clippy::too_many_arguments)]
+pub async fn handshake_outbound_with_role<S>(
     mut stream: S,
     local_peer_id: PeerId,
     remote_peer_id: PeerId,
@@ -158,6 +203,7 @@ pub async fn handshake_outbound<S>(
     network_id: u64,
     remote_peer_addrs: &[Multiaddr],
     local_listen_addrs: Vec<Multiaddr>,
+    advertise_full_node: bool,
 ) -> Result<HandshakeInfo, HandshakeError>
 where
     S: AsyncReadExt + AsyncWriteExt + Send + Unpin,
@@ -173,6 +219,7 @@ where
             network_id,
             remote_peer_addrs,
             local_listen_addrs,
+            advertise_full_node,
         ),
     )
     .await
@@ -189,6 +236,7 @@ async fn handshake_outbound_inner(
     network_id: u64,
     remote_peer_addrs: &[Multiaddr],
     local_listen_addrs: Vec<Multiaddr>,
+    advertise_full_node: bool,
 ) -> Result<HandshakeInfo, HandshakeError> {
     let sk = SigningKey::from_bytes(signing_secret.into())?;
     let vk = k256::ecdsa::VerifyingKey::from(&sk);
@@ -265,7 +313,7 @@ async fn handshake_outbound_inner(
     let mut remote_sig = [0u8; 65];
     remote_sig.copy_from_slice(&addr.signature);
 
-    verify_bzz_address_signature(
+    let remote_eth_address = verify_bzz_address_signature(
         &addr.underlay,
         &remote_overlay,
         &remote_sig,
@@ -289,7 +337,7 @@ async fn handshake_outbound_inner(
             overlay: overlay.to_vec(),
         }),
         network_id,
-        full_node: false,
+        full_node: advertise_full_node,
         nonce: overlay_nonce.to_vec(),
         welcome_message: String::new(),
     };
@@ -305,6 +353,8 @@ async fn handshake_outbound_inner(
     Ok(HandshakeInfo {
         remote_overlay,
         remote_full_node: resp_ack.full_node,
+        remote_eth_address,
+        remote_welcome: resp_ack.welcome_message.clone(),
     })
 }
 

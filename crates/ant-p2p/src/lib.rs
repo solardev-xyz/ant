@@ -8,10 +8,14 @@ mod peerstore;
 pub mod pseudosettle;
 pub mod routing;
 mod sinks;
+pub mod swap;
 mod underlay;
 
-pub use behaviour::{run, RunConfig, RunError, UploadRuntime, DEFAULT_TARGET_PEERS};
-pub use handshake::{HandshakeError, HandshakeInfo, PROTOCOL_HANDSHAKE};
+pub use behaviour::{run, RunConfig, RunError, SwapConfig, UploadRuntime, DEFAULT_TARGET_PEERS};
+pub use handshake::{
+    handshake_outbound, handshake_outbound_with_role, HandshakeError, HandshakeInfo,
+    PROTOCOL_HANDSHAKE,
+};
 pub use routing::{proximity, RoutingTable, NUM_BINS, OVERLAY_LEN};
 
 use libp2p::multiaddr::Multiaddr;
