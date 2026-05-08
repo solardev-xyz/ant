@@ -2226,7 +2226,7 @@ fn run_upload(socket: &Path, command: UploadCommand, json: bool) -> Result<()> {
             let resp = request_sync(socket, &Request::UploadList)
                 .with_context(|| format!("talk to antd at {}", socket.display()))?;
             let mut items = match resp {
-                Response::UploadList(v) => v,
+                Response::UploadList { jobs } => jobs,
                 Response::Error { message } => bail!("antd: {message}"),
                 other => bail!("unexpected response: {other:?}"),
             };

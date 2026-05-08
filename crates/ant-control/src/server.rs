@@ -729,7 +729,7 @@ fn ack_to_response(ack: ControlAck) -> Response {
         ControlAck::ChunkUploaded { reference } => Response::ChunkUploaded { reference },
         ControlAck::UploadStarted { job_id } => Response::UploadStarted { job_id },
         ControlAck::UploadJob(view) => Response::UploadJob(view),
-        ControlAck::UploadList(views) => Response::UploadList(views),
+        ControlAck::UploadList(views) => Response::UploadList { jobs: views },
         ControlAck::UploadProgress(view) => Response::UploadProgress(view),
         ControlAck::PostageStatus(view) => Response::PostageStatus(view),
         ControlAck::Error { message } => Response::Error { message },

@@ -222,7 +222,14 @@ pub enum Response {
     UploadJob(UploadJobView),
     /// All known upload jobs at the time of the request. Returned
     /// by `UploadList`.
-    UploadList(Vec<UploadJobView>),
+    ///
+    /// Wrapped in a struct variant rather than a newtype around the
+    /// vec because `#[serde(tag = "result")]` cannot inject the tag
+    /// into a JSON array (serde fails with "cannot serialize tagged
+    /// newtype variant ... containing a sequence" at runtime). The
+    /// extra `jobs` key on the wire is the price of keeping the
+    /// outer enum internally tagged.
+    UploadList { jobs: Vec<UploadJobView> },
     /// Streaming progress frame on a `UploadFollow` connection.
     /// Emitted at most once per state change; old daemons never send
     /// this variant.
@@ -696,6 +703,50 @@ impl GatewayRequestKind {
             GatewayRequestKind::Bzz => "BZZ",
             GatewayRequestKind::Chunk => "Chunk",
             GatewayRequestKind::Manifest => "Manif",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Catch the "tagged newtype variant containing a sequence" trap
+    /// before it reaches a live socket: serde's internally-tagged enum
+    /// representation cannot inject the discriminator field into a
+    /// JSON array, so any `Response::Foo(Vec<_>)` newtype variant
+    /// panics at the first write. Round-tripping every collection-
+    /// shaped variant here keeps the wire format honest.
+    #[test]
+    fn response_upload_list_roundtrips() {
+        let view = UploadJobView {
+            job_id: "deadbeef".into(),
+            source_path: "/tmp/x".into(),
+            source_size: 1,
+            batch_id: None,
+            name: None,
+            content_type: None,
+            raw: false,
+            status: "running".into(),
+            bytes_pushed: 0,
+            chunks_pushed: 0,
+            chunks_total: None,
+            created_at_unix: 0,
+            last_update_unix: 0,
+            last_error: None,
+            reference: None,
+        };
+        for jobs in [Vec::new(), vec![view]] {
+            let resp = Response::UploadList { jobs: jobs.clone() };
+            let wire = serde_json::to_string(&resp).expect("serialize");
+            assert!(wire.contains("\"result\":\"upload_list\""), "{wire}");
+            let back: Response = serde_json::from_str(&wire).expect("deserialize");
+            match back {
+                Response::UploadList { jobs: round } => {
+                    assert_eq!(round.len(), jobs.len());
+                }
+                other => panic!("wrong variant: {other:?}"),
+            }
         }
     }
 }
