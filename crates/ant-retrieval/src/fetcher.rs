@@ -356,7 +356,20 @@ impl RoutingFetcher {
             .push(peer);
     }
 
-    const MAX_PUSH_ERRORS: usize = 24;
+    /// Per-chunk skip-list cap. Bumped from 24 → 64 because a
+    /// Poisson-unlucky neighborhood (a few peers all in the middle of
+    /// dropping their TCP connection at once) was hitting the old
+    /// ceiling on otherwise-healthy uploads.
+    const MAX_PUSH_ERRORS: usize = 64;
+
+    /// One transient retry on the *same* peer, on a fresh stream,
+    /// before adding it to the skip list. The dominant failure mode in
+    /// the live network is `Io("Connection is closed")` mid-pushsync —
+    /// the peer is fine, the underlying libp2p connection just got
+    /// recycled. Re-dialing on a fresh stream succeeds the vast
+    /// majority of the time and saves us from burning through the
+    /// closest 24 peers on what is essentially noise.
+    const PER_PEER_RETRY_BUDGET: usize = 1;
 
     /// Try pushsync against up to [`MAX_PUSH_ERRORS`] peers, closest-first.
     ///
@@ -372,6 +385,7 @@ impl RoutingFetcher {
         use crate::pushsync::push_chunk_to_peer;
         let mut control = self.control.clone();
         let mut skipped = Vec::<PeerId>::new();
+        let mut last_err: Option<crate::pushsync::PushSyncError> = None;
         for _ in 0..Self::MAX_PUSH_ERRORS {
             let live = self.peers_rx.borrow().clone();
             let mut ranked: Vec<(PeerId, Overlay)> = live
@@ -393,25 +407,75 @@ impl RoutingFetcher {
                 return Err(crate::pushsync::PushSyncError::Remote("no peers".into()));
             };
 
-            match push_chunk_to_peer(&mut control, peer, chunk_addr, wire.as_slice(), &stamp).await
+            let mut err = match push_chunk_to_peer(
+                &mut control,
+                peer,
+                chunk_addr,
+                wire.as_slice(),
+                &stamp,
+            )
+            .await
             {
                 Ok(_) => return Ok(()),
-                Err(e) => {
-                    warn!(
-                        target: "ant_retrieval::fetcher",
-                        %peer,
-                        err=%e,
-                        "pushsync attempt failed",
-                    );
-                    skipped.push(peer);
+                Err(e) => e,
+            };
+
+            for _ in 0..Self::PER_PEER_RETRY_BUDGET {
+                if !is_transient_pushsync_error(&err) {
+                    break;
+                }
+                warn!(
+                    target: "ant_retrieval::fetcher",
+                    %peer,
+                    err=%err,
+                    "pushsync attempt failed; retrying same peer once on a fresh stream",
+                );
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                match push_chunk_to_peer(
+                    &mut control,
+                    peer,
+                    chunk_addr,
+                    wire.as_slice(),
+                    &stamp,
+                )
+                .await
+                {
+                    Ok(_) => return Ok(()),
+                    Err(e) => err = e,
                 }
             }
+
+            warn!(
+                target: "ant_retrieval::fetcher",
+                %peer,
+                err=%err,
+                "pushsync attempt failed; skipping peer for this chunk",
+            );
+            skipped.push(peer);
+            last_err = Some(err);
         }
-        Err(crate::pushsync::PushSyncError::Remote(
-            "exhausted pushsync peers".into(),
-        ))
+        Err(crate::pushsync::PushSyncError::Remote(format!(
+            "exhausted pushsync peers (last: {})",
+            last_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+        )))
     }
 }
+
+/// `true` for the kinds of `PushSyncError` that look like the libp2p
+/// substream got recycled out from under us. Those are worth one
+/// fast retry on a fresh stream against the same peer.
+///
+/// Explicit `Remote(_)` rejections (the peer told us, on the wire,
+/// that it didn't want the chunk) and protocol-level errors
+/// (`ProstEncode`, `ProstDecode`, `ReceiptMismatch`) are *not*
+/// transient — retrying just wastes time.
+fn is_transient_pushsync_error(err: &crate::pushsync::PushSyncError) -> bool {
+    use crate::pushsync::PushSyncError as E;
+    matches!(err, E::Io(_) | E::OpenStream(_) | E::Timeout(_))
+}
+
 #[async_trait]
 impl ChunkFetcher for RoutingFetcher {
     async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
@@ -1107,6 +1171,43 @@ mod tests {
                 "Io({kind:?}) is bee's 'no chunk' signal, must NOT poison the peer for sibling chunks",
             );
         }
+    }
+
+    /// Mirror of `peer_fatal_classifier_matrix` for the pushsync side:
+    /// pins which `PushSyncError` variants get one same-peer retry on
+    /// a fresh stream before the peer hits the per-chunk skip list.
+    /// Pre-fix every error class — including the dominant
+    /// `Io("Connection is closed")` we saw from libp2p mid-pushsync —
+    /// burned a fresh closest peer per attempt, so 24 unrelated TCP
+    /// recycles in a row were enough to fail an otherwise-healthy
+    /// upload.
+    #[test]
+    fn pushsync_transient_classifier_matrix() {
+        use crate::pushsync::PushSyncError as E;
+        assert!(
+            is_transient_pushsync_error(&E::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "connection is closed",
+            ))),
+            "stream-level Io is the dominant transient case; must retry the same peer once",
+        );
+        assert!(
+            is_transient_pushsync_error(&E::OpenStream("dial: no addresses".into())),
+            "open-stream failures often clear on a fresh dial",
+        );
+        assert!(
+            is_transient_pushsync_error(&E::Timeout(Duration::from_secs(20))),
+            "single timeout is worth one retry on a fresh stream",
+        );
+
+        assert!(
+            !is_transient_pushsync_error(&E::Remote("invalid postage stamp".into())),
+            "explicit remote rejection: do NOT retry, skip the peer",
+        );
+        assert!(
+            !is_transient_pushsync_error(&E::ReceiptMismatch),
+            "receipt mismatch is a protocol violation, not transient",
+        );
     }
 
     /// Pin the consumer side of the live-peers fix: every `ranked()`
