@@ -133,7 +133,9 @@ pub fn register(control: &mut Control, hint_tx: mpsc::Sender<PeerHint>) -> Regis
         .accept(StreamProtocol::new(PROTOCOL_HIVE_PEERS))
         .expect("hive peers protocol registered exactly once");
     let pseudosettle = control
-        .accept(StreamProtocol::new(crate::pseudosettle::PROTOCOL_PSEUDOSETTLE))
+        .accept(StreamProtocol::new(
+            crate::pseudosettle::PROTOCOL_PSEUDOSETTLE,
+        ))
         .expect("pseudosettle protocol registered exactly once");
     let swap = control
         .accept(StreamProtocol::new(crate::swap::PROTOCOL_SWAP))

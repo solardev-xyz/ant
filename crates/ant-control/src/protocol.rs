@@ -12,7 +12,19 @@ use thiserror::Error;
 /// (`false`) and continue to see exactly one response, preserving the
 /// v1 single-shot behaviour. The new `bypass_cache` request flag is
 /// equally additive — old daemons simply ignore the field.
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// v3 added the `Upload*` request set: long-lived daemon-resident
+/// upload jobs that stream `UploadProgress` over a control-socket
+/// follow connection and survive daemon restarts via on-disk
+/// manifests. v2 daemons reject `Upload*` with the standard
+/// "bad request" envelope, so an old `antctl` against a new
+/// daemon and vice versa are both observably wrong instead of
+/// silently misbehaving. The optional `raw` flag on `UploadStart`
+/// (and the `raw` field echoed back on `UploadJobView`) is
+/// additive — old daemons leave it at the `#[serde(default)]`
+/// `false` value, which preserves the original "always wrap in a
+/// single-file mantaray manifest" behaviour.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Error)]
 pub enum ProtocolError {
@@ -86,6 +98,71 @@ pub enum Request {
         #[serde(default)]
         progress: bool,
     },
+    /// Create a new upload job for a file at `source_path`. The daemon
+    /// reads the file from disk (the control socket is `0o600` and
+    /// owned by the same user, so no further auth is needed); the
+    /// CLI's job is just to hand over the path. Returns immediately
+    /// with [`Response::UploadStarted`] carrying the assigned
+    /// `job_id`; the actual splitting + pushsync happens on a daemon
+    /// background task whose progress is observable via
+    /// [`Request::UploadFollow`].
+    ///
+    /// `batch_id`: optional per-job postage batch override (32-byte
+    /// hex). `None` means "use the daemon's configured default
+    /// (`--postage-batch`)".
+    /// `name` / `content_type`: Mantaray manifest entry metadata.
+    /// `name` defaults to the source file's basename;
+    /// `content_type` defaults to `application/octet-stream`.
+    /// `raw` skips the trailing single-file mantaray manifest; the
+    /// completed job's `reference` is the data root chunk address
+    /// itself (a `/bytes/<ref>` reference, not a `/bzz/<ref>` one).
+    /// Saves 1-2 chunks of postage and a final round-trip; loses
+    /// the embedded filename + content-type, so consumers must
+    /// know the type out-of-band. Defaults to `false` so the
+    /// reference returned is bzz-compatible.
+    UploadStart {
+        source_path: String,
+        #[serde(default)]
+        batch_id: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        content_type: Option<String>,
+        #[serde(default)]
+        raw: bool,
+    },
+    /// Snapshot every known upload job (running, paused, completed,
+    /// cancelled, failed). Daemon answers with [`Response::UploadList`].
+    UploadList,
+    /// Snapshot one upload job by id (or by unique 8-hex-char prefix —
+    /// the daemon resolves prefixes for ergonomic CLI use). Daemon
+    /// answers with [`Response::UploadJob`] or [`Response::Error`].
+    UploadStatus { job_id: String },
+    /// Soft-stop a running upload. Idempotent on already-paused jobs.
+    /// Daemon answers with [`Response::UploadJob`] reflecting the new
+    /// state.
+    UploadPause { job_id: String },
+    /// Bring a paused or failed upload back to running. Spawns a
+    /// fresh driver task; the previous driver has already exited.
+    UploadResume { job_id: String },
+    /// Hard-stop an upload. Already-pushed chunks are left in the
+    /// network (Swarm GCs them at postage TTL expiry — there's no
+    /// unpush). Idempotent.
+    UploadCancel { job_id: String },
+    /// Subscribe to live upload progress. Daemon emits zero or more
+    /// [`Response::UploadProgress`] frames until the job reaches a
+    /// terminal status, then closes with [`Response::UploadJob`]
+    /// (the terminal snapshot) and EOF. Multiple followers per job
+    /// are supported; each gets its own broadcast.
+    UploadFollow { job_id: String },
+    /// Snapshot of the daemon's local postage stamp issuer:
+    /// theoretical capacity, indices issued so far, per-bucket
+    /// fill min/max, and the conservative "worst-case remaining
+    /// chunks" budget that bounds the size of the next upload.
+    /// Returns [`Response::PostageStatus`]. Pure local read — no
+    /// chain RPC. Old daemons reject this with the standard "bad
+    /// request" envelope.
+    PostageStatus,
 }
 
 /// Daemon → client response.
@@ -134,6 +211,128 @@ pub enum Response {
     ChunkUploaded {
         reference: String,
     },
+    /// Successful [`Request::UploadStart`]. The daemon has written
+    /// the on-disk job manifest and spawned the driver task.
+    UploadStarted {
+        job_id: String,
+    },
+    /// Snapshot of one upload job. Returned by `UploadStatus`,
+    /// `UploadPause`, `UploadResume`, `UploadCancel`, and as the
+    /// terminal frame on a `UploadFollow` connection.
+    UploadJob(UploadJobView),
+    /// All known upload jobs at the time of the request. Returned
+    /// by `UploadList`.
+    UploadList(Vec<UploadJobView>),
+    /// Streaming progress frame on a `UploadFollow` connection.
+    /// Emitted at most once per state change; old daemons never send
+    /// this variant.
+    UploadProgress(UploadJobView),
+    /// Local postage stamp issuer snapshot. Returned by
+    /// [`Request::PostageStatus`].
+    PostageStatus(PostageStatusView),
+}
+
+/// Wire shape of one upload job (status snapshot). Mirrors
+/// `ant_node::UploadJobInfo` but is defined here so `ant-control`
+/// stays free of an `ant-node` dependency.
+///
+/// Field semantics:
+///
+/// - `bytes_pushed` / `source_size`: drives the byte progress bar.
+/// - `chunks_pushed` / `chunks_total`: drives the chunk progress
+///   bar; `chunks_total` is `None` for very-old daemons that
+///   didn't pre-compute the estimate.
+/// - `reference`: only set once `status == "completed"`; the value
+///   is the lowercase `0x`-prefixed mantaray manifest root the
+///   uploader would publish (e.g. as a `bzz://` URL). If the job
+///   was started with `raw = true`, this is instead the data root
+///   chunk address (a `/bytes/<ref>` reference).
+/// - `raw`: echoes the request flag so consumers can pick the
+///   right URL prefix (`bzz://` vs `bytes://`) without an extra
+///   round-trip. Old daemons leave it at the `#[serde(default)]`
+///   `false`, matching the historical always-manifest behaviour.
+/// - `last_error`: most recent transient or terminal driver error,
+///   useful for debugging stalled jobs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadJobView {
+    pub job_id: String,
+    pub source_path: String,
+    pub source_size: u64,
+    #[serde(default)]
+    pub batch_id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub content_type: Option<String>,
+    #[serde(default)]
+    pub raw: bool,
+    pub status: String,
+    pub bytes_pushed: u64,
+    pub chunks_pushed: u64,
+    #[serde(default)]
+    pub chunks_total: Option<u64>,
+    pub created_at_unix: u64,
+    pub last_update_unix: u64,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub reference: Option<String>,
+}
+
+/// Snapshot of the daemon's local postage stamp issuer.
+///
+/// `enabled = false` means the daemon was started without a postage
+/// batch (no `--postage-batch` / `STORAGE_STAMP_BATCH_ID`); in that
+/// case every other field is at its default and the renderer should
+/// label the batch as "uploads disabled". When `enabled = true`:
+///
+/// - `total_capacity_chunks` is the theoretical ceiling
+///   (`2^batch_depth`). Reachable only with perfectly-even chunk
+///   routing across buckets — almost never the practical limit.
+/// - `worst_case_remaining_chunks` is the conservative budget: room
+///   left in the *currently fullest* bucket, scaled to a global
+///   count. Use this to decide whether a planned upload of N
+///   chunks is guaranteed to fit. For an immutable batch this is
+///   the right answer; for a mutable batch the upload still
+///   "fits" past this budget, but at the cost of overwriting older
+///   stamps (their chunks become un-stampable for resync).
+/// - `bucket_fill_min` / `bucket_fill_max` characterise the
+///   distribution. A large `max - min` gap signals lopsided
+///   routing: usually fine for random uploads, worth investigating
+///   if you've been pinning many addresses with a shared prefix.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PostageStatusView {
+    pub enabled: bool,
+    /// `0x`-prefixed hex of the configured batch id. Empty when
+    /// `enabled = false`.
+    #[serde(default)]
+    pub batch_id: String,
+    #[serde(default)]
+    pub batch_depth: u8,
+    #[serde(default)]
+    pub bucket_depth: u8,
+    #[serde(default)]
+    pub immutable: bool,
+    #[serde(default)]
+    pub bucket_count: u64,
+    #[serde(default)]
+    pub bucket_capacity: u32,
+    #[serde(default)]
+    pub total_capacity_chunks: u64,
+    #[serde(default)]
+    pub issued_chunks: u64,
+    #[serde(default)]
+    pub bucket_fill_min: u32,
+    #[serde(default)]
+    pub bucket_fill_max: u32,
+    /// Sum of free indices across all buckets (optimistic budget).
+    #[serde(default)]
+    pub remaining_total_chunks: u64,
+    /// `(bucket_capacity − bucket_fill_max) × bucket_count`.
+    /// Pessimistic upper bound on the next upload (see the
+    /// type-level doc). 0 when the batch is empty.
+    #[serde(default)]
+    pub worst_case_remaining_chunks: u64,
 }
 
 /// One streaming progress sample for an in-flight `Get*` request.

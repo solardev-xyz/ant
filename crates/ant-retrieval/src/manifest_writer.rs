@@ -190,8 +190,10 @@ pub fn build_collection_manifest(
         // to website-index-document, regardless of whether the named
         // file exists in the manifest. If it doesn't, bee returns 404
         // when bzz://<root>/ is hit; we mirror that exactly.
-        let mut idx_node = TrieNode::default();
-        idx_node.value = Some(EmptyValue);
+        let idx_node = TrieNode {
+            value: Some(EmptyValue),
+            ..Default::default()
+        };
         let fork = TrieFork {
             prefix: b"/".to_vec(),
             child: Box::new(idx_node),
@@ -227,7 +229,10 @@ struct TrieNode {
     /// Marker present iff this node represents the empty-stub fork
     /// for the website-index-document anchor. Distinct from
     /// `own_data_ref` because the empty stub carries refsize=0x00,
-    /// not 0x20+entry.
+    /// not 0x20+entry. Carried only as a build-time marker (the
+    /// fork insertion path inspects it via the surrounding fork's
+    /// `metadata_override`); no read-back at serialization time.
+    #[allow(dead_code)]
     value: Option<EmptyValue>,
     /// Outgoing forks keyed by the byte that distinguishes them.
     forks: BTreeMap<u8, TrieFork>,
@@ -262,9 +267,7 @@ fn trie_insert(
     // Take the existing fork (if any) by removing it; we may rebuild
     // it before re-inserting. Borrow-checker friendly.
     if let Some(mut fork) = node.forks.remove(&first) {
-        let lcp = longest_common_prefix(
-            [fork.prefix.as_slice(), path].iter().copied(),
-        );
+        let lcp = longest_common_prefix([fork.prefix.as_slice(), path].iter().copied());
         if lcp.len() == fork.prefix.len() {
             // Whole existing prefix matches; descend with the
             // remaining tail.
@@ -292,12 +295,7 @@ fn trie_insert(
                 },
             );
             // Insert the new tail into the intermediate.
-            trie_insert(
-                &mut intermediate,
-                &path[lcp.len()..],
-                data_ref,
-                metadata,
-            )?;
+            trie_insert(&mut intermediate, &path[lcp.len()..], data_ref, metadata)?;
             // Replace the original fork with one truncated to LCP.
             let lcp_path_sep = lcp.contains(&b'/');
             node.forks.insert(
@@ -317,9 +315,11 @@ fn trie_insert(
         // intermediates so each fork carries at most 30 bytes.
         let (head, tail) = path.split_at(path.len().min(MAX_FILENAME_BYTES));
         if tail.is_empty() {
-            let mut leaf = TrieNode::default();
-            leaf.own_data_ref = Some(data_ref);
-            leaf.own_metadata = metadata;
+            let leaf = TrieNode {
+                own_data_ref: Some(data_ref),
+                own_metadata: metadata,
+                ..Default::default()
+            };
             node.forks.insert(
                 first,
                 TrieFork {
@@ -422,12 +422,7 @@ fn serialize_node_payload(
         let child_ref = *child_refs
             .get(k)
             .expect("child_refs populated for every fork above");
-        let bytes = serialize_fork_to_bytes(
-            &fork.prefix,
-            &child_ref,
-            &meta,
-            fork.path_separator,
-        )?;
+        let bytes = serialize_fork_to_bytes(&fork.prefix, &child_ref, &meta, fork.path_separator)?;
         p.extend_from_slice(&bytes);
     }
 
@@ -463,7 +458,7 @@ fn serialize_fork_to_bytes(
     bytes.push(node_type);
     bytes.push(prefix.len() as u8);
     bytes.extend_from_slice(prefix);
-    bytes.extend(std::iter::repeat(0u8).take(MAX_FILENAME_BYTES - prefix.len()));
+    bytes.extend(std::iter::repeat_n(0u8, MAX_FILENAME_BYTES - prefix.len()));
     bytes.extend_from_slice(child_ref);
     if !metadata.is_empty() {
         let meta_json = encode_metadata(metadata);
@@ -472,7 +467,7 @@ fn serialize_fork_to_bytes(
             r => 32 - r,
         };
         let mut padded = meta_json.into_bytes();
-        padded.extend(std::iter::repeat(b'\n').take(pad));
+        padded.extend(std::iter::repeat_n(b'\n', pad));
         let meta_len = padded.len() as u16;
         bytes.extend_from_slice(&meta_len.to_be_bytes());
         bytes.extend_from_slice(&padded);
@@ -615,12 +610,9 @@ mod tests {
     async fn single_file_round_trip() {
         let body = b"uploaded via ant\n".to_vec();
         let split = crate::splitter::split_bytes(&body);
-        let manifest = build_single_file_manifest(
-            "hello.txt",
-            Some("text/plain; charset=utf-8"),
-            split.root,
-        )
-        .unwrap();
+        let manifest =
+            build_single_file_manifest("hello.txt", Some("text/plain; charset=utf-8"), split.root)
+                .unwrap();
 
         let mut fetcher = MapFetcher::new();
         for c in &split.chunks {
@@ -720,7 +712,9 @@ mod tests {
         for c in &manifest.chunks {
             fetcher.ingest(c);
         }
-        let r = lookup_path(&fetcher, manifest.root, "blog/post").await.unwrap();
+        let r = lookup_path(&fetcher, manifest.root, "blog/post")
+            .await
+            .unwrap();
         assert_eq!(r.data_ref, split.root);
     }
 
@@ -732,8 +726,7 @@ mod tests {
         let long = "x".repeat(90);
         let body = b"long-name body".to_vec();
         let split = crate::splitter::split_bytes(&body);
-        let manifest =
-            build_single_file_manifest(&long, Some("text/plain"), split.root).unwrap();
+        let manifest = build_single_file_manifest(&long, Some("text/plain"), split.root).unwrap();
         let mut fetcher = MapFetcher::new();
         for c in &split.chunks {
             fetcher.ingest(c);
@@ -910,9 +903,6 @@ mod tests {
         m.insert("Content-Type".to_string(), "text/plain".to_string());
         m.insert("Filename".to_string(), "hello.txt".to_string());
         let s = encode_metadata(&m);
-        assert_eq!(
-            s,
-            r#"{"Content-Type":"text/plain","Filename":"hello.txt"}"#
-        );
+        assert_eq!(s, r#"{"Content-Type":"text/plain","Filename":"hello.txt"}"#);
     }
 }

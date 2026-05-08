@@ -296,7 +296,10 @@ impl Accounting {
             _ => 0,
         };
         let limit = OVERDRAFT_LIMIT.saturating_add(allowance);
-        let next = entry.balance.saturating_add(entry.reserved).saturating_add(price);
+        let next = entry
+            .balance
+            .saturating_add(entry.reserved)
+            .saturating_add(price);
         if next > limit {
             return None;
         }
@@ -316,7 +319,9 @@ impl Accounting {
     /// `last_refresh` to `Instant::now()`, opening the per-second
     /// allowance window again.
     pub fn credit(&self, peer: PeerId, accepted: u64) {
-        let Ok(mut peers) = self.peers.lock() else { return };
+        let Ok(mut peers) = self.peers.lock() else {
+            return;
+        };
         let entry = peers.entry(peer).or_default();
         entry.balance = entry.balance.saturating_sub(accepted);
         entry.last_refresh = Some(Instant::now());
@@ -328,7 +333,9 @@ impl Accounting {
     /// `notifyPeerConnect` resets the `accountingPeer`, so we
     /// should match).
     pub fn forget(&self, peer: &PeerId) {
-        let Ok(mut peers) = self.peers.lock() else { return };
+        let Ok(mut peers) = self.peers.lock() else {
+            return;
+        };
         peers.remove(peer);
     }
 

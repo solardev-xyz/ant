@@ -58,8 +58,8 @@ pub mod splitter;
 
 pub use accounting::{Accounting, DebitGuard, HotHint, OVERDRAFT_REFRESH};
 pub use cache::{InMemoryChunkCache, DEFAULT_CAPACITY as DEFAULT_CACHE_CAPACITY};
-pub use disk_cache::{DiskCacheError, DiskChunkCache, DEFAULT_DISK_CACHE_BYTES};
 pub use counters::{ChunkSource, RetrievalCounters, RetrievalCountersSnapshot};
+pub use disk_cache::{DiskCacheError, DiskChunkCache, DEFAULT_DISK_CACHE_BYTES};
 pub use feed::{
     feed_from_metadata, resolve_sequence_feed, sequence_update_address, Feed, FeedError, FeedType,
     FEED_OWNER_KEY, FEED_TOPIC_KEY, FEED_TYPE_KEY,
@@ -70,15 +70,15 @@ pub use joiner::{
     JoinOptions, DEFAULT_MAX_FILE_BYTES,
 };
 pub use manifest_writer::{
-    build_collection_manifest, build_single_file_manifest, ManifestFile, ManifestWriteResult,
-    MAX_FILENAME_BYTES,
+    build_collection_manifest, build_single_file_manifest, ManifestFile, ManifestWriteError,
+    ManifestWriteResult, MAX_FILENAME_BYTES,
 };
 pub use mantaray::{
     list_manifest, lookup_path, resolve_feed_root, LookupResult, ManifestEntry, ManifestError,
     MANTARAY_CONTENT_TYPE_KEY, MANTARAY_ERROR_DOC_KEY, MANTARAY_INDEX_DOC_KEY,
 };
 pub use progress::{estimate_total_chunks, ProgressSample, ProgressTracker};
-pub use splitter::{split_bytes, SplitChunk, SplitResult, BRANCHES};
+pub use splitter::{split_bytes, SplitChunk, SplitResult, StreamingSplitter, BRANCHES};
 
 use ant_crypto::{cac_valid, soc_valid, CHUNK_SIZE, SOC_HEADER_SIZE, SPAN_SIZE};
 use async_trait::async_trait;
@@ -354,7 +354,9 @@ pub(crate) async fn read_delimited<M: Message + Default>(
     Ok(M::decode(buf.as_slice())?)
 }
 
-pub(crate) async fn read_varint_len<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<usize, RetrievalError> {
+pub(crate) async fn read_varint_len<R: AsyncReadExt + Unpin>(
+    r: &mut R,
+) -> Result<usize, RetrievalError> {
     let mut byte = [0u8; 1];
     let mut acc: Vec<u8> = Vec::with_capacity(10);
     loop {

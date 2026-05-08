@@ -71,8 +71,7 @@ async fn main() {
     println!("populating SQLite disk cache (put_batch ×{POPULATE_BATCH})...");
     let t0 = Instant::now();
     for chunk in addrs.chunks(POPULATE_BATCH) {
-        let batch: Vec<([u8; 32], Vec<u8>)> =
-            chunk.iter().map(|(a, w)| (*a, w.clone())).collect();
+        let batch: Vec<([u8; 32], Vec<u8>)> = chunk.iter().map(|(a, w)| (*a, w.clone())).collect();
         cache.put_batch(batch).await.unwrap();
     }
     println!(

@@ -57,7 +57,9 @@ fn deterministic_bytes(n: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(n);
     let mut state: u64 = 0x9e37_79b9_7f4a_7c15; // golden ratio constant
     while out.len() < n {
-        state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
         out.extend_from_slice(&state.to_le_bytes());
     }
     out.truncate(n);
@@ -131,21 +133,18 @@ impl ChunkFetcher for MapFetcher {
         &self,
         addr: [u8; 32],
     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-        self.chunks
-            .get(&addr)
-            .cloned()
-            .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+        self.chunks.get(&addr).cloned().ok_or_else(
+            || -> Box<dyn std::error::Error + Send + Sync> {
                 format!("missing chunk {}", hex::encode(addr)).into()
-            })
+            },
+        )
     }
 }
 
 /// Plug a chunk store + raw `data` into a router whose fake-node loop
 /// answers `StreamBytes` against the store using the same range-aware
 /// joiner production uses. Returns the router and the file bytes.
-fn router_with_chunked_file(
-    data: Vec<u8>,
-) -> (axum::Router, [u8; 32]) {
+fn router_with_chunked_file(data: Vec<u8>) -> (axum::Router, [u8; 32]) {
     let (root_addr, store) = split_file(&data);
     let fetcher = Arc::new(MapFetcher { chunks: store });
     let router = router_with_dispatcher(move |cmd| {
@@ -306,9 +305,7 @@ async fn ten_mib_full_get_streams_in_multiple_frames() {
     let first = first_at.expect("at least one frame");
     // Surface the timing in `--nocapture` output so a human can spot
     // streaming-vs-buffering at a glance.
-    println!(
-        "ten_mib_full_get: frames={frames}, first_byte_at={first:?}, full_body_at={total:?}",
-    );
+    println!("ten_mib_full_get: frames={frames}, first_byte_at={first:?}, full_body_at={total:?}",);
     assert!(
         frames >= 2,
         "expected the gateway to stream the body in multiple frames, got {frames} frame(s) in {total:?}",
@@ -375,7 +372,13 @@ async fn ten_mib_range_zero_dash_returns_full_206() {
         resp.headers().get(header::CONTENT_RANGE).unwrap(),
         format!("bytes 0-{}/{TEN_MIB}", TEN_MIB - 1).as_str(),
     );
-    let body = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
     assert_eq!(body.len(), TEN_MIB);
     assert_eq!(sha256_hex(&body), want_sha);
 }
@@ -410,7 +413,13 @@ async fn ten_mib_suffix_range_returns_tail() {
         resp.headers().get(header::CONTENT_RANGE).unwrap(),
         format!("bytes {expected_start}-{expected_end}/{TEN_MIB}").as_str(),
     );
-    let body = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
     assert_eq!(body.len(), suffix_len);
     assert_eq!(sha256_hex(&body), want_tail_sha);
 }
@@ -446,7 +455,13 @@ async fn ten_mib_mid_range_matches_reference_slice() {
         resp.headers().get(header::CONTENT_RANGE).unwrap(),
         format!("bytes {start}-{end}/{TEN_MIB}").as_str(),
     );
-    let body = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
     assert_eq!(body.len(), end - start + 1);
     assert_eq!(sha256_hex(&body), want_sha);
 }
@@ -476,7 +491,13 @@ async fn ten_mib_prefix_range_within_one_leaf() {
         resp.headers().get(header::CONTENT_RANGE).unwrap(),
         format!("bytes 0-1023/{TEN_MIB}").as_str(),
     );
-    let body = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
     assert_eq!(body.len(), 1024);
     assert_eq!(sha256_hex(&body), want_sha);
 }

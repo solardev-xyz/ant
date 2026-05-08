@@ -288,8 +288,9 @@ pub async fn refresh_peer(control: &mut Control, peer: PeerId) -> std::io::Resul
     let ack_bytes = read_delimited(&mut stream, 256)
         .await
         .map_err(|e| std::io::Error::new(e.kind(), format!("read ack: {e}")))?;
-    let ack = PaymentAckPb::decode(ack_bytes.as_slice())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("decode ack: {e}")))?;
+    let ack = PaymentAckPb::decode(ack_bytes.as_slice()).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("decode ack: {e}"))
+    })?;
     let accepted = parse_be_u64(&ack.amount).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -685,7 +686,16 @@ mod tests {
 
     #[test]
     fn big_int_be_round_trip() {
-        for v in [0u64, 1, 0xff, 0x100, 12345, 450_000, u32::MAX as u64, u64::MAX] {
+        for v in [
+            0u64,
+            1,
+            0xff,
+            0x100,
+            12345,
+            450_000,
+            u32::MAX as u64,
+            u64::MAX,
+        ] {
             let bytes = big_int_be_bytes(v);
             let parsed = parse_be_u64(&bytes).unwrap();
             assert_eq!(parsed, v, "round trip {v}");

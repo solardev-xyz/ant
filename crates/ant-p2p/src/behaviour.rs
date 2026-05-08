@@ -1041,8 +1041,7 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     // an eager check would always fire on home routers where UPnP would have
     // succeeded a moment later. The deadline is checked from the main loop
     // after every event so we don't need a separate timer.
-    let mut external_address_check_deadline =
-        Some(Instant::now() + EXTERNAL_ADDRESS_CHECK_DELAY);
+    let mut external_address_check_deadline = Some(Instant::now() + EXTERNAL_ADDRESS_CHECK_DELAY);
 
     let mut control = swarm.behaviour().stream.new_control();
     let mut peer_agents: HashMap<PeerId, String> = HashMap::new();
@@ -1122,9 +1121,8 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     let (hot_hint_tx, hot_hint_rx) = mpsc::channel::<ant_retrieval::accounting::HotHint>(
         crate::pseudosettle::HOT_HINT_CHANNEL_CAP,
     );
-    let accounting = Arc::new(
-        ant_retrieval::accounting::Accounting::new().with_hot_hint(hot_hint_tx),
-    );
+    let accounting =
+        Arc::new(ant_retrieval::accounting::Accounting::new().with_hot_hint(hot_hint_tx));
     tokio::spawn(crate::pseudosettle::run_driver(
         control.clone(),
         payment_notify_rx,
@@ -1726,6 +1724,86 @@ fn handle_control_command(
                 let _ = ack.send(reply).await;
             });
         }
+        // Upload* commands are handled by `ant_node::run_node`'s
+        // command interceptor before they ever reach this loop, so
+        // these arms exist for defense in depth: they keep the match
+        // exhaustive (so adding a new ControlCommand variant fails
+        // the build until we wire it) and they error loudly if a
+        // future caller ever bypasses the interceptor. Not reached
+        // in production daemons; not exercised by tests beyond a
+        // build check.
+        ControlCommand::UploadStart { ack, .. } => {
+            let _ = ack.send(ControlAck::Error {
+                message: "upload manager not wired into the swarm loop".into(),
+            });
+        }
+        ControlCommand::UploadList { ack } => {
+            let _ = ack.send(ControlAck::Error {
+                message: "upload manager not wired into the swarm loop".into(),
+            });
+        }
+        ControlCommand::UploadStatus { ack, .. } => {
+            let _ = ack.send(ControlAck::Error {
+                message: "upload manager not wired into the swarm loop".into(),
+            });
+        }
+        ControlCommand::UploadPause { ack, .. } => {
+            let _ = ack.send(ControlAck::Error {
+                message: "upload manager not wired into the swarm loop".into(),
+            });
+        }
+        ControlCommand::UploadResume { ack, .. } => {
+            let _ = ack.send(ControlAck::Error {
+                message: "upload manager not wired into the swarm loop".into(),
+            });
+        }
+        ControlCommand::UploadCancel { ack, .. } => {
+            let _ = ack.send(ControlAck::Error {
+                message: "upload manager not wired into the swarm loop".into(),
+            });
+        }
+        ControlCommand::UploadFollow { ack, .. } => {
+            // `ack` is an mpsc sender — drop after one error frame.
+            let _ = ack.try_send(ControlAck::Error {
+                message: "upload manager not wired into the swarm loop".into(),
+            });
+        }
+        ControlCommand::PostageStatus { ack } => {
+            // The stamp issuer's stats are pure local state — no
+            // network, no chain. Synchronous read under the same
+            // mutex `PushChunk` uses, so a status request can't
+            // race a stamp increment to a half-updated bucket
+            // count. `2^bucket_depth` is 65 536 entries at the bee
+            // default, so the walk completes in microseconds.
+            let view = match upload {
+                Some(rt) => {
+                    let stats = match rt.issuer.lock() {
+                        Ok(g) => g.stats(),
+                        Err(p) => p.into_inner().stats(),
+                    };
+                    ant_control::PostageStatusView {
+                        enabled: true,
+                        batch_id: format!("0x{}", hex::encode(stats.batch_id)),
+                        batch_depth: stats.batch_depth,
+                        bucket_depth: stats.bucket_depth,
+                        immutable: stats.immutable,
+                        bucket_count: stats.bucket_count,
+                        bucket_capacity: stats.bucket_capacity,
+                        total_capacity_chunks: stats.total_capacity,
+                        issued_chunks: stats.issued,
+                        bucket_fill_min: stats.bucket_fill_min,
+                        bucket_fill_max: stats.bucket_fill_max,
+                        remaining_total_chunks: stats.remaining_total,
+                        worst_case_remaining_chunks: stats.worst_case_remaining,
+                    }
+                }
+                None => ant_control::PostageStatusView {
+                    enabled: false,
+                    ..Default::default()
+                },
+            };
+            let _ = ack.send(ControlAck::PostageStatus(view));
+        }
     }
 }
 
@@ -1805,8 +1883,16 @@ async fn run_stream_bytes(
         return;
     }
 
-    stream_root_chunk_with_range(&fetcher, root, total_bytes, max_bytes, range, reference, ack)
-        .await;
+    stream_root_chunk_with_range(
+        &fetcher,
+        root,
+        total_bytes,
+        max_bytes,
+        range,
+        reference,
+        ack,
+    )
+    .await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2039,9 +2125,8 @@ async fn stream_root_chunk_inner(
     // gateway at any given moment.
     let (chunk_tx, mut chunk_rx) = mpsc::channel::<Vec<u8>>(64);
     let cap = clamp_max_bytes(max_bytes);
-    let body_range = range.and_then(|r| {
-        ant_retrieval::ByteRange::clamp(r.start, r.end_inclusive, total_bytes)
-    });
+    let body_range =
+        range.and_then(|r| ant_retrieval::ByteRange::clamp(r.start, r.end_inclusive, total_bytes));
     if range.is_some() && body_range.is_none() {
         let _ = ack
             .send(ControlAck::Error {
@@ -2051,12 +2136,7 @@ async fn stream_root_chunk_inner(
         return;
     }
     let mut join_fut = Box::pin(ant_retrieval::join_to_sender_range(
-        fetcher,
-        &root,
-        cap,
-        options,
-        body_range,
-        chunk_tx,
+        fetcher, &root, cap, options, body_range, chunk_tx,
     ));
     let mut join_result = None;
     loop {
@@ -2700,6 +2780,7 @@ fn bump_backoff(backoff: Duration) -> Duration {
 /// Route a `SwarmEvent` into the pipeline. Everything that mutates state
 /// lives here; the status snapshot has already been updated via
 /// `observe_event` by the time we're called.
+#[allow(clippy::too_many_arguments)]
 fn handle_swarm_event(
     swarm: &mut Swarm<AntBehaviour>,
     state: &mut SwarmState,
@@ -2716,13 +2797,7 @@ fn handle_swarm_event(
             // our identify message carries usable `listen_addrs`. Without this
             // bee's inbound handshake handler waits 10 s in `peerMultiaddrs`
             // for our peerstore entry to populate.
-            record_external_address(
-                state,
-                swarm,
-                status,
-                address,
-                ExternalAddrSource::Listener,
-            );
+            record_external_address(state, swarm, status, address, ExternalAddrSource::Listener);
         }
         // rust-libp2p's identify surfaces each remote's `observed_addr` as
         // a candidate here. Promote globally-routable ones to confirmed
@@ -2731,13 +2806,7 @@ fn handle_swarm_event(
         SwarmEvent::NewExternalAddrCandidate { address }
             if is_globally_routable_multiaddr(&address) =>
         {
-            record_external_address(
-                state,
-                swarm,
-                status,
-                address,
-                ExternalAddrSource::Observed,
-            );
+            record_external_address(state, swarm, status, address, ExternalAddrSource::Observed);
         }
         SwarmEvent::ConnectionEstablished {
             peer_id, endpoint, ..
@@ -2990,6 +3059,7 @@ fn mark_for_disconnect(state: &mut SwarmState, swarm: &mut Swarm<AntBehaviour>, 
 /// already fired before the spawn), but we don't block on it — bee's
 /// peerstore stall is going to fire either way and adding our 3 s wait on
 /// top would just stack another 3 s on every cold-start handshake.
+#[allow(clippy::too_many_arguments)]
 fn spawn_handshake_driver(
     peer_id: PeerId,
     dial_addr: Multiaddr,

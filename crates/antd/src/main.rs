@@ -166,6 +166,16 @@ struct Opt {
     /// default Ant test setup.
     #[arg(long)]
     postage_owner_key: Option<String>,
+
+    /// On startup, do **not** auto-resume upload jobs that were in
+    /// `running` state when the daemon last shut down. They're
+    /// loaded into memory and listed by `antctl upload list` as
+    /// `paused`, so the operator can inspect them and `antctl
+    /// upload resume <id>` deliberately. Default behaviour
+    /// (auto-resume) matches the "I closed my laptop"
+    /// expectation and is what most operators want.
+    #[arg(long, default_value_t = false)]
+    no_resume_uploads: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -339,9 +349,7 @@ async fn main() -> Result<()> {
         // means a hypothetical operator typo of `--disk-cache-max-gb
         // 18446744073` (a u64 GB count that overflows on multiplication)
         // produces "as big as we can represent", not a 0-byte cap.
-        let max_bytes = opt
-            .disk_cache_max_gb
-            .saturating_mul(1024 * 1024 * 1024);
+        let max_bytes = opt.disk_cache_max_gb.saturating_mul(1024 * 1024 * 1024);
         match ant_retrieval::DiskChunkCache::open(&path, max_bytes) {
             Ok(c) => {
                 tracing::info!(
@@ -387,6 +395,37 @@ async fn main() -> Result<()> {
     .await
     .map_err(|e| anyhow!("upload runtime: {e}"))?;
 
+    // `antctl upload` job manager. Built unconditionally — listing
+    // and inspecting jobs work even when no postage batch is
+    // configured. Actually starting a new job will fail (with the
+    // standard "uploads not configured" error) on `PushChunk`
+    // until the operator wires postage. Persistent state lives at
+    // `<data-dir>/uploads/<job_id>.json`, atomically rewritten on
+    // each checkpoint (same idiom as `StampIssuer`).
+    let upload_manager = ant_node::UploadManager::new(data_dir.join("uploads"), cmd_tx.clone())
+        .with_context(|| {
+            format!(
+                "open upload state dir at {}",
+                data_dir.join("uploads").display()
+            )
+        })?;
+    let restored_jobs = upload_manager
+        .rehydrate_from_disk(!opt.no_resume_uploads)
+        .with_context(|| {
+            format!(
+                "scan upload state dir {}",
+                upload_manager.state_dir().display()
+            )
+        })?;
+    if restored_jobs > 0 {
+        tracing::info!(
+            target: "antd",
+            count = restored_jobs,
+            auto_resume = !opt.no_resume_uploads,
+            "rehydrated upload jobs from disk",
+        );
+    }
+
     // SWAP listener always-on. Inbound cheques don't require us to own
     // a chequebook (we're the beneficiary, not the issuer), so the
     // only inputs we need are our EOA and the chain id. Outbound
@@ -413,7 +452,8 @@ async fn main() -> Result<()> {
             .with_gateway_activity(Some(gateway_activity.clone()))
             .with_disk_cache(disk_cache)
             .with_upload(upload)
-            .with_swap(Some(swap_cfg)),
+            .with_swap(Some(swap_cfg))
+            .with_upload_manager(Some(upload_manager)),
     );
 
     let gateway_handle = if opt.no_http_api {
@@ -662,17 +702,22 @@ async fn build_upload_runtime(
     };
     let key_hex = cli_key
         .or_else(|| std::env::var("STORAGE_STAMP_PRIVATE_KEY").ok())
-        .ok_or_else(|| anyhow!("--postage-batch set but --postage-owner-key / STORAGE_STAMP_PRIVATE_KEY missing"))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "--postage-batch set but --postage-owner-key / STORAGE_STAMP_PRIVATE_KEY missing"
+            )
+        })?;
     let rpc_url = cli_rpc
         .or_else(|| std::env::var("GNOSIS_RPC_URL").ok())
-        .ok_or_else(|| anyhow!("--postage-batch set but --gnosis-rpc-url / GNOSIS_RPC_URL missing"))?;
+        .ok_or_else(|| {
+            anyhow!("--postage-batch set but --gnosis-rpc-url / GNOSIS_RPC_URL missing")
+        })?;
 
     let mut batch_id = [0u8; 32];
     hex::decode_to_slice(strip_0x(&batch_hex), &mut batch_id)
         .with_context(|| format!("decode batch id {batch_hex}"))?;
     let mut stamp_key = [0u8; SECP256K1_SECRET_LEN];
-    hex::decode_to_slice(strip_0x(&key_hex), &mut stamp_key)
-        .context("decode postage owner key")?;
+    hex::decode_to_slice(strip_0x(&key_hex), &mut stamp_key).context("decode postage owner key")?;
 
     let signer_eth = {
         let sk =
@@ -725,7 +770,9 @@ async fn build_upload_runtime(
 }
 
 fn strip_0x(s: &str) -> &str {
-    s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s)
+    s.strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s)
 }
 
 fn secp256k1_keypair_from_signing_secret(secret: &[u8; SECP256K1_SECRET_LEN]) -> Result<Keypair> {

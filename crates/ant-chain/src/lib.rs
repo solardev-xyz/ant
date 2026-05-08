@@ -80,7 +80,14 @@ impl ChainClient {
             ]
         });
 
-        let v: RpcResp<'_> = self.http.post(&self.url).json(&body).send().await?.json().await?;
+        let v: RpcResp<'_> = self
+            .http
+            .post(&self.url)
+            .json(&body)
+            .send()
+            .await?
+            .json()
+            .await?;
 
         if let Some(e) = v.error {
             return Err(RpcError::Rpc(
@@ -91,8 +98,7 @@ impl ChainClient {
         let result = v
             .result
             .ok_or_else(|| RpcError::Rpc("missing result".to_string()))?;
-        decode_hex_prefixed_bytes(result.as_ref())
-            .map_err(|e| RpcError::Decode(e.to_string()))
+        decode_hex_prefixed_bytes(result.as_ref()).map_err(|e| RpcError::Decode(e.to_string()))
     }
 
     /// `eth_call` with an explicit `from` address — required for any
@@ -125,8 +131,14 @@ impl ChainClient {
             ],
         });
 
-        let v: serde_json::Value =
-            self.http.post(&self.url).json(&body).send().await?.json().await?;
+        let v: serde_json::Value = self
+            .http
+            .post(&self.url)
+            .json(&body)
+            .send()
+            .await?
+            .json()
+            .await?;
         if let Some(err) = v.get("error") {
             return Err(RpcError::Rpc(err.to_string()));
         }
@@ -139,17 +151,21 @@ impl ChainClient {
 
     /// Native xDAI balance for `addr` (lower 128 bits — that's
     /// 2^128 ≈ 3.4 × 10^38 wei, well above any reasonable wallet).
-    pub async fn eth_get_balance_lower128(
-        &self,
-        addr: &[u8; 20],
-    ) -> Result<u128, RpcError> {
+    pub async fn eth_get_balance_lower128(&self, addr: &[u8; 20]) -> Result<u128, RpcError> {
         let body = json!({
             "jsonrpc": "2.0",
             "id": 1u64,
             "method": "eth_getBalance",
             "params": [format!("0x{}", hex::encode(addr)), "latest"],
         });
-        let v: RpcResp<'_> = self.http.post(&self.url).json(&body).send().await?.json().await?;
+        let v: RpcResp<'_> = self
+            .http
+            .post(&self.url)
+            .json(&body)
+            .send()
+            .await?
+            .json()
+            .await?;
         if let Some(e) = v.error {
             return Err(RpcError::Rpc(
                 e.message.unwrap_or_else(|| "unknown RPC error".to_string()),

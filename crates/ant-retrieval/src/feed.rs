@@ -406,10 +406,7 @@ mod tests {
     }
     #[async_trait]
     impl ChunkFetcher for MapFetcher {
-        async fn fetch(
-            &self,
-            addr: [u8; 32],
-        ) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
+        async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
             self.chunks
                 .get(&addr)
                 .cloned()
@@ -494,8 +491,7 @@ mod tests {
             kind: FeedType::Sequence,
         };
 
-        let (soc_addr, soc_wire) =
-            make_sequence_update_v1(&secret, &owner, &topic, 0, &target_ref);
+        let (soc_addr, soc_wire) = make_sequence_update_v1(&secret, &owner, &topic, 0, &target_ref);
         // Sanity: the address we computed should match what
         // `sequence_update_address` (the production path) computes.
         assert_eq!(soc_addr, sequence_update_address(&feed, 0));
@@ -660,10 +656,7 @@ mod tests {
     #[test]
     fn metadata_with_0x_prefix_accepted() {
         let mut meta = HashMap::new();
-        meta.insert(
-            FEED_OWNER_KEY.to_string(),
-            format!("0x{}", "ab".repeat(20)),
-        );
+        meta.insert(FEED_OWNER_KEY.to_string(), format!("0x{}", "ab".repeat(20)));
         meta.insert(FEED_TOPIC_KEY.to_string(), format!("0x{}", "cd".repeat(32)));
         let feed = feed_from_metadata(&meta).unwrap().unwrap();
         assert_eq!(feed.owner, [0xabu8; 20]);

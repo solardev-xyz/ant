@@ -447,10 +447,7 @@ fn assemble_single_file(
 }
 
 #[allow(clippy::result_large_err)]
-fn assemble_collection(
-    body: &Bytes,
-    index_doc: Option<&str>,
-) -> Result<AssembledUpload, Response> {
+fn assemble_collection(body: &Bytes, index_doc: Option<&str>) -> Result<AssembledUpload, Response> {
     let mut archive = tar::Archive::new(std::io::Cursor::new(body.as_ref()));
     let mut files: Vec<ManifestFile> = Vec::new();
     let mut data_chunks: Vec<SplitChunk> = Vec::new();
@@ -490,7 +487,10 @@ fn assemble_collection(
             }
         };
         let path_str = match path_owned.to_str() {
-            Some(s) => s.trim_start_matches("./").trim_start_matches('/').to_string(),
+            Some(s) => s
+                .trim_start_matches("./")
+                .trim_start_matches('/')
+                .to_string(),
             None => {
                 return Err(json_error(
                     StatusCode::BAD_REQUEST,
@@ -527,14 +527,12 @@ fn assemble_collection(
 
     // Default index doc: `index.html` if it's present and the caller
     // didn't override. Bee's `Bee.UploadCollection` uses the same heuristic.
-    let resolved_index = index_doc
-        .map(str::to_string)
-        .or_else(|| {
-            files
-                .iter()
-                .find(|f| f.path == "index.html")
-                .map(|f| f.path.clone())
-        });
+    let resolved_index = index_doc.map(str::to_string).or_else(|| {
+        files
+            .iter()
+            .find(|f| f.path == "index.html")
+            .map(|f| f.path.clone())
+    });
     let manifest = match build_collection_manifest(&files, resolved_index.as_deref()) {
         Ok(m) => m,
         Err(e) => return Err(map_manifest_error(e)),
@@ -599,9 +597,7 @@ async fn push_chunks(
                     if stripped != want {
                         return Err(json_error(
                             StatusCode::BAD_GATEWAY,
-                            format!(
-                                "node reference {stripped} != local {want} (BMT mismatch)"
-                            ),
+                            format!("node reference {stripped} != local {want} (BMT mismatch)"),
                         ));
                     }
                     pushed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -717,19 +713,13 @@ pub async fn bytes(
 
     // Phase 1: dispatch with head_only=true if the caller is HEAD;
     // for GET we go straight to the streaming dispatcher.
-    let mut started = match dispatch_stream_bytes(
-        &handle,
-        reference,
-        timeout,
-        None,
-        head_only,
-        activity_guard,
-    )
-    .await
-    {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
+    let mut started =
+        match dispatch_stream_bytes(&handle, reference, timeout, None, head_only, activity_guard)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
 
     let total = started.total_bytes;
     let parsed_range = match raw_range.as_deref() {
@@ -907,7 +897,11 @@ async fn bzz_inner(
     } else {
         format!("{}/{path}", short_reference(&addr))
     };
-    let activity_guard = Some(handle.activity.begin(GatewayRequestKind::Bzz, activity_label));
+    let activity_guard = Some(
+        handle
+            .activity
+            .begin(GatewayRequestKind::Bzz, activity_label),
+    );
 
     let mut started = match dispatch_stream_bzz(
         &handle,

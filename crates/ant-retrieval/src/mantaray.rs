@@ -1072,12 +1072,10 @@ mod tests {
         // payload length itself (single-chunk node).
         let root_payload = hex::decode(ROOT_PAYLOAD).unwrap();
         let s_payload = hex::decode(S_PAYLOAD).unwrap();
-        let root_addr = decode_addr(
-            "567fbf0f92c09ad52afd736398deb3a674a6f8eca2495694292f42a859d9e60e",
-        );
-        let s_addr = decode_addr(
-            "e8aa9151a4c271bc7099cd1de086aa563b6b2e5ad8191e5208ad55fdaccb4484",
-        );
+        let root_addr =
+            decode_addr("567fbf0f92c09ad52afd736398deb3a674a6f8eca2495694292f42a859d9e60e");
+        let s_addr =
+            decode_addr("e8aa9151a4c271bc7099cd1de086aa563b6b2e5ad8191e5208ad55fdaccb4484");
         let mut root_wire = Vec::with_capacity(8 + root_payload.len());
         root_wire.extend_from_slice(&(root_payload.len() as u64).to_le_bytes());
         root_wire.extend_from_slice(&root_payload);
@@ -1089,7 +1087,9 @@ mod tests {
         fetcher.insert(root_addr, root_wire);
         fetcher.insert(s_addr, s_wire);
 
-        let err = lookup_path(&fetcher, root_addr, "search").await.unwrap_err();
+        let err = lookup_path(&fetcher, root_addr, "search")
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, ManifestError::NotFound { .. }),
             "expected NotFound, got {err:?}",
@@ -1152,7 +1152,10 @@ mod tests {
             "0cc878d32c96126d47f63fbe391114ee1438cd521146fc975dea1546d302b6c0",
         );
         assert_eq!(
-            slash.metadata.get("website-index-document").map(String::as_str),
+            slash
+                .metadata
+                .get("website-index-document")
+                .map(String::as_str),
             Some("index.html"),
         );
 

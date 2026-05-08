@@ -1,5 +1,7 @@
 //! Minimal node orchestration for M1.0 (p2p dial + handshake loop).
 
+pub mod uploads;
+
 use ant_control::{ControlCommand, GatewayActivity, StatusSnapshot};
 use ant_crypto::{OVERLAY_NONCE_LEN, SECP256K1_SECRET_LEN};
 use ant_p2p::{run, RunConfig, SwapConfig, UploadRuntime};
@@ -10,6 +12,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
 use tokio::sync::{mpsc, watch};
+
+pub use uploads::{estimate_chunk_count, UploadError, UploadJobInfo, UploadManager, UploadStatus};
 
 #[derive(Debug, Error)]
 pub enum NodeError {
@@ -74,6 +78,19 @@ pub struct NodeConfig {
     /// the protocol is still negotiated but every received cheque is
     /// dropped silently.
     pub swap: Option<SwapConfig>,
+    /// `antctl upload` job manager. When `Some`, `run_node` installs
+    /// a command interceptor in front of `ant-p2p` that catches
+    /// `ControlCommand::Upload*` variants and dispatches them to
+    /// the manager, leaving everything else (peer ops, retrieval,
+    /// `PushChunk`) to flow through to the swarm event loop
+    /// unchanged. The manager itself issues `PushChunk` commands
+    /// through the same outer channel, so the bounded postage
+    /// stamping path (`ant_p2p::UploadRuntime`) handles every
+    /// uploaded chunk uniformly. `None` keeps the upload commands
+    /// disabled — the interceptor is bypassed and the stub arms in
+    /// `ant_p2p::handle_control_command` reject `Upload*` with a
+    /// clear error.
+    pub upload_manager: Option<UploadManager>,
 }
 
 impl NodeConfig {
@@ -100,6 +117,7 @@ impl NodeConfig {
             disk_cache: None,
             upload: None,
             swap: None,
+            upload_manager: None,
         }
     }
 
@@ -143,7 +161,10 @@ impl NodeConfig {
         self
     }
 
-    pub fn with_disk_cache(mut self, disk_cache: Option<Arc<ant_retrieval::DiskChunkCache>>) -> Self {
+    pub fn with_disk_cache(
+        mut self,
+        disk_cache: Option<Arc<ant_retrieval::DiskChunkCache>>,
+    ) -> Self {
         self.disk_cache = disk_cache;
         self
     }
@@ -157,10 +178,33 @@ impl NodeConfig {
         self.swap = swap;
         self
     }
+
+    pub fn with_upload_manager(mut self, mgr: Option<UploadManager>) -> Self {
+        self.upload_manager = mgr;
+        self
+    }
 }
 
 /// Run the M1.0 node loop until the process is interrupted.
+///
+/// When [`NodeConfig::upload_manager`] is `Some`, this fn installs a
+/// command interceptor in front of `ant-p2p` that pulls
+/// [`ControlCommand`]s off the operator-supplied channel, routes
+/// `Upload*` variants to the manager, and forwards everything else to
+/// the swarm event loop. The manager itself issues `PushChunk` through
+/// a clone of that same outer channel — so manager-driven chunks land
+/// in `ant-p2p` exactly the way a `POST /chunks` call from `bee-js`
+/// does today.
 pub async fn run_node(cfg: NodeConfig) -> Result<(), NodeError> {
+    let (forward_rx, _interceptor) = match (cfg.commands, cfg.upload_manager.clone()) {
+        (Some(outer_rx), Some(mgr)) => {
+            let (inner_tx, inner_rx) = mpsc::channel::<ControlCommand>(64);
+            let task = tokio::spawn(intercept_commands(outer_rx, inner_tx, mgr));
+            (Some(inner_rx), Some(task))
+        }
+        (commands, _) => (commands, None),
+    };
+
     run(RunConfig {
         signing_secret: cfg.signing_secret,
         overlay_nonce: cfg.overlay_nonce,
@@ -171,7 +215,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<(), NodeError> {
         status: cfg.status,
         target_peers: 0,
         peerstore_path: cfg.peerstore_path,
-        commands: cfg.commands,
+        commands: forward_rx,
         process_start: cfg.process_start,
         per_request_chunk_cache: cfg.per_request_chunk_cache,
         chunk_record_dir: cfg.chunk_record_dir,
@@ -182,4 +226,100 @@ pub async fn run_node(cfg: NodeConfig) -> Result<(), NodeError> {
     })
     .await?;
     Ok(())
+}
+
+/// Pull commands off `outer_rx`. Dispatch `Upload*` to `mgr`; forward
+/// everything else to `inner_tx` (which feeds `ant-p2p`'s swarm event
+/// loop). Exits when `outer_rx` closes.
+///
+/// This is intentionally synchronous-per-command on the upload path:
+/// `UploadStart` returns as soon as the manager registers the job
+/// (the actual splitter / pushsync work happens on the manager's
+/// own background task). `UploadFollow` keeps the interceptor task
+/// busy for the duration of the follow because it pumps a watch
+/// receiver into the per-request `mpsc::Sender<ControlAck>` — but
+/// that's fine, follows are spawned on their own tokio task per
+/// connection, so multiple followers don't bottleneck each other.
+async fn intercept_commands(
+    mut outer_rx: mpsc::Receiver<ControlCommand>,
+    inner_tx: mpsc::Sender<ControlCommand>,
+    mgr: uploads::UploadManager,
+) {
+    use ant_control::ControlAck;
+    while let Some(cmd) = outer_rx.recv().await {
+        match cmd {
+            ControlCommand::UploadStart {
+                source_path,
+                batch_id,
+                name,
+                content_type,
+                raw,
+                ack,
+            } => {
+                let mgr = mgr.clone();
+                tokio::spawn(async move {
+                    let reply = match mgr
+                        .start(source_path, batch_id, name, content_type, raw)
+                        .await
+                    {
+                        Ok(job_id) => ControlAck::UploadStarted { job_id },
+                        Err(e) => ControlAck::Error {
+                            message: e.to_string(),
+                        },
+                    };
+                    let _ = ack.send(reply);
+                });
+            }
+            ControlCommand::UploadList { ack } => {
+                let mut views: Vec<_> = mgr.list().into_iter().map(uploads::to_view).collect();
+                views.sort_by_key(|v| v.created_at_unix);
+                let _ = ack.send(ControlAck::UploadList(views));
+            }
+            ControlCommand::UploadStatus { job_id, ack } => {
+                let reply = match mgr.status(&job_id) {
+                    Ok(info) => ControlAck::UploadJob(uploads::to_view(info)),
+                    Err(e) => ControlAck::Error {
+                        message: e.to_string(),
+                    },
+                };
+                let _ = ack.send(reply);
+            }
+            ControlCommand::UploadPause { job_id, ack } => {
+                let reply = match mgr.pause(&job_id) {
+                    Ok(info) => ControlAck::UploadJob(uploads::to_view(info)),
+                    Err(e) => ControlAck::Error {
+                        message: e.to_string(),
+                    },
+                };
+                let _ = ack.send(reply);
+            }
+            ControlCommand::UploadResume { job_id, ack } => {
+                let reply = match mgr.resume(&job_id) {
+                    Ok(info) => ControlAck::UploadJob(uploads::to_view(info)),
+                    Err(e) => ControlAck::Error {
+                        message: e.to_string(),
+                    },
+                };
+                let _ = ack.send(reply);
+            }
+            ControlCommand::UploadCancel { job_id, ack } => {
+                let reply = match mgr.cancel(&job_id) {
+                    Ok(info) => ControlAck::UploadJob(uploads::to_view(info)),
+                    Err(e) => ControlAck::Error {
+                        message: e.to_string(),
+                    },
+                };
+                let _ = ack.send(reply);
+            }
+            ControlCommand::UploadFollow { job_id, ack } => {
+                let mgr = mgr.clone();
+                tokio::spawn(async move { uploads::run_follow(mgr, job_id, ack).await });
+            }
+            other => {
+                if inner_tx.send(other).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
 }

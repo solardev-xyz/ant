@@ -58,11 +58,7 @@ impl GatewayActivity {
     /// remove the entry when dropped, plus a [`GatewayActivityHandle`]
     /// the gateway uses to push progress updates without re-acquiring
     /// the registry lock against the wrong entry.
-    pub fn begin(
-        self: &Arc<Self>,
-        kind: GatewayRequestKind,
-        path: String,
-    ) -> ActiveRequestGuard {
+    pub fn begin(self: &Arc<Self>, kind: GatewayRequestKind, path: String) -> ActiveRequestGuard {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let started_at_unix = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -92,8 +88,7 @@ impl GatewayActivity {
     /// Called by the status publisher on every tick.
     pub fn snapshot(&self) -> Vec<GatewayRequestInfo> {
         let map = self.inner.lock().expect("activity mutex poisoned");
-        let mut entries: Vec<(u64, Entry)> =
-            map.iter().map(|(id, e)| (*id, e.clone())).collect();
+        let mut entries: Vec<(u64, Entry)> = map.iter().map(|(id, e)| (*id, e.clone())).collect();
         drop(map);
         entries.sort_by_key(|(id, e)| (e.started_at_unix, *id));
         entries
@@ -112,10 +107,7 @@ impl GatewayActivity {
 
     /// Number of currently-active requests, for tests and assertions.
     pub fn len(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("activity mutex poisoned")
-            .len()
+        self.inner.lock().expect("activity mutex poisoned").len()
     }
 
     /// `true` when no request is currently registered.
@@ -158,7 +150,13 @@ impl ActiveRequestGuard {
     /// streaming-body loop calls this on every `Progress` ack from the
     /// daemon. A no-op if the registry has been dropped (process
     /// shutdown).
-    pub fn update(&self, chunks_done: u64, total_chunks_estimate: u64, chunks_in_flight: u32, bytes_done: u64) {
+    pub fn update(
+        &self,
+        chunks_done: u64,
+        total_chunks_estimate: u64,
+        chunks_in_flight: u32,
+        bytes_done: u64,
+    ) {
         if let Some(reg) = self.registry.upgrade() {
             reg.update(self.id, |entry| {
                 entry.chunks_done = chunks_done;
@@ -203,7 +201,13 @@ pub struct GatewayActivityHandle {
 
 impl GatewayActivityHandle {
     /// Same semantics as [`ActiveRequestGuard::update`].
-    pub fn update(&self, chunks_done: u64, total_chunks_estimate: u64, chunks_in_flight: u32, bytes_done: u64) {
+    pub fn update(
+        &self,
+        chunks_done: u64,
+        total_chunks_estimate: u64,
+        chunks_in_flight: u32,
+        bytes_done: u64,
+    ) {
         if let Some(reg) = self.registry.upgrade() {
             reg.update(self.id, |entry| {
                 entry.chunks_done = chunks_done;

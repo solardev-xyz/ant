@@ -208,7 +208,10 @@ pub fn decode_signed_cheque_json(bytes: &[u8]) -> Result<SignedCheque, SwapError
 
 fn parse_addr_0x(s: &str) -> Result<[u8; 20], SwapError> {
     let s = s.trim();
-    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    let s = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     let bytes = hex::decode(s)?;
     if bytes.len() != 20 {
         return Err(SwapError::Rejected(format!(
@@ -278,11 +281,7 @@ impl CreditLedger {
     /// if `None`). Loads any existing snapshot if the file exists; an
     /// unreadable / unparseable snapshot is treated as empty after
     /// logging — better to lose history than refuse to start.
-    pub fn open(
-        persist_path: Option<PathBuf>,
-        chain_id: u64,
-        our_beneficiary: [u8; 20],
-    ) -> Self {
+    pub fn open(persist_path: Option<PathBuf>, chain_id: u64, our_beneficiary: [u8; 20]) -> Self {
         let inner = match &persist_path {
             Some(p) if p.exists() => match std::fs::read(p) {
                 Ok(bytes) => match serde_json::from_slice::<LedgerSnapshot>(&bytes) {
@@ -349,9 +348,8 @@ impl CreditLedger {
                         c.issuer_eoa_hex,
                     )));
                 }
-                U256::from_dec_str(&c.cumulative_payout_dec).map_err(|e| {
-                    SwapError::Decimal(format!("stored cumulative: {e}"))
-                })?
+                U256::from_dec_str(&c.cumulative_payout_dec)
+                    .map_err(|e| SwapError::Decimal(format!("stored cumulative: {e}")))?
             }
             None => U256::zero(),
         };
@@ -491,9 +489,7 @@ impl OutboundLedger {
                 Ok(bytes) => match serde_json::from_slice::<HashMap<String, String>>(&bytes) {
                     Ok(map) => map
                         .into_iter()
-                        .filter_map(|(k, v)| {
-                            U256::from_dec_str(&v).ok().map(|u| (k, u))
-                        })
+                        .filter_map(|(k, v)| U256::from_dec_str(&v).ok().map(|u| (k, u)))
                         .collect(),
                     Err(e) => {
                         warn!(
@@ -543,8 +539,10 @@ fn persist_outbound(path: &Path, map: &HashMap<String, U256>) -> std::io::Result
     std::fs::create_dir_all(parent)?;
     let tmp = path.with_extension("json.tmp");
     // Serialise as map<hex, dec-string> so U256 round-trips as text.
-    let dec_map: HashMap<String, String> =
-        map.iter().map(|(k, v)| (k.clone(), v.to_string())).collect();
+    let dec_map: HashMap<String, String> = map
+        .iter()
+        .map(|(k, v)| (k.clone(), v.to_string()))
+        .collect();
     let bytes = serde_json::to_vec_pretty(&dec_map).map_err(std::io::Error::other)?;
     {
         let mut f = std::fs::File::create(&tmp)?;
@@ -916,8 +914,7 @@ mod tests {
         let mut cheque_wrong_ben = cheque2.clone();
         cheque_wrong_ben.beneficiary = [0xffu8; 20];
         cheque_wrong_ben.cumulative_payout = U256::from(160u64);
-        let signed_wrong_ben =
-            sign_cheque(&issuer_secret, &cheque_wrong_ben, 100).unwrap();
+        let signed_wrong_ben = sign_cheque(&issuer_secret, &cheque_wrong_ben, 100).unwrap();
         assert!(matches!(
             ledger.record_accepted(&signed_wrong_ben).unwrap_err(),
             SwapError::Rejected(_),
@@ -1028,14 +1025,8 @@ mod tests {
     fn issue_cheque_round_trip() {
         let secret = make_secret();
         let want_eoa = eoa(&secret);
-        let signed = issue_cheque(
-            &secret,
-            [0x99u8; 20],
-            [0x88u8; 20],
-            U256::from(999u64),
-            100,
-        )
-        .unwrap();
+        let signed =
+            issue_cheque(&secret, [0x99u8; 20], [0x88u8; 20], U256::from(999u64), 100).unwrap();
         assert_eq!(signed.cheque.cumulative_payout, U256::from(999u64));
         let recovered = recover_cheque_signer(&signed, 100).unwrap();
         assert_eq!(recovered, want_eoa);

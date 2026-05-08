@@ -100,6 +100,51 @@ pub struct StampIssuer {
     persist_path: Option<PathBuf>,
 }
 
+/// Snapshot of a [`StampIssuer`]'s capacity and fill, suitable for
+/// ops dashboards and pre-flight upload checks. Returned by
+/// [`StampIssuer::stats`].
+///
+/// Field semantics:
+///
+/// - `total_capacity` = `bucket_count * bucket_capacity` = `2^batch_depth`.
+///   The number of stamps the batch can issue *if every bucket fills
+///   evenly*. Practical capacity is lower because chunk addresses
+///   route to specific buckets.
+/// - `worst_case_remaining` = `(bucket_capacity − bucket_fill_max) *
+///   bucket_count`. The number of new chunks guaranteed to fit no
+///   matter how the next file's chunk addresses route (assumes the
+///   worst case where every new chunk hashes into the
+///   currently-fullest bucket). This is the right number to use as
+///   a pre-flight budget for an immutable batch.
+/// - `remaining_total` is the sum of free indices across buckets;
+///   the *optimistic* counterpart to `worst_case_remaining` (would
+///   only be reachable with perfectly even bucket routing).
+#[derive(Debug, Clone, Copy)]
+pub struct BucketStats {
+    pub batch_id: [u8; 32],
+    pub batch_depth: u8,
+    pub bucket_depth: u8,
+    pub immutable: bool,
+    /// Number of buckets in the batch (`2^bucket_depth`).
+    pub bucket_count: u64,
+    /// Per-bucket index ceiling (`2^(batch_depth − bucket_depth)`).
+    pub bucket_capacity: u32,
+    /// `bucket_count × bucket_capacity`.
+    pub total_capacity: u64,
+    /// Indices issued so far across every bucket.
+    pub issued: u64,
+    pub bucket_fill_min: u32,
+    pub bucket_fill_max: u32,
+    /// Sum of free indices across all buckets. Reachable only with
+    /// perfectly-even chunk-address routing.
+    pub remaining_total: u64,
+    /// Conservative chunk budget: room left in the *currently
+    /// fullest* bucket, scaled to a global count. Use this as the
+    /// pre-flight ceiling for "will my next upload fit?" — see the
+    /// type-level doc for the reasoning.
+    pub worst_case_remaining: u64,
+}
+
 impl StampIssuer {
     /// Build an in-memory-only issuer. Useful for tests and one-shot
     /// CLI dry-runs; production callers should use
@@ -156,13 +201,7 @@ impl StampIssuer {
                 persist_path: Some(path),
             });
         }
-        let issuer = Self::build(
-            batch_id,
-            batch_depth,
-            bucket_depth,
-            immutable,
-            Some(path),
-        )?;
+        let issuer = Self::build(batch_id, batch_depth, bucket_depth, immutable, Some(path))?;
         issuer.persist()?;
         Ok(issuer)
     }
@@ -181,7 +220,6 @@ impl StampIssuer {
         }
         let n = 1usize
             .checked_shl(u32::from(bucket_depth))
-            .and_then(|v| usize::try_from(v).ok())
             .ok_or_else(|| PostageError::Msg("bucket bitmap too large".into()))?;
         Ok(Self {
             batch_id,
@@ -205,11 +243,56 @@ impl StampIssuer {
         &self.batch_id
     }
 
+    pub fn immutable(&self) -> bool {
+        self.immutable
+    }
+
     /// Total number of indices issued so far across every bucket. Used
     /// for ops dashboards / "batch is N% full" reporting; not on the
     /// critical path.
     pub fn issued_count(&self) -> u64 {
         self.buckets.iter().map(|&n| n as u64).sum()
+    }
+
+    /// Per-bucket fill summary used by `antctl postage status` and the
+    /// upload pre-flight check. Walks the in-memory bucket vector
+    /// once: O(2^bucket_depth) — that's 65 536 elements at the bee
+    /// default, ~50 µs in release. Cheap to call on every status
+    /// tick.
+    pub fn stats(&self) -> BucketStats {
+        let bucket_count = self.buckets.len() as u64;
+        let bucket_capacity = self.bucket_upper_bound();
+        let total_capacity = bucket_count.saturating_mul(bucket_capacity as u64);
+        let issued: u64 = self.buckets.iter().map(|&n| n as u64).sum();
+        let (bucket_fill_min, bucket_fill_max) = if self.buckets.is_empty() {
+            (0u32, 0u32)
+        } else {
+            self.buckets
+                .iter()
+                .copied()
+                .fold((u32::MAX, 0u32), |(mn, mx), v| (mn.min(v), mx.max(v)))
+        };
+        let remaining_total: u64 = self
+            .buckets
+            .iter()
+            .map(|&n| (bucket_capacity.saturating_sub(n)) as u64)
+            .sum();
+        let worst_case_remaining =
+            (bucket_capacity.saturating_sub(bucket_fill_max)) as u64 * bucket_count;
+        BucketStats {
+            batch_id: self.batch_id,
+            batch_depth: self.batch_depth,
+            bucket_depth: self.bucket_depth,
+            immutable: self.immutable,
+            bucket_count,
+            bucket_capacity,
+            total_capacity,
+            issued,
+            bucket_fill_min,
+            bucket_fill_max,
+            remaining_total,
+            worst_case_remaining,
+        }
     }
 
     fn bucket_upper_bound(&self) -> u32 {
@@ -429,7 +512,12 @@ fn index_bytes(bucket: u32, within_bucket: u32) -> [u8; INDEX_SIZE] {
     out
 }
 
-pub fn postage_sign_digest(chunk_addr: &[u8; 32], batch_id: &[u8; 32], index: &[u8; 8], ts: &[u8; 8]) -> [u8; 32] {
+pub fn postage_sign_digest(
+    chunk_addr: &[u8; 32],
+    batch_id: &[u8; 32],
+    index: &[u8; 8],
+    ts: &[u8; 8],
+) -> [u8; 32] {
     let mut h = Keccak256::default();
     h.update(chunk_addr);
     h.update(batch_id);
@@ -549,7 +637,14 @@ mod tests {
         let chunk = [7u8; 32];
 
         let stamp = sign_stamp_bytes(&secret, &mut issuer, &chunk).unwrap();
-        verify_stamp_owner(&chunk, &stamp, &owner, issuer.batch_depth, issuer.bucket_depth).unwrap();
+        verify_stamp_owner(
+            &chunk,
+            &stamp,
+            &owner,
+            issuer.batch_depth,
+            issuer.bucket_depth,
+        )
+        .unwrap();
     }
 
     /// Writing then re-loading the store must preserve every counter
@@ -562,8 +657,7 @@ mod tests {
 
         // Use a small bucket_depth so the file stays test-friendly (8 → 256
         // counters → 1 KiB file). batch_depth must be > bucket_depth.
-        let mut issuer =
-            StampIssuer::open_or_new(path.clone(), batch_id, 12, 8, true).unwrap();
+        let mut issuer = StampIssuer::open_or_new(path.clone(), batch_id, 12, 8, true).unwrap();
         // Issue indices on a few different addresses to populate
         // distinct buckets. The exact bucket choice depends on
         // collision_bucket_from_addr but we don't care which buckets
@@ -579,8 +673,7 @@ mod tests {
 
         // Reload. Counters must match exactly.
         drop(issuer);
-        let reloaded =
-            StampIssuer::open_or_new(path.clone(), batch_id, 12, 8, true).unwrap();
+        let reloaded = StampIssuer::open_or_new(path.clone(), batch_id, 12, 8, true).unwrap();
         assert_eq!(reloaded.issued_count(), 50);
         assert_eq!(reloaded.buckets, buckets_before);
 
@@ -598,8 +691,7 @@ mod tests {
         let batch_id = [0xcdu8; 32];
 
         // First run: issue 5 stamps on the same chunk address.
-        let mut issuer1 =
-            StampIssuer::open_or_new(path.clone(), batch_id, 14, 8, true).unwrap();
+        let mut issuer1 = StampIssuer::open_or_new(path.clone(), batch_id, 14, 8, true).unwrap();
         let chunk = [0u8; 32]; // same bucket every time
         let mut issued: Vec<[u8; 8]> = Vec::new();
         for _ in 0..5 {
@@ -615,8 +707,7 @@ mod tests {
         // Simulated crash: drop, then re-open with no graceful shutdown.
         drop(issuer1);
 
-        let mut issuer2 =
-            StampIssuer::open_or_new(path.clone(), batch_id, 14, 8, true).unwrap();
+        let mut issuer2 = StampIssuer::open_or_new(path.clone(), batch_id, 14, 8, true).unwrap();
         // Next index for the same bucket must be 5, not 0.
         let (idx, _) = issuer2.increment(&chunk).unwrap();
         let within = u32::from_be_bytes(idx[4..8].try_into().unwrap());
@@ -656,8 +747,7 @@ mod tests {
         let path = dir.join("batch.bin");
         let batch_id = [0xeeu8; 32];
         {
-            let mut issuer =
-                StampIssuer::open_or_new(path.clone(), batch_id, 12, 8, true).unwrap();
+            let mut issuer = StampIssuer::open_or_new(path.clone(), batch_id, 12, 8, true).unwrap();
             // Issue at least one stamp so the buckets blob is non-zero
             // somewhere.
             issuer.increment(&[0u8; 32]).unwrap();
@@ -668,8 +758,7 @@ mod tests {
         bytes[target] ^= 0xff;
         std::fs::write(&path, &bytes).unwrap();
 
-        let err =
-            StampIssuer::open_or_new(path.clone(), batch_id, 12, 8, true).unwrap_err();
+        let err = StampIssuer::open_or_new(path.clone(), batch_id, 12, 8, true).unwrap_err();
         assert!(
             matches!(err, PostageError::Load(_)),
             "expected Load error on checksum mismatch, got {err:?}",

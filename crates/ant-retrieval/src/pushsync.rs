@@ -8,7 +8,7 @@ use thiserror::Error;
 use tracing::{debug, trace};
 
 use crate::{
-    read_delimited, write_delimited, PbHeaders, HEADERS_MAX, RETRIEVE_TIMEOUT, RetrievalError,
+    read_delimited, write_delimited, PbHeaders, RetrievalError, HEADERS_MAX, RETRIEVE_TIMEOUT,
 };
 
 /// Bee `pkg/pushsync/pushsync.go` pinned protocol id.
@@ -139,9 +139,9 @@ fn map_retrieval(e: RetrievalError) -> PushSyncError {
         RetrievalError::Io(io) => PushSyncError::Io(io),
         RetrievalError::ProstEncode(pe) => PushSyncError::ProstEncode(pe),
         RetrievalError::ProstDecode(pe) => PushSyncError::ProstDecode(pe),
-        RetrievalError::MessageTooLarge { got, cap } => PushSyncError::Remote(format!(
-            "message too large: {got} (cap {cap})"
-        )),
+        RetrievalError::MessageTooLarge { got, cap } => {
+            PushSyncError::Remote(format!("message too large: {got} (cap {cap})"))
+        }
         RetrievalError::OpenStream(s) => PushSyncError::OpenStream(s),
         RetrievalError::Timeout(d) => PushSyncError::Timeout(d),
         RetrievalError::Remote(s) => PushSyncError::Remote(s),

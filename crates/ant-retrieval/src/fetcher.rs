@@ -18,10 +18,10 @@
 //! manifest walk is so long-lived that it matters in practice. Re-issuing
 //! the command is cheap.
 
-use crate::progress::ProgressTracker;
 use crate::accounting::{Accounting, DebitGuard};
 use crate::counters::RetrievalCounters;
 use crate::disk_cache::DiskChunkCache;
+use crate::progress::ProgressTracker;
 use crate::{retrieve_chunk, ChunkFetcher, InMemoryChunkCache, RetrievalError, RetrievedChunk};
 use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -390,19 +390,10 @@ impl RoutingFetcher {
                 Ordering::Equal
             });
             let Some((peer, _)) = ranked.first().copied() else {
-                return Err(crate::pushsync::PushSyncError::Remote(
-                    "no peers".into(),
-                ));
+                return Err(crate::pushsync::PushSyncError::Remote("no peers".into()));
             };
 
-            match push_chunk_to_peer(
-                &mut control,
-                peer,
-                chunk_addr,
-                wire.as_slice(),
-                &stamp,
-            )
-            .await
+            match push_chunk_to_peer(&mut control, peer, chunk_addr, wire.as_slice(), &stamp).await
             {
                 Ok(_) => return Ok(()),
                 Err(e) => {
@@ -586,74 +577,70 @@ impl ChunkFetcher for RoutingFetcher {
         // walk continues to the next-closest peer — exactly bee's
         // `pkg/retrieval/retrieval.go` flow when `prepareCredit`
         // returns `ErrOverdraft`.
-        let pick_next = |asked: &Vec<PeerId>,
-                         overdraft_skip: &mut std::collections::HashMap<
-            PeerId,
-            std::time::Instant,
-        >|
-         -> Option<(PeerId, Option<DebitGuard>)> {
-            let now = std::time::Instant::now();
-            // Sweep expired overdraft entries so the candidate set
-            // reopens once `lightRefreshRate` has had time to clear
-            // the peer's debt on bee's side.
-            overdraft_skip.retain(|_, until| now < *until);
-            let ranked = self.ranked(&addr);
-            for (peer, peer_overlay) in ranked {
-                if asked.contains(&peer) {
-                    continue;
-                }
-                if overdraft_skip.contains_key(&peer) {
-                    continue;
-                }
-                match self.accounting.as_ref() {
-                    Some(acc) => {
-                        let price = Accounting::peer_price(&peer_overlay, &addr);
-                        match acc.try_reserve(peer, price) {
-                            Some(guard) => return Some((peer, Some(guard))),
-                            None => {
-                                trace!(
-                                    target: "ant_retrieval::fetcher",
-                                    %peer,
-                                    chunk = %hex::encode(addr),
-                                    price,
-                                    "overdraft skip; trying next-closest peer",
-                                );
-                                overdraft_skip
-                                    .insert(peer, now + crate::accounting::OVERDRAFT_REFRESH);
-                                continue;
+        let pick_next =
+            |asked: &Vec<PeerId>,
+             overdraft_skip: &mut std::collections::HashMap<PeerId, std::time::Instant>|
+             -> Option<(PeerId, Option<DebitGuard>)> {
+                let now = std::time::Instant::now();
+                // Sweep expired overdraft entries so the candidate set
+                // reopens once `lightRefreshRate` has had time to clear
+                // the peer's debt on bee's side.
+                overdraft_skip.retain(|_, until| now < *until);
+                let ranked = self.ranked(&addr);
+                for (peer, peer_overlay) in ranked {
+                    if asked.contains(&peer) {
+                        continue;
+                    }
+                    if overdraft_skip.contains_key(&peer) {
+                        continue;
+                    }
+                    match self.accounting.as_ref() {
+                        Some(acc) => {
+                            let price = Accounting::peer_price(&peer_overlay, &addr);
+                            match acc.try_reserve(peer, price) {
+                                Some(guard) => return Some((peer, Some(guard))),
+                                None => {
+                                    trace!(
+                                        target: "ant_retrieval::fetcher",
+                                        %peer,
+                                        chunk = %hex::encode(addr),
+                                        price,
+                                        "overdraft skip; trying next-closest peer",
+                                    );
+                                    overdraft_skip
+                                        .insert(peer, now + crate::accounting::OVERDRAFT_REFRESH);
+                                    continue;
+                                }
                             }
                         }
+                        None => return Some((peer, None)),
                     }
-                    None => return Some((peer, None)),
                 }
-            }
-            None
-        };
+                None
+            };
 
         // True iff at least one ranked peer is admissible right now —
         // i.e., not in `asked`, not in the overdraft skip set. Used by
         // the "give up" arm of the loop. Doesn't actually try_reserve
         // (cheaper, and avoids burning a reservation we'd discard).
-        let candidate_available = |asked: &Vec<PeerId>,
-                                   overdraft_skip: &std::collections::HashMap<
-            PeerId,
-            std::time::Instant,
-        >|
-         -> bool {
-            let now = std::time::Instant::now();
-            for (peer, _) in self.ranked(&addr) {
-                if asked.contains(&peer) {
-                    continue;
-                }
-                if let Some(until) = overdraft_skip.get(&peer) {
-                    if now < *until {
+        let candidate_available =
+            |asked: &Vec<PeerId>,
+             overdraft_skip: &std::collections::HashMap<PeerId, std::time::Instant>|
+             -> bool {
+                let now = std::time::Instant::now();
+                for (peer, _) in self.ranked(&addr) {
+                    if asked.contains(&peer) {
                         continue;
                     }
+                    if let Some(until) = overdraft_skip.get(&peer) {
+                        if now < *until {
+                            continue;
+                        }
+                    }
+                    return true;
                 }
-                return true;
-            }
-            false
-        };
+                false
+            };
 
         // Initial dispatch.
         match pick_next(&asked, &mut overdraft_skip) {
@@ -1246,9 +1233,7 @@ mod tests {
         use tempfile::tempdir;
 
         let dir = tempdir().unwrap();
-        let disk = Arc::new(
-            DiskChunkCache::open(dir.path().join("disk.sqlite"), 1 << 20).unwrap(),
-        );
+        let disk = Arc::new(DiskChunkCache::open(dir.path().join("disk.sqlite"), 1 << 20).unwrap());
         let (addr, wire) = cac_new(b"tier-2 hit").unwrap();
         disk.put(addr, wire.clone()).await.unwrap();
 
@@ -1294,7 +1279,10 @@ mod tests {
 
         let _ = fetcher.fetch(addr).await.expect("memory hit");
         let snap = counters.snapshot();
-        assert_eq!(snap.disk_hits, 1, "warm in-memory hit must not bump disk_hits");
+        assert_eq!(
+            snap.disk_hits, 1,
+            "warm in-memory hit must not bump disk_hits"
+        );
         assert_eq!(snap.mem_hits, 1, "warm in-memory hit must bump mem_hits");
         assert_eq!(snap.chunks_fetched, 2);
     }
@@ -1314,9 +1302,7 @@ mod tests {
         use tempfile::tempdir;
 
         let dir = tempdir().unwrap();
-        let disk = Arc::new(
-            DiskChunkCache::open(dir.path().join("disk.sqlite"), 1 << 20).unwrap(),
-        );
+        let disk = Arc::new(DiskChunkCache::open(dir.path().join("disk.sqlite"), 1 << 20).unwrap());
         let (addr, wire) = cac_new(b"bypass test").unwrap();
         disk.put(addr, wire.clone()).await.unwrap();
         assert_eq!(disk.row_count().await.unwrap(), 1);
@@ -1328,8 +1314,8 @@ mod tests {
         let (_tx, rx) = watch::channel(Vec::new());
         let behaviour = libp2p_stream::Behaviour::default();
         let control = behaviour.new_control();
-        let fetcher = RoutingFetcher::new(control, rx)
-            .with_cache(Arc::new(InMemoryChunkCache::new(8)));
+        let fetcher =
+            RoutingFetcher::new(control, rx).with_cache(Arc::new(InMemoryChunkCache::new(8)));
 
         let res = fetcher.fetch(addr).await;
         assert!(res.is_err(), "bypass must not consult the disk cache");

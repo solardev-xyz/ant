@@ -9,7 +9,8 @@
 //! see the terminal line, so the v1 single-shot framing is preserved.
 
 use crate::protocol::{
-    GetProgress, Request, Response, StatusSnapshot, VersionInfo, PROTOCOL_VERSION,
+    GetProgress, PostageStatusView, Request, Response, StatusSnapshot, UploadJobView, VersionInfo,
+    PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -174,6 +175,55 @@ pub enum ControlCommand {
         wire: Vec<u8>,
         ack: oneshot::Sender<ControlAck>,
     },
+    /// Create a new upload job. The node loop forwards to its
+    /// `UploadManager`, which writes the persistent manifest, spawns
+    /// the driver task, and acks with the assigned job id.
+    UploadStart {
+        source_path: PathBuf,
+        batch_id: Option<String>,
+        name: Option<String>,
+        content_type: Option<String>,
+        /// Skip the trailing single-file mantaray manifest. The
+        /// completed job's `reference` is the data root chunk
+        /// address (a `/bytes/<ref>` reference). See the
+        /// [`Request::UploadStart`] doc for the trade-off.
+        raw: bool,
+        ack: oneshot::Sender<ControlAck>,
+    },
+    /// Snapshot every known upload job. Cheap (returns the in-memory
+    /// table; no I/O).
+    UploadList { ack: oneshot::Sender<ControlAck> },
+    /// Snapshot one upload job by id (or unique 8-hex-char prefix).
+    UploadStatus {
+        job_id: String,
+        ack: oneshot::Sender<ControlAck>,
+    },
+    /// Soft-stop, hard-stop, or restart an upload job. Each variant
+    /// acks with a fresh [`UploadJobView`] reflecting the new state.
+    UploadPause {
+        job_id: String,
+        ack: oneshot::Sender<ControlAck>,
+    },
+    UploadResume {
+        job_id: String,
+        ack: oneshot::Sender<ControlAck>,
+    },
+    UploadCancel {
+        job_id: String,
+        ack: oneshot::Sender<ControlAck>,
+    },
+    /// Subscribe to live upload progress. Sends zero or more
+    /// [`ControlAck::UploadProgress`] frames followed by a terminal
+    /// [`ControlAck::UploadJob`] / [`ControlAck::Error`] when the job
+    /// reaches a terminal status (or an error happens).
+    UploadFollow {
+        job_id: String,
+        ack: mpsc::Sender<ControlAck>,
+    },
+    /// Snapshot of the local postage stamp issuer (capacity, fill,
+    /// per-bucket extremes). Pure local read — no chain RPC, no
+    /// network round-trip.
+    PostageStatus { ack: oneshot::Sender<ControlAck> },
 }
 
 /// Inclusive byte range used by [`ControlCommand::StreamBytes`] and
@@ -230,6 +280,21 @@ pub enum ControlAck {
     ChunkUploaded {
         reference: String,
     },
+    /// Successful `UploadStart`.
+    UploadStarted {
+        job_id: String,
+    },
+    /// Snapshot of one upload job (terminal ack on
+    /// `UploadStatus`/`UploadPause`/`UploadResume`/`UploadCancel`,
+    /// terminal frame on `UploadFollow`).
+    UploadJob(UploadJobView),
+    /// Snapshot of every upload job (terminal ack on `UploadList`).
+    UploadList(Vec<UploadJobView>),
+    /// Streaming progress frame for `UploadFollow`. Non-terminal.
+    UploadProgress(UploadJobView),
+    /// Local postage stamp issuer snapshot. Terminal ack on
+    /// `PostageStatus`.
+    PostageStatus(PostageStatusView),
     Error {
         message: String,
     },
@@ -252,6 +317,7 @@ impl ControlAck {
                 | ControlAck::BytesStreamStart { .. }
                 | ControlAck::BzzStreamStart { .. }
                 | ControlAck::BytesChunk { .. }
+                | ControlAck::UploadProgress(_)
         )
     }
 }
@@ -441,6 +507,82 @@ async fn handle_connection(
                 .await?;
             }
         },
+        Ok(Request::UploadStart {
+            source_path,
+            batch_id,
+            name,
+            content_type,
+            raw,
+        }) => {
+            let response = dispatch_oneshot(command_tx.as_ref(), FAST_COMMAND_TIMEOUT, |ack| {
+                ControlCommand::UploadStart {
+                    source_path: PathBuf::from(source_path),
+                    batch_id,
+                    name,
+                    content_type,
+                    raw,
+                    ack,
+                }
+            })
+            .await;
+            write_response(&mut write_half, &response).await?;
+        }
+        Ok(Request::UploadList) => {
+            let response = dispatch_oneshot(command_tx.as_ref(), FAST_COMMAND_TIMEOUT, |ack| {
+                ControlCommand::UploadList { ack }
+            })
+            .await;
+            write_response(&mut write_half, &response).await?;
+        }
+        Ok(Request::UploadStatus { job_id }) => {
+            let response = dispatch_oneshot(command_tx.as_ref(), FAST_COMMAND_TIMEOUT, |ack| {
+                ControlCommand::UploadStatus { job_id, ack }
+            })
+            .await;
+            write_response(&mut write_half, &response).await?;
+        }
+        Ok(Request::UploadPause { job_id }) => {
+            let response = dispatch_oneshot(command_tx.as_ref(), FAST_COMMAND_TIMEOUT, |ack| {
+                ControlCommand::UploadPause { job_id, ack }
+            })
+            .await;
+            write_response(&mut write_half, &response).await?;
+        }
+        Ok(Request::UploadResume { job_id }) => {
+            let response = dispatch_oneshot(command_tx.as_ref(), FAST_COMMAND_TIMEOUT, |ack| {
+                ControlCommand::UploadResume { job_id, ack }
+            })
+            .await;
+            write_response(&mut write_half, &response).await?;
+        }
+        Ok(Request::UploadCancel { job_id }) => {
+            let response = dispatch_oneshot(command_tx.as_ref(), FAST_COMMAND_TIMEOUT, |ack| {
+                ControlCommand::UploadCancel { job_id, ack }
+            })
+            .await;
+            write_response(&mut write_half, &response).await?;
+        }
+        Ok(Request::PostageStatus) => {
+            let response = dispatch_oneshot(command_tx.as_ref(), FAST_COMMAND_TIMEOUT, |ack| {
+                ControlCommand::PostageStatus { ack }
+            })
+            .await;
+            write_response(&mut write_half, &response).await?;
+        }
+        Ok(Request::UploadFollow { job_id }) => {
+            // Use the upload-specific timeout: a stalled upload may
+            // emit no progress for many seconds (e.g. waiting on a
+            // slow neighbour during pushsync), so reuse the
+            // tree-command timeout that already covers the
+            // analogous "no progress for a while" case on reads.
+            dispatch_streaming(
+                &mut write_half,
+                command_tx.as_ref(),
+                TREE_COMMAND_TIMEOUT,
+                |ack| ControlCommand::UploadFollow { job_id, ack },
+            )
+            .await?;
+        }
         Err(e) => {
             write_response(
                 &mut write_half,
@@ -585,6 +727,11 @@ fn ack_to_response(ack: ControlAck) -> Response {
             message: "stream complete".to_string(),
         },
         ControlAck::ChunkUploaded { reference } => Response::ChunkUploaded { reference },
+        ControlAck::UploadStarted { job_id } => Response::UploadStarted { job_id },
+        ControlAck::UploadJob(view) => Response::UploadJob(view),
+        ControlAck::UploadList(views) => Response::UploadList(views),
+        ControlAck::UploadProgress(view) => Response::UploadProgress(view),
+        ControlAck::PostageStatus(view) => Response::PostageStatus(view),
         ControlAck::Error { message } => Response::Error { message },
     }
 }

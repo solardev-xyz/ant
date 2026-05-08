@@ -4,8 +4,9 @@
 //! `ant-control::Request` / `Response`).
 
 use ant_control::{
-    request_streaming, request_sync, GatewayRequestInfo, GetProgress, PeerConnectionInfo,
-    PeerConnectionState, Request, Response, RetrievalInfo, StatusSnapshot,
+    request_streaming, request_sync, request_upload_follow, GatewayRequestInfo, GetProgress,
+    PeerConnectionInfo, PeerConnectionState, Request, Response, RetrievalInfo, StatusSnapshot,
+    UploadJobView,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -106,6 +107,19 @@ Examples:
         #[command(subcommand)]
         command: ChequebookCommand,
     },
+    /// Upload a file to Swarm via the daemon's pushsync path.
+    /// Default invocation (`antctl upload <path>`) starts a new
+    /// job and follows it until the manifest reference is known —
+    /// Ctrl+C detaches (the upload keeps running on `antd`); a
+    /// second Ctrl+C cancels.
+    ///
+    /// Subcommands `list / status / pause / resume / cancel /
+    /// follow` operate on existing jobs. Job ids are 16 hex chars;
+    /// any unique 8-hex prefix also resolves.
+    Upload {
+        #[command(subcommand)]
+        command: UploadCommand,
+    },
     Get {
         /// Reference. See above for accepted forms.
         reference: String,
@@ -184,6 +198,95 @@ enum PeersCommand {
     /// in-memory dedup set. Existing connections stay up; the next restart
     /// will bootstrap fresh through the bootnodes.
     Reset,
+}
+
+#[derive(Subcommand, Debug)]
+enum UploadCommand {
+    /// Start a new upload job. Without `--detach`, the command also
+    /// follows the job and prints a live progress line until the
+    /// upload completes; press Ctrl+C to detach (the job keeps
+    /// running in the daemon — use `antctl upload follow <id>` to
+    /// reattach later, or `cancel <id>` to abort).
+    Start {
+        /// Source file. Must be a regular file the daemon can read.
+        path: PathBuf,
+        /// Optional postage batch override (`0x` + 64 hex). Defaults
+        /// to the daemon's `--postage-batch` if absent.
+        #[arg(long)]
+        batch: Option<String>,
+        /// Filename to embed in the single-file mantaray manifest.
+        /// Defaults to the source file's basename. Ignored when
+        /// `--raw` is set.
+        #[arg(long)]
+        name: Option<String>,
+        /// MIME type for the manifest entry. Defaults to
+        /// `application/octet-stream`. Ignored when `--raw` is
+        /// set.
+        #[arg(long)]
+        content_type: Option<String>,
+        /// Skip the trailing single-file mantaray manifest. The
+        /// returned reference is the raw data root chunk address
+        /// — fetch it with `/bytes/<ref>` (not `/bzz/<ref>`).
+        /// Saves 1-2 chunks of postage and a final round-trip;
+        /// loses the embedded filename + content-type, so the
+        /// downloader has to know the file type out-of-band. Use
+        /// for content-addressed blob storage where the consumer
+        /// is your own code; leave off when humans / browsers
+        /// will fetch the result.
+        #[arg(long)]
+        raw: bool,
+        /// Skip the postage pre-flight check that compares the
+        /// file's estimated chunk count against the daemon's
+        /// worst-case remaining-chunk budget (`antctl postage
+        /// status`). Useful for scripts that have already done
+        /// their own accounting, or when the operator
+        /// intentionally wants to top up / dilute mid-upload. The
+        /// pre-flight is a stderr warning, not a hard block, so
+        /// most callers can leave this off.
+        #[arg(long)]
+        no_preflight: bool,
+        /// Return immediately after the daemon registers the job.
+        /// Use `antctl upload follow <id>` to attach to its
+        /// progress later. Without this flag the command blocks
+        /// and prints live progress.
+        #[arg(long)]
+        detach: bool,
+    },
+    /// List every known upload job (running, paused, completed,
+    /// cancelled, failed). Output is sorted by creation time with
+    /// the oldest first.
+    List,
+    /// Snapshot one job by id (or unique 8-hex prefix).
+    Status {
+        /// Job id, or any unique prefix.
+        job_id: String,
+    },
+    /// Stream live progress for a job until it reaches a terminal
+    /// status (or the user disconnects with Ctrl+C).
+    Follow {
+        /// Job id, or any unique prefix.
+        job_id: String,
+    },
+    /// Soft-stop a running job. The driver drains in-flight pushes,
+    /// checkpoints state, and parks. Use `resume` to bring it back.
+    Pause {
+        /// Job id, or any unique prefix.
+        job_id: String,
+    },
+    /// Bring a paused or failed job back to running. Spawns a
+    /// fresh driver task; any error stored in `last_error` is
+    /// cleared.
+    Resume {
+        /// Job id, or any unique prefix.
+        job_id: String,
+    },
+    /// Hard-stop a job. Already-pushed chunks stay in the network
+    /// (Swarm GCs them at postage TTL expiry — there's no unpush);
+    /// the daemon updates the on-disk manifest to `cancelled`.
+    Cancel {
+        /// Job id, or any unique prefix.
+        job_id: String,
+    },
 }
 
 /// Common chain-write flags shared by every `postage` write subcommand.
@@ -328,6 +431,23 @@ enum PostageCommand {
         )]
         bzz_token: String,
     },
+    /// Live snapshot of the daemon's local postage stamp issuer:
+    /// theoretical capacity, indices issued so far, per-bucket fill
+    /// extremes, and the conservative "worst-case remaining chunks"
+    /// budget that bounds the size of the next upload. Pure local
+    /// read against `antd` — no on-chain RPC, so the chain flags
+    /// (`--gnosis-rpc-url`, `--postage-contract`, key envs) are not
+    /// required.
+    Status {
+        /// Path to the daemon's control socket. Defaults to
+        /// `<data-dir>/antd.sock`.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// Data directory, used to locate the default control
+        /// socket.
+        #[arg(long, default_value = "~/.antd")]
+        data_dir: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -456,11 +576,29 @@ fn main() -> Result<()> {
                 other => bail!("unexpected response: {other:?}"),
             }
         }
-        Command::Postage { command } => {
-            run_postage(command, opt.json)?;
-        }
+        Command::Postage { command } => match command {
+            // `Status` doesn't need a tokio runtime or chain RPC —
+            // it talks to the local daemon socket synchronously,
+            // exactly like `antctl status`.
+            PostageCommand::Status {
+                socket: socket_override,
+                data_dir,
+            } => {
+                let s = match socket_override {
+                    Some(s) => s,
+                    None => default_socket_for(&data_dir)?,
+                };
+                run_postage_status(&s, opt.json)?;
+            }
+            other => {
+                run_postage(other, opt.json)?;
+            }
+        },
         Command::Chequebook { command } => {
             run_chequebook(command, opt.json)?;
+        }
+        Command::Upload { command } => {
+            run_upload(&socket, command, opt.json)?;
         }
         Command::Get {
             reference,
@@ -623,7 +761,10 @@ async fn run_chequebook_async(cmd: ChequebookCommand, json: bool) -> Result<()> 
                     let addr = parse_addr(&b)?;
                     let calldata = chequebook_paid_out_calldata(&addr);
                     let v = client
-                        .eth_call(&format!("0x{}", hex::encode(cb)), &format!("0x{}", hex::encode(&calldata)))
+                        .eth_call(
+                            &format!("0x{}", hex::encode(cb)),
+                            &format!("0x{}", hex::encode(&calldata)),
+                        )
                         .await
                         .context("paidOut")?;
                     let w = ant_chain_padded_last_word(&v)?;
@@ -634,8 +775,14 @@ async fn run_chequebook_async(cmd: ChequebookCommand, json: bool) -> Result<()> 
 
             if json {
                 let mut obj = serde_json::Map::new();
-                obj.insert("chequebook".into(), serde_json::Value::String(hex_addr(&cb)));
-                obj.insert("issuer".into(), serde_json::Value::String(hex_addr(&issuer)));
+                obj.insert(
+                    "chequebook".into(),
+                    serde_json::Value::String(hex_addr(&cb)),
+                );
+                obj.insert(
+                    "issuer".into(),
+                    serde_json::Value::String(hex_addr(&issuer)),
+                );
                 obj.insert(
                     "balance_plur".into(),
                     serde_json::Value::String(balance.to_string()),
@@ -649,7 +796,10 @@ async fn run_chequebook_async(cmd: ChequebookCommand, json: bool) -> Result<()> 
                     serde_json::Value::String(liquid.to_string()),
                 );
                 if let Some(addr) = beneficiary_addr {
-                    obj.insert("beneficiary".into(), serde_json::Value::String(hex_addr(&addr)));
+                    obj.insert(
+                        "beneficiary".into(),
+                        serde_json::Value::String(hex_addr(&addr)),
+                    );
                     obj.insert(
                         "paid_out_plur".into(),
                         serde_json::Value::String(paid_out.unwrap().to_string()),
@@ -685,8 +835,8 @@ async fn run_chequebook_async(cmd: ChequebookCommand, json: bool) -> Result<()> 
 
             let client = ChainClient::new(gnosis_rpc_url);
 
-            let issuer_wallet = Wallet::new(issuer_secret, GNOSIS_CHAIN_ID)
-                .context("derive issuer wallet")?;
+            let issuer_wallet =
+                Wallet::new(issuer_secret, GNOSIS_CHAIN_ID).context("derive issuer wallet")?;
             let issuer_addr = *issuer_wallet.address();
 
             let mut beneficiary_wallet = Wallet::new(beneficiary_secret, GNOSIS_CHAIN_ID)
@@ -705,8 +855,7 @@ async fn run_chequebook_async(cmd: ChequebookCommand, json: bool) -> Result<()> 
             // key derives to chequebook.issuer(), and we know the
             // current paidOut[beneficiary] so we can build a cheque
             // the contract won't reject as already-cashed.
-            let onchain_issuer =
-                read_address(&client, &cb, &chequebook_issuer_selector()).await?;
+            let onchain_issuer = read_address(&client, &cb, &chequebook_issuer_selector()).await?;
             if onchain_issuer != issuer_addr {
                 bail!(
                     "issuer mismatch: chequebook.issuer() = {}, but --issuer-key derives to {}",
@@ -714,8 +863,7 @@ async fn run_chequebook_async(cmd: ChequebookCommand, json: bool) -> Result<()> 
                     hex_addr(&issuer_addr),
                 );
             }
-            let liquid =
-                read_u256(&client, &cb, &chequebook_liquid_balance_selector()).await?;
+            let liquid = read_u256(&client, &cb, &chequebook_liquid_balance_selector()).await?;
             let paid_calldata = chequebook_paid_out_calldata(&beneficiary_addr);
             let v = client
                 .eth_call(
@@ -738,8 +886,8 @@ async fn run_chequebook_async(cmd: ChequebookCommand, json: bool) -> Result<()> 
                 beneficiary: beneficiary_addr,
                 cumulative_payout: cumulative,
             };
-            let signed = sign_cheque(&issuer_secret, &cheque, GNOSIS_CHAIN_ID)
-                .context("sign cheque")?;
+            let signed =
+                sign_cheque(&issuer_secret, &cheque, GNOSIS_CHAIN_ID).context("sign cheque")?;
             let signature = signed.signature;
 
             let local_digest = cheque_digest(&cheque, GNOSIS_CHAIN_ID);
@@ -767,11 +915,8 @@ async fn run_chequebook_async(cmd: ChequebookCommand, json: bool) -> Result<()> 
             // (our wire format is wrong) from "liquid balance not
             // sufficient" (signature OK, the chequebook just hasn't
             // got the BZZ on-hand to actually pay out).
-            let calldata = cash_cheque_beneficiary_calldata(
-                &recipient_addr,
-                cumulative,
-                &signature,
-            );
+            let calldata =
+                cash_cheque_beneficiary_calldata(&recipient_addr, cumulative, &signature);
             let dry_run = client
                 .eth_call_from(&beneficiary_addr, &cb, &calldata)
                 .await;
@@ -820,16 +965,40 @@ async fn run_chequebook_async(cmd: ChequebookCommand, json: bool) -> Result<()> 
 
             if json {
                 let mut obj = serde_json::Map::new();
-                obj.insert("chequebook".into(), serde_json::Value::String(hex_addr(&cb)));
-                obj.insert("issuer".into(), serde_json::Value::String(hex_addr(&issuer_addr)));
-                obj.insert("beneficiary".into(), serde_json::Value::String(hex_addr(&beneficiary_addr)));
-                obj.insert("recipient".into(), serde_json::Value::String(hex_addr(&recipient_addr)));
-                obj.insert("cumulative_payout_plur".into(), serde_json::Value::String(cumulative.to_string()));
-                obj.insert("paid_out_before_plur".into(), serde_json::Value::String(already_paid.to_string()));
+                obj.insert(
+                    "chequebook".into(),
+                    serde_json::Value::String(hex_addr(&cb)),
+                );
+                obj.insert(
+                    "issuer".into(),
+                    serde_json::Value::String(hex_addr(&issuer_addr)),
+                );
+                obj.insert(
+                    "beneficiary".into(),
+                    serde_json::Value::String(hex_addr(&beneficiary_addr)),
+                );
+                obj.insert(
+                    "recipient".into(),
+                    serde_json::Value::String(hex_addr(&recipient_addr)),
+                );
+                obj.insert(
+                    "cumulative_payout_plur".into(),
+                    serde_json::Value::String(cumulative.to_string()),
+                );
+                obj.insert(
+                    "paid_out_before_plur".into(),
+                    serde_json::Value::String(already_paid.to_string()),
+                );
                 obj.insert("dry_run".into(), serde_json::Value::String(dry_status));
-                obj.insert("signature_accepted".into(), serde_json::Value::Bool(signature_ok));
+                obj.insert(
+                    "signature_accepted".into(),
+                    serde_json::Value::Bool(signature_ok),
+                );
                 if let Some(h) = tx_hash {
-                    obj.insert("tx".into(), serde_json::Value::String(format!("0x{}", hex::encode(h))));
+                    obj.insert(
+                        "tx".into(),
+                        serde_json::Value::String(format!("0x{}", hex::encode(h))),
+                    );
                 }
                 if let Some(b) = block_number {
                     obj.insert("block".into(), serde_json::Value::Number(b.into()));
@@ -900,9 +1069,7 @@ fn ant_chain_padded_last_word(data: &[u8]) -> Result<[u8; 32]> {
 }
 
 async fn run_postage_async(cmd: PostageCommand, json: bool) -> Result<()> {
-    use ant_chain::tx::{
-        extract_created_batch_id, Wallet, GNOSIS_CHAIN_ID,
-    };
+    use ant_chain::tx::{extract_created_batch_id, Wallet, GNOSIS_CHAIN_ID};
     use ant_chain::{fetch_postage_batch_meta, ChainClient};
     use primitive_types::U256;
     use std::time::Duration;
@@ -1171,8 +1338,7 @@ async fn run_postage_async(cmd: PostageCommand, json: bool) -> Result<()> {
                              not set",
                         )?;
                     let secret = parse_secret(&key)?;
-                    let wallet = Wallet::new(secret, GNOSIS_CHAIN_ID)
-                        .context("derive wallet")?;
+                    let wallet = Wallet::new(secret, GNOSIS_CHAIN_ID).context("derive wallet")?;
                     *wallet.address()
                 }
             };
@@ -1200,15 +1366,254 @@ async fn run_postage_async(cmd: PostageCommand, json: bool) -> Result<()> {
                 println!("  BZZ    {} PLUR ({})", bzz, format_eth_16(bzz));
             }
         }
+        PostageCommand::Status { .. } => {
+            // Routed via `main` -> `run_postage_status` so we don't
+            // pay the cost of building a tokio runtime + chain
+            // context for a pure local socket round-trip. This arm
+            // keeps the match exhaustive but is unreachable in
+            // practice.
+            unreachable!("PostageCommand::Status is dispatched in main, not here");
+        }
     }
     Ok(())
+}
+
+/// Local control-socket call: snapshot the daemon's stamp issuer
+/// state and pretty-print it (or emit JSON). No chain RPC.
+fn run_postage_status(socket: &Path, json: bool) -> Result<()> {
+    let resp = request_sync(socket, &Request::PostageStatus)
+        .with_context(|| format!("talk to antd at {}", socket.display()))?;
+    let view = match resp {
+        Response::PostageStatus(v) => v,
+        Response::Error { message } => bail!("antd: {message}"),
+        other => bail!("unexpected response: {other:?}"),
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&view).context("serialise postage status")?,
+        );
+        return Ok(());
+    }
+    print_postage_status(&view);
+    Ok(())
+}
+
+/// Render a `PostageStatusView` as a human-readable block. Matches
+/// the column-aligned style of the upload status block so the two
+/// look like siblings in CLI sessions.
+fn print_postage_status(v: &ant_control::PostageStatusView) {
+    if !v.enabled {
+        println!("uploads disabled");
+        println!("  reason  no postage batch configured on antd");
+        println!("          set --postage-batch / STORAGE_STAMP_BATCH_ID and restart");
+        return;
+    }
+
+    let total_bytes = v.total_capacity_chunks.saturating_mul(CHUNK_SIZE_BYTES);
+    let issued_bytes = v.issued_chunks.saturating_mul(CHUNK_SIZE_BYTES);
+    let remaining_bytes = v.remaining_total_chunks.saturating_mul(CHUNK_SIZE_BYTES);
+    let worst_case_bytes = v
+        .worst_case_remaining_chunks
+        .saturating_mul(CHUNK_SIZE_BYTES);
+    let issued_pct = pct(v.issued_chunks, v.total_capacity_chunks);
+    let bucket_max_pct = pct(u64::from(v.bucket_fill_max), u64::from(v.bucket_capacity));
+
+    println!("batch         {}", v.batch_id);
+    println!(
+        "  depth       {}  bucket_depth {}  immutable {}",
+        v.batch_depth, v.bucket_depth, v.immutable,
+    );
+    println!(
+        "  capacity    {} chunks  ({})",
+        v.total_capacity_chunks,
+        format_bytes(total_bytes),
+    );
+    println!(
+        "  issued      {} chunks  ({})  {:.1}%",
+        v.issued_chunks,
+        format_bytes(issued_bytes),
+        issued_pct,
+    );
+    println!(
+        "  free        {} chunks  ({})  optimistic, even routing",
+        v.remaining_total_chunks,
+        format_bytes(remaining_bytes),
+    );
+    println!(
+        "  buckets     {} total  cap {}  fullest {} ({:.1}%)  emptiest {}",
+        v.bucket_count, v.bucket_capacity, v.bucket_fill_max, bucket_max_pct, v.bucket_fill_min,
+    );
+    println!(
+        "  upload room {} chunks  ({})  worst-case (next bucket-collision)",
+        v.worst_case_remaining_chunks,
+        format_bytes(worst_case_bytes),
+    );
+    if v.immutable {
+        println!("  note        immutable batch — stamps are rejected once a bucket fills");
+    } else {
+        println!(
+            "  note        mutable batch — past worst-case room, new stamps wrap and overwrite"
+        );
+        println!("              older indices, leaving their chunks un-restampable for resync");
+    }
+}
+
+/// Swarm chunk size (data + span). Used to convert
+/// `PostageStatusView` chunk counts into byte estimates for human
+/// rendering. Mirrors `ant_retrieval::CHUNK_SIZE`; duplicated here
+/// to keep `antctl` free of an `ant-retrieval` build dep.
+const CHUNK_SIZE_BYTES: u64 = 4096;
+
+fn pct(num: u64, denom: u64) -> f64 {
+    if denom == 0 {
+        0.0
+    } else {
+        (num as f64) * 100.0 / (denom as f64)
+    }
+}
+
+/// Postage pre-flight: snapshot the daemon's stamp issuer state and
+/// compare an estimated chunk count for `source_size` against the
+/// conservative worst-case bucket budget. Bails on "uploads
+/// disabled"; warns (stderr) but does not block when the estimate
+/// exceeds the budget.
+///
+/// Why it's a warning, not a block: the operator can legitimately
+/// want to top up / dilute a batch mid-upload (`antctl postage
+/// topup` / `dilute`), or knowingly accept some chunks landing on a
+/// fresher batch in a future re-upload. The pre-flight is here to
+/// make the most common surprise — "I just kicked off a 7 GiB
+/// upload that's going to fail at 5 GiB" — observable before any
+/// chunk leaves the daemon, not to gate the operator's intent.
+fn preflight_postage(socket: &Path, source_size: u64, raw: bool) -> Result<()> {
+    let resp = match request_sync(socket, &Request::PostageStatus) {
+        Ok(r) => r,
+        Err(e) => {
+            // Older daemons that don't know `PostageStatus` answer
+            // with `Error{message:"bad request: …"}`, which
+            // request_sync surfaces as Ok(Response::Error). A
+            // transport-level error is a different case and almost
+            // certainly means the upload itself will fail next; we
+            // warn and let the caller proceed so the real error
+            // surfaces below.
+            eprintln!("warning: postage pre-flight skipped — control socket: {e}");
+            return Ok(());
+        }
+    };
+    let view = match resp {
+        Response::PostageStatus(v) => v,
+        Response::Error { message } => {
+            // Old daemon, or status temporarily unavailable.
+            eprintln!("warning: postage pre-flight skipped — antd: {message}");
+            return Ok(());
+        }
+        other => bail!("unexpected response to PostageStatus: {other:?}"),
+    };
+    if !view.enabled {
+        bail!(
+            "uploads are disabled on this daemon: no postage batch configured. \
+             Start antd with --postage-batch (or set STORAGE_STAMP_BATCH_ID) and try again",
+        );
+    }
+    let estimate = estimate_chunk_count(source_size, raw);
+    if estimate <= view.worst_case_remaining_chunks {
+        return Ok(());
+    }
+    let estimate_bytes = estimate.saturating_mul(CHUNK_SIZE_BYTES);
+    let budget_bytes = view
+        .worst_case_remaining_chunks
+        .saturating_mul(CHUNK_SIZE_BYTES);
+    let policy = if view.immutable {
+        "this immutable batch will reject the next stamp once a single bucket fills, \
+         so the upload may FAIL mid-flight"
+    } else {
+        "this mutable batch will start overwriting older indices once a single bucket fills, \
+         leaving previously-stamped chunks un-restampable for resync"
+    };
+    eprintln!(
+        "warning: estimated upload ({} chunks ≈ {}) exceeds the daemon's worst-case \
+         remaining-chunks budget ({} chunks ≈ {}). {policy}.\n         \
+         pass --no-preflight to silence this warning, or run `antctl postage topup` / `dilute` \
+         to extend the batch.",
+        estimate,
+        format_bytes(estimate_bytes),
+        view.worst_case_remaining_chunks,
+        format_bytes(budget_bytes),
+    );
+    Ok(())
+}
+
+/// Local copy of `ant_node::uploads::estimate_chunk_count`.
+/// Duplicated here so `antctl` doesn't take a build-graph
+/// dependency on `ant-node` / `ant-retrieval` just for the
+/// pre-flight chunk count. Must stay byte-compatible with the
+/// daemon's estimator; the unit test below pins both formulas to
+/// the same canonical inputs.
+fn estimate_chunk_count(source_size: u64, raw: bool) -> u64 {
+    /// Mantaray fan-out matching `ant_retrieval::BRANCHES`. Hard
+    /// constant in the splitter; would only change as part of a
+    /// chunk-format break that bumps the protocol version.
+    const BRANCHES: u64 = 128;
+    if source_size == 0 {
+        return if raw { 1 } else { 2 };
+    }
+    let leaves = source_size.div_ceil(CHUNK_SIZE_BYTES);
+    let mut total = leaves;
+    let mut level = leaves;
+    while level > 1 {
+        level = level.div_ceil(BRANCHES);
+        total += level;
+    }
+    if raw {
+        total
+    } else {
+        total + 1
+    }
+}
+
+#[cfg(test)]
+mod estimate_chunk_count_tests {
+    use super::*;
+
+    /// Pin a few canonical sizes so a divergence from the daemon's
+    /// formula is caught at CI time rather than in a real upload.
+    /// Mirrors the test fixtures used by the `ant-node::uploads`
+    /// path.
+    #[test]
+    fn matches_daemon_formula() {
+        // Empty file: one leaf chunk + one manifest chunk, or just
+        // one leaf in raw mode.
+        assert_eq!(estimate_chunk_count(0, false), 2);
+        assert_eq!(estimate_chunk_count(0, true), 1);
+
+        // Single full leaf, no intermediate.
+        assert_eq!(estimate_chunk_count(4096, false), 2);
+        assert_eq!(estimate_chunk_count(4096, true), 1);
+
+        // 2 leaves: fits in one intermediate fork; with manifest
+        // adds 1.
+        assert_eq!(estimate_chunk_count(8192, false), 4);
+        assert_eq!(estimate_chunk_count(8192, true), 3);
+
+        // 7 GiB: 1 835 008 leaves, 14 336 + 112 + 1 intermediates,
+        // + 1 manifest = 1 849 458; raw drops the manifest.
+        let size_7gib: u64 = 7 * 1024 * 1024 * 1024;
+        let raw = estimate_chunk_count(size_7gib, true);
+        let with_manifest = estimate_chunk_count(size_7gib, false);
+        assert_eq!(with_manifest, raw + 1);
+        assert_eq!(raw, 1_835_008 + 14_336 + 112 + 1);
+    }
 }
 
 fn parse_addr(s: &str) -> Result<[u8; 20]> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     let bytes = hex::decode(s).with_context(|| format!("address hex: {s}"))?;
     if bytes.len() != 20 {
-        bail!("address must be 20 bytes (40 hex chars); got {}", bytes.len());
+        bail!(
+            "address must be 20 bytes (40 hex chars); got {}",
+            bytes.len()
+        );
     }
     let mut out = [0u8; 20];
     out.copy_from_slice(&bytes);
@@ -1241,9 +1646,7 @@ fn random_word32() -> [u8; 32] {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     out[..16].copy_from_slice(&nanos.to_be_bytes()[..16]);
-    if let Ok(_) = getrandom_fill(&mut out[16..]) {
-        // ok
-    }
+    let _ = getrandom_fill(&mut out[16..]);
     out
 }
 
@@ -1270,7 +1673,11 @@ fn format_eth_18(plur: u128) -> String {
     } else {
         let frac_str = format!("{:018}", frac);
         let trimmed = frac_str.trim_end_matches('0');
-        let trimmed = if trimmed.len() > 6 { &trimmed[..6] } else { trimmed };
+        let trimmed = if trimmed.len() > 6 {
+            &trimmed[..6]
+        } else {
+            trimmed
+        };
         format!("{whole}.{trimmed} xDAI")
     }
 }
@@ -1285,7 +1692,11 @@ fn format_eth_16(plur: u128) -> String {
     } else {
         let frac_str = format!("{:016}", frac);
         let trimmed = frac_str.trim_end_matches('0');
-        let trimmed = if trimmed.len() > 6 { &trimmed[..6] } else { trimmed };
+        let trimmed = if trimmed.len() > 6 {
+            &trimmed[..6]
+        } else {
+            trimmed
+        };
         format!("{whole}.{trimmed} BZZ")
     }
 }
@@ -1769,6 +2180,312 @@ fn format_progress_elapsed(ms: u64) -> String {
     } else {
         format!("{secs}.{tenths}s")
     }
+}
+
+/// Drive the `antctl upload` subcommand tree against the daemon's
+/// control socket. Each variant maps to one or two `Request::Upload*`
+/// round-trips; the default `start` path tail-follows the new job
+/// until it reaches a terminal status (or the operator detaches with
+/// Ctrl+C — the upload survives in the daemon).
+fn run_upload(socket: &Path, command: UploadCommand, json: bool) -> Result<()> {
+    match command {
+        UploadCommand::Start {
+            path,
+            batch,
+            name,
+            content_type,
+            raw,
+            no_preflight,
+            detach,
+        } => {
+            let abs_path = path
+                .canonicalize()
+                .with_context(|| format!("source path {}", path.display()))?;
+            // Pre-flight: ask the daemon for the local stamp
+            // issuer state and compare the file's chunk estimate
+            // against the worst-case bucket budget. Bails early on
+            // "uploads disabled"; otherwise warns (never blocks)
+            // when the upload would exceed the conservative
+            // budget. `--no-preflight` skips the check entirely.
+            if !no_preflight {
+                let metadata = std::fs::metadata(&abs_path)
+                    .with_context(|| format!("stat source {}", abs_path.display()))?;
+                preflight_postage(socket, metadata.len(), raw)?;
+            }
+            let req = Request::UploadStart {
+                source_path: abs_path.display().to_string(),
+                batch_id: batch,
+                name,
+                content_type,
+                raw,
+            };
+            let resp = request_sync(socket, &req)
+                .with_context(|| format!("talk to antd at {}", socket.display()))?;
+            let job_id = match resp {
+                Response::UploadStarted { job_id } => job_id,
+                Response::Error { message } => bail!("antd: {message}"),
+                other => bail!("unexpected response: {other:?}"),
+            };
+            if json {
+                println!("{}", serde_json::json!({"ok": true, "job_id": job_id}));
+            } else {
+                eprintln!("upload {job_id} started");
+            }
+            if !detach {
+                follow_upload(socket, &job_id, json)?;
+            }
+        }
+        UploadCommand::List => {
+            let resp = request_sync(socket, &Request::UploadList)
+                .with_context(|| format!("talk to antd at {}", socket.display()))?;
+            let mut items = match resp {
+                Response::UploadList(v) => v,
+                Response::Error { message } => bail!("antd: {message}"),
+                other => bail!("unexpected response: {other:?}"),
+            };
+            items.sort_by_key(|j| j.created_at_unix);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&items).context("serialise upload list")?,
+                );
+            } else if items.is_empty() {
+                println!("no upload jobs");
+            } else {
+                print_upload_table(&items);
+            }
+        }
+        UploadCommand::Status { job_id } => {
+            let resp = request_sync(socket, &Request::UploadStatus { job_id })
+                .with_context(|| format!("talk to antd at {}", socket.display()))?;
+            print_upload_response(resp, json)?;
+        }
+        UploadCommand::Pause { job_id } => {
+            let resp = request_sync(socket, &Request::UploadPause { job_id })
+                .with_context(|| format!("talk to antd at {}", socket.display()))?;
+            print_upload_response(resp, json)?;
+        }
+        UploadCommand::Resume { job_id } => {
+            let resp = request_sync(socket, &Request::UploadResume { job_id })
+                .with_context(|| format!("talk to antd at {}", socket.display()))?;
+            print_upload_response(resp, json)?;
+        }
+        UploadCommand::Cancel { job_id } => {
+            let resp = request_sync(socket, &Request::UploadCancel { job_id })
+                .with_context(|| format!("talk to antd at {}", socket.display()))?;
+            print_upload_response(resp, json)?;
+        }
+        UploadCommand::Follow { job_id } => {
+            follow_upload(socket, &job_id, json)?;
+        }
+    }
+    Ok(())
+}
+
+fn print_upload_response(resp: Response, json: bool) -> Result<()> {
+    match resp {
+        Response::UploadJob(view) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&view).context("serialise upload job")?,
+                );
+            } else {
+                println!("{}", format_upload_view_block(&view));
+            }
+        }
+        Response::Error { message } => bail!("antd: {message}"),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+/// Tail-follow one upload job. Renders a one-line stderr status that
+/// updates on every progress frame; on terminal status (`completed`,
+/// `cancelled`, `failed`) clears the line and prints the final
+/// snapshot on stdout. Returns immediately on `EOF` (server closed
+/// the connection — same as a clean terminal) or on a
+/// [`Response::Error`].
+fn follow_upload(socket: &Path, job_id: &str, json: bool) -> Result<()> {
+    let req = Request::UploadFollow {
+        job_id: job_id.to_string(),
+    };
+    let show_progress = !json && std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let mut renderer = UploadProgressRenderer::default();
+    let terminal = request_upload_follow(socket, &req, |view| {
+        if show_progress {
+            renderer.render(view);
+        }
+    })
+    .with_context(|| format!("talk to antd at {}", socket.display()))?;
+    if show_progress {
+        renderer.finish();
+    }
+    match terminal {
+        Response::UploadJob(view) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&view).context("serialise upload job")?,
+                );
+            } else {
+                println!("{}", format_upload_view_block(&view));
+            }
+            Ok(())
+        }
+        Response::Error { message } => bail!("antd: {message}"),
+        other => bail!("unexpected response in follow: {other:?}"),
+    }
+}
+
+#[derive(Default)]
+struct UploadProgressRenderer {
+    last_line_width: usize,
+    started: bool,
+}
+
+impl UploadProgressRenderer {
+    fn render(&mut self, view: &UploadJobView) {
+        use std::io::Write as _;
+        let line = format_upload_progress_line(view);
+        let new_width = display_width(&line);
+        let padding = self.last_line_width.saturating_sub(new_width);
+        let mut err = std::io::stderr().lock();
+        let _ = write!(err, "\r\x1b[2K{line}{}", " ".repeat(padding));
+        let _ = err.flush();
+        self.last_line_width = new_width;
+        self.started = true;
+    }
+
+    fn finish(&mut self) {
+        if !self.started {
+            return;
+        }
+        use std::io::Write as _;
+        let mut err = std::io::stderr().lock();
+        let _ = write!(err, "\r\x1b[2K\r");
+        let _ = err.flush();
+    }
+}
+
+fn format_upload_progress_line(view: &UploadJobView) -> String {
+    let chunks = match view.chunks_total {
+        Some(t) if t > 0 => format!("{}/{}", view.chunks_pushed, t),
+        _ => format!("{}/?", view.chunks_pushed),
+    };
+    let bytes = if view.source_size > 0 {
+        format!(
+            "{}/{}",
+            format_bytes(view.bytes_pushed),
+            format_bytes(view.source_size),
+        )
+    } else {
+        format!("{}/?", format_bytes(view.bytes_pushed))
+    };
+    let percent = if view.source_size > 0 {
+        format!(
+            " {:>5.1}%",
+            (view.bytes_pushed as f64 * 100.0 / view.source_size as f64).min(100.0),
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "↑ [{}]{percent}  {chunks} chunks  {bytes}",
+        format_upload_status_label(&view.status),
+    )
+}
+
+fn print_upload_table(items: &[UploadJobView]) {
+    println!(
+        "{:<16}  {:<10}  {:>10}  {:<48}  PATH",
+        "JOB", "STATUS", "PROGRESS", "REFERENCE",
+    );
+    for view in items {
+        let percent = if view.source_size > 0 {
+            format!(
+                "{:>5.1}%",
+                (view.bytes_pushed as f64 * 100.0 / view.source_size as f64).min(100.0),
+            )
+        } else {
+            "  ?.?%".to_string()
+        };
+        let reference = view.reference.as_deref().unwrap_or("-").to_string();
+        let path = view.source_path.as_str();
+        println!(
+            "{:<16}  {:<10}  {:>10}  {:<48}  {}",
+            view.job_id,
+            format_upload_status_label(&view.status),
+            percent,
+            reference,
+            path,
+        );
+    }
+}
+
+fn format_upload_view_block(view: &UploadJobView) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("job_id:    {}\n", view.job_id));
+    out.push_str(&format!(
+        "status:    {}\n",
+        format_upload_status_label(&view.status)
+    ));
+    out.push_str(&format!("source:    {}\n", view.source_path));
+    out.push_str(&format!(
+        "size:      {} ({} bytes)\n",
+        format_bytes(view.source_size),
+        view.source_size,
+    ));
+    if view.source_size > 0 {
+        out.push_str(&format!(
+            "progress:  {} / {} ({:.1}%)\n",
+            format_bytes(view.bytes_pushed),
+            format_bytes(view.source_size),
+            (view.bytes_pushed as f64 * 100.0 / view.source_size as f64).min(100.0),
+        ));
+    }
+    if let Some(t) = view.chunks_total {
+        out.push_str(&format!("chunks:    {} / {}\n", view.chunks_pushed, t,));
+    } else {
+        out.push_str(&format!("chunks:    {}\n", view.chunks_pushed));
+    }
+    out.push_str(&format!(
+        "mode:      {}\n",
+        if view.raw {
+            "raw (/bytes)"
+        } else {
+            "manifest (/bzz)"
+        }
+    ));
+    if let Some(b) = &view.batch_id {
+        out.push_str(&format!("batch:     {b}\n"));
+    }
+    if let Some(n) = &view.name {
+        out.push_str(&format!("name:      {n}\n"));
+    }
+    if let Some(c) = &view.content_type {
+        out.push_str(&format!("type:      {c}\n"));
+    }
+    if let Some(r) = &view.reference {
+        out.push_str(&format!("reference: {r}\n"));
+        let scheme = if view.raw { "bytes" } else { "bzz" };
+        out.push_str(&format!(
+            "url:       {scheme}://{}\n",
+            r.trim_start_matches("0x")
+        ));
+    }
+    if let Some(e) = &view.last_error {
+        out.push_str(&format!("error:     {e}\n"));
+    }
+    // Drop the trailing newline.
+    if out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+fn format_upload_status_label(s: &str) -> &str {
+    s
 }
 
 /// Human-readable byte size: SI-ish powers of 1024 with a single decimal
@@ -2280,6 +2997,14 @@ fn resolve_socket(opt: &Opt) -> Result<PathBuf> {
     Ok(dir.join("antd.sock"))
 }
 
+/// Path of the default control socket inside `data_dir`. Mirrors
+/// [`resolve_socket`] for subcommands that take their own
+/// `--data-dir` (e.g. `antctl postage status`).
+fn default_socket_for(data_dir: &str) -> Result<PathBuf> {
+    let dir = expand_tilde(Path::new(data_dir));
+    Ok(dir.join("antd.sock"))
+}
+
 fn expand_tilde(p: &Path) -> PathBuf {
     if let Some(s) = p.to_str() {
         if let Some(rest) = s.strip_prefix("~/") {
@@ -2770,12 +3495,7 @@ fn gateway_constraints() -> [Constraint; 6] {
     ]
 }
 
-fn draw_gateway_requests(
-    frame: &mut Frame,
-    area: TuiRect,
-    r: &RetrievalInfo,
-    now: u64,
-) {
+fn draw_gateway_requests(frame: &mut Frame, area: TuiRect, r: &RetrievalInfo, now: u64) {
     let block = Block::default()
         .title(" Gateway requests ")
         .borders(Borders::ALL)
@@ -3577,8 +4297,8 @@ mod tests {
             mem_hits_total: 1_213_000,
             disk: DiskCacheInfo {
                 enabled: true,
-                used_bytes: 13_200_000_000,         // ~12.3 GiB
-                capacity_bytes: 107_374_182_400,    // 100 GiB
+                used_bytes: 13_200_000_000,      // ~12.3 GiB
+                capacity_bytes: 107_374_182_400, // 100 GiB
                 hits_total: 487_000,
             },
             gateway_requests: Vec::new(),
@@ -3603,13 +4323,7 @@ mod tests {
         let rendered: String = (0..buf.area.height)
             .map(|y| {
                 (0..buf.area.width)
-                    .map(|x| {
-                        buf[(x, y)]
-                            .symbol()
-                            .chars()
-                            .next()
-                            .unwrap_or(' ')
-                    })
+                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
                     .collect::<String>()
             })
             .collect::<Vec<_>>()
@@ -3694,13 +4408,7 @@ mod tests {
         let rendered: String = (0..buf.area.height)
             .map(|y| {
                 (0..buf.area.width)
-                    .map(|x| {
-                        buf[(x, y)]
-                            .symbol()
-                            .chars()
-                            .next()
-                            .unwrap_or(' ')
-                    })
+                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
                     .collect::<String>()
             })
             .collect::<Vec<_>>()
@@ -3748,7 +4456,10 @@ mod tests {
     fn random_word32_is_unique() {
         let a = super::random_word32();
         let b = super::random_word32();
-        assert_ne!(a, b, "random_word32 collisions imply both nanos+urandom failed");
+        assert_ne!(
+            a, b,
+            "random_word32 collisions imply both nanos+urandom failed"
+        );
     }
 
     #[test]
@@ -3756,10 +4467,7 @@ mod tests {
         // 1 xDAI exactly.
         assert_eq!(super::format_eth_18(1_000_000_000_000_000_000), "1 xDAI");
         // 0.5 xDAI.
-        assert_eq!(
-            super::format_eth_18(500_000_000_000_000_000),
-            "0.5 xDAI",
-        );
+        assert_eq!(super::format_eth_18(500_000_000_000_000_000), "0.5 xDAI",);
         // Truncates to 6 fractional digits, no rounding.
         assert_eq!(
             super::format_eth_18(123_456_789_012_345_678),
@@ -3768,14 +4476,21 @@ mod tests {
     }
 
     #[test]
+    fn format_upload_status_known_states() {
+        assert_eq!(super::format_upload_status_label("running"), "running");
+        assert_eq!(super::format_upload_status_label("completed"), "completed");
+        assert_eq!(super::format_upload_status_label("paused"), "paused");
+        // Unknown values fall through unchanged so a future status
+        // string from a newer daemon doesn't render as `?`.
+        assert_eq!(super::format_upload_status_label("future"), "future");
+    }
+
+    #[test]
     fn format_eth_16_handles_bzz() {
         // 1 BZZ.
         assert_eq!(super::format_eth_16(10_000_000_000_000_000), "1 BZZ");
         // The live storage-stamp wallet had 42_849_794_328_341_404 PLUR.
         // Expected display: 4.284979 BZZ (truncated, no rounding).
-        assert_eq!(
-            super::format_eth_16(42_849_794_328_341_404),
-            "4.284979 BZZ",
-        );
+        assert_eq!(super::format_eth_16(42_849_794_328_341_404), "4.284979 BZZ",);
     }
 }

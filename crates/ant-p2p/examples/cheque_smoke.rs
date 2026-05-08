@@ -112,8 +112,7 @@ fn parse_hex_secret(name: &str) -> [u8; 32] {
     let s = std::env::var(name).unwrap_or_else(|_| panic!("env {name} missing"));
     let s = s.trim().trim_start_matches("0x").trim_start_matches("0X");
     let mut out = [0u8; 32];
-    hex::decode_to_slice(s, &mut out)
-        .unwrap_or_else(|e| panic!("decode {name}: {e}"));
+    hex::decode_to_slice(s, &mut out).unwrap_or_else(|e| panic!("decode {name}: {e}"));
     out
 }
 
@@ -121,8 +120,7 @@ fn parse_hex_addr(name: &str) -> [u8; 20] {
     let s = std::env::var(name).unwrap_or_else(|_| panic!("env {name} missing"));
     let s = s.trim().trim_start_matches("0x").trim_start_matches("0X");
     let mut out = [0u8; 20];
-    hex::decode_to_slice(s, &mut out)
-        .unwrap_or_else(|e| panic!("decode {name}: {e}"));
+    hex::decode_to_slice(s, &mut out).unwrap_or_else(|e| panic!("decode {name}: {e}"));
     out
 }
 
@@ -181,7 +179,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             noise::Config::new,
             yamux::Config::default,
         )?
-        .with_dns_config(dns::ResolverConfig::cloudflare(), dns::ResolverOpts::default())
+        .with_dns_config(
+            dns::ResolverConfig::cloudflare(),
+            dns::ResolverOpts::default(),
+        )
         .with_behaviour(|_| behaviour)
         .expect("infallible behaviour")
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(120)))
@@ -190,7 +191,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut control = swarm.behaviour().stream.new_control();
 
     let bootnodes = ant_p2p::default_mainnet_bootnodes();
-    println!("\n[1/4] resolving {} dnsaddr bootnode roots", bootnodes.len());
+    println!(
+        "\n[1/4] resolving {} dnsaddr bootnode roots",
+        bootnodes.len()
+    );
     let resolved = ant_p2p::dnsaddr::resolve_all(bootnodes).await;
     println!("       resolved {} concrete multiaddrs", resolved.len());
     if resolved.is_empty() {
@@ -214,10 +218,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 let evt = swarm.next().await;
                 match evt {
-                    Some(SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. }) => {
+                    Some(SwarmEvent::ConnectionEstablished {
+                        peer_id, endpoint, ..
+                    }) => {
                         let addr = match &endpoint {
                             ConnectedPoint::Dialer { address, .. } => address.clone(),
-                            ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr.clone(),
+                            ConnectedPoint::Listener { send_back_addr, .. } => {
+                                send_back_addr.clone()
+                            }
                         };
                         println!("       connected: peer={peer_id} addr={addr}");
                         let (tx, rx) = oneshot::channel();
@@ -225,7 +233,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Wait until we've seen identify so the BZZ handshake has
                         // a chance — start a side task that on the FIRST identify
                         // for this peer fires the channel sent up to the smoke.
-                        let _ = rx;
+                        std::mem::drop(rx);
                         if let Some(tx) = peer_idnt_tx.take() {
                             let _ = tx.send((peer_id, addr));
                         }
@@ -234,7 +242,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("       dial error peer={peer_id:?}: {error}");
                     }
                     Some(SwarmEvent::Behaviour(BEvent::Identify(identify::Event::Received {
-                        peer_id, ..
+                        peer_id,
+                        ..
                     }))) => {
                         println!("       identify received: peer={peer_id}");
                         if let Some(tx) = identify_signals.remove(&peer_id) {
@@ -279,11 +288,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto = StreamProtocol::new(PROTOCOL_HANDSHAKE);
     let stream = control.open_stream(peer_id, proto).await?;
     let overlay_nonce = [0u8; 32]; // smoke-only; real antd persists this
-    // Advertise full_node = true so bee's swap handler accepts our
-    // cheques. Bee rejects emit_cheque from peers it knows as light
-    // nodes (`if !p.FullNode { return errNotFullNode }`). We'll
-    // confirm the rejection vs acceptance directly by comparing the
-    // two runs; flip ANT_FULL_NODE=false to reproduce the rejection.
+                                   // Advertise full_node = true so bee's swap handler accepts our
+                                   // cheques. Bee rejects emit_cheque from peers it knows as light
+                                   // nodes (`if !p.FullNode { return errNotFullNode }`). We'll
+                                   // confirm the rejection vs acceptance directly by comparing the
+                                   // two runs; flip ANT_FULL_NODE=false to reproduce the rejection.
     let advertise_full_node: bool = std::env::var("ANT_FULL_NODE")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -295,15 +304,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &secret,
         &overlay_nonce,
         network_id,
-        &[peer_addr.clone()],
+        std::slice::from_ref(&peer_addr),
         Vec::new(),
         advertise_full_node,
     )
     .await?;
 
     println!("       handshake ok:");
-    println!("         remote_overlay:     0x{}", hex::encode(info.remote_overlay));
-    println!("         remote_eth_address: 0x{}", hex::encode(info.remote_eth_address));
+    println!(
+        "         remote_overlay:     0x{}",
+        hex::encode(info.remote_overlay)
+    );
+    println!(
+        "         remote_eth_address: 0x{}",
+        hex::encode(info.remote_eth_address)
+    );
     println!("         remote_full_node:   {}", info.remote_full_node);
     println!("         remote_welcome:     {:?}", info.remote_welcome);
 
@@ -325,7 +340,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let t = Instant::now();
             let _ = stream.write_all(&[0x00]).await;
             let _ = stream.flush().await;
-            println!("       wrote 1 byte (varint length 0 = empty Headers) in {} ms", t.elapsed().as_millis());
+            println!(
+                "       wrote 1 byte (varint length 0 = empty Headers) in {} ms",
+                t.elapsed().as_millis()
+            );
             let mut buf = [0u8; 1024];
             let read_t = Instant::now();
             match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await {
@@ -342,9 +360,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if n > 0 {
                         // Try a second read in case bee sends more
                         let mut buf2 = [0u8; 1024];
-                        match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf2)).await {
+                        match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf2))
+                            .await
+                        {
                             Ok(Ok(m)) if m > 0 => {
-                                println!("       bee sent {m} more bytes: hex={}", hex::encode(&buf2[..m]));
+                                println!(
+                                    "       bee sent {m} more bytes: hex={}",
+                                    hex::encode(&buf2[..m])
+                                );
                             }
                             _ => {}
                         }
@@ -370,7 +393,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         U256::from(1u64),
         chain_id,
     )?;
-    println!("       cheque signature: 0x{}", hex::encode(signed.signature));
+    println!(
+        "       cheque signature: 0x{}",
+        hex::encode(signed.signature)
+    );
 
     let t0 = Instant::now();
     match emit_cheque(&mut control, peer_id, &signed).await {

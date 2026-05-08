@@ -199,7 +199,7 @@ pub fn cash_cheque_beneficiary_calldata(
     data.extend_from_slice(signature);
     // Pad the signature blob to the next 32-byte boundary (it's 65,
     // so we pad 31 bytes).
-    data.extend(std::iter::repeat(0u8).take(32 - signature.len() % 32));
+    data.extend(std::iter::repeat_n(0u8, 32 - signature.len() % 32));
     data
 }
 
@@ -415,8 +415,7 @@ mod tests {
     #[test]
     fn deploy_chequebook_selector() {
         let want = &keccak(b"deploySimpleSwap(address,uint256,bytes32)")[0..4];
-        let calldata =
-            deploy_chequebook_calldata(&[0u8; 20], U256::from(86400u64), &[0u8; 32]);
+        let calldata = deploy_chequebook_calldata(&[0u8; 20], U256::from(86400u64), &[0u8; 32]);
         assert_eq!(&calldata[0..4], want);
         assert_eq!(calldata.len(), 4 + 32 * 3);
     }
@@ -427,7 +426,10 @@ mod tests {
     /// `pkg/settlement/swap/chequebook` ABI bindings.
     #[test]
     fn chequebook_read_selectors() {
-        assert_eq!(chequebook_issuer_selector().to_vec(), keccak(b"issuer()")[0..4].to_vec());
+        assert_eq!(
+            chequebook_issuer_selector().to_vec(),
+            keccak(b"issuer()")[0..4].to_vec()
+        );
         assert_eq!(
             chequebook_total_paid_out_selector().to_vec(),
             keccak(b"totalPaidOut()")[0..4].to_vec()

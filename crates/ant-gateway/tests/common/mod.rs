@@ -297,14 +297,8 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
             ack,
         } => {
             stream_via_fetcher(
-                fetcher,
-                reference,
-                /* path */ None,
-                /* allow_degraded */ true,
-                max_bytes,
-                range,
-                head_only,
-                ack,
+                fetcher, reference, /* path */ None, /* allow_degraded */ true,
+                max_bytes, range, head_only, ack,
             )
             .await;
         }
@@ -420,6 +414,43 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
                 }
             };
             let _ = ack.send(reply);
+        }
+        // Upload* control commands are only meaningful with a real
+        // `UploadManager`; gateway tests don't model the upload
+        // pipeline, so reject any that leak in here as a test bug.
+        ControlCommand::UploadStart { ack, .. } => {
+            let _ = ack.send(ControlAck::Error {
+                message: "Upload* not supported in gateway test fixtures".into(),
+            });
+        }
+        ControlCommand::UploadList { ack } => {
+            let _ = ack.send(ControlAck::Error {
+                message: "Upload* not supported in gateway test fixtures".into(),
+            });
+        }
+        ControlCommand::UploadStatus { ack, .. }
+        | ControlCommand::UploadPause { ack, .. }
+        | ControlCommand::UploadResume { ack, .. }
+        | ControlCommand::UploadCancel { ack, .. } => {
+            let _ = ack.send(ControlAck::Error {
+                message: "Upload* not supported in gateway test fixtures".into(),
+            });
+        }
+        ControlCommand::UploadFollow { ack, .. } => {
+            let _ = ack.try_send(ControlAck::Error {
+                message: "Upload* not supported in gateway test fixtures".into(),
+            });
+        }
+        // `PostageStatus` is the daemon's stamp issuer view; the
+        // gateway test fixtures don't model an issuer, so respond
+        // with the default "uploads disabled" snapshot. Mirrors
+        // what a daemon started without `--postage-batch` would
+        // return — exercises the antctl renderer's "disabled"
+        // branch when wired into a future end-to-end test.
+        ControlCommand::PostageStatus { ack } => {
+            let _ = ack.send(ControlAck::PostageStatus(
+                ant_control::PostageStatusView::default(),
+            ));
         }
     }
 }

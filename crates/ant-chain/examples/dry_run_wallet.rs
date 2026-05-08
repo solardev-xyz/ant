@@ -32,7 +32,8 @@ use primitive_types::U256;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let url = env::var("GNOSIS_RPC_URL")?;
-    let key_hex = env::var("POSTAGE_OWNER_KEY").or_else(|_| env::var("STORAGE_STAMP_PRIVATE_KEY"))?;
+    let key_hex =
+        env::var("POSTAGE_OWNER_KEY").or_else(|_| env::var("STORAGE_STAMP_PRIVATE_KEY"))?;
     let postage = env::var("POSTAGE_CONTRACT")?;
     let batch_hex = env::var("STORAGE_STAMP_BATCH_ID")?;
 
@@ -51,10 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let client = ChainClient::new(url);
     let wallet = Wallet::new(secret, GNOSIS_CHAIN_ID)?;
-    println!(
-        "wallet address: 0x{}",
-        hex::encode(wallet.address())
-    );
+    println!("wallet address: 0x{}", hex::encode(wallet.address()));
 
     let nonce = client
         .eth_get_transaction_count_pending(wallet.address())

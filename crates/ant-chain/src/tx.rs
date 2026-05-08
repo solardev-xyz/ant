@@ -104,10 +104,14 @@ pub fn sign_legacy_tx(
     let s = &sig[32..64];
     // `sign_prehash` returns recid in {27, 28}. EIP-155 wants
     // v = chain_id * 2 + 35 + recid where recid is in {0, 1}.
-    let recid = sig[64].checked_sub(27).ok_or_else(|| {
-        TxError::Decode(format!("invalid recovery id {} from signer", sig[64]))
-    })?;
-    let v = tx.chain_id.saturating_mul(2).saturating_add(35).saturating_add(recid as u64);
+    let recid = sig[64]
+        .checked_sub(27)
+        .ok_or_else(|| TxError::Decode(format!("invalid recovery id {} from signer", sig[64])))?;
+    let v = tx
+        .chain_id
+        .saturating_mul(2)
+        .saturating_add(35)
+        .saturating_add(recid as u64);
 
     let raw = rlp_encode_legacy(
         tx,
@@ -132,11 +136,7 @@ struct SignatureBytes {
 /// `None`, emit the EIP-155 signing payload (nine fields, last three
 /// being `[chain_id, 0, 0]`). When `sig` is `Some`, emit the final
 /// signed envelope (nine fields, last three being `[v, r, s]`).
-fn rlp_encode_legacy(
-    tx: &LegacyTx,
-    signing: bool,
-    sig: Option<SignatureBytes>,
-) -> Vec<u8> {
+fn rlp_encode_legacy(tx: &LegacyTx, signing: bool, sig: Option<SignatureBytes>) -> Vec<u8> {
     let mut s = rlp::RlpStream::new_list(9);
     rlp_append_u64(&mut s, tx.nonce);
     rlp_append_u64(&mut s, tx.gas_price_wei);
@@ -247,9 +247,7 @@ pub fn postage_increase_depth_calldata(batch_id: &[u8; 32], new_depth: u8) -> Ve
 /// 4-byte selector for the `BatchCreated` event (used by
 /// `eth_getLogs` filtering when watching for our own create txs).
 pub fn batch_created_event_topic() -> [u8; 32] {
-    keccak256(
-        b"BatchCreated(bytes32,uint256,uint256,address,uint8,uint8,bool)",
-    )
+    keccak256(b"BatchCreated(bytes32,uint256,uint256,address,uint8,uint8,bool)")
 }
 
 fn pad_word_address(addr: &[u8; 20]) -> [u8; 32] {
@@ -288,8 +286,14 @@ impl ChainClient {
             "method": "eth_getTransactionCount",
             "params": params,
         });
-        let v: serde_json::Value =
-            self.http().post(self.url()).json(&body).send().await?.json().await?;
+        let v: serde_json::Value = self
+            .http()
+            .post(self.url())
+            .json(&body)
+            .send()
+            .await?
+            .json()
+            .await?;
         if let Some(err) = v.get("error") {
             return Err(RpcError::Rpc(err.to_string()));
         }
@@ -312,8 +316,14 @@ impl ChainClient {
             "method": "eth_sendRawTransaction",
             "params": [format!("0x{}", hex::encode(raw))],
         });
-        let v: serde_json::Value =
-            self.http().post(self.url()).json(&body).send().await?.json().await?;
+        let v: serde_json::Value = self
+            .http()
+            .post(self.url())
+            .json(&body)
+            .send()
+            .await?
+            .json()
+            .await?;
         if let Some(err) = v.get("error") {
             return Err(RpcError::Rpc(err.to_string()));
         }
@@ -351,18 +361,15 @@ impl ChainClient {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| RpcError::Http(e))?
+                .map_err(RpcError::Http)?
                 .json()
                 .await
-                .map_err(|e| RpcError::Http(e))?;
+                .map_err(RpcError::Http)?;
             if let Some(err) = v.get("error") {
                 return Err(RpcError::Rpc(err.to_string()).into());
             }
             if let Some(receipt) = v.get("result").filter(|r| !r.is_null()) {
-                let status = receipt
-                    .get("status")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("");
+                let status = receipt.get("status").and_then(|s| s.as_str()).unwrap_or("");
                 let block_number = receipt
                     .get("blockNumber")
                     .and_then(|s| s.as_str())
@@ -410,10 +417,13 @@ fn parse_log(v: &serde_json::Value) -> Result<EventLog, RpcError> {
         .ok_or_else(|| RpcError::Decode("log missing topics".into()))?
         .iter()
         .map(|t| {
-            let s = t.as_str().ok_or_else(|| RpcError::Decode("non-string topic".into()))?;
+            let s = t
+                .as_str()
+                .ok_or_else(|| RpcError::Decode("non-string topic".into()))?;
             let s = s.trim_start_matches("0x");
             let mut out = [0u8; 32];
-            hex::decode_to_slice(s, &mut out).map_err(|e| RpcError::Decode(format!("topic: {e}")))?;
+            hex::decode_to_slice(s, &mut out)
+                .map_err(|e| RpcError::Decode(format!("topic: {e}")))?;
             Ok(out)
         })
         .collect::<Result<Vec<_>, RpcError>>()?;
@@ -491,10 +501,7 @@ impl Wallet {
     /// Build a wallet from a 32-byte secret. Derives the Ethereum
     /// address locally so the operator can cross-check it before
     /// sending value-bearing txs.
-    pub fn new(
-        secret: [u8; SECP256K1_SECRET_LEN],
-        chain_id: u64,
-    ) -> Result<Self, TxError> {
+    pub fn new(secret: [u8; SECP256K1_SECRET_LEN], chain_id: u64) -> Result<Self, TxError> {
         let sk = k256_signing_key(&secret)?;
         let vk = *sk.verifying_key();
         let address = ant_crypto::ethereum_address_from_public_key(&vk);
@@ -624,7 +631,9 @@ impl Wallet {
         data: Vec<u8>,
         gas_limit: u64,
     ) -> Result<TxReceipt, TxError> {
-        let nonce = client.eth_get_transaction_count_pending(&self.address).await?;
+        let nonce = client
+            .eth_get_transaction_count_pending(&self.address)
+            .await?;
         let tx = LegacyTx {
             nonce,
             gas_price_wei: self.default_gas_price_wei,
@@ -640,7 +649,9 @@ impl Wallet {
     }
 }
 
-fn k256_signing_key(secret: &[u8; SECP256K1_SECRET_LEN]) -> Result<k256::ecdsa::SigningKey, TxError> {
+fn k256_signing_key(
+    secret: &[u8; SECP256K1_SECRET_LEN],
+) -> Result<k256::ecdsa::SigningKey, TxError> {
     k256::ecdsa::SigningKey::from_bytes(secret.into())
         .map_err(|e| TxError::Decode(format!("signing key from secret: {e}")))
 }
@@ -673,14 +684,8 @@ mod tests {
     /// 4-byte selector for the canonical signature.
     #[test]
     fn create_batch_selector() {
-        let calldata = postage_create_batch_calldata(
-            &[0u8; 20],
-            &U256::zero(),
-            17,
-            16,
-            &[0u8; 32],
-            true,
-        );
+        let calldata =
+            postage_create_batch_calldata(&[0u8; 20], &U256::zero(), 17, 16, &[0u8; 32], true);
         assert_eq!(hex::encode(&calldata[0..4]), "5239af71");
         // 4 selector + 6 words.
         assert_eq!(calldata.len(), 4 + 32 * 6);
@@ -724,9 +729,7 @@ mod tests {
         };
         let (raw, _hash) = sign_legacy_tx(&secret, &tx).unwrap();
         // Decode the outer RLP list and inspect the seventh field (v).
-        let list: Vec<rlp::Rlp> = rlp::Rlp::new(&raw)
-            .into_iter()
-            .collect();
+        let list: Vec<rlp::Rlp> = rlp::Rlp::new(&raw).into_iter().collect();
         assert_eq!(list.len(), 9);
         let v: u64 = list[6].as_val().unwrap();
         assert!(

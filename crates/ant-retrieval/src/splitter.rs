@@ -129,6 +129,234 @@ pub fn split_bytes(payload: &[u8]) -> SplitResult {
     }
 }
 
+/// Streaming counterpart of [`split_bytes`]: feed leaves one at a time
+/// and pull the resulting [`SplitChunk`]s as they're produced, never
+/// materialising the whole file (or the whole chunk list) in RAM.
+///
+/// The output is byte-identical to what [`split_bytes`] would have
+/// produced for the same total payload, including the well-known
+/// edge cases (empty input → single zero-byte leaf; ≤ `CHUNK_SIZE`
+/// input → root == leaf, no intermediate). This is the property the
+/// upload manager relies on when it re-streams a file from byte 0
+/// during resume: every chunk address is a deterministic function of
+/// position, so we can skip pushsync for chunks already accepted by
+/// the network without storing per-chunk receipts.
+///
+/// # Memory profile
+///
+/// Bounded above by `tree_depth × BRANCHES × 32 B`. For a 7 GiB file
+/// (~1.7 M leaves, depth 4) that's `4 × 128 × 32 = 16 KiB` of rolling
+/// child references plus the in-flight leaf payload — independent of
+/// file size.
+///
+/// # API contract
+///
+/// 1. Call [`StreamingSplitter::push_leaf`] with leaves in order. Every
+///    leaf except possibly the last must be exactly `CHUNK_SIZE` bytes;
+///    the final leaf may be shorter (including zero, which is what
+///    [`split_bytes`] produces for `payload.len() == 0`).
+/// 2. Each call returns the freshly-produced chunks: always the leaf
+///    itself, plus any intermediates that bubbled to fullness during
+///    that call.
+/// 3. Call [`StreamingSplitter::finish`] exactly once at the end. It
+///    drains partial intermediate levels into the final root chunk
+///    and returns `(root_addr, total_bytes, tail_chunks)`.
+///
+/// Calls after [`finish`](StreamingSplitter::finish) panic.
+#[derive(Debug)]
+pub struct StreamingSplitter {
+    /// `levels[L]` accumulates child `(addr, span)` pairs for the
+    /// not-yet-flushed intermediate at depth `L`. `levels[0]` only
+    /// holds the *most recent* leaf so [`finish`](Self::finish) can
+    /// recognise the "single leaf, no intermediate" root case.
+    levels: Vec<Vec<(ChunkAddr, u64)>>,
+    /// Cumulative bytes fed via [`push_leaf`]; equals the file body
+    /// size once [`finish`](Self::finish) is called.
+    bytes_consumed: u64,
+    /// Cumulative leaves fed via [`push_leaf`]. Used by `finish` to
+    /// distinguish "empty file" (must emit the empty leaf to match
+    /// [`split_bytes`]) from "non-empty file with at least one leaf".
+    leaves_emitted: u64,
+}
+
+impl Default for StreamingSplitter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StreamingSplitter {
+    pub fn new() -> Self {
+        Self {
+            levels: Vec::new(),
+            bytes_consumed: 0,
+            leaves_emitted: 0,
+        }
+    }
+
+    /// Bytes fed in so far. Useful for progress accounting.
+    pub fn bytes_consumed(&self) -> u64 {
+        self.bytes_consumed
+    }
+
+    /// Number of leaves fed in so far (== chunk index of the next
+    /// leaf to be pushed).
+    pub fn leaves_emitted(&self) -> u64 {
+        self.leaves_emitted
+    }
+
+    /// Feed one leaf payload. Length must be ≤ `CHUNK_SIZE`; only the
+    /// last leaf may be shorter than `CHUNK_SIZE`. Returns the chunks
+    /// produced by this call: the leaf itself, plus any intermediates
+    /// that filled and were flushed in the bubble-up.
+    pub fn push_leaf(&mut self, payload: &[u8]) -> Vec<SplitChunk> {
+        assert!(
+            payload.len() <= CHUNK_SIZE,
+            "leaf payload {} > CHUNK_SIZE {CHUNK_SIZE}",
+            payload.len(),
+        );
+        let (addr, wire) = cac_new(payload).expect("leaf ≤ CHUNK_SIZE by construction");
+        self.bytes_consumed += payload.len() as u64;
+        self.leaves_emitted += 1;
+        let mut emitted = vec![SplitChunk {
+            address: addr,
+            wire,
+        }];
+        self.bubble_up(0, addr, payload.len() as u64, &mut emitted);
+        emitted
+    }
+
+    /// Bubble a fresh `(addr, span)` into level `level`. If that level
+    /// fills, flush it into a fresh intermediate chunk, append it to
+    /// `emitted`, and recurse into `level + 1`.
+    fn bubble_up(
+        &mut self,
+        level: usize,
+        child_addr: ChunkAddr,
+        child_span: u64,
+        emitted: &mut Vec<SplitChunk>,
+    ) {
+        if self.levels.len() <= level {
+            self.levels.push(Vec::with_capacity(BRANCHES));
+        }
+        // Level 0 is special: it holds *only* the last leaf, so
+        // `finish` can detect "the single leaf is the root". Higher
+        // levels accumulate up to BRANCHES children before flushing.
+        if level == 0 {
+            let buf = &mut self.levels[0];
+            buf.clear();
+            buf.push((child_addr, child_span));
+            // We don't bubble up from level 0 on every leaf — that's
+            // what level 1's accumulator does. Bubble the leaf into
+            // level 1 directly.
+            self.bubble_up(1, child_addr, child_span, emitted);
+            return;
+        }
+        self.levels[level].push((child_addr, child_span));
+        if self.levels[level].len() == BRANCHES {
+            let (addr, span, chunk) = flush_level(&mut self.levels[level]);
+            emitted.push(chunk);
+            self.bubble_up(level + 1, addr, span, emitted);
+        }
+    }
+
+    /// Drain partial intermediate levels into the file root. Returns
+    /// `(root_addr, total_bytes, tail_chunks)` where `tail_chunks` is
+    /// any intermediates produced by the drain (the root is the last
+    /// entry, except in the single-leaf case where the leaf was
+    /// already returned by [`push_leaf`] and `tail_chunks` is empty).
+    ///
+    /// For an empty input (no [`push_leaf`] calls), emits the
+    /// well-known zero-byte leaf and returns it as the root, matching
+    /// [`split_bytes(b"")`].
+    pub fn finish(mut self) -> (ChunkAddr, u64, Vec<SplitChunk>) {
+        // Empty input: emit the zero-byte leaf as both leaf and root,
+        // matching `split_bytes(b"")`.
+        if self.leaves_emitted == 0 {
+            let (addr, wire) = cac_new(b"").expect("empty leaf");
+            return (
+                addr,
+                0,
+                vec![SplitChunk {
+                    address: addr,
+                    wire,
+                }],
+            );
+        }
+
+        // Single-leaf file (≤ CHUNK_SIZE): the leaf is the root and
+        // was already returned by `push_leaf`. No intermediate exists
+        // — `levels[1]` was created with one entry but never reached
+        // BRANCHES, and we must NOT wrap a 1-child intermediate
+        // around it. This matches the `split_bytes` fast path.
+        if self.leaves_emitted == 1 {
+            let (root_addr, root_span) = self.levels[0][0];
+            return (root_addr, root_span, Vec::new());
+        }
+
+        // General case: flush partial levels bottom-up. Skip level 0
+        // (it only ever held the last leaf, which is already in level
+        // 1).
+        let mut emitted = Vec::new();
+        let mut level = 1;
+        loop {
+            // Grow `levels` lazily so the `level + 1 == levels.len()`
+            // invariant below is meaningful.
+            if self.levels.len() <= level {
+                self.levels.push(Vec::new());
+            }
+            let n = self.levels[level].len();
+            // Reached a level that has exactly the root — done.
+            if level + 1 >= self.levels.len() && n == 1 {
+                let (root_addr, root_span) = self.levels[level][0];
+                return (root_addr, root_span, emitted);
+            }
+            // Empty level (everything already bubbled up at fullness):
+            // climb one rung.
+            if n == 0 {
+                level += 1;
+                continue;
+            }
+            let (addr, span, chunk) = flush_level(&mut self.levels[level]);
+            emitted.push(chunk);
+            // Bubble into the next level up; create one if necessary.
+            if self.levels.len() <= level + 1 {
+                self.levels.push(Vec::new());
+            }
+            self.levels[level + 1].push((addr, span));
+            level += 1;
+        }
+    }
+}
+
+/// Flush a level's accumulator into one intermediate chunk. Drains
+/// `buf` in place. Caller is responsible for not calling this on an
+/// empty buffer.
+fn flush_level(buf: &mut Vec<(ChunkAddr, u64)>) -> (ChunkAddr, u64, SplitChunk) {
+    debug_assert!(!buf.is_empty(), "flush_level on empty accumulator");
+    let mut payload = Vec::with_capacity(buf.len() * 32);
+    let mut span: u64 = 0;
+    for (addr, child_span) in buf.iter() {
+        payload.extend_from_slice(addr);
+        span += *child_span;
+    }
+    let span_le = span.to_le_bytes();
+    let addr =
+        bmt_hash_with_span(&span_le, &payload).expect("intermediate payload ≤ BRANCHES * 32");
+    let mut wire = Vec::with_capacity(SPAN_SIZE + payload.len());
+    wire.extend_from_slice(&span_le);
+    wire.extend_from_slice(&payload);
+    buf.clear();
+    (
+        addr,
+        span,
+        SplitChunk {
+            address: addr,
+            wire,
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +465,133 @@ mod tests {
         assert_eq!(result.chunks.len(), expected);
         let back = round_trip(&payload).await.unwrap();
         assert_eq!(back, payload);
+    }
+
+    /// Run the same payload through both [`split_bytes`] and the
+    /// streaming splitter and assert the two outputs are equivalent:
+    /// same root, same total bytes, same set of `(address, wire)`
+    /// pairs (the *order* differs — streaming emits intermediates
+    /// as soon as they fill, while `split_bytes` writes all leaves
+    /// first then all intermediates).
+    ///
+    /// Also runs the streaming output through the joiner to confirm
+    /// it reconstructs the original payload byte-for-byte; this is
+    /// the same correctness check the rest of the test module uses
+    /// for `split_bytes`.
+    fn assert_streaming_matches(payload: &[u8]) {
+        let baseline = split_bytes(payload);
+
+        let mut s = StreamingSplitter::new();
+        let mut produced: Vec<SplitChunk> = Vec::new();
+        if payload.is_empty() {
+            // Match the `split_bytes(b"")` shape: no `push_leaf`
+            // calls, `finish` emits the empty leaf.
+        } else {
+            for leaf in payload.chunks(CHUNK_SIZE) {
+                produced.extend(s.push_leaf(leaf));
+            }
+        }
+        let (root, total_bytes, tail) = s.finish();
+        produced.extend(tail);
+
+        assert_eq!(root, baseline.root, "root mismatch");
+        assert_eq!(total_bytes, baseline.total_bytes, "total_bytes mismatch");
+        assert_eq!(
+            produced.len(),
+            baseline.chunks.len(),
+            "chunk count mismatch",
+        );
+
+        // Compare as sorted-by-address lists so emit-order
+        // differences don't trigger false positives.
+        let mut a: Vec<&SplitChunk> = produced.iter().collect();
+        let mut b: Vec<&SplitChunk> = baseline.chunks.iter().collect();
+        a.sort_by_key(|c| c.address);
+        b.sort_by_key(|c| c.address);
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(x.address, y.address, "sorted entry {i} address mismatch");
+            assert_eq!(x.wire, y.wire, "sorted entry {i} wire mismatch");
+        }
+
+        // Round-trip through the joiner using a HashMap fetcher
+        // built from the streaming output.
+        let mut map = HashMap::new();
+        for c in &produced {
+            map.insert(c.address, c.wire.clone());
+        }
+        let fetcher = MapFetcher { chunks: map };
+        let root_chunk = fetcher.chunks.get(&root).expect("root chunk in fetcher");
+        let rt = futures::executor::block_on(join(&fetcher, root_chunk, 256 * 1024 * 1024))
+            .expect("streaming output joined back without error");
+        assert_eq!(rt, payload, "streaming output round-tripped to wrong bytes");
+    }
+
+    #[test]
+    fn streaming_matches_split_bytes_empty() {
+        assert_streaming_matches(b"");
+    }
+
+    #[test]
+    fn streaming_matches_split_bytes_short() {
+        assert_streaming_matches(b"hello swarm");
+    }
+
+    #[test]
+    fn streaming_matches_split_bytes_exact_chunk() {
+        let p: Vec<u8> = (0..CHUNK_SIZE as u32).map(|i| (i % 251) as u8).collect();
+        assert_streaming_matches(&p);
+    }
+
+    #[test]
+    fn streaming_matches_split_bytes_two_leaves() {
+        let p: Vec<u8> = (0..5120).map(|i| (i % 251) as u8).collect();
+        assert_streaming_matches(&p);
+    }
+
+    #[test]
+    fn streaming_matches_split_bytes_full_first_intermediate() {
+        let len = CHUNK_SIZE * BRANCHES;
+        let p: Vec<u8> = (0..len).map(|i| ((i * 7) % 251) as u8).collect();
+        assert_streaming_matches(&p);
+    }
+
+    #[test]
+    fn streaming_matches_split_bytes_partial_intermediate() {
+        let len = 1_000_000usize;
+        let p: Vec<u8> = (0..len).map(|i| ((i * 31) % 251) as u8).collect();
+        assert_streaming_matches(&p);
+    }
+
+    /// Two-level fan-out with the top level partially full: the
+    /// second L1 intermediate carries fewer than `BRANCHES`
+    /// children, and the L2 root has exactly two children. Catches
+    /// off-by-one drain errors in `finish`. Kept small (BRANCHES + 5
+    /// leaves ≈ 532 KiB) so the unit test runs in well under a second
+    /// even in debug mode.
+    #[test]
+    fn streaming_matches_split_bytes_two_levels_partial() {
+        let len = CHUNK_SIZE * (BRANCHES + 5);
+        let p: Vec<u8> = (0..len).map(|i| ((i * 17) % 251) as u8).collect();
+        assert_streaming_matches(&p);
+    }
+
+    /// Three-level fan-out: BRANCHES * BRANCHES + 5 leaves so the L3
+    /// root has exactly 2 L2 children, the second L2 has exactly 1
+    /// L1 child carrying 5 leaves. Exercises the recursive bubble-up
+    /// across three intermediate levels and matches the shape of a
+    /// multi-GiB upload at small scale.
+    ///
+    /// `#[ignore]` only because this synthesises ~64 MiB of payload
+    /// and BMT-hashes it through both the reference and the
+    /// streaming splitter — ~110 s in debug, well under a second in
+    /// release. Run on demand with `cargo test --release -p
+    /// ant-retrieval -- --include-ignored streaming_matches_split_bytes_three_levels`.
+    #[test]
+    #[ignore]
+    fn streaming_matches_split_bytes_three_levels() {
+        let len = CHUNK_SIZE * (BRANCHES * BRANCHES + 5);
+        let p: Vec<u8> = (0..len).map(|i| ((i * 23) % 251) as u8).collect();
+        assert_streaming_matches(&p);
     }
 
     /// Boundary that bee's splitter explicitly tests: 524288 bytes (128

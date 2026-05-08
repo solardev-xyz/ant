@@ -1,6 +1,6 @@
 //! Blocking std-only client for `antctl`. No tokio runtime needed.
 
-use crate::protocol::{GetProgress, Request, Response};
+use crate::protocol::{GetProgress, Request, Response, UploadJobView};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -31,7 +31,9 @@ const TREE_TIMEOUT: Duration = Duration::from_secs(75);
 
 fn timeout_for(request: &Request) -> Duration {
     match request {
-        Request::GetBytes { .. } | Request::GetBzz { .. } => TREE_TIMEOUT,
+        Request::GetBytes { .. } | Request::GetBzz { .. } | Request::UploadFollow { .. } => {
+            TREE_TIMEOUT
+        }
         _ => DEFAULT_TIMEOUT,
     }
 }
@@ -42,7 +44,10 @@ fn timeout_for(request: &Request) -> Duration {
 /// wall time), so we hand the daemon's tree timeout to the underlying
 /// stream regardless of whether progress was actually requested.
 fn is_streamable(request: &Request) -> bool {
-    matches!(request, Request::GetBytes { .. } | Request::GetBzz { .. })
+    matches!(
+        request,
+        Request::GetBytes { .. } | Request::GetBzz { .. } | Request::UploadFollow { .. },
+    )
 }
 
 /// Round-trip one request to the daemon and return its terminal response.
@@ -118,6 +123,58 @@ where
         match serde_json::from_str::<Response>(trimmed)? {
             Response::Progress(p) => {
                 on_progress(&p);
+            }
+            other => return Ok(other),
+        }
+    }
+}
+
+/// Stream a `Request::UploadFollow` (or any other request that may
+/// emit `Response::UploadProgress` frames). `on_progress` fires for
+/// every progress frame; the call returns the *terminal*
+/// `Response::UploadJob` (or `Response::Error`) once the daemon
+/// closes the stream.
+///
+/// Why a separate helper instead of overloading [`request_streaming`]:
+/// the existing helper's callback type is tied to [`GetProgress`];
+/// upload progress carries a richer per-job snapshot, so the two
+/// paths bind to different types and can't share a single closure.
+pub fn request_upload_follow<F>(
+    socket_path: &Path,
+    request: &Request,
+    mut on_progress: F,
+) -> Result<Response, ClientError>
+where
+    F: FnMut(&UploadJobView),
+{
+    let mut stream = UnixStream::connect(socket_path).map_err(|e| ClientError::Connect {
+        path: socket_path.display().to_string(),
+        source: e,
+    })?;
+    stream.set_read_timeout(Some(TREE_TIMEOUT))?;
+    stream.set_write_timeout(Some(DEFAULT_TIMEOUT))?;
+
+    let mut line = serde_json::to_vec(request)?;
+    line.push(b'\n');
+    stream.write_all(&line)?;
+    stream.flush()?;
+    stream.shutdown(std::net::Shutdown::Write)?;
+
+    let mut reader = BufReader::new(stream);
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        let n = reader.read_line(&mut buf)?;
+        if n == 0 {
+            return Err(ClientError::EmptyResponse);
+        }
+        let trimmed = buf.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Response>(trimmed)? {
+            Response::UploadProgress(view) => {
+                on_progress(&view);
             }
             other => return Ok(other),
         }

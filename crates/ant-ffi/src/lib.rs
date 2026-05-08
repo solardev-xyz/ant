@@ -21,7 +21,9 @@
 //! `ant_download` calls are allowed and share the node's cache /
 //! retrieval pipeline; the mpsc command channel serialises dispatch.
 
-use ant_control::{ControlAck, ControlCommand, GetProgress, IdentityInfo, PeerInfo, StatusSnapshot};
+use ant_control::{
+    ControlAck, ControlCommand, GetProgress, IdentityInfo, PeerInfo, StatusSnapshot,
+};
 use ant_crypto::{
     ethereum_address_from_public_key, overlay_from_ethereum_address, random_overlay_nonce,
     random_secp256k1_secret, OVERLAY_NONCE_LEN, SECP256K1_SECRET_LEN,
@@ -453,8 +455,7 @@ fn download_inner(handle: &AntHandle, reference: &str) -> Result<Vec<u8>, FfiErr
                             DOWNLOAD_TIMEOUT.as_secs()
                         )));
                     }
-                    let wait =
-                        NO_PEERS_RETRY_INTERVAL.min(deadline.saturating_duration_since(now));
+                    let wait = NO_PEERS_RETRY_INTERVAL.min(deadline.saturating_duration_since(now));
                     // Wake up early on cancel so the user doesn't have
                     // to stare at a 2 s backoff after hitting Stop.
                     tokio::select! {
@@ -555,7 +556,12 @@ async fn attempt_download(
             | Ok(Some(ControlAck::BzzStreamStart { .. }))
             | Ok(Some(ControlAck::BytesChunk { .. }))
             | Ok(Some(ControlAck::StreamDone))
-            | Ok(Some(ControlAck::ChunkUploaded { .. })) => continue,
+            | Ok(Some(ControlAck::ChunkUploaded { .. }))
+            | Ok(Some(ControlAck::UploadStarted { .. }))
+            | Ok(Some(ControlAck::UploadJob(_)))
+            | Ok(Some(ControlAck::UploadList(_)))
+            | Ok(Some(ControlAck::UploadProgress(_)))
+            | Ok(Some(ControlAck::PostageStatus(_))) => continue,
             Ok(None) => {
                 return Err(FfiError::Download(
                     "node dropped the ack channel without a terminal response".to_string(),
@@ -908,10 +914,7 @@ mod tests {
 
     #[test]
     fn parse_reference_percent_decodes_bzz_path() {
-        let hex = format!(
-            "bzz://{}/tracks/02%20butterfly.wav",
-            "e".repeat(64)
-        );
+        let hex = format!("bzz://{}/tracks/02%20butterfly.wav", "e".repeat(64));
         match parse_reference(&hex) {
             Ok(ParsedRef::Bzz { root, path }) => {
                 assert_eq!(root, [0xee; 32]);

@@ -16,12 +16,14 @@ pub use activity::{ActiveRequestGuard, GatewayActivity, GatewayActivityHandle};
 pub use protocol::{
     CacheInfo, DiskCacheInfo, ExternalAddressInfo, GatewayRequestInfo, GatewayRequestKind,
     GetProgress, HandshakeReport, IdentityInfo, PeerConnectionInfo, PeerConnectionState, PeerInfo,
-    PeerPipelineEntry, ProtocolError, Request, Response, RetrievalInfo, RoutingInfo,
-    StatusSnapshot, VersionInfo, PROTOCOL_VERSION,
+    PeerPipelineEntry, PostageStatusView, ProtocolError, Request, Response, RetrievalInfo,
+    RoutingInfo, StatusSnapshot, UploadJobView, VersionInfo, PROTOCOL_VERSION,
 };
 
 #[cfg(unix)]
-pub use client::{request_streaming, request_sync, ClientError, StreamEvent};
+pub use client::{
+    request_streaming, request_sync, request_upload_follow, ClientError, StreamEvent,
+};
 #[cfg(unix)]
 pub use server::{
     serve, streaming_ack_channel, ControlAck, ControlCommand, ManifestEntryInfo, ServerError,

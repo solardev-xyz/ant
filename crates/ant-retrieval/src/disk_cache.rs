@@ -188,14 +188,9 @@ impl DiskChunkCache {
         let join = std::thread::Builder::new()
             .name("ant-disk-cache-writer".into())
             .spawn(move || {
-                if let Err(e) = writer_main(
-                    path_thread,
-                    write_rx,
-                    ready_tx,
-                    tb,
-                    max_bytes,
-                    slack_bytes,
-                ) {
+                if let Err(e) =
+                    writer_main(path_thread, write_rx, ready_tx, tb, max_bytes, slack_bytes)
+                {
                     warn!(
                         target: "ant_retrieval::disk_cache",
                         "writer thread exited with error: {e}",
@@ -204,15 +199,13 @@ impl DiskChunkCache {
             })
             .map_err(|e| DiskCacheError::Io(e.to_string()))?;
 
-        ready_rx
-            .recv()
-            .map_err(|_| DiskCacheError::WriterStopped)?;
+        ready_rx.recv().map_err(|_| DiskCacheError::WriterStopped)?;
 
         let n_read = read_worker_count();
         let mut read_tx = Vec::with_capacity(n_read);
         let mut read_joins = Vec::with_capacity(n_read);
         for i in 0..n_read {
-        let (job_tx, job_rx) = cb_bounded::<ReadJob>(4096);
+            let (job_tx, job_rx) = cb_bounded::<ReadJob>(4096);
             let path_r = path.clone();
             let wt = write_tx.clone();
             let j = std::thread::Builder::new()
@@ -285,14 +278,9 @@ impl DiskChunkCache {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.inner
             .write_tx
-            .send(WriteMsg::PutBatch {
-                items,
-                ack: ack_tx,
-            })
+            .send(WriteMsg::PutBatch { items, ack: ack_tx })
             .map_err(|_| DiskCacheError::WriterStopped)?;
-        ack_rx
-            .await
-            .map_err(|_| DiskCacheError::Panicked)?
+        ack_rx.await.map_err(|_| DiskCacheError::Panicked)?
     }
 
     pub async fn put(&self, addr: [u8; 32], data: Vec<u8>) -> Result<(), DiskCacheError> {
@@ -305,9 +293,7 @@ impl DiskChunkCache {
                 ack: ack_tx,
             })
             .map_err(|_| DiskCacheError::WriterStopped)?;
-        ack_rx
-            .await
-            .map_err(|_| DiskCacheError::Panicked)?
+        ack_rx.await.map_err(|_| DiskCacheError::Panicked)?
     }
 
     pub async fn row_count(&self) -> Result<u64, DiskCacheError> {
@@ -366,9 +352,9 @@ fn read_worker_loop(path: PathBuf, rx: CbReceiver<ReadJob>, write_tx: CbSender<W
     let Ok(conn) = open_read_connection(&path) else {
         return;
     };
-    let Ok(mut sel_stmt) = conn.prepare_cached(
-        "SELECT data, last_access FROM chunks WHERE address = ?1",
-    ) else {
+    let Ok(mut sel_stmt) =
+        conn.prepare_cached("SELECT data, last_access FROM chunks WHERE address = ?1")
+    else {
         return;
     };
     let Ok(mut count_stmt) = conn.prepare_cached("SELECT COUNT(*) FROM chunks") else {
@@ -432,6 +418,15 @@ fn process_put_batch_transaction(
     Ok(())
 }
 
+/// Pending put: chunk address, wire bytes, and the ack channel back
+/// to the caller. Sized as a separate type alias to keep
+/// `consume_put_touch_batch` readable.
+type PutOp = (
+    [u8; 32],
+    Vec<u8>,
+    oneshot::Sender<Result<(), DiskCacheError>>,
+);
+
 fn consume_put_touch_batch(
     conn: &mut Connection,
     batch: Vec<WriteMsg>,
@@ -440,8 +435,7 @@ fn consume_put_touch_batch(
     slack_bytes: u64,
 ) -> Result<bool, DiskCacheError> {
     let mut shutdown = false;
-    let mut put_ops: Vec<([u8; 32], Vec<u8>, oneshot::Sender<Result<(), DiskCacheError>>)> =
-        Vec::new();
+    let mut put_ops: Vec<PutOp> = Vec::new();
     let mut touches: Vec<([u8; 32], i64)> = Vec::new();
 
     for m in batch {
@@ -519,7 +513,9 @@ fn writer_main(
         .unwrap_or(0);
     total_bytes.store(initial_total, Ordering::Relaxed);
 
-    ready_tx.send(()).map_err(|_| DiskCacheError::WriterStopped)?;
+    ready_tx
+        .send(())
+        .map_err(|_| DiskCacheError::WriterStopped)?;
 
     'outer: loop {
         match rx.recv() {
@@ -652,7 +648,7 @@ fn evict_to_slack(
 
     let mut stmt = conn
         .prepare("SELECT address, size FROM chunks ORDER BY last_access ASC, address ASC")
-        .map_err(|e| DiskCacheError::from(e))?;
+        .map_err(DiskCacheError::from)?;
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)? as u64))
     })?;
@@ -660,7 +656,7 @@ fn evict_to_slack(
     let mut victim_addrs: Vec<Vec<u8>> = Vec::new();
     let mut freed: u64 = 0;
     for row in rows {
-        let (addr, size) = row.map_err(|e| DiskCacheError::from(e))?;
+        let (addr, size) = row.map_err(DiskCacheError::from)?;
         victim_addrs.push(addr);
         freed += size;
         if freed >= need_to_free {
@@ -673,16 +669,16 @@ fn evict_to_slack(
         return Ok(());
     }
 
-    let tx = conn.unchecked_transaction().map_err(|e| DiskCacheError::from(e))?;
+    let tx = conn.unchecked_transaction().map_err(DiskCacheError::from)?;
     {
         let mut del = tx
             .prepare("DELETE FROM chunks WHERE address = ?1")
-            .map_err(|e| DiskCacheError::from(e))?;
+            .map_err(DiskCacheError::from)?;
         for addr in &victim_addrs {
-            del.execute(params![addr]).map_err(|e| DiskCacheError::from(e))?;
+            del.execute(params![addr]).map_err(DiskCacheError::from)?;
         }
     }
-    tx.commit().map_err(|e| DiskCacheError::from(e))?;
+    tx.commit().map_err(DiskCacheError::from)?;
 
     update_total(total_bytes, -(freed as i64));
     debug!(

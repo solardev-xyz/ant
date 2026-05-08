@@ -394,10 +394,7 @@ async fn head_dispatches_head_only_flag() {
         let head = head_clone.clone();
         let body = body_clone.clone();
         async move {
-            if let ControlCommand::StreamBzz {
-                head_only, ack, ..
-            } = cmd
-            {
+            if let ControlCommand::StreamBzz { head_only, ack, .. } = cmd {
                 if head_only {
                     head.store(true, Ordering::SeqCst);
                 }
@@ -435,10 +432,7 @@ async fn head_dispatches_head_only_flag() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        resp.headers().get(header::CONTENT_LENGTH).unwrap(),
-        "1024",
-    );
+    assert_eq!(resp.headers().get(header::CONTENT_LENGTH).unwrap(), "1024",);
     assert_eq!(
         resp.headers().get(header::CONTENT_TYPE).unwrap(),
         "video/mp4",
@@ -628,8 +622,7 @@ async fn content_addressed_endpoints_emit_immutable_cache_control() {
     let router = handle_with_fixture_node();
 
     // The chunk endpoint serves the raw manifest root chunk by hash.
-    let chunk_addr =
-        "ed5b81dac5d34d22acd6db28ee864bc6f4d0d31db17f9f4ec6e62a89c1f31cab";
+    let chunk_addr = "ed5b81dac5d34d22acd6db28ee864bc6f4d0d31db17f9f4ec6e62a89c1f31cab";
     let resp = send(
         router.clone(),
         Request::builder()
