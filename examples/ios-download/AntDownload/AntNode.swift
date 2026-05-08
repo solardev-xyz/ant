@@ -199,30 +199,47 @@ final class AntNode: ObservableObject {
             throughputBytesPerSec: 0
         )
         progressPollTask = Task { [weak self] in
-            // Exponential-moving-average smoothing over raw
-            // (delta_bytes / delta_time) samples keeps the throughput
-            // readout from bouncing every tick when a single chunk
-            // fetch happens to land between polls.
-            var emaBytesPerSec: Double = 0
-            let alpha: Double = 0.3
-            var lastBytes: UInt64 = 0
-            var lastAt: Date = Date()
+            // Sliding-window mean over the last `windowSeconds` of
+            // (timestamp, bytes_done) samples. Compared to the EMA we
+            // had before (alpha = 0.3 → ~830 ms time constant), a
+            // straight 3 s window is a) much calmer when chunks land
+            // in `buffer_unordered` bursts and b) easier to reason
+            // about: the readout literally is "average MiB/s across
+            // the last 3 s", which is what users expect a download
+            // speedometer to mean. The chunks / peers / in-flight
+            // counters keep updating at the full 250 ms cadence
+            // because the window only smooths the rate, not the rest.
+            let windowSeconds: TimeInterval = 3.0
+            var samples: [(at: Date, bytes: UInt64)] = []
             var progress = AntProgress()
             while !Task.isCancelled {
                 let rc = ant_download_progress(handle, &progress)
                 if rc == 0 {
                     let now = Date()
-                    let dt = now.timeIntervalSince(lastAt)
-                    if dt > 0.05 {
-                        let deltaBytes = progress.bytes_done >= lastBytes
-                            ? Double(progress.bytes_done - lastBytes)
-                            : 0
-                        let raw = deltaBytes / dt
-                        emaBytesPerSec = emaBytesPerSec == 0
-                            ? raw
-                            : (alpha * raw + (1 - alpha) * emaBytesPerSec)
-                        lastBytes = progress.bytes_done
-                        lastAt = now
+                    samples.append((now, progress.bytes_done))
+                    let cutoff = now.addingTimeInterval(-windowSeconds)
+                    if let firstFresh = samples.firstIndex(where: { $0.at >= cutoff }),
+                       firstFresh > 1 {
+                        // Keep one stale sample so the window has a
+                        // baseline at the trailing edge — without it,
+                        // dropping every "too old" entry would leave
+                        // us computing rate over only the latest few
+                        // hundred ms again.
+                        samples.removeFirst(firstFresh - 1)
+                    }
+                    let bytesPerSec: Double
+                    if let oldest = samples.first, samples.count >= 2 {
+                        let dt = now.timeIntervalSince(oldest.at)
+                        if dt > 0.25 {
+                            let delta = progress.bytes_done >= oldest.bytes
+                                ? Double(progress.bytes_done - oldest.bytes)
+                                : 0
+                            bytesPerSec = delta / dt
+                        } else {
+                            bytesPerSec = 0
+                        }
+                    } else {
+                        bytesPerSec = 0
                     }
                     let snapshot = DownloadProgress(
                         bytesDone: progress.bytes_done,
@@ -233,7 +250,7 @@ final class AntNode: ObservableObject {
                         peersUsed: progress.peers_used,
                         inFlight: progress.in_flight,
                         cacheHits: progress.cache_hits,
-                        throughputBytesPerSec: emaBytesPerSec
+                        throughputBytesPerSec: bytesPerSec
                     )
                     await MainActor.run {
                         guard let self = self, self.handle == handle else { return }

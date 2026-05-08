@@ -1,6 +1,6 @@
 [package]
 name = "ant-ffi"
-version = "0.3.4"
+version = "0.3.5"
 edition.workspace = true
 
 # staticlib for the iOS simulator + device slices (linked into the Xcode
@@ -25,6 +25,7 @@ ant-retrieval = { path = "../ant-retrieval" }
 hex.workspace = true
 k256.workspace = true
 libp2p.workspace = true
+percent-encoding = "2.3"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

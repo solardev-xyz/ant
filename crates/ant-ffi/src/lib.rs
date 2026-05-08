@@ -375,13 +375,27 @@ fn parse_reference(input: &str) -> Result<ParsedRef, FfiError> {
         };
         Ok(ParsedRef::Bzz {
             root: parse_hex32(hex_part)?,
-            path: path_part.to_string(),
+            path: decode_bzz_path(path_part)?,
         })
     } else if let Some(rest) = trimmed.strip_prefix("bytes://") {
         Ok(ParsedRef::Bytes(parse_hex32(rest)?))
     } else {
         Ok(ParsedRef::Bytes(parse_hex32(trimmed)?))
     }
+}
+
+/// Percent-decode a `bzz://` path component the same way `ant-gateway`'s
+/// axum extractor does, so manifest entries containing literal spaces /
+/// unicode survive a round trip through a URL the user pastes in. A
+/// path like `tracks/02%20butterfly.wav` decodes to `tracks/02 butterfly.wav`,
+/// which is what the mantaray manifest stores. Invalid UTF-8 in the
+/// decoded bytes is rejected loudly rather than masked with the lossy
+/// replacement character — a manifest path is an exact byte sequence.
+fn decode_bzz_path(raw: &str) -> Result<String, FfiError> {
+    percent_encoding::percent_decode_str(raw)
+        .decode_utf8()
+        .map(|cow| cow.into_owned())
+        .map_err(|e| FfiError::Reference(format!("invalid percent-encoding in bzz path: {e}")))
 }
 
 fn parse_hex32(s: &str) -> Result<[u8; 32], FfiError> {
@@ -889,6 +903,43 @@ mod tests {
                 assert_eq!(path, "index.html");
             }
             other => panic!("expected ParsedRef::Bzz, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_reference_percent_decodes_bzz_path() {
+        let hex = format!(
+            "bzz://{}/tracks/02%20butterfly.wav",
+            "e".repeat(64)
+        );
+        match parse_reference(&hex) {
+            Ok(ParsedRef::Bzz { root, path }) => {
+                assert_eq!(root, [0xee; 32]);
+                assert_eq!(path, "tracks/02 butterfly.wav");
+            }
+            other => panic!("expected ParsedRef::Bzz, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_reference_decodes_unicode_bzz_path() {
+        let hex = format!("bzz://{}/caf%C3%A9/men%C3%BC.txt", "f".repeat(64));
+        match parse_reference(&hex) {
+            Ok(ParsedRef::Bzz { path, .. }) => {
+                assert_eq!(path, "café/menü.txt");
+            }
+            other => panic!("expected ParsedRef::Bzz, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_reference_rejects_invalid_percent_utf8() {
+        let hex = format!("bzz://{}/bad%FFpath", "1".repeat(64));
+        match parse_reference(&hex) {
+            Err(FfiError::Reference(msg)) => {
+                assert!(msg.contains("percent-encoding"), "got {msg:?}");
+            }
+            other => panic!("expected FfiError::Reference, got {other:?}"),
         }
     }
 

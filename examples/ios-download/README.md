@@ -15,10 +15,11 @@ the end of Phase 4.
 
 - macOS 13+ with **Xcode 15 or newer** (Xcode 26 was the version used
   to validate — any recent release should work).
-- Rust stable with the iOS simulator target installed:
+- Rust stable with the iOS targets you intend to use installed:
   ```sh
-  rustup target add aarch64-apple-ios-sim
-  # Intel-Mac host? Use x86_64-apple-ios instead.
+  rustup target add aarch64-apple-ios-sim       # simulator (default)
+  rustup target add aarch64-apple-ios           # real device (only for §"Running on a real iPhone")
+  # Intel-Mac host? Add x86_64-apple-ios for the simulator instead.
   ```
 - Apple Silicon Mac to match the default `aarch64-apple-ios-sim`
   simulator slice, or an Intel Mac with the x86_64 slice.
@@ -95,6 +96,78 @@ The underlying FFI retries the "no peers available; wait for
 handshakes to complete" error from a cold node for up to 75 seconds,
 so the first run on a fresh simulator usually succeeds without
 babysitting.
+
+## Running on a real iPhone
+
+The Xcode project picks the right Rust slice automatically based on
+`PLATFORM_NAME`: a simulator destination cross-compiles
+`aarch64-apple-ios-sim`, a device destination cross-compiles
+`aarch64-apple-ios`. `LIBRARY_SEARCH_PATHS` is `[sdk=...]`-conditional
+so the device build can never accidentally link the simulator slice.
+
+One-time GUI setup (cannot be scripted — Apple requires interactive
+prompts on the Mac and the iPhone for trust and codesigning):
+
+1. **Enable Developer Mode on the iPhone.** The toggle is hidden until
+   a dev tool first contacts the device. Plug the phone in via USB,
+   trust the Mac, then run any `xcrun devicectl device info details`
+   command from this Mac. The toggle then appears at the bottom of
+   `Settings → Privacy & Security → Developer Mode`. Turn it on; the
+   phone reboots and prompts again on unlock.
+2. **Sign in to Xcode.** `Xcode → Settings → Accounts → +` → Apple ID.
+   Click `Manage Certificates… → + → Apple Development` to create the
+   iOS development certificate (you most likely only have a macOS
+   `Developer ID Application` cert prior to this).
+3. **Confirm the team in `project.pbxproj`.** Both `Debug` and
+   `Release` configs hard-code `DEVELOPMENT_TEAM = 46XPHRBLH5`
+   (Solar Dev Ltd). If you sign in to Xcode with an Apple ID that
+   isn't a member of that team, change both occurrences to your own
+   team ID — Personal Teams are a 10-char ID visible in
+   `Xcode → Settings → Accounts` next to the team name.
+
+Then from the shell:
+
+```sh
+# Pre-build the device slice (the Build Rust phase will also do this
+# automatically when Xcode targets a device, this is just a sanity
+# check that the cross-compile works in isolation).
+cargo xtask build-ios-device
+
+cd examples/ios-download
+
+# Build, sign, and install. -allowProvisioningUpdates lets xcodebuild
+# create / refresh the provisioning profile non-interactively the
+# first time (subsequent builds reuse the cached profile).
+xcodebuild -project AntDownload.xcodeproj -scheme AntDownload \
+    -configuration Release -destination 'generic/platform=iOS' \
+    -allowProvisioningUpdates \
+    -derivedDataPath build-device \
+    build
+
+DEVICE_UDID=$(xcrun devicectl list devices --json-output - 2>/dev/null \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["devices"][0]["identifier"])')
+APP=build-device/Build/Products/Release-iphoneos/AntDownload.app
+
+xcrun devicectl device install app --device "$DEVICE_UDID" "$APP"
+xcrun devicectl device process launch \
+    --device "$DEVICE_UDID" at.vibing.ant.downloadsmoke
+```
+
+Common failure modes:
+
+- `linker command failed … built for 'iOS-simulator'` — the
+  `LIBRARY_SEARCH_PATHS[sdk=...]` overlay is missing or the Rust
+  device slice hasn't been built yet. `cargo xtask build-ios-device`
+  fixes the latter; the former should already be wired up in
+  `project.pbxproj`.
+- `The operation failed because Developer Mode is disabled.` — step 1
+  above hasn't been completed, or wasn't completed for *this* Mac.
+- `No profiles for 'at.vibing.ant.downloadsmoke' were found` — Xcode
+  hasn't been signed in (step 2) or the team in
+  `project.pbxproj` isn't one your Apple ID has membership in (step 3).
+- The phone is `tunnelState: disconnected` in `devicectl list devices`
+  — unlock the phone and re-run; iOS suspends the dev tunnel when the
+  device is locked for more than a few minutes.
 
 ## Troubleshooting
 

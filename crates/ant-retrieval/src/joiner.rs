@@ -60,7 +60,17 @@ const MAX_BRANCHES: usize = CHUNK_SIZE / 32;
 /// Combined with bee's per-chunk retrieval client (preemptive multi-peer
 /// fanout, 1 s ticker), this gives roughly the same effective breadth
 /// per file as bee's `errgroup.Group` model in `pkg/file/joiner`.
-const FETCH_FANOUT: usize = 8;
+///
+/// Sized at 16 from a sweep on the `litter-ally.eth` WAV tree (release
+/// `antd`, ~100 BZZ peers, cold disk cache, two files of 44–55 MiB):
+/// 8 → 16 lifted average throughput from 0.55 → 0.61 MiB/s (≈ +12 %)
+/// for ~6 MiB extra resident set; 32 was indistinguishable from 16; 64
+/// regressed to baseline as extra in-flight requests just diluted load
+/// across peers without the chunk. Past ~16 the bottleneck shifts to
+/// per-chunk close-peer latency (XOR-distance ranking + 1 s hedge),
+/// not local fanout, so adding more subtree workers buys nothing.
+const FETCH_FANOUT: usize = 16;
+
 /// Retry a child subtree in place when it fails because one descendant
 /// chunk could not be fetched. This is the streaming equivalent of the
 /// old whole-file retry loop: once the gateway has emitted earlier bytes

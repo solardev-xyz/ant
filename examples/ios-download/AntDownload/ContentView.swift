@@ -19,6 +19,12 @@ struct ContentView: View {
     var body: some View {
         NavigationStack {
             Form {
+                if let progress = node.downloadProgress {
+                    Section("Progress") {
+                        progressSection(progress)
+                    }
+                }
+
                 Section("Status") {
                     HStack {
                         Text("Node")
@@ -33,6 +39,42 @@ struct ContentView: View {
                             .foregroundStyle(node.peerCount > 0 ? Color.green : .secondary)
                             .monospacedDigit()
                     }
+                }
+
+                Section {
+                    ForEach(DownloadPreset.all) { preset in
+                        Button {
+                            referenceFieldFocused = false
+                            reference = preset.reference
+                            errorMessage = nil
+                            result = nil
+                            Task { await download() }
+                        } label: {
+                            HStack {
+                                Image(systemName: preset.symbol)
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 22)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(preset.title)
+                                    Text(preset.subtitle)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Text(preset.sizeLabel)
+                                    .font(.system(.footnote, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(isDownloading || !node.status.isReady)
+                    }
+                } header: {
+                    Text("Examples")
+                } footer: {
+                    Text("Tap to fetch a known-good `bzz://` reference from the litter-ally.eth tree.")
+                        .font(.caption2)
                 }
 
                 Section("Reference") {
@@ -89,12 +131,6 @@ struct ContentView: View {
                             Text("Download")
                         }
                         .disabled(reference.isEmpty || !node.status.isReady)
-                    }
-                }
-
-                if let progress = node.downloadProgress {
-                    Section("Progress") {
-                        progressSection(progress)
                     }
                 }
 
@@ -262,6 +298,54 @@ private struct DownloadResult {
     let byteCount: Int
     let hexPrefix: String
     let elapsed: TimeInterval
+}
+
+/// Curated list of `bzz://` references presented as one-tap example
+/// downloads on the main screen. All entries point at the
+/// litter-ally.eth manifest because that's the asset tree we already
+/// exercise from the Rust benches and PLAN appendices, so we know it
+/// resolves on mainnet and survives a cold-cache fetch.
+///
+/// Sizes are the actual bee `Content-Length` values reported by the
+/// gateway, not user-asked round numbers — the smallest litter-ally
+/// payload is `cover.jpg` at ~60 KB, so the "small" tier doesn't quite
+/// hit 200 KB. Showing the real number in the trailing label keeps the
+/// demo honest and avoids surprise when the progress bar finishes
+/// faster (or slower) than the round-number prompt would suggest.
+struct DownloadPreset: Identifiable {
+    let id: String
+    let title: String
+    let subtitle: String
+    let reference: String
+    let sizeLabel: String
+    let symbol: String
+
+    static let all: [DownloadPreset] = [
+        DownloadPreset(
+            id: "small",
+            title: "Small",
+            subtitle: "cover.jpg",
+            reference: "bzz://c4f8a45301b57d0e36f0f5348ed371aee42ea0b9fe9b3caaf26015d652eedc40/cover.jpg",
+            sizeLabel: "60 KB",
+            symbol: "photo"
+        ),
+        DownloadPreset(
+            id: "medium",
+            title: "Medium",
+            subtitle: "artist.jpg",
+            reference: "bzz://c4f8a45301b57d0e36f0f5348ed371aee42ea0b9fe9b3caaf26015d652eedc40/artist.jpg",
+            sizeLabel: "697 KB",
+            symbol: "person.crop.square"
+        ),
+        DownloadPreset(
+            id: "large",
+            title: "Large",
+            subtitle: "tracks/06 flutterby.wav",
+            reference: "bzz://c4f8a45301b57d0e36f0f5348ed371aee42ea0b9fe9b3caaf26015d652eedc40/tracks/06%20flutterby.wav",
+            sizeLabel: "112 MB",
+            symbol: "waveform"
+        ),
+    ]
 }
 
 #Preview {

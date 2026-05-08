@@ -1,12 +1,16 @@
-//! Developer task runner. For now it only knows how to cross-compile
-//! `ant-ffi` for the iOS simulator — the smoke-test app in
-//! `examples/ios-download/` links the resulting static library.
+//! Developer task runner. Cross-compiles `ant-ffi` for either the iOS
+//! simulator (`build-ios-sim`) or a physical iOS device
+//! (`build-ios-device`) — the smoke-test app in `examples/ios-download/`
+//! links one of the resulting static libraries depending on which
+//! destination Xcode is targeting.
 //!
 //! Usage:
 //!
-//!     cargo xtask build-ios-sim           # aarch64-apple-ios-sim (Apple Silicon)
-//!     cargo xtask build-ios-sim --arch x86_64   # x86_64-apple-ios (Intel simulator)
+//!     cargo xtask build-ios-sim                    # aarch64-apple-ios-sim
+//!     cargo xtask build-ios-sim --arch x86_64      # x86_64-apple-ios (Intel simulator)
 //!     cargo xtask build-ios-sim --profile debug
+//!     cargo xtask build-ios-device                 # aarch64-apple-ios (real iPhone / iPad)
+//!     cargo xtask build-ios-device --profile debug
 //!
 //! On success prints the absolute path of `libant_ffi.a`. The Xcode
 //! project's "Build Rust" run-script phase calls this so a plain
@@ -25,6 +29,7 @@ use anyhow::{anyhow, bail, Context, Result};
 
 const DEFAULT_SIM_TARGET: &str = "aarch64-apple-ios-sim";
 const X86_SIM_TARGET: &str = "x86_64-apple-ios";
+const DEVICE_TARGET: &str = "aarch64-apple-ios";
 
 fn main() -> ExitCode {
     match run() {
@@ -40,9 +45,10 @@ fn run() -> Result<()> {
     let mut args = env::args_os().skip(1);
     let sub = args
         .next()
-        .ok_or_else(|| anyhow!("missing subcommand (try `build-ios-sim`)"))?;
+        .ok_or_else(|| anyhow!("missing subcommand (try `build-ios-sim` or `build-ios-device`)"))?;
     match sub.to_string_lossy().as_ref() {
-        "build-ios-sim" => build_ios_sim(args.collect::<Vec<_>>()),
+        "build-ios-sim" => build_ios(args.collect::<Vec<_>>(), IosFlavor::Simulator),
+        "build-ios-device" => build_ios(args.collect::<Vec<_>>(), IosFlavor::Device),
         "help" | "-h" | "--help" => {
             print_help();
             Ok(())
@@ -58,8 +64,17 @@ fn print_help() {
          SUBCOMMANDS:\n\
              build-ios-sim [--arch aarch64|x86_64] [--profile debug|release]\n\
                  Cross-compile crates/ant-ffi for the iOS simulator.\n\
-                 Default: --arch aarch64 --profile release.\n"
+                 Default: --arch aarch64 --profile release.\n\
+             build-ios-device [--profile debug|release]\n\
+                 Cross-compile crates/ant-ffi for a real iPhone / iPad\n\
+                 (aarch64-apple-ios). Default: --profile release.\n"
     );
+}
+
+#[derive(Clone, Copy)]
+enum IosFlavor {
+    Simulator,
+    Device,
 }
 
 struct BuildOpts {
@@ -82,8 +97,8 @@ impl Profile {
     }
 }
 
-fn build_ios_sim(args: Vec<OsString>) -> Result<()> {
-    let opts = parse_build_opts(args)?;
+fn build_ios(args: Vec<OsString>, flavor: IosFlavor) -> Result<()> {
+    let opts = parse_build_opts(args, flavor)?;
 
     ensure_rust_target(opts.target)?;
 
@@ -122,14 +137,20 @@ fn build_ios_sim(args: Vec<OsString>) -> Result<()> {
     Ok(())
 }
 
-fn parse_build_opts(args: Vec<OsString>) -> Result<BuildOpts> {
-    let mut target = DEFAULT_SIM_TARGET;
+fn parse_build_opts(args: Vec<OsString>, flavor: IosFlavor) -> Result<BuildOpts> {
+    let mut target: &'static str = match flavor {
+        IosFlavor::Simulator => DEFAULT_SIM_TARGET,
+        IosFlavor::Device => DEVICE_TARGET,
+    };
     let mut profile = Profile::Release;
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
         let arg = arg.to_string_lossy().into_owned();
         match arg.as_str() {
             "--arch" => {
+                if matches!(flavor, IosFlavor::Device) {
+                    bail!("--arch is only meaningful for build-ios-sim (device is always aarch64)");
+                }
                 let v = it
                     .next()
                     .ok_or_else(|| anyhow!("--arch requires a value"))?

@@ -832,7 +832,7 @@ It is **not** a substitute for the M2 Phase 4 deliverable and does not change an
 
 In:
 
-- `aarch64-apple-ios-sim` static lib only — no device slice, no `lipo`, no `.xcframework`.
+- `aarch64-apple-ios-sim` static lib for the simulator. `aarch64-apple-ios` device slice is also built side-by-side (`cargo xtask build-ios-device`) so a paired iPhone is reachable behind a one-time Xcode sign-in — see `examples/ios-download/README.md` § "Running on a real iPhone". Still no `lipo` and no `.xcframework`; both slices live as plain `target/<triple>/release/libant_ffi.a` and the Xcode project picks the right one with `LIBRARY_SEARCH_PATHS[sdk=...]`.
 - Three hand-written `extern "C"` functions: `ant_init(data_dir)`, `ant_download(handle, ref_hex, …)`, `ant_free`. No UniFFI, no `.udl`, no codegen.
 - Hardcoded mainnet bootnodes; throwaway libp2p identity persisted under the app sandbox; in-memory chunk cache only (`disk_cache: None`).
 - One SwiftUI screen: tap a button → "got N bytes" plus a hex prefix.
@@ -856,7 +856,7 @@ Anything any iOS app would need lives in `vibing/ant`; anything specific to this
 | Mainnet bootnode + `network_id = 1` defaults | ant — app calls `ant_init(data_dir)`, never `ant_init(data_dir, bootnodes, network_id, …)` |
 | Auto-generated libp2p identity persisted under `<data_dir>/identity.json` | ant (replaced by `KeyProvider` callback later, see §5.10) |
 | `tracing` → `OSLog` bridge, behind `#[cfg(target_os = "ios")]` | ant (replaced by `set_log_sink` callback per §11) |
-| `cargo xtask build-ios-sim` cross-compile recipe | ant |
+| `cargo xtask build-ios-sim` / `cargo xtask build-ios-device` cross-compile recipes | ant |
 | Sandbox path (`Application Support/`) chosen and passed in to `ant_init` | app |
 | `Info.plist`, `NSAppTransportSecurity / NSAllowsArbitraryLoads = true` (Noise XX is not TLS) | app |
 | SwiftUI views, the hardcoded test reference, code signing, provisioning | app |
@@ -870,7 +870,7 @@ vibing/ant/
 ├── crates/
 │   └── ant-ffi/                # staticlib + cbindgen + extern "C"
 │       └── include/ant.h       # checked in; bridging-header points here
-├── xtask/                      # build-ios-sim, later build-ios-xcframework
+├── xtask/                      # build-ios-sim, build-ios-device, later build-ios-xcframework
 └── examples/
     └── ios-download/           # SwiftUI smoke-test app, Xcode project
 ```

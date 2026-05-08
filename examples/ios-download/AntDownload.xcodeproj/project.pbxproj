@@ -154,7 +154,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/bash;
-			shellScript = "# Cross-compile crates/ant-ffi for the simulator slice this build\n# is targeting. The xtask prints the absolute path of libant_ffi.a\n# on the last line; we ignore the output because the Xcode library\n# search path points at the same well-known location.\nset -euo pipefail\n\ncd \"$SRCROOT/../..\"\n\nPROFILE=release\nif [ \"${CONFIGURATION:-Release}\" = \"Debug\" ]; then\n    PROFILE=debug\nfi\n\n# Xcode sets ARCHS for the archs this build targets. For a simulator\n# build that can be \"arm64\", \"x86_64\", or \"arm64 x86_64\". We build\n# one rust slice per build invocation; prefer the host arch when\n# both are requested so a plain ⌘B on Apple Silicon doesn't sit\n# through an unnecessary x86_64 cross-compile.\nARCH=aarch64\nhost_arch=$(uname -m)\nif [ \"${ARCHS:-arm64}\" = \"x86_64\" ]; then\n    ARCH=x86_64\nelif [ \"${ARCHS:-arm64}\" = \"arm64\" ]; then\n    ARCH=aarch64\nelse\n    case \"$host_arch\" in\n        arm64) ARCH=aarch64 ;;\n        x86_64) ARCH=x86_64 ;;\n    esac\nfi\n\nexport PATH=\"$HOME/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:$PATH\"\n\ncargo xtask build-ios-sim --arch \"$ARCH\" --profile \"$PROFILE\"\n";
+			shellScript = "# Cross-compile crates/ant-ffi for the slice this build is\n# targeting. The xtask prints the absolute path of libant_ffi.a\n# on the last line; we ignore the output because the Xcode library\n# search path points at the same well-known location.\nset -euo pipefail\n\ncd \"$SRCROOT/../..\"\n\nPROFILE=release\nif [ \"${CONFIGURATION:-Release}\" = \"Debug\" ]; then\n    PROFILE=debug\nfi\n\nexport PATH=\"$HOME/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:$PATH\"\n\n# PLATFORM_NAME is iphoneos for a real device, iphonesimulator for\n# a simulator. Pick the right xtask subcommand so a plain ⌘B does\n# the cross-compile that matches the destination Xcode is targeting.\nif [ \"${PLATFORM_NAME:-iphonesimulator}\" = \"iphoneos\" ]; then\n    cargo xtask build-ios-device --profile \"$PROFILE\"\nelse\n    # Simulator builds may target arm64, x86_64, or both. We build one\n    # rust slice per invocation; prefer the host arch when both are\n    # requested so a plain ⌘B on Apple Silicon doesn't sit through an\n    # unnecessary x86_64 cross-compile.\n    ARCH=aarch64\n    host_arch=$(uname -m)\n    if [ \"${ARCHS:-arm64}\" = \"x86_64\" ]; then\n        ARCH=x86_64\n    elif [ \"${ARCHS:-arm64}\" = \"arm64\" ]; then\n        ARCH=aarch64\n    else\n        case \"$host_arch\" in\n            arm64) ARCH=aarch64 ;;\n            x86_64) ARCH=x86_64 ;;\n        esac\n    fi\n    cargo xtask build-ios-sim --arch \"$ARCH\" --profile \"$PROFILE\"\nfi\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -290,7 +290,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = 46XPHRBLH5;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				HEADER_SEARCH_PATHS = (
@@ -301,7 +301,10 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				LIBRARY_SEARCH_PATHS = (
+				"LIBRARY_SEARCH_PATHS[sdk=iphoneos*]" = (
+					"$(SRCROOT)/../../target/aarch64-apple-ios/debug",
+				);
+				"LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]" = (
 					"$(SRCROOT)/../../target/aarch64-apple-ios-sim/debug",
 					"$(SRCROOT)/../../target/x86_64-apple-ios/debug",
 				);
@@ -330,7 +333,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = 46XPHRBLH5;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				HEADER_SEARCH_PATHS = (
@@ -341,7 +344,10 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				LIBRARY_SEARCH_PATHS = (
+				"LIBRARY_SEARCH_PATHS[sdk=iphoneos*]" = (
+					"$(SRCROOT)/../../target/aarch64-apple-ios/release",
+				);
+				"LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]" = (
 					"$(SRCROOT)/../../target/aarch64-apple-ios-sim/release",
 					"$(SRCROOT)/../../target/x86_64-apple-ios/release",
 				);

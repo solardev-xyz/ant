@@ -7,7 +7,7 @@ use ant_control::{
     request_streaming, request_sync, GatewayRequestInfo, GetProgress, PeerConnectionInfo,
     PeerConnectionState, Request, Response, RetrievalInfo, StatusSnapshot,
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::{
     cursor::{Hide, Show},
@@ -1290,6 +1290,19 @@ fn format_eth_16(plur: u128) -> String {
     }
 }
 
+/// Percent-decode a `bzz://<hex>/<path>` URL path component the same
+/// way `ant-gateway`'s axum extractor does, so a manifest entry with a
+/// literal space (e.g. `02 butterfly.wav`) is still reachable via the
+/// shell-friendly URL form `02%20butterfly.wav`. Only applied to the
+/// `bzz://` URL branch — `--bzz-path <p>` is a literal argument the
+/// caller already typed in raw form, so a `%20` there is preserved.
+fn decode_bzz_url_path(raw: &str) -> Result<String> {
+    percent_encoding::percent_decode_str(raw)
+        .decode_utf8()
+        .map(|cow| cow.into_owned())
+        .map_err(|e| anyhow!("invalid percent-encoding in bzz path: {e}"))
+}
+
 /// Resolve a CLI reference + mode into the daemon-side `Request`. URL
 /// schemes (`bzz://…`, `bytes://…`) on the reference take precedence
 /// over the explicit `--bzz` / `--bytes` flags; the flags fill in the
@@ -1309,7 +1322,7 @@ fn parse_reference_with_mode(
         };
         return Ok(Request::GetBzz {
             reference: hex_part.to_string(),
-            path: path_part.to_string(),
+            path: decode_bzz_url_path(path_part)?,
             allow_degraded_redundancy,
             bypass_cache,
             progress,
