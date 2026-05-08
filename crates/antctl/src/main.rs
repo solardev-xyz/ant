@@ -437,17 +437,9 @@ enum PostageCommand {
     /// budget that bounds the size of the next upload. Pure local
     /// read against `antd` — no on-chain RPC, so the chain flags
     /// (`--gnosis-rpc-url`, `--postage-contract`, key envs) are not
-    /// required.
-    Status {
-        /// Path to the daemon's control socket. Defaults to
-        /// `<data-dir>/antd.sock`.
-        #[arg(long)]
-        socket: Option<PathBuf>,
-        /// Data directory, used to locate the default control
-        /// socket.
-        #[arg(long, default_value = "~/.antd")]
-        data_dir: String,
-    },
+    /// required. Honours the top-level `--socket` / `--data-dir`
+    /// flags like every other socket-talking subcommand.
+    Status,
 }
 
 #[derive(Subcommand, Debug)]
@@ -579,16 +571,11 @@ fn main() -> Result<()> {
         Command::Postage { command } => match command {
             // `Status` doesn't need a tokio runtime or chain RPC —
             // it talks to the local daemon socket synchronously,
-            // exactly like `antctl status`.
-            PostageCommand::Status {
-                socket: socket_override,
-                data_dir,
-            } => {
-                let s = match socket_override {
-                    Some(s) => s,
-                    None => default_socket_for(&data_dir)?,
-                };
-                run_postage_status(&s, opt.json)?;
+            // exactly like `antctl status`. The global `--socket`
+            // / `--data-dir` flags resolved into `socket` above
+            // are reused here.
+            PostageCommand::Status => {
+                run_postage_status(&socket, opt.json)?;
             }
             other => {
                 run_postage(other, opt.json)?;
@@ -2994,14 +2981,6 @@ fn resolve_socket(opt: &Opt) -> Result<PathBuf> {
         return Ok(expand_tilde(p));
     }
     let dir = expand_tilde(&opt.data_dir);
-    Ok(dir.join("antd.sock"))
-}
-
-/// Path of the default control socket inside `data_dir`. Mirrors
-/// [`resolve_socket`] for subcommands that take their own
-/// `--data-dir` (e.g. `antctl postage status`).
-fn default_socket_for(data_dir: &str) -> Result<PathBuf> {
-    let dir = expand_tilde(Path::new(data_dir));
     Ok(dir.join("antd.sock"))
 }
 
