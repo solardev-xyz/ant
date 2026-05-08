@@ -193,6 +193,14 @@ const HINT_CHAN_CAP: usize = 512;
 /// ConnectionEstablished → handshake pipeline from being drowned in parallel
 /// dials when a fresh bootnode dumps its full neighbourhood at once.
 const HINT_DIAL_BATCH: usize = 4;
+/// Minimum gap between two consecutive peer top-ups. Sustained connection
+/// churn (bee-side load shedding under pushsync pressure being the canonical
+/// trigger) drops the peer set below the floor; the top-up clears the
+/// `seen_hints` dedup, re-warms from the on-disk peerstore, and re-bootstraps
+/// to pull fresh hive gossip. 15 s is short enough to recover within a single
+/// scripted upload's retry budget yet long enough that a flapping bootnode
+/// region can't turn the recovery path into a hot loop.
+const PEER_TOP_UP_INTERVAL: Duration = Duration::from_secs(15);
 /// Default target peer count if `RunConfig::target_peers` is left at zero.
 /// Bee's mainnet neighbourhood typically fans out to a few hundred peers
 /// once kademlia stabilises; 100 keeps us connected to a useful slice of
@@ -1160,6 +1168,12 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
 
     let mut backoff = MIN_BACKOFF;
     let mut last_bootstrap_at = Instant::now();
+    // Last time the partial-drain top-up fired. Initialised so the very first
+    // loop iteration is allowed to top up — useful when the daemon resumes
+    // with a peerstore but no connected BZZ peers yet.
+    let mut last_top_up_at = Instant::now()
+        .checked_sub(PEER_TOP_UP_INTERVAL)
+        .unwrap_or_else(Instant::now);
     bootstrap_dial(&mut swarm, &cfg.bootnodes, &mut state).await;
 
     let mut flush_timer = tokio::time::interval(PEERSTORE_FLUSH_INTERVAL);
@@ -1185,6 +1199,15 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
 
     loop {
         fill_pipeline_from_hints(&mut swarm, &mut state);
+        maybe_top_up_peers(
+            &mut swarm,
+            &cfg.bootnodes,
+            &mut state,
+            &peerstore,
+            &mut last_top_up_at,
+            local_peer_id,
+        )
+        .await;
         maybe_rebootstrap(
             &mut swarm,
             &cfg.bootnodes,
@@ -2744,6 +2767,61 @@ fn fill_pipeline_from_hints(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmSt
                 debug!(target: "ant_p2p", peer = %peer_id, "hint dial error: {e}");
             }
         }
+    }
+}
+
+/// Re-warm the dial pipeline + re-bootstrap when sustained connection churn
+/// drops the peer set below half of `target_peers`. Without this, peers
+/// disconnected by remote-side close (bee's "load shedding" under sustained
+/// pushsync pressure being the canonical trigger) are never re-dialed:
+///
+/// * `seen_hints` permanently dedups every peer we've ever queued, so the
+///   same peer cannot re-enter the queue via fresh hive gossip,
+/// * the hint queue drains naturally (every entry is consumed by
+///   `fill_pipeline_from_hints`),
+/// * `maybe_rebootstrap` only fires when the entire pipeline is empty —
+///   one surviving BZZ peer keeps it parked.
+///
+/// Observable failure mode before this guard: the peer set slid from 100 →
+/// ~15 mid-upload, never recovered without a daemon restart, and the upload
+/// died with `pushsync: no peers`.
+async fn maybe_top_up_peers(
+    swarm: &mut Swarm<AntBehaviour>,
+    bootnodes: &[Multiaddr],
+    state: &mut SwarmState,
+    peerstore: &PeerStore,
+    last_top_up_at: &mut Instant,
+    local_peer_id: PeerId,
+) {
+    let floor = state.target_peers / 2;
+    let before = state.peer_set_size();
+    if floor == 0 || before >= floor {
+        return;
+    }
+    if last_top_up_at.elapsed() < PEER_TOP_UP_INTERVAL {
+        return;
+    }
+    *last_top_up_at = Instant::now();
+    // Clear the dedup so peers we've previously connected to (and lost) can
+    // re-enter the queue. `enqueue_hint` still filters out peers that are
+    // currently `bzz_peers` / `pending` / `dialing`, so a wholesale clear is
+    // safe — surviving connections aren't disturbed.
+    state.seen_hints.clear();
+    let warm = peerstore.warm_hints();
+    let warmed = warm.len();
+    for hint in warm {
+        state.enqueue_hint(hint, local_peer_id);
+    }
+    info!(
+        target: "ant_p2p",
+        peer_set_size = before,
+        target = state.target_peers,
+        floor,
+        warmed,
+        "peer set below floor; re-warming dial queue + re-bootstrapping",
+    );
+    if !bootnodes.is_empty() {
+        bootstrap_dial(swarm, bootnodes, state).await;
     }
 }
 
