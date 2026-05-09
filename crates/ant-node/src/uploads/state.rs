@@ -55,11 +55,9 @@ pub enum UploadStatus {
 
 impl UploadStatus {
     /// Status implies the driver should stop holding resources.
-    pub fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            UploadStatus::Completed | UploadStatus::Cancelled | UploadStatus::Failed
-        )
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Cancelled | Self::Failed)
     }
 }
 
@@ -141,6 +139,7 @@ pub struct UploadJobInfo {
 
 impl UploadJobInfo {
     /// Path of the on-disk manifest for `state_dir/<job_id>.json`.
+    #[must_use]
     pub fn manifest_path(state_dir: &Path, job_id: &str) -> PathBuf {
         state_dir.join(format!("{job_id}.json"))
     }

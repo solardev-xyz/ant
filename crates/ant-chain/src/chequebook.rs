@@ -36,6 +36,7 @@ use sha3::{Digest, Keccak256};
 /// Mirrors the constant bee hardcodes in
 /// `pkg/settlement/swap/chequebook/cheque.go`. Recomputed here so the
 /// test suite verifies our keccak path matches.
+#[must_use]
 pub fn cheque_type_hash() -> [u8; 32] {
     keccak(b"Cheque(address chequebook,address beneficiary,uint256 cumulativePayout)")
 }
@@ -50,6 +51,7 @@ pub fn cheque_type_hash() -> [u8; 32] {
 /// separator. Adding a `verifyingContract` here produces a digest
 /// that bee's `cashChequeBeneficiary` view rejects with
 /// `invalid issuer signature`.
+#[must_use]
 pub fn eip712_domain_type_hash() -> [u8; 32] {
     keccak(b"EIP712Domain(string name,string version,uint256 chainId)")
 }
@@ -92,6 +94,7 @@ pub struct SignedCheque {
 /// Gnosis). The chequebook address is *not* part of the domain
 /// separator — it enters the digest through the `Cheque.chequebook`
 /// field of the struct hash. See [`eip712_domain_type_hash`].
+#[must_use]
 pub fn cheque_digest(cheque: &Cheque, chain_id: u64) -> [u8; 32] {
     let domain_sep = eip712_domain_separator(chain_id);
     let struct_hash = cheque_struct_hash(cheque);
@@ -162,6 +165,7 @@ fn cheque_struct_hash(cheque: &Cheque) -> [u8; 32] {
 
 /// `SimpleSwapFactory.deploySimpleSwap(address issuer, uint256 defaultHardDepositTimeoutDuration, bytes32 salt)`
 /// — the bee chequebook factory's deploy entrypoint.
+#[must_use]
 pub fn deploy_chequebook_calldata(
     issuer: &[u8; 20],
     default_hard_deposit_timeout: U256,
@@ -181,6 +185,7 @@ pub fn deploy_chequebook_calldata(
 /// beneficiary themselves, but bee allows redirecting to a custodial
 /// address. `signature` is the 65-byte EIP-712 cheque signature
 /// produced by [`sign_cheque`].
+#[must_use]
 pub fn cash_cheque_beneficiary_calldata(
     recipient: &[u8; 20],
     cumulative_payout: U256,
@@ -205,6 +210,7 @@ pub fn cash_cheque_beneficiary_calldata(
 
 /// `Chequebook.issuer()` selector for read-only verification that
 /// the recovered cheque signer actually controls the chequebook.
+#[must_use]
 pub fn chequebook_issuer_selector() -> [u8; 4] {
     let h = keccak(b"issuer()");
     [h[0], h[1], h[2], h[3]]
@@ -218,6 +224,7 @@ pub fn chequebook_issuer_selector() -> [u8; 4] {
 /// (Bee's chequebook contract does *not* have a `totalIssued()` view
 /// — issuance is purely an off-chain accounting concept; the contract
 /// only sees what's been cashed.)
+#[must_use]
 pub fn chequebook_total_paid_out_selector() -> [u8; 4] {
     let h = keccak(b"totalPaidOut()");
     [h[0], h[1], h[2], h[3]]
@@ -228,6 +235,7 @@ pub fn chequebook_total_paid_out_selector() -> [u8; 4] {
 /// `liquidBalance()` is what's available *right now* (i.e. after
 /// subtracting any pending hard deposits) — prefer `liquidBalance()`
 /// when checking that a cheque can actually be cashed.
+#[must_use]
 pub fn chequebook_balance_selector() -> [u8; 4] {
     let h = keccak(b"balance()");
     [h[0], h[1], h[2], h[3]]
@@ -236,10 +244,11 @@ pub fn chequebook_balance_selector() -> [u8; 4] {
 /// `Chequebook.chequeHash(address chequebook, address beneficiary, uint256 cumulativePayout)`
 /// view — recomputes the EIP-712 digest exactly the way the contract
 /// does internally before recovering the issuer in
-/// `cashChequeBeneficiary`. eth_call this and compare to
+/// `cashChequeBeneficiary`. `eth_call` this and compare to
 /// [`cheque_digest`] to debug any signature-rejection: a mismatch
 /// proves our digest is wrong, a match proves the bug is on the
 /// signature side (recid byte, secret key wrong, etc.).
+#[must_use]
 pub fn chequebook_cheque_hash_calldata(
     chequebook: &[u8; 20],
     beneficiary: &[u8; 20],
@@ -257,6 +266,7 @@ pub fn chequebook_cheque_hash_calldata(
 /// the cumulative payout for `beneficiary` has already been cashed.
 /// Subtract from `cheque.cumulative_payout` to learn how much BZZ
 /// the cheque is worth right now.
+#[must_use]
 pub fn chequebook_paid_out_selector() -> [u8; 4] {
     let h = keccak(b"paidOut(address)");
     [h[0], h[1], h[2], h[3]]
@@ -266,12 +276,14 @@ pub fn chequebook_paid_out_selector() -> [u8; 4] {
 /// right now (`balance` minus the sum of all open hard deposits).
 /// `cashChequeBeneficiary` reverts with `liquid balance not
 /// sufficient` when the requested cheque diff exceeds this.
+#[must_use]
 pub fn chequebook_liquid_balance_selector() -> [u8; 4] {
     let h = keccak(b"liquidBalance()");
     [h[0], h[1], h[2], h[3]]
 }
 
 /// Encode a `paidOut(beneficiary)` call's full calldata.
+#[must_use]
 pub fn chequebook_paid_out_calldata(beneficiary: &[u8; 20]) -> Vec<u8> {
     let mut data = Vec::with_capacity(4 + 32);
     data.extend_from_slice(&chequebook_paid_out_selector());

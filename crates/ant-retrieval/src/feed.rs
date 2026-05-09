@@ -165,8 +165,8 @@ pub fn feed_from_metadata(meta: &HashMap<String, String>) -> Result<Option<Feed>
         .get(FEED_TOPIC_KEY)
         .ok_or_else(|| FeedError::InvalidMetadata(format!("missing {FEED_TOPIC_KEY}")))?
         .trim_start_matches("0x");
-    let kind = match meta.get(FEED_TYPE_KEY).map(|s| s.as_str()) {
-        Some("Sequence") | Some("sequence") | None => FeedType::Sequence,
+    let kind = match meta.get(FEED_TYPE_KEY).map(std::string::String::as_str) {
+        Some("Sequence" | "sequence") | None => FeedType::Sequence,
         Some(other) => return Err(FeedError::UnsupportedType(other.to_string())),
     };
 
@@ -195,6 +195,7 @@ pub fn feed_from_metadata(meta: &HashMap<String, String>) -> Result<Option<Feed>
 
 /// Compute the SOC chunk address for a sequential feed update at
 /// `index`. Mirrors `bee/pkg/feeds/feed.go::Update.Address`.
+#[must_use]
 pub fn sequence_update_address(feed: &Feed, index: u64) -> [u8; 32] {
     let mut id_input = Vec::with_capacity(32 + 8);
     id_input.extend_from_slice(&feed.topic);
@@ -701,7 +702,7 @@ mod tests {
         topic_alt[0] ^= 0x01;
         let feed_alt = Feed {
             topic: topic_alt,
-            ..feed.clone()
+            ..feed
         };
         assert_ne!(sequence_update_address(&feed_alt, 0), addr0);
     }

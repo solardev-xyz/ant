@@ -14,7 +14,7 @@
 //!
 //! # Wire format ([`bee/pkg/manifest/mantaray/marshal.go`])
 //!
-//! After XOR-decoding the body (every 32-byte block past the first XORed
+//! After XOR-decoding the body (every 32-byte block past the first `XORed`
 //! with the obfuscation key, which lives unencrypted in bytes 0..32):
 //!
 //! ```text
@@ -535,7 +535,7 @@ struct Fork {
 
 impl Node {
     /// Parse a fully-joined manifest node. The first 32 bytes are the
-    /// obfuscation key (treated literally), the rest is XORed with that
+    /// obfuscation key (treated literally), the rest is `XORed` with that
     /// key as a 32-byte rolling pad before parsing.
     fn unmarshal(input: &[u8]) -> Result<Self, ManifestError> {
         if input.len() < NODE_HEADER_SIZE {
@@ -732,7 +732,7 @@ impl Node {
         // for `swarm-cli upload <file>`, the metadata goes on the value
         // fork; we already pulled that into fork_meta. The root node
         // itself doesn't carry metadata directly in this serialiser.
-        Ok(Node {
+        Ok(Self {
             node_type,
             entry: entry_bytes,
             metadata: HashMap::new(),
@@ -963,7 +963,9 @@ mod tests {
             Some("text/plain; charset=utf-8")
         );
         assert_eq!(
-            res.metadata.get("Filename").map(|s| s.as_str()),
+            res.metadata
+                .get("Filename")
+                .map(std::string::String::as_str),
             Some("hello.txt")
         );
     }
@@ -1107,7 +1109,7 @@ mod tests {
         assert_eq!(payload.len(), 480);
         let node = Node::unmarshal(&payload).expect("unmarshal");
         let mut keys: Vec<u8> = node.forks.keys().copied().collect();
-        keys.sort();
+        keys.sort_unstable();
         assert_eq!(keys, b"eiw".to_vec());
         let e = node.forks.get(&b'e').unwrap();
         assert_eq!(e.prefix, b"earch/index.html");
@@ -1123,8 +1125,8 @@ mod tests {
     /// manifest `antd` was failing to walk after feed dereferencing —
     /// the on-disk obfuscation key happens to be all zeros, so
     /// XOR-decryption is a no-op and bee's parse can be exercised
-    /// directly. Pins the v0.2 fork header layout (type, prefix_len,
-    /// padded prefix, child_ref, optional metadata size + bytes) so
+    /// directly. Pins the v0.2 fork header layout (type, `prefix_len`,
+    /// padded prefix, `child_ref`, optional metadata size + bytes) so
     /// any drift between us and bee surfaces here rather than as a
     /// silent all-zero `child_ref` request at runtime.
     #[test]
@@ -1139,7 +1141,7 @@ mod tests {
         // 's', 'u', 'w', 'z'. (Verified against `swarm-cli` output.)
         let want_keys: Vec<u8> = b"/4acdefhipsuwz".to_vec();
         let mut got_keys: Vec<u8> = node.forks.keys().copied().collect();
-        got_keys.sort();
+        got_keys.sort_unstable();
         assert_eq!(got_keys, want_keys, "fork set mismatch");
 
         // Spot-check three forks across the manifest to catch drift in

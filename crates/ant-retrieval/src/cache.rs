@@ -18,7 +18,7 @@
 //!   skips the network entirely.
 //!
 //! This is the in-memory tier described in `PLAN.md` § "chunk store".
-//! A persistent tier backed by SQLite will sit underneath later;
+//! A persistent tier backed by `SQLite` will sit underneath later;
 //! the [`crate::ChunkFetcher`] integration in [`crate::RoutingFetcher`]
 //! is unchanged when that lands — it just becomes a write-through
 //! to the persistent layer below.
@@ -46,6 +46,7 @@ impl InMemoryChunkCache {
     /// Build a cache with `capacity` slots. Capacity is clamped to at
     /// least 1 — `LruCache::new` panics on zero, but a daemon misconfig
     /// shouldn't take the process down.
+    #[must_use]
     pub fn new(capacity: usize) -> Self {
         let cap = NonZeroUsize::new(capacity.max(1)).expect("capacity clamped to >= 1 above");
         Self {
@@ -54,6 +55,7 @@ impl InMemoryChunkCache {
     }
 
     /// Convenience: a cache sized at [`DEFAULT_CAPACITY`].
+    #[must_use]
     pub fn with_default_capacity() -> Self {
         Self::new(DEFAULT_CAPACITY)
     }

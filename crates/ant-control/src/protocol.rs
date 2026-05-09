@@ -248,7 +248,9 @@ pub enum Response {
     /// newtype variant ... containing a sequence" at runtime). The
     /// extra `jobs` key on the wire is the price of keeping the
     /// outer enum internally tagged.
-    UploadList { jobs: Vec<UploadJobView> },
+    UploadList {
+        jobs: Vec<UploadJobView>,
+    },
     /// Streaming progress frame on a `UploadFollow` connection.
     /// Emitted at most once per state change; old daemons never send
     /// this variant.
@@ -429,7 +431,7 @@ pub struct StatusSnapshot {
     /// Externally-advertised multiaddrs the daemon has registered with
     /// libp2p-identify, with the source that produced each one
     /// (operator-supplied, listener auto-promotion, observed-from-peer,
-    /// or UPnP). Older daemons leave this at the `#[serde(default)]`
+    /// or `UPnP`). Older daemons leave this at the `#[serde(default)]`
     /// empty value; new clients should fall back to `listeners` when it
     /// is empty. Order is insertion-stable so the UI can show a
     /// deterministic history.
@@ -456,7 +458,7 @@ pub struct IdentityInfo {
 /// daemon learned it. UIs typically render the `source` column verbatim
 /// so operators can tell at a glance whether their address came from a
 /// CLI flag, listener auto-promotion, a peer's identify push, or the
-/// UPnP behaviour talking to a home router.
+/// `UPnP` behaviour talking to a home router.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExternalAddressInfo {
     /// Multiaddr we advertise via libp2p-identify (e.g.
@@ -657,7 +659,7 @@ pub struct RetrievalInfo {
     /// `disk_hits_total`.
     #[serde(default)]
     pub mem_hits_total: u64,
-    /// Persistent (SQLite) chunk-cache snapshot. `enabled = false`
+    /// Persistent (`SQLite`) chunk-cache snapshot. `enabled = false`
     /// when the daemon was started without a disk cache.
     #[serde(default)]
     pub disk: DiskCacheInfo,
@@ -716,12 +718,13 @@ impl GatewayRequestKind {
     /// while still being self-explanatory: each label is the bee /
     /// Ant endpoint name (`/bytes`, `/bzz`, `/chunks`, `/v0/manifest`)
     /// either spelled in full or trimmed to the same root.
-    pub fn label(self) -> &'static str {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
         match self {
-            GatewayRequestKind::Bytes => "Bytes",
-            GatewayRequestKind::Bzz => "BZZ",
-            GatewayRequestKind::Chunk => "Chunk",
-            GatewayRequestKind::Manifest => "Manif",
+            Self::Bytes => "Bytes",
+            Self::Bzz => "BZZ",
+            Self::Chunk => "Chunk",
+            Self::Manifest => "Manif",
         }
     }
 }

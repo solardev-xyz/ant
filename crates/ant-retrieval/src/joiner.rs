@@ -240,6 +240,7 @@ impl ByteRange {
     /// Build a range covering `[start, end_inclusive]` after clamping to
     /// `total - 1` on the right edge. Returns `None` for empty / invalid
     /// inputs so the caller can short-circuit to a 416 response.
+    #[must_use]
     pub fn clamp(start: u64, end_inclusive: u64, total: u64) -> Option<Self> {
         if total == 0 || start > end_inclusive || start >= total {
             return None;
@@ -495,7 +496,7 @@ fn join_subtree_to_sender<'a>(
         let fanout = FETCH_FANOUT.min(refs).max(1);
         let mut child_rxs: Vec<mpsc::Receiver<Vec<u8>>> = Vec::with_capacity(refs);
         let mut producers: Vec<ProducerFut<'a>> = Vec::with_capacity(refs);
-        for (addr, child_span, child_offset) in specs.into_iter() {
+        for (addr, child_span, child_offset) in specs {
             let (tx, rx) = mpsc::channel::<Vec<u8>>(STREAM_PIPE_DEPTH);
             child_rxs.push(rx);
             producers.push(Box::pin(async move {
@@ -754,7 +755,7 @@ async fn join_child_once(
     join_subtree(fetcher, child_payload, child_span, child_offset).await
 }
 
-fn is_transient_join_error(err: &JoinError) -> bool {
+const fn is_transient_join_error(err: &JoinError) -> bool {
     matches!(err, JoinError::FetchChunk { .. })
 }
 
@@ -776,7 +777,7 @@ fn split_chunk(data: &[u8], offset: u64) -> Result<([u8; 8], &[u8]), JoinError> 
 /// span to encode the redundancy level for RS-protected intermediate
 /// chunks. A real file's span tops out at 2^56 bytes (~72 PB), so any
 /// legitimate span has its high byte clear.
-fn is_redundancy_none(span: [u8; 8]) -> bool {
+const fn is_redundancy_none(span: [u8; 8]) -> bool {
     span[7] == 0
 }
 
@@ -822,7 +823,7 @@ fn effective_payload_size(payload: &[u8]) -> usize {
 /// (`4096`), grow by the branching factor (128) until the last child fits
 /// within `branch_size`. The first `refs-1` children are full subtrees of
 /// `branch_size` bytes; the last child holds the remainder.
-fn subtrie_section(refs: usize, subtree_span: u64) -> u64 {
+const fn subtrie_section(refs: usize, subtree_span: u64) -> u64 {
     let refs = refs as u64;
     let branching = MAX_BRANCHES as u64;
     let mut branch_size = CHUNK_SIZE as u64;
@@ -1095,7 +1096,7 @@ mod tests {
     }
 
     /// Cap is honored before any allocation happens. Even a manifestly
-    /// dishonest root chunk (span = u64::MAX) is rejected promptly.
+    /// dishonest root chunk (span = `u64::MAX`) is rejected promptly.
     #[tokio::test]
     async fn rejects_oversized_span() {
         let bogus_payload = vec![0u8; 32];

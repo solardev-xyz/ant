@@ -46,6 +46,7 @@ pub const SPAN_SIZE: usize = 8;
 /// [`bmt_hash_with_span`] for the chunk address.
 ///
 /// `payload.len()` must be `<= CHUNK_SIZE`. Returns `None` otherwise.
+#[must_use]
 pub fn bmt_root(payload: &[u8]) -> Option<[u8; SEGMENT_SIZE]> {
     if payload.len() > CHUNK_SIZE {
         return None;
@@ -88,6 +89,7 @@ pub fn bmt_root(payload: &[u8]) -> Option<[u8; SEGMENT_SIZE]> {
 /// `span` is the 8-byte little-endian length prefix that precedes the
 /// payload on the wire. For a content-addressed chunk that bee built with
 /// `cac.New(payload)`, `span = u64::to_le_bytes(payload.len() as u64)`.
+#[must_use]
 pub fn bmt_hash_with_span(span: &[u8; SPAN_SIZE], payload: &[u8]) -> Option<[u8; SEGMENT_SIZE]> {
     let root = bmt_root(payload)?;
     let mut h = Keccak256::new();
@@ -104,6 +106,7 @@ pub fn bmt_hash_with_span(span: &[u8; SPAN_SIZE], payload: &[u8]) -> Option<[u8;
 ///
 /// Mirrors `bee` `pkg/cac.Valid`: returns `true` iff `data` parses, the
 /// payload size is within bounds, and the recomputed hash matches `address`.
+#[must_use]
 pub fn cac_valid(address: &[u8; SEGMENT_SIZE], data: &[u8]) -> bool {
     if data.len() < SPAN_SIZE || data.len() > SPAN_SIZE + CHUNK_SIZE {
         return false;
@@ -122,6 +125,7 @@ pub fn cac_valid(address: &[u8; SEGMENT_SIZE], data: &[u8]) -> bool {
 ///
 /// Convenience helper for tests; production code receives the chunk bytes
 /// from the network and only needs [`cac_valid`].
+#[must_use]
 pub fn cac_new(payload: &[u8]) -> Option<([u8; SEGMENT_SIZE], Vec<u8>)> {
     if payload.len() > CHUNK_SIZE {
         return None;

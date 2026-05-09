@@ -6,7 +6,7 @@
 //! these strings, so any drift will look like data corruption to a
 //! consumer.
 //!
-//! The plan (PLAN.md C.4.2) writes some shapes in snake_case as informal
+//! The plan (PLAN.md C.4.2) writes some shapes in `snake_case` as informal
 //! notation, but the reference bee implementation marshals every JSON
 //! field in camelCase. We follow bee on the wire: that's what bee-js
 //! decodes against.
@@ -182,10 +182,10 @@ pub async fn topology(State(handle): State<GatewayHandle>) -> Response {
     let snap = handle.status.borrow();
     let routing = &snap.peers.routing;
 
-    let base_addr = if !routing.base_overlay.is_empty() {
-        strip_0x(&routing.base_overlay).to_string()
-    } else {
+    let base_addr = if routing.base_overlay.is_empty() {
         handle.identity.overlay_hex.clone()
+    } else {
+        strip_0x(&routing.base_overlay).to_string()
     };
 
     let mut bins = BTreeMap::new();
@@ -243,13 +243,10 @@ fn format_rfc3339(unix: u64) -> String {
     let hour = secs_of_day / 3_600;
     let minute = (secs_of_day / 60) % 60;
     let second = secs_of_day % 60;
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        year, month, day, hour, minute, second
-    )
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
-fn civil_from_days(days: i64) -> (i32, u32, u32) {
+const fn civil_from_days(days: i64) -> (i32, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = (z - era * 146_097) as u64;

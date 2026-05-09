@@ -96,8 +96,7 @@ impl Gateway {
             .map_err(|e| GatewayError::Bind { addr, source: e })?;
         let bound = listener
             .local_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|_| addr.to_string());
+            .map_or_else(|_| addr.to_string(), |a| a.to_string());
         tracing::info!(target: "ant_gateway", "HTTP API listening on {bound}");
         axum::serve(listener, app)
             .await

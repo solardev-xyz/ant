@@ -73,6 +73,7 @@ impl ProgressTracker {
     /// Build a fresh tracker. `bypass_cache` is just plumbed through
     /// to the snapshot for client-side rendering; the tracker doesn't
     /// itself care whether the cache is bypassed.
+    #[must_use]
     pub fn new(bypass_cache: bool) -> Self {
         Self {
             chunks_done: AtomicU64::new(0),
@@ -156,6 +157,7 @@ impl ProgressTracker {
 /// "?" instead of a misleading `1`. Mirrors the layout
 /// [`crate::joiner`] reconstructs against, so the estimate matches
 /// the actual fetch count for sane inputs.
+#[must_use]
 pub fn estimate_total_chunks(span_bytes: u64) -> u64 {
     if span_bytes == 0 {
         return 0;

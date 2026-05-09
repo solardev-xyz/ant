@@ -795,7 +795,7 @@ async fn post_chunks_rejects_oversized_body() {
 /// `POST /bzz?name=hello.txt` chunks the request body, builds a
 /// single-file mantaray, pushes every chunk via `PushChunk`, then
 /// returns a Bee-shaped 201 with the manifest root. Reusing the fake
-/// node loop's BMT-only PushChunk handler means we only assert
+/// node loop's BMT-only `PushChunk` handler means we only assert
 /// reference shape + chunk count here; the production smoke test
 /// covers the live pushsync handshake.
 #[tokio::test]
@@ -857,7 +857,7 @@ async fn post_bzz_single_file_returns_manifest_reference() {
 /// produce a multi-file manifest. The returned reference must be
 /// retrievable as a manifest with each archive entry's path resolving
 /// to its own data ref. We don't have round-trip retrieval for the
-/// just-uploaded chunks here (the dispatcher only handles PushChunk),
+/// just-uploaded chunks here (the dispatcher only handles `PushChunk`),
 /// but we do verify the chunk count makes sense and the response
 /// shape is bee-compatible.
 #[tokio::test]

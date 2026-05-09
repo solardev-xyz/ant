@@ -9,7 +9,7 @@
 //!   bee's own tx layer (`pkg/transaction`) does the same.
 //! - EIP-155 chain-id replay protection (`v = chain_id * 2 + 35 + recid`).
 //! - Calldata builders for `IERC20.approve(address,uint256)` and the
-//!   three PostageStamp write methods.
+//!   three `PostageStamp` write methods.
 //! - Receipt polling (`eth_getTransactionReceipt`) with a configurable
 //!   timeout and per-poll backoff so a stuck mempool surfaces as a
 //!   structured error instead of hanging forever.
@@ -39,7 +39,7 @@ pub const GNOSIS_CHAIN_ID: u64 = 100;
 pub const DEFAULT_GAS_PRICE_WEI: u64 = 2_000_000_000;
 
 /// Conservative gas-limit defaults per workflow, sized off live
-/// `eth_estimateGas` against the deployed Gnosis PostageStamp
+/// `eth_estimateGas` against the deployed Gnosis `PostageStamp`
 /// (`0x45a1502382541Cd610CC9068e88727426b696293`):
 ///
 /// - `topUp`: ~370 k → 600 k cap
@@ -121,7 +121,7 @@ pub fn sign_legacy_tx(
         .chain_id
         .saturating_mul(2)
         .saturating_add(35)
-        .saturating_add(recid as u64);
+        .saturating_add(u64::from(recid));
 
     let raw = rlp_encode_legacy(
         tx,
@@ -205,6 +205,7 @@ fn keccak256(data: &[u8]) -> [u8; 32] {
 // --- ABI calldata builders ---
 
 /// `IERC20.approve(address spender, uint256 value)` calldata.
+#[must_use]
 pub fn erc20_approve_calldata(spender: &[u8; 20], value: &U256) -> Vec<u8> {
     let mut data = Vec::with_capacity(4 + 32 + 32);
     data.extend_from_slice(&keccak256(b"approve(address,uint256)")[0..4]);
@@ -228,6 +229,7 @@ pub fn erc20_transfer_calldata(to: &[u8; 20], value: &U256) -> Vec<u8> {
 
 /// `PostageStamp.createBatch(address owner, uint256 initialBalancePerChunk,
 ///                           uint8 depth, uint8 bucketDepth, bytes32 nonce, bool immutableFlag)`.
+#[must_use]
 pub fn postage_create_batch_calldata(
     owner: &[u8; 20],
     initial_balance_per_chunk: &U256,
@@ -250,6 +252,7 @@ pub fn postage_create_batch_calldata(
 }
 
 /// `PostageStamp.topUp(bytes32 batchId, uint256 topupAmountPerChunk)`.
+#[must_use]
 pub fn postage_top_up_calldata(batch_id: &[u8; 32], topup_per_chunk: &U256) -> Vec<u8> {
     let mut data = Vec::with_capacity(4 + 32 + 32);
     data.extend_from_slice(&keccak256(b"topUp(bytes32,uint256)")[0..4]);
@@ -259,6 +262,7 @@ pub fn postage_top_up_calldata(batch_id: &[u8; 32], topup_per_chunk: &U256) -> V
 }
 
 /// `PostageStamp.increaseDepth(bytes32 batchId, uint8 newDepth)`.
+#[must_use]
 pub fn postage_increase_depth_calldata(batch_id: &[u8; 32], new_depth: u8) -> Vec<u8> {
     let mut data = Vec::with_capacity(4 + 32 + 32);
     data.extend_from_slice(&keccak256(b"increaseDepth(bytes32,uint8)")[0..4]);
@@ -269,6 +273,7 @@ pub fn postage_increase_depth_calldata(batch_id: &[u8; 32], new_depth: u8) -> Ve
 
 /// 4-byte selector for the `BatchCreated` event (used by
 /// `eth_getLogs` filtering when watching for our own create txs).
+#[must_use]
 pub fn batch_created_event_topic() -> [u8; 32] {
     keccak256(b"BatchCreated(bytes32,uint256,uint256,address,uint8,uint8,bool)")
 }
@@ -279,14 +284,14 @@ fn pad_word_address(addr: &[u8; 20]) -> [u8; 32] {
     w
 }
 
-fn pad_word_u8(v: u8) -> [u8; 32] {
+const fn pad_word_u8(v: u8) -> [u8; 32] {
     let mut w = [0u8; 32];
     w[31] = v;
     w
 }
 
 fn pad_word_bool(v: bool) -> [u8; 32] {
-    pad_word_u8(if v { 1 } else { 0 })
+    pad_word_u8(u8::from(v))
 }
 
 fn u256_be_word(v: &U256) -> [u8; 32] {
@@ -402,11 +407,10 @@ impl ChainClient {
                         receipt_status: status.to_string(),
                     });
                 }
-                let logs = receipt
-                    .get("logs")
-                    .and_then(|l| l.as_array())
-                    .map(|arr| arr.iter().map(parse_log).collect::<Result<Vec<_>, _>>())
-                    .unwrap_or_else(|| Ok(Vec::new()))?;
+                let logs = receipt.get("logs").and_then(|l| l.as_array()).map_or_else(
+                    || Ok(Vec::new()),
+                    |arr| arr.iter().map(parse_log).collect::<Result<Vec<_>, _>>(),
+                )?;
                 return Ok(TxReceipt {
                     tx_hash: *tx_hash,
                     block_number: parse_hex_u64(block_number).unwrap_or(0),
@@ -492,6 +496,7 @@ pub struct TxReceipt {
 /// the `BatchCreated` event topic and reading the batch id from
 /// topic[1] (it's an indexed parameter). Returns `None` if no such
 /// event is in the receipt.
+#[must_use]
 pub fn extract_created_batch_id(receipt: &TxReceipt) -> Option<[u8; 32]> {
     let topic = batch_created_event_topic();
     receipt
@@ -537,19 +542,21 @@ impl Wallet {
         })
     }
 
-    pub fn address(&self) -> &[u8; 20] {
+    #[must_use]
+    pub const fn address(&self) -> &[u8; 20] {
         &self.address
     }
 
     /// Override the default wait timeout.
-    pub fn wait_for(mut self, d: Duration) -> Self {
+    #[must_use]
+    pub const fn wait_for(mut self, d: Duration) -> Self {
         self.default_wait = d;
         self
     }
 
     /// `IERC20.approve(spender, value)` against `token`. Returns the
     /// receipt once the tx has confirmed. Use this before
-    /// `create_batch` / `top_up` so the PostageStamp contract has
+    /// `create_batch` / `top_up` so the `PostageStamp` contract has
     /// permission to pull BZZ from the wallet.
     pub async fn approve_bzz(
         &self,
@@ -744,8 +751,8 @@ mod tests {
     }
 
     /// `createBatch(address,uint256,uint8,uint8,bytes32,bool)` —
-    /// known selector verified against a live Gnosis BatchCreated tx
-    /// (`0xc9e741a0…` at PostageStamp `0x45a1502382541Cd610CC9068e88727426b696293`):
+    /// known selector verified against a live Gnosis `BatchCreated` tx
+    /// (`0xc9e741a0…` at `PostageStamp` `0x45a1502382541Cd610CC9068e88727426b696293`):
     /// the tx input begins with `0x5239af71`, the keccak256-derived
     /// 4-byte selector for the canonical signature.
     #[test]
@@ -804,12 +811,12 @@ mod tests {
         );
     }
 
-    /// Round-trip the BatchCreated topic computation against a
-    /// hex pulled from a live Gnosis BatchCreated log so a future
+    /// Round-trip the `BatchCreated` topic computation against a
+    /// hex pulled from a live Gnosis `BatchCreated` log so a future
     /// signature change in the contract is caught immediately.
-    /// Verified by `eth_getLogs` against PostageStamp
+    /// Verified by `eth_getLogs` against `PostageStamp`
     /// `0x45a1502382541Cd610CC9068e88727426b696293` — the topic[0]
-    /// of every observed BatchCreated event matches.
+    /// of every observed `BatchCreated` event matches.
     #[test]
     fn batch_created_topic_matches_known() {
         let topic = batch_created_event_topic();
@@ -867,7 +874,7 @@ mod tests {
         assert_eq!(recovered_addr, want_addr);
     }
 
-    /// extract_created_batch_id pulls topic[1] when the topic[0] matches.
+    /// `extract_created_batch_id` pulls topic[1] when the topic[0] matches.
     #[test]
     fn extract_batch_id_from_synthetic_receipt() {
         let mut topics = vec![batch_created_event_topic()];

@@ -83,7 +83,7 @@ const MAX_PUSH_CONCURRENCY: usize = 32;
 /// the entire upload + every assembled chunk in memory until pushsync
 /// finishes. 64 MiB covers a typical photo album or short audio file
 /// without letting one bad client tip the daemon over.
-pub(crate) const GATEWAY_MAX_UPLOAD_BYTES: u64 = 64 * 1024 * 1024;
+pub const GATEWAY_MAX_UPLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
 /// `Cache-Control` value emitted on every content-addressed response
 /// (`/chunks`, `/bytes`, `/bzz`, `/v0/manifest`). All four endpoints
@@ -159,7 +159,7 @@ const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// 6.7 GiB GGUF upload surfaced "file too large: span 7162394016
 /// bytes, cap 1073741824 bytes" on the very first retrieval (see
 /// PLAN.md Phase 7g).
-pub(crate) const GATEWAY_MAX_FILE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+pub const GATEWAY_MAX_FILE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 /// `GET /chunks/{addr}` and `HEAD /chunks/{addr}`. Returns the chunk's
 /// **wire bytes** (`span(8 LE) || payload`) — bee's `chunkstore.Get`
@@ -352,8 +352,7 @@ pub async fn upload_bzz(
     let collection = headers
         .get(SWARM_COLLECTION)
         .and_then(|v| v.to_str().ok())
-        .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
-        .unwrap_or(false);
+        .is_some_and(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"));
 
     let timeout = request_timeout(&headers, DEFAULT_REQUEST_TIMEOUT);
 
@@ -523,7 +522,7 @@ fn assemble_collection(body: &Bytes, index_doc: Option<&str>) -> Result<Assemble
         }
         let split = split_bytes(&buf);
         data_chunks.extend(split.chunks);
-        let ct = content_type_from_extension(&path_str).map(|s| s.to_string());
+        let ct = content_type_from_extension(&path_str).map(std::string::ToString::to_string);
         files.push(ManifestFile {
             path: path_str,
             content_type: ct,
@@ -651,7 +650,7 @@ async fn push_chunks(
         result?;
         let p = pushed.load(std::sync::atomic::Ordering::Relaxed);
         let b = bytes_done.load(std::sync::atomic::Ordering::Relaxed);
-        let in_flight = (total - p).min(u32::MAX as u64) as u32;
+        let in_flight = (total - p).min(u64::from(u32::MAX)) as u32;
         guard.update(p, total, in_flight, b);
     }
     Ok(())
@@ -1017,7 +1016,7 @@ struct ManifestListing {
 }
 
 #[derive(Debug, Default, Deserialize)]
-pub(crate) struct BytesQuery {
+pub struct BytesQuery {
     #[serde(default, alias = "name")]
     filename: Option<String>,
 }
@@ -1035,7 +1034,7 @@ impl BytesQuery {
 /// same query parameter on its `/bzz` upload endpoint to override the
 /// manifest entry name without requiring a multipart body.
 #[derive(Debug, Default, Deserialize)]
-pub(crate) struct UploadBzzQuery {
+pub struct UploadBzzQuery {
     #[serde(default)]
     name: Option<String>,
 }
@@ -1090,7 +1089,7 @@ impl Started {
     /// path). The redispatched `Started` brings its own `cancel`
     /// semantics; reusing the existing guard keeps the entry stable
     /// across the brief window where two streams are active.
-    fn take_activity_guard(&mut self) -> Option<ActiveRequestGuard> {
+    const fn take_activity_guard(&mut self) -> Option<ActiveRequestGuard> {
         self.activity_guard.take()
     }
 
@@ -1104,13 +1103,15 @@ impl Started {
             self.rx.close_now();
             return Body::empty();
         }
-        let Started {
+        let Self {
             first_chunk,
             rx,
             activity_guard,
             ..
         } = self;
-        let activity = activity_guard.as_ref().map(|g| g.handle());
+        let activity = activity_guard
+            .as_ref()
+            .map(ant_control::ActiveRequestGuard::handle);
         let body_stream = stream::unfold(
             (first_chunk, rx, activity, activity_guard),
             |(mut first, mut rx, activity, guard)| async move {
@@ -1250,7 +1251,9 @@ async fn consume_stream_prologue(
     head_only: bool,
     activity_guard: Option<ActiveRequestGuard>,
 ) -> Result<Started, Response> {
-    let activity_handle = activity_guard.as_ref().map(|g| g.handle());
+    let activity_handle = activity_guard
+        .as_ref()
+        .map(ant_control::ActiveRequestGuard::handle);
     let total_bytes;
     let mut content_type = None;
     let mut filename = None;
@@ -1368,7 +1371,7 @@ async fn consume_stream_prologue(
 /// chunk" remote) and manifest-lookup misses (`'path'`) become 404; the
 /// rest are bad-gateway conditions.
 fn map_retrieval_error(message: String) -> Response {
-    let status = if message.contains("not found") || message.contains("'") {
+    let status = if message.contains("not found") || message.contains('\'') {
         StatusCode::NOT_FOUND
     } else {
         StatusCode::BAD_GATEWAY

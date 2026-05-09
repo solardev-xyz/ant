@@ -274,9 +274,9 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
                 let opts = JoinOptions {
                     allow_degraded_redundancy: true,
                 };
-                let cap = max_bytes
-                    .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
-                    .unwrap_or(DEFAULT_MAX_FILE_BYTES);
+                let cap = max_bytes.map_or(DEFAULT_MAX_FILE_BYTES, |n| {
+                    usize::try_from(n).unwrap_or(usize::MAX)
+                });
                 join_with_options(fetcher, &root, cap, opts)
                     .await
                     .map_err(|e| e.to_string())
@@ -344,9 +344,9 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
                 let opts = JoinOptions {
                     allow_degraded_redundancy,
                 };
-                let cap = max_bytes
-                    .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
-                    .unwrap_or(DEFAULT_MAX_FILE_BYTES);
+                let cap = max_bytes.map_or(DEFAULT_MAX_FILE_BYTES, |n| {
+                    usize::try_from(n).unwrap_or(usize::MAX)
+                });
                 let body = join_with_options(fetcher, &root, cap, opts)
                     .await
                     .map_err(|e| e.to_string())?;
@@ -532,7 +532,10 @@ async fn stream_via_fetcher(
                     if trimmed.is_empty() {
                         None
                     } else {
-                        trimmed.rsplit('/').next().map(|s| s.to_string())
+                        trimmed
+                            .rsplit('/')
+                            .next()
+                            .map(std::string::ToString::to_string)
                     }
                 });
                 (lookup.data_ref, lookup.content_type, filename)
@@ -567,9 +570,9 @@ async fn stream_via_fetcher(
         let opts = JoinOptions {
             allow_degraded_redundancy: allow_degraded,
         };
-        let cap = max_bytes
-            .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
-            .unwrap_or(DEFAULT_MAX_FILE_BYTES);
+        let cap = max_bytes.map_or(DEFAULT_MAX_FILE_BYTES, |n| {
+            usize::try_from(n).unwrap_or(usize::MAX)
+        });
         let body_range = range.and_then(|r| ByteRange::clamp(r.start, r.end_inclusive, total));
         let mut join_fut = Box::pin(join_to_sender_range(
             fetcher, &root, cap, opts, body_range, chunk_tx,

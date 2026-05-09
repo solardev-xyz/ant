@@ -478,7 +478,7 @@ fn serialize_fork_to_bytes(
 // --- internal helpers ---
 
 /// Stable JSON encoding for mantaray fork metadata: flat string→string
-/// object, BTreeMap order, no whitespace, escape `"` and `\`. Bee
+/// object, `BTreeMap` order, no whitespace, escape `"` and `\`. Bee
 /// itself uses `encoding/json` which produces the same wire bytes for
 /// the keys and values we ever emit (no nested objects, no Unicode
 /// surrogates, no NUL bytes).
@@ -779,7 +779,7 @@ mod tests {
         let mut data_refs: HashMap<String, [u8; 32]> = HashMap::new();
         let mut fetcher = MapFetcher::new();
         for i in 0..64u8 {
-            let path = format!("blog/posts/post-{:02x}", i);
+            let path = format!("blog/posts/post-{i:02x}");
             let body = format!("body-{i}").into_bytes();
             let split = crate::splitter::split_bytes(&body);
             for c in &split.chunks {
@@ -812,7 +812,7 @@ mod tests {
     }
 
     /// Insertion order must not change the manifest root. The trie
-    /// builder sorts forks by byte at every node (BTreeMap), so two
+    /// builder sorts forks by byte at every node (`BTreeMap`), so two
     /// permutations of the same file set hash to the same root.
     #[test]
     fn insertion_order_does_not_change_root() {

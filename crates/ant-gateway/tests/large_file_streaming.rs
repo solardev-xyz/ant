@@ -205,9 +205,9 @@ async fn stream_via_fetcher(
         }
         let (chunk_tx, mut chunk_rx) = mpsc::channel(8);
         let opts = JoinOptions::default();
-        let cap = max_bytes
-            .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
-            .unwrap_or(ant_retrieval::DEFAULT_MAX_FILE_BYTES);
+        let cap = max_bytes.map_or(ant_retrieval::DEFAULT_MAX_FILE_BYTES, |n| {
+            usize::try_from(n).unwrap_or(usize::MAX)
+        });
         let body_range = range.and_then(|r| ByteRange::clamp(r.start, r.end_inclusive, total));
         let mut join_fut = Box::pin(join_to_sender_range(
             fetcher, &root, cap, opts, body_range, chunk_tx,

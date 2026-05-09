@@ -65,6 +65,7 @@ pub struct SplitResult {
 /// Never; all chunk constructions stay within [`CHUNK_SIZE`] by
 /// construction. The internal `cac_new` / `bmt_hash_with_span` callers
 /// `unwrap()` only after enforcing payload length ≤ `CHUNK_SIZE`.
+#[must_use]
 pub fn split_bytes(payload: &[u8]) -> SplitResult {
     if payload.len() <= CHUNK_SIZE {
         let (root, wire) = cac_new(payload).expect("payload length already ≤ CHUNK_SIZE");
@@ -186,7 +187,8 @@ impl Default for StreamingSplitter {
 }
 
 impl StreamingSplitter {
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             levels: Vec::new(),
             bytes_consumed: 0,
@@ -195,13 +197,15 @@ impl StreamingSplitter {
     }
 
     /// Bytes fed in so far. Useful for progress accounting.
-    pub fn bytes_consumed(&self) -> u64 {
+    #[must_use]
+    pub const fn bytes_consumed(&self) -> u64 {
         self.bytes_consumed
     }
 
     /// Number of leaves fed in so far (== chunk index of the next
     /// leaf to be pushed).
-    pub fn leaves_emitted(&self) -> u64 {
+    #[must_use]
+    pub const fn leaves_emitted(&self) -> u64 {
         self.leaves_emitted
     }
 
@@ -269,6 +273,7 @@ impl StreamingSplitter {
     /// For an empty input (no [`push_leaf`] calls), emits the
     /// well-known zero-byte leaf and returns it as the root, matching
     /// [`split_bytes(b"")`].
+    #[must_use]
     pub fn finish(mut self) -> (ChunkAddr, u64, Vec<SplitChunk>) {
         // Empty input: emit the zero-byte leaf as both leaf and root,
         // matching `split_bytes(b"")`.
@@ -401,7 +406,7 @@ mod tests {
         join(&fetcher, root_chunk, 64 * 1024 * 1024).await
     }
 
-    /// Tiny payload (< CHUNK_SIZE): one leaf, root == leaf.
+    /// Tiny payload (< `CHUNK_SIZE)`: one leaf, root == leaf.
     #[tokio::test]
     async fn single_leaf_round_trip() {
         let payload = b"hello swarm".to_vec();

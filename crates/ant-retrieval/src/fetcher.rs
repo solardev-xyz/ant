@@ -42,7 +42,7 @@ pub type Overlay = [u8; 32];
 
 /// Per-chunk error budget, matching bee `maxOriginErrors` in
 /// `pkg/retrieval/retrieval.go`. Bee's origin path tolerates up to 32
-/// peer errors (Remote / Timeout / Io / OpenStream) before giving up
+/// peer errors (Remote / Timeout / Io / `OpenStream`) before giving up
 /// on a chunk; we mirror that exactly so behaviour is comparable
 /// chunk-for-chunk. Beyond ~32 candidates the chunk is almost
 /// certainly not retrievable from our connected set anyway.
@@ -200,7 +200,8 @@ impl RoutingFetcher {
     /// sibling chunks of the same request, but they're not banned
     /// across attempts either. The retry wrapper in `ant-p2p` constructs
     /// a fresh fetcher per attempt to keep that scoping honest.
-    pub fn new(control: Control, peers_rx: watch::Receiver<Vec<(PeerId, Overlay)>>) -> Self {
+    #[must_use]
+    pub const fn new(control: Control, peers_rx: watch::Receiver<Vec<(PeerId, Overlay)>>) -> Self {
         Self {
             control,
             peers_rx,
@@ -260,6 +261,7 @@ impl RoutingFetcher {
     /// The `Sender` is dropped immediately; `watch::Receiver::borrow`
     /// keeps returning the seeded value indefinitely afterwards.
     #[cfg(test)]
+    #[must_use]
     pub fn with_static_peers(control: Control, peers: Vec<(PeerId, Overlay)>) -> Self {
         let (_tx, rx) = watch::channel(peers);
         Self::new(control, rx)
@@ -459,7 +461,7 @@ impl RoutingFetcher {
             )
             .await
             {
-                Ok(_) => {
+                Ok(()) => {
                     if let Some(s) = self.pushsync_settlement.as_ref() {
                         s.note_pushsync(peer, chunk_price).await;
                     }
@@ -488,7 +490,7 @@ impl RoutingFetcher {
                 )
                 .await
                 {
-                    Ok(_) => {
+                    Ok(()) => {
                         if let Some(s) = self.pushsync_settlement.as_ref() {
                             s.note_pushsync(peer, chunk_price).await;
                         }
@@ -714,21 +716,18 @@ impl ChunkFetcher for RoutingFetcher {
                     match self.accounting.as_ref() {
                         Some(acc) => {
                             let price = Accounting::peer_price(&peer_overlay, &addr);
-                            match acc.try_reserve(peer, price) {
-                                Some(guard) => return Some((peer, Some(guard))),
-                                None => {
-                                    trace!(
-                                        target: "ant_retrieval::fetcher",
-                                        %peer,
-                                        chunk = %hex::encode(addr),
-                                        price,
-                                        "overdraft skip; trying next-closest peer",
-                                    );
-                                    overdraft_skip
-                                        .insert(peer, now + crate::accounting::OVERDRAFT_REFRESH);
-                                    continue;
-                                }
+                            if let Some(guard) = acc.try_reserve(peer, price) {
+                                return Some((peer, Some(guard)));
                             }
+                            trace!(
+                                target: "ant_retrieval::fetcher",
+                                %peer,
+                                chunk = %hex::encode(addr),
+                                price,
+                                "overdraft skip; trying next-closest peer",
+                            );
+                            overdraft_skip.insert(peer, now + crate::accounting::OVERDRAFT_REFRESH);
+                            continue;
                         }
                         None => return Some((peer, None)),
                     }
@@ -922,7 +921,7 @@ impl ChunkFetcher for RoutingFetcher {
                         }
                     }
                 }
-                _ = &mut hedge_timer, if errors_left > 0 => {
+                () = &mut hedge_timer, if errors_left > 0 => {
                     // Tail-slow chunk: layer one more peer onto the race.
                     // Reset the timer so the next hedge needs another
                     // full HEDGE_DELAY of silence before firing — we
@@ -941,9 +940,7 @@ impl ChunkFetcher for RoutingFetcher {
             "all peers failed for chunk {} after {} attempts (last: {})",
             hex::encode(addr),
             asked.len(),
-            last_err
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "no candidates".into())
+            last_err.map_or_else(|| "no candidates".into(), |e| e.to_string())
         )
         .into())
     }
@@ -967,7 +964,7 @@ impl ChunkFetcher for RoutingFetcher {
 ///
 /// `Io(_)` is *also* non-fatal, and this is the load-bearing addition
 /// that fixed the "WAV files won't load" production regression: bee
-/// signals "I don't have this chunk" by closing the libp2p_stream
+/// signals "I don't have this chunk" by closing the `libp2p_stream`
 /// without writing the protobuf reply. Our reader then surfaces
 /// `UnexpectedEof` (most common) or `BrokenPipe` / `ConnectionReset`
 /// (when the close races our read), all of which surface here as
@@ -995,7 +992,7 @@ impl ChunkFetcher for RoutingFetcher {
 /// say the peer is misbehaving or speaking a protocol we can't decode,
 /// and there's no reason to expect a different chunk fetch against the
 /// same peer to behave any differently.
-fn is_peer_fatal(err: &RetrievalError) -> bool {
+const fn is_peer_fatal(err: &RetrievalError) -> bool {
     match err {
         RetrievalError::Remote(_) => false,
         RetrievalError::Timeout(_) => false,

@@ -58,7 +58,7 @@ pub struct HandshakeInfo {
     /// SWAP layer uses this as the **beneficiary** of cheques: when we
     /// owe a peer, the cheque we emit has `beneficiary = this`. We
     /// recover it here by re-deriving the secp256k1 verifying key
-    /// from the BzzAddress signature against the same digest the
+    /// from the `BzzAddress` signature against the same digest the
     /// peer signed during handshake.
     pub remote_eth_address: [u8; 20],
     /// Welcome message string the remote sent in its handshake Ack.
@@ -68,13 +68,13 @@ pub struct HandshakeInfo {
     pub remote_welcome: String,
 }
 
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, ::prost::Message)]
 pub struct Syn {
     #[prost(bytes = "vec", tag = "1")]
     pub observed_underlay: Vec<u8>,
 }
 
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, ::prost::Message)]
 pub struct BzzAddress {
     #[prost(bytes = "vec", tag = "1")]
     pub underlay: Vec<u8>,
@@ -84,7 +84,7 @@ pub struct BzzAddress {
     pub overlay: Vec<u8>,
 }
 
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, ::prost::Message)]
 pub struct Ack {
     #[prost(message, optional, tag = "1")]
     pub address: Option<BzzAddress>,
@@ -98,7 +98,7 @@ pub struct Ack {
     pub welcome_message: String,
 }
 
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, ::prost::Message)]
 pub struct SynAck {
     #[prost(message, optional, tag = "1")]
     pub syn: Option<Syn>,
@@ -358,7 +358,7 @@ async fn handshake_outbound_inner(
     })
 }
 
-fn resolve_advertisable(observed: Multiaddr) -> Multiaddr {
+const fn resolve_advertisable(observed: Multiaddr) -> Multiaddr {
     observed
 }
 
@@ -394,6 +394,6 @@ fn build_full_peer_maddrs(
 }
 
 fn sort_dedupe_maddrs(addrs: &mut Vec<Multiaddr>) {
-    addrs.sort_by_key(|a| a.to_string());
+    addrs.sort_by_key(std::string::ToString::to_string);
     addrs.dedup_by(|a, b| a == b);
 }

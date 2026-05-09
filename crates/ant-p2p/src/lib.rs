@@ -28,6 +28,7 @@ use std::time::Duration;
 
 /// Default mainnet bootnodes, matching upstream `bee` >= 2.7
 /// (`/dnsaddr/mainnet.ethswarm.org` is the only published entry).
+#[must_use]
 pub fn default_mainnet_bootnodes() -> Vec<Multiaddr> {
     ["/dnsaddr/mainnet.ethswarm.org"]
         .iter()
@@ -36,6 +37,7 @@ pub fn default_mainnet_bootnodes() -> Vec<Multiaddr> {
 }
 
 /// Default backoff range after a failed dial / handshake.
-pub fn default_backoff() -> Duration {
+#[must_use]
+pub const fn default_backoff() -> Duration {
     Duration::from_secs(5)
 }

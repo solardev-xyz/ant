@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// [`RetrievalCounters::record_chunk`] so the snapshot can split the
 /// "cache hits" gauge into per-tier counts.
 ///
-/// Splitting tier 1 (in-memory LRU) from tier 2 (SQLite) matters for
+/// Splitting tier 1 (in-memory LRU) from tier 2 (`SQLite`) matters for
 /// `antctl top`'s diagnostic value: a hot daemon with a large warm
 /// disk cache should show non-zero `disk` even right after restart,
 /// while the same daemon serving repeat requests should drive `mem`
@@ -43,7 +43,7 @@ pub enum ChunkSource {
     /// Served from the in-memory LRU
     /// ([`super::InMemoryChunkCache`]).
     Memory,
-    /// Served from the persistent SQLite cache
+    /// Served from the persistent `SQLite` cache
     /// ([`super::DiskChunkCache`]). The chunk is also lifted into
     /// the in-memory tier on a tier-2 hit, but only one source is
     /// recorded per delivery — the one that actually saved the
@@ -60,7 +60,7 @@ pub struct RetrievalCounters {
     /// Tier-1 (in-memory LRU) hits. `mem_hits + disk_hits + network`
     /// always equals `chunks_fetched`.
     mem_hits: AtomicU64,
-    /// Tier-2 (persistent SQLite) hits. Bumps the in-memory tier as
+    /// Tier-2 (persistent `SQLite`) hits. Bumps the in-memory tier as
     /// a side effect of [`super::ChunkFetcher::fetch`], so a chunk
     /// that lands here lifts to memory and the *next* request for
     /// the same chunk will increment `mem_hits`.
@@ -76,7 +76,7 @@ pub struct RetrievalCountersSnapshot {
     pub bytes_fetched: u64,
     /// In-memory LRU hits.
     pub mem_hits: u64,
-    /// Persistent SQLite cache hits.
+    /// Persistent `SQLite` cache hits.
     pub disk_hits: u64,
 }
 
@@ -84,7 +84,8 @@ impl RetrievalCountersSnapshot {
     /// Total cache hits (memory + disk). Convenience for the
     /// `antctl top` "x cache hits" overall summary so the renderer
     /// doesn't have to add the two fields itself everywhere.
-    pub fn cache_hits(&self) -> u64 {
+    #[must_use]
+    pub const fn cache_hits(&self) -> u64 {
         self.mem_hits.saturating_add(self.disk_hits)
     }
 }
@@ -92,6 +93,7 @@ impl RetrievalCountersSnapshot {
 impl RetrievalCounters {
     /// Build a fresh zero-initialised counter set. The daemon constructs
     /// exactly one of these and clones the `Arc` into every fetcher.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }

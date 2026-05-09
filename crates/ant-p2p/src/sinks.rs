@@ -70,11 +70,11 @@ const HIVE_MAX: usize = 128 * 1024;
 /// never send non-trivial headers so a much tighter cap is safe here — but
 /// giving bee the same 8 KiB window it uses lets us stay compatible with
 /// tracing, settlement, and any future non-empty headers payload.
-pub(crate) const HEADERS_MAX: usize = 8 * 1024;
+pub const HEADERS_MAX: usize = 8 * 1024;
 /// Per-stream wall-clock cap; bee's `pricing.AnnouncePaymentThreshold` uses
 /// a 5 s context and its headers exchange a 10 s one, so 15 s is enough to
 /// survive both without letting a stuck stream leak forever.
-pub(crate) const STREAM_TIMEOUT: Duration = Duration::from_secs(15);
+pub const STREAM_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A decoded hive `BzzAddress` reduced to the fields the swarm loop needs
 /// to dial the peer. The overlay is carried through so the swarm loop can
