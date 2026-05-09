@@ -1,6 +1,6 @@
 [package]
 name = "antctl"
-version = "0.3.17"
+version = "0.3.18"
 edition.workspace = true
 
 [[bin]]
@@ -10,11 +10,14 @@ path = "src/main.rs"
 [dependencies]
 ant-chain = { path = "../ant-chain" }
 ant-control = { path = "../ant-control" }
+ant-crypto = { path = "../ant-crypto" }
+ant-retrieval = { path = "../ant-retrieval" }
 anyhow.workspace = true
 clap = { workspace = true, features = ["env"] }
 crossterm = "0.29.0"
 dirs = "6.0.0"
 hex.workspace = true
+memmap2 = "0.9.10"
 percent-encoding = "2.3"
 primitive-types = { version = "0.14.0", default-features = false }
 ratatui = "0.30.0"

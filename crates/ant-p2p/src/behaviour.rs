@@ -1910,7 +1910,49 @@ fn handle_control_command(
             };
             let _ = ack.send(ControlAck::PostageStatus(view));
         }
+        ControlCommand::PutChunkLocal { wire, ack } => {
+            handle_put_chunk_local(state, wire, ack);
+        }
     }
+}
+
+fn handle_put_chunk_local(
+    state: &mut SwarmState,
+    wire: Vec<u8>,
+    ack: oneshot::Sender<ControlAck>,
+) {
+    let Some(disk_cache) = state.disk_cache.clone() else {
+        let _ = ack.send(ControlAck::Error {
+            message: "disk chunk cache disabled; pass --disk-cache-bytes > 0 at startup".into(),
+        });
+        return;
+    };
+    if wire.len() < 8 || wire.len() > 8 + ant_crypto::CHUNK_SIZE {
+        let _ = ack.send(ControlAck::Error {
+            message: format!("chunk wire size out of range: {} bytes", wire.len()),
+        });
+        return;
+    }
+    let mut span = [0u8; 8];
+    span.copy_from_slice(&wire[..8]);
+    let payload = &wire[8..];
+    let Some(addr) = ant_crypto::bmt::bmt_hash_with_span(&span, payload) else {
+        let _ = ack.send(ControlAck::Error {
+            message: "failed to BMT-hash chunk".into(),
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let reply = match disk_cache.put(addr, wire).await {
+            Ok(()) => ControlAck::Ok {
+                message: format!("0x{}", hex::encode(addr)),
+            },
+            Err(e) => ControlAck::Error {
+                message: format!("disk cache write failed: {e}"),
+            },
+        };
+        let _ = ack.send(reply);
+    });
 }
 
 #[allow(clippy::too_many_arguments)]

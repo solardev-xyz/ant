@@ -163,6 +163,25 @@ pub enum Request {
     /// chain RPC. Old daemons reject this with the standard "bad
     /// request" envelope.
     PostageStatus,
+    /// Insert a CAC-validated chunk directly into the daemon's
+    /// disk chunk cache, without stamping or pushsync. Used by
+    /// `antctl pin` to make a previously-uploaded file
+    /// retrievable through *this* node's HTTP gateway without
+    /// waiting for bee-side neighbourhood replication.
+    ///
+    /// `wire_hex` is the chunk's full wire bytes (`span (8 LE) ||
+    /// payload`, ≤ 8 + 4096 bytes), `0x`-prefixed lowercase hex.
+    /// The daemon recomputes the chunk address from the wire
+    /// (CAC) and rejects mismatched payloads — callers cannot
+    /// poison the disk cache by putting wrong-address bytes.
+    ///
+    /// Returns [`Response::Ok`] on success; the message carries
+    /// the resulting chunk address. Old daemons reject this with
+    /// the standard "bad request" envelope.
+    PutChunkLocal {
+        /// `0x`-prefixed lowercase hex of the chunk wire bytes.
+        wire_hex: String,
+    },
 }
 
 /// Daemon → client response.

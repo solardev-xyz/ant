@@ -30,6 +30,8 @@ use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod pin;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "antctl",
@@ -120,6 +122,7 @@ Examples:
         #[command(subcommand)]
         command: UploadCommand,
     },
+    Pin(PinArgs),
     Get {
         /// Reference. See above for accepted forms.
         reference: String,
@@ -190,6 +193,19 @@ Examples:
 enum ProgressStyle {
     Line,
     Visual,
+}
+
+#[derive(clap::Args, Debug)]
+struct PinArgs {
+    /// Bzz reference returned by the original upload.
+    reference: String,
+    path: PathBuf,
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long)]
+    content_type: Option<String>,
+    #[arg(long)]
+    raw: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -671,6 +687,7 @@ fn main() -> Result<()> {
         Command::Upload { command } => {
             run_upload(&socket, command, opt.json)?;
         }
+        Command::Pin(p) => pin::run(&socket, p, opt.json)?,
         Command::Get {
             reference,
             out,

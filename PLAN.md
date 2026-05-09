@@ -1480,19 +1480,68 @@ to wait — there is no client-side fix.
 **Action plan if `+72 h` doesn't recover availability** (not
 expected, but worth recording):
 
-1. **Phase 7h: `antctl upload reseed <job-id>`.** Walks the
+1. **Phase 7h: `antctl pin <reference> <file>` (DELIVERED, 2026-05-09, antd 0.3.18).**
+   Local-only chunk write that bypasses bee-side replication
+   entirely. Reuses [`ant_retrieval::StreamingSplitter`] to
+   walk the source file with constant memory, derives the
+   matching mantaray manifest with [`build_single_file_manifest`]
+   (so the derived root is byte-identical to what `antctl
+   upload` produced), and dispatches every chunk through a new
+   [`Request::PutChunkLocal`] control command. The daemon
+   validates each wire (BMT-with-span match) and writes it
+   straight into [`DiskChunkCache`] (`<data-dir>/chunks.sqlite`)
+   without stamping or pushsync. The CLI verifies the derived
+   manifest root matches the user-supplied `<reference>`
+   *after* every chunk has been dispatched, so a typo or
+   wrong-source-file mismatch surfaces as a hard error
+   before the operator trusts the pin.
+
+   Caveat: `antd` is dialer-only on the retrieval protocol,
+   so a local pin only makes the file resolvable through *this*
+   node's HTTP gateway. Other Swarm nodes still see the file
+   only through bee-side neighbourhood replication. That's
+   exactly the right behaviour for the use case (operator wants
+   `vibing.at/ai/<file>` to work *now*, not "when the network
+   catches up"). LRU eviction at the disk-cache cap means the
+   pin survives daemon restarts but eventually decays — re-run
+   `antctl pin` to refresh.
+
+   Production deployment also raised
+   `--disk-cache-max-gb` from 10 to 32 in
+   `/etc/systemd/system/antd.service` so the 6.7 GiB GGUF
+   plus other content fits comfortably.
+
+   **Acceptance** (verified on 2026-05-09):
+   - Smoke test: 20 MiB file, 5 164 chunks, pinned in 1.4 s
+     (14 MiB/s); `GET /bzz/<ref>/` returned the full body in
+     150 ms with matching SHA-256.
+   - gemma4:e2b GGUF (6.7 GiB, 1 762 407 chunks): pinned in
+     570 s (12 MiB/s, bounded by the SQLite writer); the
+     control-socket fan-out (8 worker threads, one socket
+     each) saturated the daemon's disk-cache queue without
+     touching the upload pipeline. `GET /bzz/<ref>/` for the
+     full body returned 7 162 394 016 bytes in 153 s
+     (≈ 47 MB/s, served entirely from the local SQLite cache);
+     SHA-256 of the response matched the source file
+     (`4e30e266…07448`) exactly. After the daemon restarted
+     (cache-cap bump), a partial fetch confirmed the rows
+     persist across restart.
+
+2. **Phase 7i (deferred): `antctl upload reseed <job-id>`.** Walks the
    local source file, derives every chunk address, queries
    `/chunks/0x<addr>` for each, re-pushes any that 404. The
    re-push lands on whichever peer is now the closest
    neighbour (which may differ from the original receiver),
-   materially accelerating availability. Bandwidth bounded by
-   the miss rate: at 24 % miss × 1.76 M chunks × 4 KiB ≈
-   1.7 GiB to re-push.
-2. **Phase 7i: target-peers ≥ 600 + 24 h soak.** Raises the
+   materially accelerating *network-wide* availability — which
+   `pin` does not address. Bandwidth bounded by the miss rate:
+   at 24 % miss × 1.76 M chunks × 4 KiB ≈ 1.7 GiB to re-push.
+   Lower priority now that pinning unblocks the operator's own
+   gateway.
+3. **Phase 7j: target-peers ≥ 600 + 24 h soak.** Raises the
    probability that *our* routing table covers every k-bucket
    at least once. Pre-req: the dial-pipeline audit listed
    under Phase 7f's follow-ups.
-3. **Phase 7j: bee-side hand-off.** Drive a temporary
+4. **Phase 7k: bee-side hand-off.** Drive a temporary
    high-stake bee node next to antd, let pullsync replicate
    our upload through it, then retire the bee node. Most
    surgical option for forcing replication; needs SWAP plumbing

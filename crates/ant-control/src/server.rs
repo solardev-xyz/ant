@@ -224,6 +224,19 @@ pub enum ControlCommand {
     /// per-bucket extremes). Pure local read — no chain RPC, no
     /// network round-trip.
     PostageStatus { ack: oneshot::Sender<ControlAck> },
+    /// Write a single CAC chunk straight into the local disk chunk
+    /// cache (no postage stamp, no pushsync). Backs `antctl pin`,
+    /// which lets an operator make a previously-uploaded file
+    /// retrievable through this node's HTTP gateway without
+    /// waiting for bee-side neighbourhood replication.
+    ///
+    /// `wire` is the full chunk wire bytes (`span (8 LE) ||
+    /// payload`); the handler recomputes the address (BMT-with-span)
+    /// and rejects payloads whose hash doesn't match.
+    PutChunkLocal {
+        wire: Vec<u8>,
+        ack: oneshot::Sender<ControlAck>,
+    },
 }
 
 /// Inclusive byte range used by [`ControlCommand::StreamBytes`] and
@@ -569,6 +582,25 @@ async fn handle_connection(
             .await;
             write_response(&mut write_half, &response).await?;
         }
+        Ok(Request::PutChunkLocal { wire_hex }) => match parse_chunk_wire(&wire_hex) {
+            Ok(wire) => {
+                let response =
+                    dispatch_oneshot(command_tx.as_ref(), FAST_COMMAND_TIMEOUT, |ack| {
+                        ControlCommand::PutChunkLocal { wire, ack }
+                    })
+                    .await;
+                write_response(&mut write_half, &response).await?;
+            }
+            Err(e) => {
+                write_response(
+                    &mut write_half,
+                    &Response::Error {
+                        message: format!("bad request: {e}"),
+                    },
+                )
+                .await?;
+            }
+        },
         Ok(Request::UploadFollow { job_id }) => {
             // Use the upload-specific timeout: a stalled upload may
             // emit no progress for many seconds (e.g. waiting on a
@@ -753,6 +785,34 @@ fn parse_reference(s: &str) -> Result<[u8; 32], String> {
     let mut out = [0u8; 32];
     hex::decode_to_slice(stripped, &mut out).map_err(|e| format!("invalid hex: {e}"))?;
     Ok(out)
+}
+
+/// Parse the chunk wire bytes carried by `Request::PutChunkLocal`.
+/// Accepts `0x`-prefixed or bare hex; even-length only. Enforces a
+/// generous upper bound (~4200 bytes) so a hostile client can't OOM
+/// the daemon by sending a giant "chunk"; tighter per-variant
+/// validation (CAC vs SOC, BMT match) lives in the ant-p2p handler
+/// where chunk crypto helpers are already in scope.
+fn parse_chunk_wire(s: &str) -> Result<Vec<u8>, String> {
+    let stripped = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
+    if !stripped.len().is_multiple_of(2) {
+        return Err("chunk wire hex must have even length".to_string());
+    }
+    const MAX_WIRE_BYTES: usize = 4200;
+    if stripped.len() / 2 > MAX_WIRE_BYTES {
+        return Err(format!(
+            "chunk wire {} bytes exceeds cap {} bytes",
+            stripped.len() / 2,
+            MAX_WIRE_BYTES
+        ));
+    }
+    if stripped.len() < 16 {
+        return Err("chunk wire must include the 8-byte span prefix".to_string());
+    }
+    hex::decode(stripped).map_err(|e| format!("invalid hex: {e}"))
 }
 
 #[cfg(unix)]
