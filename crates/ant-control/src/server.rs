@@ -175,6 +175,17 @@ pub enum ControlCommand {
         wire: Vec<u8>,
         ack: oneshot::Sender<ControlAck>,
     },
+    /// Gateway `POST /soc/{owner}/{id}`: stamp the SOC at `address` and
+    /// pushsync the wire bytes. `address` is `keccak256(id || owner)`,
+    /// already validated by the gateway via `soc_valid(&address, &wire)`;
+    /// `wire` is the SOC's `swarm.Chunk.Data()` form (`id || sig ||
+    /// inner_cac`). The node stamps directly at `address` rather than
+    /// rederiving via BMT, since SOC addresses are not BMT-addressable.
+    PushSoc {
+        address: [u8; 32],
+        wire: Vec<u8>,
+        ack: oneshot::Sender<ControlAck>,
+    },
     /// Create a new upload job. The node loop forwards to its
     /// `UploadManager`, which writes the persistent manifest, spawns
     /// the driver task, and acks with the assigned job id.

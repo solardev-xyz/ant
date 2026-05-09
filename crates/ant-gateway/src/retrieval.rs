@@ -69,6 +69,10 @@ const SWARM_COLLECTION: HeaderName = HeaderName::from_static("swarm-collection")
 /// when the user requests `bzz://<root>/` (no path). Mirrored on the
 /// root manifest's `/` fork as `website-index-document` metadata.
 const SWARM_INDEX_DOCUMENT: HeaderName = HeaderName::from_static("swarm-index-document");
+/// Bee request header on `POST /soc/{owner}/{id}`: 65-byte secp256k1
+/// signature over `keccak256(id || inner_cac_addr)` (EIP-191 wrapped),
+/// hex-encoded with or without an `0x` prefix.
+const SWARM_SOC_SIGNATURE: HeaderName = HeaderName::from_static("swarm-soc-signature");
 
 /// Concurrency cap on outbound `PushChunk` commands during a `POST /bzz`
 /// upload. Matched to the daemon-side
@@ -444,6 +448,135 @@ pub async fn upload_chunk(
         }
         other => {
             warn!(target: "ant_gateway", ?other, "unexpected ack from PushChunk");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "unexpected node ack")
+        }
+    }
+}
+
+/// `POST /soc/{owner}/{id}` — accept a single-owner-chunk's inner CAC
+/// payload, validate the signature, then stamp + pushsync the SOC. The
+/// path carries the 32-byte `id` and the 20-byte `owner` Ethereum
+/// address; the signature is supplied via the `swarm-soc-signature`
+/// header (bee convention). The body is the **inner CAC wire**:
+/// `span(8 LE) || payload(≤4096)`. The full SOC wire that hits the
+/// network is `id || sig || body`, addressed at
+/// `keccak256(id || owner)`.
+///
+/// Bee's HTTP API exposes the same shape on `POST /soc/{owner}/{id}`,
+/// see `bee/pkg/api/soc.go`. Returns bee-shaped
+/// `{"reference": "<lowercase 64-hex>"}` with status 201 on success.
+pub async fn upload_soc(
+    State(handle): State<GatewayHandle>,
+    Path((owner_hex, id_hex)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let owner = match parse_hex_fixed::<20>(&owner_hex) {
+        Ok(o) => o,
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("bad owner: {e}")),
+    };
+    let id = match parse_hex_fixed::<32>(&id_hex) {
+        Ok(i) => i,
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("bad id: {e}")),
+    };
+
+    let Some(sig_header) = headers.get(&SWARM_SOC_SIGNATURE) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "missing swarm-soc-signature header",
+        );
+    };
+    let Ok(sig_str) = sig_header.to_str() else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "swarm-soc-signature must be ascii hex",
+        );
+    };
+    let sig = match parse_hex_fixed::<65>(sig_str) {
+        Ok(s) => s,
+        Err(e) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                format!("bad swarm-soc-signature: {e}"),
+            );
+        }
+    };
+
+    if body.len() < 8 || body.len() > 8 + 4096 {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            format!("soc inner cac size out of range: {} bytes", body.len()),
+        );
+    }
+
+    // SOC wire: id(32) || sig(65) || inner_cac(span(8) || payload).
+    let mut wire = Vec::with_capacity(32 + 65 + body.len());
+    wire.extend_from_slice(&id);
+    wire.extend_from_slice(&sig);
+    wire.extend_from_slice(&body);
+
+    // Address binds id and owner: address = keccak256(id || owner).
+    let mut addr_input = [0u8; 32 + 20];
+    addr_input[..32].copy_from_slice(&id);
+    addr_input[32..].copy_from_slice(&owner);
+    let address = ant_crypto::keccak256(&addr_input);
+
+    if !ant_crypto::soc_valid(&address, &wire) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "soc signature does not recover the supplied owner",
+        );
+    }
+
+    let timeout = request_timeout(&headers, CHUNK_REQUEST_TIMEOUT);
+
+    let guard = handle.activity.begin(
+        GatewayRequestKind::Soc,
+        short_reference(&hex::encode(address)),
+    );
+
+    let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
+    let cmd = ControlCommand::PushSoc {
+        address,
+        wire,
+        ack: ack_tx,
+    };
+    if handle.commands.send(cmd).await.is_err() {
+        return node_unavailable();
+    }
+    guard.update(0, 1, 1, 0);
+
+    let ack = match tokio::time::timeout(timeout, ack_rx).await {
+        Ok(Ok(ack)) => ack,
+        Ok(Err(_)) => return node_unavailable(),
+        Err(_) => {
+            return json_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("upload timed out after {}s", timeout.as_secs()),
+            );
+        }
+    };
+
+    match ack {
+        ControlAck::ChunkUploaded { reference } => {
+            guard.update(1, 1, 0, body.len() as u64);
+            let stripped = reference
+                .strip_prefix("0x")
+                .or_else(|| reference.strip_prefix("0X"))
+                .unwrap_or(reference.as_str())
+                .to_string();
+            // SOC writes are mutable at the address level (the owner can
+            // sign a new payload at the same id), so don't apply the
+            // immutable cache headers `upload_chunk` uses.
+            json_response(
+                StatusCode::CREATED,
+                &serde_json::json!({ "reference": stripped }),
+            )
+        }
+        ControlAck::NotReady { message } => json_error(StatusCode::SERVICE_UNAVAILABLE, message),
+        ControlAck::Error { message } => json_error(StatusCode::BAD_GATEWAY, message),
+        other => {
+            warn!(target: "ant_gateway", ?other, "unexpected ack from PushSoc");
             json_error(StatusCode::INTERNAL_SERVER_ERROR, "unexpected node ack")
         }
     }

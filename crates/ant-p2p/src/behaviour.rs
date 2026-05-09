@@ -1499,6 +1499,78 @@ fn handle_control_command(
                 let _ = ack.send(reply);
             });
         }
+        ControlCommand::PushSoc { address, wire, ack } => {
+            let Some(upload) = upload.clone() else {
+                let _ = ack.send(ControlAck::NotReady {
+                    message: "uploads not configured: pass --postage-batch and --wallet-key (or set the env vars) at startup".into(),
+                });
+                return;
+            };
+
+            // Re-check the wire layout locally even though the gateway
+            // has already validated `soc_valid(&address, &wire)`: a
+            // misbehaving gateway must not be able to coerce us into
+            // stamping a malformed chunk. SOC wire layout: id(32) +
+            // sig(65) + span(8) + payload(≤4096).
+            const SOC_HEADER: usize = 32 + 65;
+            if wire.len() < SOC_HEADER + 8 || wire.len() > SOC_HEADER + 8 + 4096 {
+                let _ = ack.send(ControlAck::Error {
+                    message: format!("soc wire size out of range: {} bytes", wire.len()),
+                });
+                return;
+            }
+
+            // Stamp under the issuer mutex so concurrent pushes can't
+            // collide on the same bucket index, matching the PushChunk
+            // path. The address is owner-bound (`keccak256(id || owner)`),
+            // so the stamp signs the SOC's content address rather than
+            // a BMT hash. Bee stamps SOCs the same way: see
+            // `bee/pkg/api/soc.go` (the `chunk.NewChunk(addr, ...)` is
+            // handed to the postage stamper as-is) and
+            // `bee/pkg/postage/stampissuer.go::Issue` which signs over
+            // the chunk's address bytes regardless of CAC vs SOC.
+            let stamp = {
+                let mut issuer = match upload.issuer.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                match ant_postage::sign_stamp_bytes(&upload.stamp_key, &mut issuer, &address) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = ack.send(ControlAck::Error {
+                            message: format!("stamp issue failed: {e}"),
+                        });
+                        return;
+                    }
+                }
+            };
+
+            let peers_rx = state.peers_watch.subscribe();
+            if peers_rx.borrow().is_empty() {
+                let _ = ack.send(ControlAck::NotReady {
+                    message: "no peers available; wait for handshakes to complete".into(),
+                });
+                return;
+            }
+            let control = control.clone();
+            let pushsync_swap = state.pushsync_swap.clone();
+            tokio::spawn(async move {
+                let mut fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx);
+                if let Some(svc) = pushsync_swap {
+                    let s: Arc<dyn ant_retrieval::PushsyncSettlement> = svc;
+                    fetcher = fetcher.with_pushsync_settlement(s);
+                }
+                let reply = match fetcher.push_stamped_chunk(address, wire, stamp).await {
+                    Ok(()) => ControlAck::ChunkUploaded {
+                        reference: format!("0x{}", hex::encode(address)),
+                    },
+                    Err(e) => ControlAck::Error {
+                        message: format!("pushsync: {e}"),
+                    },
+                };
+                let _ = ack.send(reply);
+            });
+        }
         ControlCommand::GetChunkRaw { reference, ack } => {
             // Same routing / fetch path as `GetChunk`, but ack carries
             // the wire bytes (`span || payload`) so `ant-gateway` can

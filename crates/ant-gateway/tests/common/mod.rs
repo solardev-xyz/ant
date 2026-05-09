@@ -390,6 +390,22 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
                 message: "ok".to_string(),
             });
         }
+        ControlCommand::PushSoc { address, wire, ack } => {
+            // Mirror the real handler: trust the gateway's `soc_valid`
+            // pre-check and reply with the supplied address. Test
+            // fixtures exercise the gateway's validation path; the
+            // node-side stamping path is covered by `ant-p2p`.
+            let reply = if wire.len() < 32 + 65 + 8 || wire.len() > 32 + 65 + 8 + 4096 {
+                ControlAck::Error {
+                    message: format!("soc wire size out of range: {} bytes", wire.len()),
+                }
+            } else {
+                ControlAck::ChunkUploaded {
+                    reference: format!("0x{}", hex::encode(address)),
+                }
+            };
+            let _ = ack.send(reply);
+        }
         ControlCommand::PushChunk { wire, ack } => {
             // Mirror what `ant-p2p`'s `PushChunk` handler does: BMT-hash
             // the wire bytes and reply with the resulting reference.

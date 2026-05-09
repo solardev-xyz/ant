@@ -1190,6 +1190,13 @@ mod tests {
                             reference: format!("0x{}", hex::encode(addr)),
                         });
                     }
+                    ControlCommand::PushSoc { ack, .. } => {
+                        // Upload pipeline never emits PushSoc; surface a
+                        // bug if it ever does.
+                        let _ = ack.send(ControlAck::Error {
+                            message: "PushSoc unexpected in upload tests".into(),
+                        });
+                    }
                     other => panic!("unexpected control command in upload tests: {other:?}"),
                 }
             }

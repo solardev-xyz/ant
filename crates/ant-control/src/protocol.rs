@@ -708,9 +708,9 @@ pub enum GatewayRequestKind {
     Bzz,
     /// `GET/HEAD /chunks/{addr}` — single-chunk wire fetch.
     Chunk,
-    /// `GET/HEAD /soc/{owner}/{id}` — single-owner-chunk wire fetch.
-    /// Distinct from [`Self::Chunk`] so operators can tell SOC reads
-    /// apart from CAC reads in `antctl top`.
+    /// `GET/HEAD/POST /soc/{owner}/{id}` — single-owner-chunk wire
+    /// fetch or upload. Distinct from [`Self::Chunk`] so operators can
+    /// tell SOC traffic apart from CAC traffic in `antctl top`.
     Soc,
     /// `GET /feeds/{owner}/{topic}` — sequence-feed resolution.
     Feed,
