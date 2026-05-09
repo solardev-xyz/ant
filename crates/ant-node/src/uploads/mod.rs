@@ -220,7 +220,7 @@ impl UploadManager {
     /// round-trip but loses the embedded filename + content-type;
     /// consumers must know the type out-of-band. `raw = false`
     /// keeps the historical bzz-compatible behaviour.
-    pub async fn start(
+    pub fn start(
         &self,
         source_path: PathBuf,
         batch_id: Option<String>,
@@ -498,7 +498,7 @@ impl UploadManager {
         // 8 bytes of identity: low 40 bits of nanos XOR with the
         // counter (so two starts in the same nanosecond don't
         // collide). Hex-encoded for `antctl upload <id>` ergonomics.
-        let raw = (nanos & 0x000000FF_FFFFFFFF) ^ (counter << 40);
+        let raw = (nanos & 0x0000_00FF_FFFF_FFFF) ^ (counter << 40);
         format!("{raw:016x}")
     }
 
@@ -1220,7 +1220,6 @@ mod tests {
 
         let id = mgr
             .start(f.path().to_path_buf(), None, None, None, false)
-            .await
             .expect("start");
 
         let mut rx = mgr.subscribe(&id).expect("subscribe");
@@ -1283,7 +1282,6 @@ mod tests {
 
         let id = mgr
             .start(f.path().to_path_buf(), None, None, None, true)
-            .await
             .expect("start");
 
         let mut rx = mgr.subscribe(&id).expect("subscribe");
@@ -1346,7 +1344,6 @@ mod tests {
         let mgr1 = UploadManager::new(state_dir.path().to_path_buf(), tx1).expect("manager");
         let id = mgr1
             .start(f.path().to_path_buf(), None, None, None, false)
-            .await
             .expect("start");
         let mut rx = mgr1.subscribe(&id).expect("subscribe");
         let final_snap = loop {
@@ -1411,7 +1408,6 @@ mod tests {
 
         let id = mgr
             .start(f.path().to_path_buf(), None, None, None, false)
-            .await
             .expect("start");
 
         // Give the driver a moment to dispatch a few chunks, then

@@ -125,8 +125,8 @@ pub const LIGHT_DISCONNECT_LIMIT: u64 = 1_687_500;
 pub const LIGHT_REFRESH_RATE_PER_SEC: u64 = 450_000;
 
 /// Combined ceiling we refuse to cross. Bee's `debitAction.Apply`
-/// blocklists at `disconnectLimit + min(int64(elapsed_seconds), 1)
-/// * refreshRate`, which is *either* `disconnectLimit` (when
+/// blocklists at `disconnectLimit + min(int64(elapsed_seconds), 1) * refreshRate`,
+/// which is *either* `disconnectLimit` (when
 /// elapsed < 1 s) *or* `disconnectLimit + refreshRate` (when
 /// elapsed ≥ 1 s) — bee's `min` operates on `int64` second
 /// granularity, no fractional seconds. See
@@ -467,8 +467,8 @@ mod tests {
 
     #[test]
     fn proximity_first_byte_differs() {
-        let a = addr(0b10000000);
-        let b = addr(0b00000000);
+        let a = addr(0b1000_0000);
+        let b = addr(0b0000_0000);
         assert_eq!(proximity(&a, &b), 0);
     }
 

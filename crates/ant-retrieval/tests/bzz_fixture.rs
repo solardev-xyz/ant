@@ -60,9 +60,8 @@ impl DirFetcher {
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
-            let stem = match path.file_stem().and_then(|s| s.to_str()) {
-                Some(s) => s,
-                None => continue,
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
             };
             if path.extension().and_then(|s| s.to_str()) != Some("bin") {
                 continue;

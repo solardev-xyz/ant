@@ -522,8 +522,7 @@ fn writer_main(
 
     'outer: loop {
         match rx.recv() {
-            Err(_) => break,
-            Ok(WriteMsg::Shutdown) => break,
+            Err(_) | Ok(WriteMsg::Shutdown) => break,
             Ok(WriteMsg::PutBatch { items, ack }) => {
                 let r = process_put_batch_transaction(
                     &mut conn,
@@ -533,7 +532,6 @@ fn writer_main(
                     slack_bytes,
                 );
                 let _ = ack.send(r);
-                continue;
             }
             Ok(first) => {
                 let mut batch = vec![first];

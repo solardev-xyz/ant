@@ -592,7 +592,7 @@ mod tests {
     /// release. Run on demand with `cargo test --release -p
     /// ant-retrieval -- --include-ignored streaming_matches_split_bytes_three_levels`.
     #[test]
-    #[ignore]
+    #[ignore = "slow in debug; run with --release --include-ignored"]
     fn streaming_matches_split_bytes_three_levels() {
         let len = CHUNK_SIZE * (BRANCHES * BRANCHES + 5);
         let p: Vec<u8> = (0..len).map(|i| ((i * 23) % 251) as u8).collect();

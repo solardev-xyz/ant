@@ -22,7 +22,7 @@
 //! retrieval pipeline; the mpsc command channel serialises dispatch.
 
 use ant_control::{
-    ControlAck, ControlCommand, GetProgress, IdentityInfo, PeerInfo, StatusSnapshot,
+    ControlAck, ControlCommand, GetProgress, IdentityInfo, PeerInfo, RetrievalInfo, StatusSnapshot,
 };
 use ant_crypto::{
     ethereum_address_from_public_key, overlay_from_ethereum_address, random_overlay_nonce,
@@ -196,20 +196,22 @@ pub unsafe extern "C" fn ant_init(
     data_dir: *const c_char,
     out_err: *mut *mut c_char,
 ) -> *mut AntHandle {
-    clear_out_err(out_err);
-    let result = catch_unwind(AssertUnwindSafe(|| -> Result<AntHandle, FfiError> {
-        let path = cstr_to_path(data_dir)?;
-        init_inner(&path)
-    }));
-    match result {
-        Ok(Ok(handle)) => Box::into_raw(Box::new(handle)),
-        Ok(Err(e)) => {
-            write_out_err(out_err, &e.to_string());
-            std::ptr::null_mut()
-        }
-        Err(_) => {
-            write_out_err(out_err, "panic in ant_init");
-            std::ptr::null_mut()
+    unsafe {
+        clear_out_err(out_err);
+        let result = catch_unwind(AssertUnwindSafe(|| -> Result<AntHandle, FfiError> {
+            let path = cstr_to_path(data_dir)?;
+            init_inner(&path)
+        }));
+        match result {
+            Ok(Ok(handle)) => Box::into_raw(Box::new(handle)),
+            Ok(Err(e)) => {
+                write_out_err(out_err, &e.to_string());
+                std::ptr::null_mut()
+            }
+            Err(_) => {
+                write_out_err(out_err, "panic in ant_init");
+                std::ptr::null_mut()
+            }
         }
     }
 }
@@ -252,7 +254,7 @@ fn init_inner(data_dir: &Path) -> Result<AntHandle, FfiError> {
         listeners: Vec::new(),
         external_addresses: Vec::new(),
         control_socket: String::new(),
-        retrieval: Default::default(),
+        retrieval: RetrievalInfo::default(),
     };
     let (status_tx, status_rx) = watch::channel(initial_snapshot);
 
@@ -332,33 +334,37 @@ pub unsafe extern "C" fn ant_download(
     out_len: *mut usize,
     out_err: *mut *mut c_char,
 ) -> *mut u8 {
-    clear_out_err(out_err);
-    if !out_len.is_null() {
-        *out_len = 0;
-    }
-    let result = catch_unwind(AssertUnwindSafe(|| -> Result<Vec<u8>, FfiError> {
-        let handle = handle.as_ref().ok_or(FfiError::NullPointer)?;
-        let reference = cstr_to_str(reference)?;
-        download_inner(handle, reference)
-    }));
-    match result {
-        Ok(Ok(bytes)) => {
-            let len = bytes.len();
-            let mut boxed = bytes.into_boxed_slice();
-            let ptr = boxed.as_mut_ptr();
-            std::mem::forget(boxed);
-            if !out_len.is_null() {
-                *out_len = len;
+    unsafe {
+        clear_out_err(out_err);
+        if !out_len.is_null() {
+            *out_len = 0;
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| -> Result<Vec<u8>, FfiError> {
+            let handle = handle.as_ref().ok_or(FfiError::NullPointer)?;
+            let reference = cstr_to_str(reference)?;
+            download_inner(handle, reference)
+        }));
+        match result {
+            Ok(Ok(bytes)) => {
+                let len = bytes.len();
+                let mut boxed = bytes.into_boxed_slice();
+                let ptr = boxed.as_mut_ptr();
+                // Ownership crosses the FFI boundary; freed by `ant_free`.
+                #[allow(clippy::mem_forget)]
+                std::mem::forget(boxed);
+                if !out_len.is_null() {
+                    *out_len = len;
+                }
+                ptr
             }
-            ptr
-        }
-        Ok(Err(e)) => {
-            write_out_err(out_err, &e.to_string());
-            std::ptr::null_mut()
-        }
-        Err(_) => {
-            write_out_err(out_err, "panic in ant_download");
-            std::ptr::null_mut()
+            Ok(Err(e)) => {
+                write_out_err(out_err, &e.to_string());
+                std::ptr::null_mut()
+            }
+            Err(_) => {
+                write_out_err(out_err, "panic in ant_download");
+                std::ptr::null_mut()
+            }
         }
     }
 }
@@ -466,7 +472,6 @@ fn download_inner(handle: &AntHandle, reference: &str) -> Result<Vec<u8>, FfiErr
                     if cancel_flag.load(Ordering::SeqCst) {
                         return Err(FfiError::Download("download canceled".to_string()));
                     }
-                    continue;
                 }
                 Err(e) => return Err(e),
             }
@@ -548,7 +553,6 @@ async fn attempt_download(
                 if let Ok(mut slot) = progress_slot.lock() {
                     slot.apply(&p);
                 }
-                continue;
             }
             Ok(Some(
                 ControlAck::Ok { .. }
@@ -563,7 +567,7 @@ async fn attempt_download(
                 | ControlAck::UploadList(_)
                 | ControlAck::UploadProgress(_)
                 | ControlAck::PostageStatus(_),
-            )) => continue,
+            )) => {}
             Ok(None) => {
                 return Err(FfiError::Download(
                     "node dropped the ack channel without a terminal response".to_string(),
@@ -596,11 +600,13 @@ async fn attempt_download(
 /// to [`ant_shutdown`].
 #[no_mangle]
 pub unsafe extern "C" fn ant_peer_count(handle: *const AntHandle) -> i32 {
-    let Some(handle) = handle.as_ref() else {
-        return -1;
-    };
-    let connected = handle.status_rx.borrow().peers.connected;
-    i32::try_from(connected).unwrap_or(i32::MAX)
+    unsafe {
+        let Some(handle) = handle.as_ref() else {
+            return -1;
+        };
+        let connected = handle.status_rx.borrow().peers.connected;
+        i32::try_from(connected).unwrap_or(i32::MAX)
+    }
 }
 
 /// C-ABI mirror of [`DownloadProgressState`]. Kept as `#[repr(C)]` so
@@ -656,12 +662,14 @@ pub struct AntProgress {
 /// to [`ant_shutdown`].
 #[no_mangle]
 pub unsafe extern "C" fn ant_cancel_download(handle: *const AntHandle) -> i32 {
-    let Some(handle) = handle.as_ref() else {
-        return -1;
-    };
-    handle.cancel_flag.store(true, Ordering::SeqCst);
-    handle.cancel_notify.notify_waiters();
-    0
+    unsafe {
+        let Some(handle) = handle.as_ref() else {
+            return -1;
+        };
+        handle.cancel_flag.store(true, Ordering::SeqCst);
+        handle.cancel_notify.notify_waiters();
+        0
+    }
 }
 
 /// Sample the current download progress. Swift polls this every few
@@ -683,28 +691,30 @@ pub unsafe extern "C" fn ant_download_progress(
     handle: *const AntHandle,
     out: *mut AntProgress,
 ) -> i32 {
-    let Some(handle) = handle.as_ref() else {
-        return -1;
-    };
-    let Some(out) = out.as_mut() else {
-        return -1;
-    };
-    let snapshot = match handle.progress.lock() {
-        Ok(guard) => *guard,
-        Err(poisoned) => *poisoned.into_inner(),
-    };
-    *out = AntProgress {
-        in_progress: u8::from(snapshot.in_progress),
-        bytes_done: snapshot.bytes_done,
-        total_bytes: snapshot.total_bytes,
-        chunks_done: snapshot.chunks_done,
-        total_chunks: snapshot.total_chunks,
-        elapsed_ms: snapshot.elapsed_ms,
-        peers_used: snapshot.peers_used,
-        in_flight: snapshot.in_flight,
-        cache_hits: snapshot.cache_hits,
-    };
-    0
+    unsafe {
+        let Some(handle) = handle.as_ref() else {
+            return -1;
+        };
+        let Some(out) = out.as_mut() else {
+            return -1;
+        };
+        let snapshot = match handle.progress.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        };
+        *out = AntProgress {
+            in_progress: u8::from(snapshot.in_progress),
+            bytes_done: snapshot.bytes_done,
+            total_bytes: snapshot.total_bytes,
+            chunks_done: snapshot.chunks_done,
+            total_chunks: snapshot.total_chunks,
+            elapsed_ms: snapshot.elapsed_ms,
+            peers_used: snapshot.peers_used,
+            in_flight: snapshot.in_flight,
+            cache_hits: snapshot.cache_hits,
+        };
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -720,11 +730,13 @@ pub unsafe extern "C" fn ant_download_progress(
 /// See above. Calling with a null pointer is a no-op.
 #[no_mangle]
 pub unsafe extern "C" fn ant_free_buffer(ptr: *mut u8, len: usize) {
-    if ptr.is_null() || len == 0 {
-        return;
+    unsafe {
+        if ptr.is_null() || len == 0 {
+            return;
+        }
+        let slice = std::slice::from_raw_parts_mut(ptr, len);
+        drop(Box::from_raw(std::ptr::from_mut::<[u8]>(slice)));
     }
-    let slice = std::slice::from_raw_parts_mut(ptr, len);
-    drop(Box::from_raw(std::ptr::from_mut::<[u8]>(slice)));
 }
 
 /// Free a NUL-terminated string written by the FFI into an `out_err`
@@ -735,10 +747,12 @@ pub unsafe extern "C" fn ant_free_buffer(ptr: *mut u8, len: usize) {
 /// `ptr` must have come from this crate. Null is a no-op.
 #[no_mangle]
 pub unsafe extern "C" fn ant_free_string(ptr: *mut c_char) {
-    if ptr.is_null() {
-        return;
+    unsafe {
+        if ptr.is_null() {
+            return;
+        }
+        drop(CString::from_raw(ptr));
     }
-    drop(CString::from_raw(ptr));
 }
 
 /// Shut the embedded node down. Aborts the Tokio runtime and frees the
@@ -749,15 +763,17 @@ pub unsafe extern "C" fn ant_free_string(ptr: *mut c_char) {
 /// `handle` must have come from [`ant_init`]. Null is a no-op.
 #[no_mangle]
 pub unsafe extern "C" fn ant_shutdown(handle: *mut AntHandle) {
-    if handle.is_null() {
-        return;
+    unsafe {
+        if handle.is_null() {
+            return;
+        }
+        let handle = Box::from_raw(handle);
+        // Dropping the runtime aborts every spawned task (including the
+        // node loop) and joins blocking threads. We ship it off to a
+        // `shutdown_background` call so this FFI entry point never blocks
+        // if the node loop is mid-dial and holding a socket open.
+        handle.runtime.shutdown_background();
     }
-    let handle = Box::from_raw(handle);
-    // Dropping the runtime aborts every spawned task (including the
-    // node loop) and joins blocking threads. We ship it off to a
-    // `shutdown_background` call so this FFI entry point never blocks
-    // if the node loop is mid-dial and holding a socket open.
-    handle.runtime.shutdown_background();
 }
 
 // ---------------------------------------------------------------------------
@@ -765,31 +781,37 @@ pub unsafe extern "C" fn ant_shutdown(handle: *mut AntHandle) {
 // ---------------------------------------------------------------------------
 
 unsafe fn cstr_to_str<'a>(ptr: *const c_char) -> Result<&'a str, FfiError> {
-    if ptr.is_null() {
-        return Err(FfiError::NullPointer);
+    unsafe {
+        if ptr.is_null() {
+            return Err(FfiError::NullPointer);
+        }
+        CStr::from_ptr(ptr)
+            .to_str()
+            .map_err(|_| FfiError::InvalidUtf8)
     }
-    CStr::from_ptr(ptr)
-        .to_str()
-        .map_err(|_| FfiError::InvalidUtf8)
 }
 
 unsafe fn cstr_to_path(ptr: *const c_char) -> Result<PathBuf, FfiError> {
-    Ok(PathBuf::from(cstr_to_str(ptr)?))
+    unsafe { Ok(PathBuf::from(cstr_to_str(ptr)?)) }
 }
 
 unsafe fn clear_out_err(out_err: *mut *mut c_char) {
-    if !out_err.is_null() {
-        *out_err = std::ptr::null_mut();
+    unsafe {
+        if !out_err.is_null() {
+            *out_err = std::ptr::null_mut();
+        }
     }
 }
 
 unsafe fn write_out_err(out_err: *mut *mut c_char, msg: &str) {
-    if out_err.is_null() {
-        return;
+    unsafe {
+        if out_err.is_null() {
+            return;
+        }
+        let cstring = CString::new(msg.replace('\0', "?"))
+            .unwrap_or_else(|_| CString::new("error message contained a NUL byte").unwrap());
+        *out_err = cstring.into_raw();
     }
-    let cstring = CString::new(msg.replace('\0', "?"))
-        .unwrap_or_else(|_| CString::new("error message contained a NUL byte").unwrap());
-    *out_err = cstring.into_raw();
 }
 
 fn load_or_create_identity(

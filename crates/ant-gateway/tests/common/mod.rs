@@ -25,7 +25,7 @@
 
 use ant_control::{
     ControlAck, ControlCommand, GatewayActivity, IdentityInfo, PeerConnectionInfo, PeerInfo,
-    RoutingInfo, StatusSnapshot, StreamRange, PROTOCOL_VERSION,
+    RetrievalInfo, RoutingInfo, StatusSnapshot, StreamRange, PROTOCOL_VERSION,
 };
 use ant_gateway::testkit::build_router;
 use ant_gateway::{GatewayHandle, GatewayIdentity};
@@ -72,9 +72,8 @@ impl DirFetcher {
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
-            let stem = match path.file_stem().and_then(|s| s.to_str()) {
-                Some(s) => s,
-                None => continue,
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
             };
             if path.extension().and_then(|s| s.to_str()) != Some("bin") {
                 continue;
@@ -152,7 +151,7 @@ pub fn snapshot_with_one_peer() -> StatusSnapshot {
         listeners: vec!["/ip4/127.0.0.1/tcp/1634".to_string()],
         external_addresses: Vec::new(),
         control_socket: "/tmp/antd.sock".to_string(),
-        retrieval: Default::default(),
+        retrieval: RetrievalInfo::default(),
     }
 }
 
@@ -418,17 +417,9 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
         // Upload* control commands are only meaningful with a real
         // `UploadManager`; gateway tests don't model the upload
         // pipeline, so reject any that leak in here as a test bug.
-        ControlCommand::UploadStart { ack, .. } => {
-            let _ = ack.send(ControlAck::Error {
-                message: "Upload* not supported in gateway test fixtures".into(),
-            });
-        }
-        ControlCommand::UploadList { ack } => {
-            let _ = ack.send(ControlAck::Error {
-                message: "Upload* not supported in gateway test fixtures".into(),
-            });
-        }
-        ControlCommand::UploadStatus { ack, .. }
+        ControlCommand::UploadStart { ack, .. }
+        | ControlCommand::UploadList { ack }
+        | ControlCommand::UploadStatus { ack, .. }
         | ControlCommand::UploadPause { ack, .. }
         | ControlCommand::UploadResume { ack, .. }
         | ControlCommand::UploadCancel { ack, .. } => {

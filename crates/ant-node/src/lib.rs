@@ -312,10 +312,7 @@ async fn intercept_commands(
             } => {
                 let mgr = mgr.clone();
                 tokio::spawn(async move {
-                    let reply = match mgr
-                        .start(source_path, batch_id, name, content_type, raw)
-                        .await
-                    {
+                    let reply = match mgr.start(source_path, batch_id, name, content_type, raw) {
                         Ok(job_id) => ControlAck::UploadStarted { job_id },
                         Err(e) => ControlAck::Error {
                             message: e.to_string(),

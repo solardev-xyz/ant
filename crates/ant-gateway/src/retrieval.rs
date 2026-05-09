@@ -1139,7 +1139,6 @@ impl Started {
                                     p.bytes_done,
                                 );
                             }
-                            continue;
                         }
                         Some(ControlAck::Error { message }) => {
                             return Some((
@@ -1282,7 +1281,6 @@ async fn consume_stream_prologue(
                         p.bytes_done,
                     );
                 }
-                continue;
             }
             Ok(Some(ControlAck::Error { message })) => {
                 return Err(map_retrieval_error(message));
@@ -1329,7 +1327,6 @@ async fn consume_stream_prologue(
                         p.bytes_done,
                     );
                 }
-                continue;
             }
             Ok(Some(ControlAck::Error { message })) => {
                 return Err(map_retrieval_error(message));
@@ -1420,7 +1417,7 @@ async fn drain_terminal(
 ) -> Result<ControlAck, Response> {
     loop {
         match tokio::time::timeout(timeout, rx.recv()).await {
-            Ok(Some(ControlAck::Progress(_))) => continue,
+            Ok(Some(ControlAck::Progress(_))) => {}
             Ok(Some(ack)) => return Ok(ack),
             Ok(None) => return Err(node_unavailable()),
             Err(_) => {

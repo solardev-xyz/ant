@@ -44,13 +44,7 @@ pub async fn resolve_all<I>(addrs: I) -> Vec<Multiaddr>
 where
     I: IntoIterator<Item = Multiaddr>,
 {
-    let resolver = match build_resolver() {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(target: "ant_p2p::dnsaddr", "resolver init failed: {e}; passing addrs through");
-            return addrs.into_iter().collect();
-        }
-    };
+    let resolver = build_resolver();
 
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -138,7 +132,7 @@ fn resolve_recursive<'a>(
     })
 }
 
-fn build_resolver() -> Result<TokioResolver, String> {
+fn build_resolver() -> TokioResolver {
     let (cfg, opts) = match hickory_resolver::system_conf::read_system_conf() {
         Ok(c) => c,
         Err(_) => (ResolverConfig::cloudflare(), ResolverOpts::default()),
@@ -146,7 +140,7 @@ fn build_resolver() -> Result<TokioResolver, String> {
     let sanitized = ResolverConfig::from_parts(None, Vec::new(), cfg.name_servers().to_vec());
     let builder = TokioResolver::builder_with_config(sanitized, TokioConnectionProvider::default())
         .with_options(opts);
-    Ok(builder.build())
+    builder.build()
 }
 
 #[cfg(test)]

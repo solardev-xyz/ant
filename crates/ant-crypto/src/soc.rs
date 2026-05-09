@@ -70,9 +70,9 @@ pub fn soc_valid(expected_addr: &[u8; 32], wire: &[u8]) -> bool {
         Ok(s) => s,
         Err(_) => return false,
     };
-    let inner_cac_addr = match bmt_hash_with_span(inner_span, &inner_cac[SPAN_SIZE..]) {
-        Some(a) => a,
-        None => return false,
+
+    let Some(inner_cac_addr) = bmt_hash_with_span(inner_span, &inner_cac[SPAN_SIZE..]) else {
+        return false;
     };
 
     // Build the byte string the SOC signer originally signed:
@@ -88,9 +88,8 @@ pub fn soc_valid(expected_addr: &[u8; 32], wire: &[u8]) -> bool {
     sig_data[SOC_ID_SIZE..].copy_from_slice(&inner_cac_addr);
     let prehash = keccak256(&sig_data);
 
-    let pubkey = match recover_public_key(&signature, &prehash) {
-        Ok(pk) => pk,
-        Err(_) => return false,
+    let Ok(pubkey) = recover_public_key(&signature, &prehash) else {
+        return false;
     };
     let owner = ethereum_address_from_public_key(&pubkey);
 
