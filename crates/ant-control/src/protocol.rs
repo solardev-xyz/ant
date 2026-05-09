@@ -708,6 +708,10 @@ pub enum GatewayRequestKind {
     Bzz,
     /// `GET/HEAD /chunks/{addr}` — single-chunk wire fetch.
     Chunk,
+    /// `GET/HEAD /soc/{owner}/{id}` — single-owner-chunk wire fetch.
+    /// Distinct from [`Self::Chunk`] so operators can tell SOC reads
+    /// apart from CAC reads in `antctl top`.
+    Soc,
     /// `GET /v0/manifest/{addr}` — Ant-specific manifest enumeration.
     Manifest,
 }
@@ -716,14 +720,16 @@ impl GatewayRequestKind {
     /// Short label shown in the `antctl top` Retrieval tab. Up to 5
     /// ASCII characters so the table's `Kind` column stays narrow
     /// while still being self-explanatory: each label is the bee /
-    /// Ant endpoint name (`/bytes`, `/bzz`, `/chunks`, `/v0/manifest`)
-    /// either spelled in full or trimmed to the same root.
+    /// Ant endpoint name (`/bytes`, `/bzz`, `/chunks`, `/soc`,
+    /// `/v0/manifest`) either spelled in full or trimmed to the same
+    /// root.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
             Self::Bytes => "Bytes",
             Self::Bzz => "BZZ",
             Self::Chunk => "Chunk",
+            Self::Soc => "SOC",
             Self::Manifest => "Manif",
         }
     }

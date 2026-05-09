@@ -161,6 +161,14 @@ const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
 /// PLAN.md Phase 7g).
 pub const GATEWAY_MAX_FILE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
+/// `Cache-Control` value for endpoints returning chunks at addresses
+/// that may be re-stamped with a new payload. SOCs are addressed by
+/// `keccak256(id || owner)`, which is stable across payload updates,
+/// so the same URL can return different bytes after an owner update;
+/// browsers must not freeze the first response forever the way they do
+/// for content-addressed `/chunks/{addr}`.
+const MUTABLE_CACHE_CONTROL: HeaderValue = HeaderValue::from_static("no-cache");
+
 /// `GET /chunks/{addr}` and `HEAD /chunks/{addr}`. Returns the chunk's
 /// **wire bytes** (`span(8 LE) || payload`) — bee's `chunkstore.Get`
 /// returns `Chunk.Data()` which is the wire form, so we must too.
@@ -226,6 +234,134 @@ pub async fn chunk(
     let len = bytes.len() as u64;
     guard.update(1, 1, 0, len);
     chunk_response(method, bytes)
+}
+
+/// `GET /soc/{owner}/{id}` and `HEAD /soc/{owner}/{id}` — fetch a
+/// single-owner-chunk by `(owner, id)`. The path carries the 20-byte
+/// owner Ethereum address and the 32-byte id, both hex-encoded with
+/// optional `0x` / `0X` prefix. The gateway derives
+/// `address = keccak256(id || owner)` and dispatches the same
+/// retrieval path used by `/chunks/{addr}`; `ant_retrieval::retrieve_chunk`
+/// validates the response via `soc_valid`, so no further crypto is
+/// done here.
+///
+/// Returns the SOC's **wire bytes** (`id(32) || sig(65) || inner_cac`)
+/// with `Content-Type: application/octet-stream`. Cache-Control is
+/// `no-cache` because the same address is mutable: a later
+/// `POST /soc/{owner}/{id}` by the same owner replaces the payload at
+/// the same URL.
+///
+/// Bee's HTTP API exposes the same shape on `GET /soc/{owner}/{id}`,
+/// see `bee/pkg/api/soc.go`.
+pub async fn download_soc(
+    State(handle): State<GatewayHandle>,
+    Path((owner_hex, id_hex)): Path<(String, String)>,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
+    let owner = match parse_hex_fixed::<20>(&owner_hex) {
+        Ok(o) => o,
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("bad owner: {e}")),
+    };
+    let id = match parse_hex_fixed::<32>(&id_hex) {
+        Ok(i) => i,
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("bad id: {e}")),
+    };
+
+    let mut addr_input = [0u8; 32 + 20];
+    addr_input[..32].copy_from_slice(&id);
+    addr_input[32..].copy_from_slice(&owner);
+    let reference = ant_crypto::keccak256(&addr_input);
+
+    let guard = handle.activity.begin(
+        GatewayRequestKind::Soc,
+        short_reference(&hex::encode(reference)),
+    );
+
+    let timeout = request_timeout(&headers, CHUNK_REQUEST_TIMEOUT);
+
+    let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
+    let cmd = ControlCommand::GetChunkRaw {
+        reference,
+        ack: ack_tx,
+    };
+    if handle.commands.send(cmd).await.is_err() {
+        return node_unavailable();
+    }
+    guard.update(0, 1, 1, 0);
+
+    let ack = match tokio::time::timeout(timeout, ack_rx).await {
+        Ok(Ok(ack)) => ack,
+        Ok(Err(_)) => return node_unavailable(),
+        Err(_) => {
+            return json_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("retrieval timed out after {}s", timeout.as_secs()),
+            );
+        }
+    };
+
+    let bytes = match ack {
+        ControlAck::Bytes { data } => data,
+        ControlAck::Error { message } => {
+            return json_error(StatusCode::NOT_FOUND, message);
+        }
+        other => {
+            warn!(target: "ant_gateway", ?other, "unexpected ack from GetChunkRaw (soc)");
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "unexpected node ack");
+        }
+    };
+    let len = bytes.len() as u64;
+    guard.update(1, 1, 0, len);
+    soc_response(method, bytes)
+}
+
+/// Build the `200 OK` (or empty `200 OK` for `HEAD`) response for a
+/// SOC fetch. Mirrors [`chunk_response`] for layout, but stamps a
+/// mutable `Cache-Control` because SOCs at the same address can be
+/// re-uploaded with new payload.
+fn soc_response(method: Method, body: Vec<u8>) -> Response {
+    let len = body.len();
+    let body = if method == Method::HEAD {
+        Body::empty()
+    } else {
+        Body::from(body)
+    };
+    let mut resp = Response::new(body);
+    let _ = resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    let _ = resp
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    let _ = resp
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, MUTABLE_CACHE_CONTROL);
+    resp
+}
+
+/// Decode a fixed-length hex string with optional `0x` prefix into a
+/// byte array. The error string starts with `"must be N bytes …"`;
+/// callers prepend a field name (`"reference {…}"`, `"owner {…}"`)
+/// to produce a 400 body that pinpoints which path segment was
+/// malformed.
+fn parse_hex_fixed<const N: usize>(s: &str) -> Result<[u8; N], String> {
+    let stripped = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
+    if stripped.len() != N * 2 {
+        return Err(format!(
+            "must be {} bytes ({} hex chars); got {}",
+            N,
+            N * 2,
+            stripped.len()
+        ));
+    }
+    let mut out = [0u8; N];
+    hex::decode_to_slice(stripped, &mut out).map_err(|e| format!("invalid hex: {e}"))?;
+    Ok(out)
 }
 
 /// `POST /chunks` — accept a single content-addressed chunk's wire
@@ -1431,19 +1567,7 @@ async fn drain_terminal(
 }
 
 fn parse_reference(s: &str) -> Result<[u8; 32], String> {
-    let stripped = s
-        .strip_prefix("0x")
-        .or_else(|| s.strip_prefix("0X"))
-        .unwrap_or(s);
-    if stripped.len() != 64 {
-        return Err(format!(
-            "reference must be 32 bytes (64 hex chars); got {}",
-            stripped.len()
-        ));
-    }
-    let mut out = [0u8; 32];
-    hex::decode_to_slice(stripped, &mut out).map_err(|e| format!("invalid hex: {e}"))?;
-    Ok(out)
+    parse_hex_fixed::<32>(s).map_err(|e| format!("reference {e}"))
 }
 
 fn request_timeout(headers: &HeaderMap, default: Duration) -> Duration {

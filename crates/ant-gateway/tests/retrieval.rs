@@ -929,6 +929,295 @@ async fn post_bzz_collection_uploads_tar_archive() {
     );
 }
 
+// =====================================================================
+// SOC reads: GET / HEAD `/soc/{owner}/{id}`.
+//
+// Freedom Browser navigates `bzz://` URLs; once the gateway resolves a
+// feed-mounted manifest it sometimes wants the underlying SOC bytes
+// directly (e.g. to surface the publisher key without re-walking the
+// feed). These tests use `router_with_dispatcher` so we can stage a
+// single `(addr → soc_wire)` mapping rather than dropping fixture
+// chunks on disk; the gateway only ever sends `GetChunkRaw` for SOCs,
+// so the dispatcher stays small.
+// =====================================================================
+
+/// Owner secret + id + payload bundle. Every test builds one with a
+/// fresh `secret` byte so the owner address is deterministic but
+/// unique per test, avoiding any cross-test cache interference.
+struct SocFixture {
+    owner: [u8; 20],
+    id: [u8; 32],
+    soc_address: [u8; 32],
+    wire: Vec<u8>,
+    inner_cac_wire: Vec<u8>,
+}
+
+/// Build a self-consistent SOC: signs `keccak256(id || inner_cac_addr)`
+/// with `secret`, packs `id || sig || inner_cac_wire`, and computes the
+/// `keccak256(id || owner)` address that `GET /soc/{owner}/{id}` should
+/// resolve to.
+fn signed_soc(secret: [u8; 32], id: [u8; 32], payload: &[u8]) -> SocFixture {
+    use k256::ecdsa::{SigningKey, VerifyingKey};
+
+    let sk = SigningKey::from_bytes(&secret.into()).expect("valid secret");
+    let vk = VerifyingKey::from(&sk);
+    let owner = ant_crypto::ethereum_address_from_public_key(&vk);
+
+    let (inner_cac_addr, inner_cac_wire) = ant_crypto::cac_new(payload).expect("cac_new");
+
+    let mut digest_input = [0u8; 64];
+    digest_input[..32].copy_from_slice(&id);
+    digest_input[32..].copy_from_slice(&inner_cac_addr);
+    let sig = ant_crypto::sign_handshake_data(&secret, &ant_crypto::keccak256(&digest_input))
+        .expect("sign");
+
+    let mut soc_addr_input = [0u8; 52];
+    soc_addr_input[..32].copy_from_slice(&id);
+    soc_addr_input[32..].copy_from_slice(&owner);
+    let soc_address = ant_crypto::keccak256(&soc_addr_input);
+
+    let mut wire = Vec::with_capacity(32 + 65 + inner_cac_wire.len());
+    wire.extend_from_slice(&id);
+    wire.extend_from_slice(&sig);
+    wire.extend_from_slice(&inner_cac_wire);
+
+    SocFixture {
+        owner,
+        id,
+        soc_address,
+        wire,
+        inner_cac_wire,
+    }
+}
+
+/// Build a router that serves the staged SOC at its derived address and
+/// errors on any other reference. Mirrors how the production node loop
+/// resolves `GetChunkRaw` against the chunk store.
+fn router_serving_soc(fixture: &SocFixture) -> axum::Router {
+    let addr = fixture.soc_address;
+    let wire = fixture.wire.clone();
+    router_with_dispatcher(move |cmd| {
+        let wire = wire.clone();
+        async move {
+            match cmd {
+                ControlCommand::GetChunkRaw { reference, ack } => {
+                    let reply = if reference == addr {
+                        ControlAck::Bytes { data: wire }
+                    } else {
+                        ControlAck::Error {
+                            message: format!("not found: {}", hex::encode(reference)),
+                        }
+                    };
+                    let _ = ack.send(reply);
+                }
+                _ => panic!("unexpected command in SOC test: {cmd:?}"),
+            }
+        }
+    })
+}
+
+#[tokio::test]
+async fn get_soc_returns_wire_bytes_for_known_address() {
+    let fixture = signed_soc([0x11; 32], [0xa1; 32], b"hello soc");
+    let router = router_serving_soc(&fixture);
+    let uri = format!(
+        "/soc/{}/{}",
+        hex::encode(fixture.owner),
+        hex::encode(fixture.id),
+    );
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::GET)
+            .uri(&uri)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/octet-stream",
+    );
+    let bytes = body_bytes(resp).await;
+    assert_eq!(bytes, fixture.wire);
+}
+
+#[tokio::test]
+async fn get_soc_accepts_0x_prefixed_hex() {
+    let fixture = signed_soc([0x12; 32], [0xa2; 32], b"0x-prefixed");
+    let router = router_serving_soc(&fixture);
+    let uri = format!(
+        "/soc/0x{}/0X{}",
+        hex::encode(fixture.owner),
+        hex::encode(fixture.id),
+    );
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::GET)
+            .uri(&uri)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_bytes(resp).await, fixture.wire);
+}
+
+#[tokio::test]
+async fn get_soc_rejects_bad_owner_hex() {
+    let fixture = signed_soc([0x13; 32], [0xa3; 32], b"x");
+    let router = router_serving_soc(&fixture);
+    // Owner is too short (19 bytes worth of hex).
+    let uri = format!("/soc/{}/{}", "ab".repeat(19), hex::encode(fixture.id));
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::GET)
+            .uri(&uri)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert_eq!(json["code"], 400);
+    assert!(json["message"].as_str().unwrap().contains("bad owner"));
+}
+
+#[tokio::test]
+async fn get_soc_rejects_bad_id_hex() {
+    let fixture = signed_soc([0x14; 32], [0xa4; 32], b"x");
+    let router = router_serving_soc(&fixture);
+    // Id contains a non-hex character.
+    let uri = format!("/soc/{}/{}", hex::encode(fixture.owner), "zz".repeat(32));
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::GET)
+            .uri(&uri)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert!(json["message"].as_str().unwrap().contains("bad id"));
+}
+
+#[tokio::test]
+async fn get_soc_returns_404_when_chunk_missing() {
+    let fixture = signed_soc([0x15; 32], [0xa5; 32], b"x");
+    // Drop the wire so the dispatcher can't find this address.
+    let other_id = [0xff; 32];
+    let router = router_serving_soc(&fixture);
+    let uri = format!("/soc/{}/{}", hex::encode(fixture.owner), hex::encode(other_id));
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::GET)
+            .uri(&uri)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn head_soc_returns_200_no_body() {
+    let fixture = signed_soc([0x16; 32], [0xa6; 32], b"head probe");
+    let router = router_serving_soc(&fixture);
+    let uri = format!(
+        "/soc/{}/{}",
+        hex::encode(fixture.owner),
+        hex::encode(fixture.id),
+    );
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::HEAD)
+            .uri(&uri)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let expected_len = fixture.wire.len().to_string();
+    assert_eq!(
+        resp.headers().get(header::CONTENT_LENGTH).unwrap(),
+        expected_len.as_str(),
+    );
+    let bytes = body_bytes(resp).await;
+    assert!(bytes.is_empty(), "HEAD body must be empty, got {} bytes", bytes.len());
+}
+
+#[tokio::test]
+async fn get_soc_does_not_set_immutable_cache_control() {
+    // SOCs are mutable at the address level — same `(owner, id)` after
+    // a re-upload returns a different inner CAC. The cache header must
+    // not let the browser pin the first response forever.
+    let fixture = signed_soc([0x17; 32], [0xa7; 32], b"mutable");
+    let router = router_serving_soc(&fixture);
+    let uri = format!(
+        "/soc/{}/{}",
+        hex::encode(fixture.owner),
+        hex::encode(fixture.id),
+    );
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::GET)
+            .uri(&uri)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cc = resp
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .expect("/soc must emit Cache-Control");
+    let cc_str = cc.to_str().unwrap();
+    assert!(
+        !cc_str.contains("immutable"),
+        "/soc Cache-Control must not be immutable: {cc_str}",
+    );
+    assert!(
+        cc_str.contains("no-cache"),
+        "/soc Cache-Control should be `no-cache`, got {cc_str}",
+    );
+}
+
+#[tokio::test]
+async fn get_soc_returns_full_soc_wire_not_inner_cac() {
+    // The body must be `id(32) || sig(65) || inner_cac_wire`, not just
+    // the inner CAC. Pin the length bookkeeping so a refactor that
+    // accidentally peels the SOC header before responding fails loudly.
+    let fixture = signed_soc([0x18; 32], [0xa8; 32], b"layout pin");
+    let router = router_serving_soc(&fixture);
+    let uri = format!(
+        "/soc/{}/{}",
+        hex::encode(fixture.owner),
+        hex::encode(fixture.id),
+    );
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::GET)
+            .uri(&uri)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = body_bytes(resp).await;
+    assert_eq!(bytes.len(), 32 + 65 + fixture.inner_cac_wire.len());
+    assert_eq!(&bytes[..32], &fixture.id);
+    assert_eq!(&bytes[32 + 65..], fixture.inner_cac_wire.as_slice());
+}
+
 /// Oversized body must be rejected with 413 before chunking begins.
 #[tokio::test]
 async fn post_bzz_rejects_oversized_body() {
