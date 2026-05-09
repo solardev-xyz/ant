@@ -219,7 +219,7 @@ pub fn erc20_approve_calldata(spender: &[u8; 20], value: &U256) -> Vec<u8> {
 /// directly from the operator's wallet (the `SimpleSwap` contract
 /// has no `deposit()` view; its `balance()` is just
 /// `BZZ.balanceOf(swap)`, so a plain transfer is the funding path).
-#[must_use] 
+#[must_use]
 pub fn erc20_transfer_calldata(to: &[u8; 20], value: &U256) -> Vec<u8> {
     let mut data = Vec::with_capacity(4 + 32 + 32);
     data.extend_from_slice(&keccak256(b"transfer(address,uint256)")[0..4]);

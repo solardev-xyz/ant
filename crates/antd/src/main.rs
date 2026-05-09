@@ -932,11 +932,10 @@ fn build_pushsync_swap_config(
             hex::decode_to_slice(strip_0x(&cb), &mut chequebook)
                 .with_context(|| format!("decode --chequebook {cb}"))?;
             let mut swap_secret = [0u8; SECP256K1_SECRET_LEN];
-            hex::decode_to_slice(strip_0x(&key), &mut swap_secret)
-                .context("decode --swap-key")?;
+            hex::decode_to_slice(strip_0x(&key), &mut swap_secret).context("decode --swap-key")?;
             let swap_eoa = {
-                let sk = SigningKey::from_bytes((&swap_secret).into())
-                    .context("--swap-key invalid")?;
+                let sk =
+                    SigningKey::from_bytes((&swap_secret).into()).context("--swap-key invalid")?;
                 ethereum_address_from_public_key(sk.verifying_key())
             };
             tracing::info!(
@@ -972,13 +971,8 @@ fn strip_0x(s: &str) -> &str {
 /// uses to decide whether to accept a cheque drawn on it. Any RPC
 /// failure surfaces as `Err`, distinguishable from the legitimate
 /// "no, that contract is unknown to us" answer.
-async fn verify_chequebook_with_factory(
-    rpc_url: &str,
-    chequebook: &[u8; 20],
-) -> Result<bool> {
-    use ant_chain::chequebook::{
-        factory_deployed_contracts_calldata, GNOSIS_CHEQUEBOOK_FACTORY,
-    };
+async fn verify_chequebook_with_factory(rpc_url: &str, chequebook: &[u8; 20]) -> Result<bool> {
+    use ant_chain::chequebook::{factory_deployed_contracts_calldata, GNOSIS_CHEQUEBOOK_FACTORY};
     use ant_chain::ChainClient;
 
     let client = ChainClient::new(rpc_url);
@@ -991,7 +985,10 @@ async fn verify_chequebook_with_factory(
         .await
         .context("factory.deployedContracts eth_call")?;
     if v.len() < 32 {
-        bail!("factory.deployedContracts returned <32 bytes (got {} bytes)", v.len());
+        bail!(
+            "factory.deployedContracts returned <32 bytes (got {} bytes)",
+            v.len()
+        );
     }
     let last_word = &v[v.len() - 32..];
     Ok(last_word.iter().any(|&b| b != 0))

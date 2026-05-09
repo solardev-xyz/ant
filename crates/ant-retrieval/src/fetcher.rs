@@ -227,10 +227,7 @@ impl RoutingFetcher {
     /// the same peer to potentially be RST'd by bee. See
     /// [`PushsyncSettlement`] for the rationale.
     #[must_use]
-    pub fn with_pushsync_settlement(
-        mut self,
-        settlement: Arc<dyn PushsyncSettlement>,
-    ) -> Self {
+    pub fn with_pushsync_settlement(mut self, settlement: Arc<dyn PushsyncSettlement>) -> Self {
         self.pushsync_settlement = Some(settlement);
         self
     }
@@ -460,23 +457,18 @@ impl RoutingFetcher {
                 s.note_pushsync(peer, 0).await;
             }
 
-            let mut err = match push_chunk_to_peer(
-                &mut control,
-                peer,
-                chunk_addr,
-                wire.as_slice(),
-                &stamp,
-            )
-            .await
-            {
-                Ok(()) => {
-                    if let Some(s) = self.pushsync_settlement.as_ref() {
-                        s.note_pushsync(peer, chunk_price).await;
+            let mut err =
+                match push_chunk_to_peer(&mut control, peer, chunk_addr, wire.as_slice(), &stamp)
+                    .await
+                {
+                    Ok(()) => {
+                        if let Some(s) = self.pushsync_settlement.as_ref() {
+                            s.note_pushsync(peer, chunk_price).await;
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
-                }
-                Err(e) => e,
-            };
+                    Err(e) => e,
+                };
 
             for _ in 0..Self::PER_PEER_RETRY_BUDGET {
                 if !is_transient_pushsync_error(&err) {
@@ -489,14 +481,8 @@ impl RoutingFetcher {
                     "pushsync attempt failed; retrying same peer once on a fresh stream",
                 );
                 tokio::time::sleep(Duration::from_millis(150)).await;
-                match push_chunk_to_peer(
-                    &mut control,
-                    peer,
-                    chunk_addr,
-                    wire.as_slice(),
-                    &stamp,
-                )
-                .await
+                match push_chunk_to_peer(&mut control, peer, chunk_addr, wire.as_slice(), &stamp)
+                    .await
                 {
                     Ok(()) => {
                         if let Some(s) = self.pushsync_settlement.as_ref() {
