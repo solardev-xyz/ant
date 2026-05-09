@@ -40,6 +40,12 @@ pub fn build(handle: GatewayHandle) -> Router {
         .route("/chequebook/balance", get(stubs::chequebook_balance))
         .route("/chunks", post(retrieval::upload_chunk))
         .route("/chunks/{addr}", get_or_head(retrieval::chunk))
+        // Single-owner-chunk read: the address is derived as
+        // `keccak256(id || owner)`, so callers that already know the
+        // `(owner, id)` pair can avoid computing it client-side. Read
+        // path only — publisher-side `POST /soc/{owner}/{id}` is out of
+        // scope for the Freedom Browser concern this branch addresses.
+        .route("/soc/{owner}/{id}", get_or_head(retrieval::download_soc))
         .route("/bzz", post(retrieval::upload_bzz))
         .route("/bytes/{addr}", get_or_head(retrieval::bytes))
         // Ant-specific extension (not part of bee Tier-A): list paths in
