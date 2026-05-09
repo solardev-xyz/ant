@@ -1892,11 +1892,7 @@ fn handle_control_command(
     }
 }
 
-fn handle_put_chunk_local(
-    state: &mut SwarmState,
-    wire: Vec<u8>,
-    ack: oneshot::Sender<ControlAck>,
-) {
+fn handle_put_chunk_local(state: &mut SwarmState, wire: Vec<u8>, ack: oneshot::Sender<ControlAck>) {
     let Some(disk_cache) = state.disk_cache.clone() else {
         let _ = ack.send(ControlAck::Error {
             message: "disk chunk cache disabled; pass --disk-cache-bytes > 0 at startup".into(),

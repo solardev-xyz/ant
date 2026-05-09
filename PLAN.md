@@ -1527,7 +1527,45 @@ expected, but worth recording):
      (cache-cap bump), a partial fetch confirmed the rows
      persist across restart.
 
-2. **Phase 7i (deferred): `antctl upload reseed <job-id>`.** Walks the
+2. **Phase 7h.2: `antctl pin-collection` (DELIVERED, 2026-05-09, antd 0.3.19).**
+   Same local-only mechanism as `pin`, but takes one or more
+   `<path-in-manifest>=<local-file>` entries and builds a *collection*
+   mantaray on top of them. Each input file is walked with the
+   streaming splitter to derive its data-tree root (no chunks
+   dispatched — the operator is expected to have run `antctl pin
+   <reference> <file>` for each entry first, so its data chunks
+   are already cached); the collection manifest is then minted
+   with [`build_collection_manifest`] and its handful of nodes
+   pinned via [`Request::PutChunkLocal`]. An optional
+   `--index <path>` stamps the `website-index-document`
+   metadata, and `--expect <ref>` asserts the derived root
+   matches a known value (useful when re-pinning a previously
+   built collection on a fresh node). Per-entry MIME overrides
+   are not yet wired — `--content-type` applies to every entry.
+
+   This closes the "is there a single folder manifest" gap for
+   batches like the gemma4:e2b ollama blobs, where each file
+   was uploaded independently and we wanted a single bzz
+   reference under which all four files resolve at their
+   sha256-prefixed paths. Avoids a re-upload (the chunks are
+   already on the network); only the few-chunk collection
+   manifest needs to be cached locally.
+
+   **Acceptance** (verified on 2026-05-09):
+   - 4-entry gemma4:e2b collection (3 small blobs + the 6.7 GiB
+     GGUF) built and pinned in 161 s — almost all of which is
+     the streaming hash of the GGUF (≈ 13 GiB/s mmap-backed
+     scan; the tiny blobs dispatch in milliseconds and the
+     final manifest is 14 chunks total).
+   - Collection root:
+     `0x9d2f8f41941969b20813495fab985abbe82e6286b63eb7824e81766ed7e72531`.
+   - All four entries resolve through this node's gateway:
+     `GET /bzz/<root>/sha256-…` returned the full body byte-for-byte
+     for the three small blobs (42 B, 473 B, 11 355 B) and a
+     `Content-Length: 7162394016` HEAD plus matching SHA-256
+     spot-checks at the head and tail of the GGUF.
+
+3. **Phase 7i (deferred): `antctl upload reseed <job-id>`.** Walks the
    local source file, derives every chunk address, queries
    `/chunks/0x<addr>` for each, re-pushes any that 404. The
    re-push lands on whichever peer is now the closest
@@ -1537,11 +1575,11 @@ expected, but worth recording):
    at 24 % miss × 1.76 M chunks × 4 KiB ≈ 1.7 GiB to re-push.
    Lower priority now that pinning unblocks the operator's own
    gateway.
-3. **Phase 7j: target-peers ≥ 600 + 24 h soak.** Raises the
+4. **Phase 7j: target-peers ≥ 600 + 24 h soak.** Raises the
    probability that *our* routing table covers every k-bucket
    at least once. Pre-req: the dial-pipeline audit listed
    under Phase 7f's follow-ups.
-4. **Phase 7k: bee-side hand-off.** Drive a temporary
+5. **Phase 7k: bee-side hand-off.** Drive a temporary
    high-stake bee node next to antd, let pullsync replicate
    our upload through it, then retire the bee node. Most
    surgical option for forcing replication; needs SWAP plumbing

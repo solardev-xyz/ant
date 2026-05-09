@@ -124,6 +124,15 @@ Examples:
         command: UploadCommand,
     },
     Pin(PinArgs),
+    /// Build a *collection* mantaray manifest pointing at multiple
+    /// previously-pinned files (one entry per
+    /// `<path-in-manifest>=<local-file>` argument), pin its few
+    /// manifest chunks locally, and return the resulting bzz
+    /// reference. Useful when several uploads share a logical
+    /// "folder" and the operator wants a single root that resolves
+    /// every entry under its filename. No postage / pushsync —
+    /// purely local.
+    PinCollection(PinCollectionArgs),
     Get {
         /// Reference. See above for accepted forms.
         reference: String,
@@ -194,6 +203,35 @@ Examples:
 enum ProgressStyle {
     Line,
     Visual,
+}
+
+#[derive(clap::Args, Debug)]
+struct PinCollectionArgs {
+    /// One or more `<path-in-manifest>=<local-file>` entries. The
+    /// `<path>` is what the resulting `bzz://<root>/<path>` URL will
+    /// resolve to; `<local-file>` is the source on disk used to
+    /// re-derive the data-tree root. Local files must already have
+    /// their data chunks pinned (typically via `antctl pin
+    /// <reference> <file>` for each), since this command only
+    /// pins the *manifest* chunks on top.
+    #[arg(required = true)]
+    entries: Vec<String>,
+    /// Manifest path that should resolve when the user fetches
+    /// `bzz://<root>/` with no trailing path
+    /// (`website-index-document` metadata). Must match exactly
+    /// one of the `<path>` parts above.
+    #[arg(long)]
+    index: Option<String>,
+    /// MIME type stamped on every entry's manifest metadata.
+    /// Defaults to `application/octet-stream`. Per-entry MIME
+    /// overrides are not yet supported (file an issue if needed).
+    #[arg(long)]
+    content_type: Option<String>,
+    /// Optional: assert the derived collection root equals this
+    /// reference. Useful for re-pinning a previously-built
+    /// collection on a fresh node.
+    #[arg(long)]
+    expect: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -689,6 +727,7 @@ fn main() -> Result<()> {
             run_upload(&socket, command, opt.json)?;
         }
         Command::Pin(p) => pin::run(&socket, p, opt.json)?,
+        Command::PinCollection(p) => pin::run_collection(&socket, p, opt.json)?,
         Command::Get {
             reference,
             out,

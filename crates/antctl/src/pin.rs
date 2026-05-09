@@ -1,34 +1,55 @@
-//! `antctl pin` — populate the daemon's local disk chunk cache with
-//! every chunk of a previously-uploaded file, so this node's HTTP
-//! gateway resolves `/bzz/<reference>` immediately without waiting
-//! for bee-side neighbourhood replication.
+//! `antctl pin` — populate the daemon's local disk chunk cache so this
+//! node's HTTP gateway resolves a previously-uploaded reference (or a
+//! freshly-built collection manifest) immediately, without waiting for
+//! bee-side neighbourhood replication.
 //!
-//! Re-uses [`ant_retrieval::StreamingSplitter`] (constant-memory chunk
-//! tree) and [`ant_retrieval::build_single_file_manifest`] (the same
-//! manifest writer the upload driver uses), so the derived chunk
-//! addresses match `antctl upload` byte-for-byte. The CLI dispatches
-//! every chunk over the control socket as a
-//! [`Request::PutChunkLocal`]; the daemon validates the wire bytes
-//! (BMT-with-span match) and writes them straight to the SQLite-backed
-//! disk cache (`<data-dir>/cache.sqlite`). No postage stamp, no
-//! pushsync — pinning is purely a local mirror.
+//! Two entry points:
+//!
+//! - [`run`] backs `antctl pin <reference> <file>`: re-splits a single
+//!   source file, derives the matching mantaray manifest with the same
+//!   writer the upload driver uses, and pins every chunk after asserting
+//!   the derived root matches the user-supplied `<reference>`.
+//! - [`run_collection`] backs `antctl pin-collection`: takes one or
+//!   more `<path-in-manifest>=<local-file>` pairs, computes each
+//!   file's data-tree root with the streaming splitter (no chunks
+//!   dispatched — those are assumed already pinned), builds a
+//!   *collection* mantaray pointing at all of them, and pins the
+//!   collection's manifest chunks (typically ≤ 5). Returns the new
+//!   bzz reference, which exposes every entry under its `path`.
+//!
+//! Re-uses [`ant_retrieval::StreamingSplitter`] (constant-memory
+//! chunk tree) and [`ant_retrieval::build_single_file_manifest`] /
+//! [`ant_retrieval::build_collection_manifest`] (the same manifest
+//! writers the daemon uses), so derived addresses match `antctl
+//! upload` byte-for-byte. Chunks travel to the daemon over the
+//! control socket as [`Request::PutChunkLocal`]; the daemon
+//! BMT-validates each wire and writes it straight to
+//! [`ant_retrieval::DiskChunkCache`]. No postage stamp, no pushsync —
+//! pinning is purely a local mirror.
 //!
 //! The CLI verifies the derived manifest root against the
 //! user-supplied `<reference>` *after* every chunk has been
-//! dispatched. A mismatch surfaces as a hard error at the end (the
-//! data chunks are still in the cache; LRU will reclaim them
-//! eventually if the operator never pins a matching file).
+//! dispatched (single-file pin only; collections are freshly minted
+//! so there's nothing to compare against by default — pass
+//! `--expect <ref>` to assert). A mismatch surfaces as a hard error
+//! at the end (the data chunks are still in the cache; LRU will
+//! reclaim them eventually if the operator never pins a matching
+//! file).
 //!
-//! Concurrency: 8 worker threads, each holding their own UnixStream.
-//! The splitter is much faster than SQLite at this scale, so
-//! workers are the bottleneck — but 8x parallelism is enough to
-//! pin a 6.7 GiB file (≈ 1.76M chunks) in 2-3 minutes against the
-//! local disk-cache writer.
+//! Concurrency: 8 worker threads, each holding their own `UnixStream`.
+//! The splitter is much faster than `SQLite` at this scale, so workers
+//! are the bottleneck — but 8x parallelism is enough to pin a 6.7 GiB
+//! file (≈ 1.76M chunks) in 9-10 minutes against the local disk-cache
+//! writer. Collection pinning is single-threaded since the chunk
+//! count is tiny (≤ 5).
 
-use crate::PinArgs;
+use crate::{PinArgs, PinCollectionArgs};
 use ant_control::{request_sync, Request, Response};
 use ant_crypto::CHUNK_SIZE;
-use ant_retrieval::{build_single_file_manifest, SplitChunk, StreamingSplitter};
+use ant_retrieval::{
+    build_collection_manifest, build_single_file_manifest, ManifestFile, SplitChunk,
+    StreamingSplitter,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use memmap2::Mmap;
 use std::io::Write as _;
@@ -38,17 +59,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// 8 sockets in parallel saturates the daemon's SQLite writer at the
-/// chunk sizes we care about (≤ 8 + 4096 wire bytes); going wider
-/// would burn more daemon-side connection slots without improving
-/// throughput.
 const WORKER_COUNT: usize = 8;
 
-/// Entry point for `antctl pin`. Splits the source file with the
-/// streaming splitter, derives the matching mantaray manifest (or
-/// skips it under `--raw`), dispatches every chunk to the daemon's
-/// disk cache via `Request::PutChunkLocal`, and verifies that the
-/// derived root matches the user-supplied `<reference>`.
+/// Single-file pin. Splits the source, derives the matching
+/// manifest, dispatches every chunk to the daemon's disk cache, and
+/// verifies that the derived root matches the user-supplied
+/// reference.
 pub fn run(socket: &Path, args: PinArgs, json: bool) -> Result<()> {
     let target_addr = parse_reference(&args.reference)?;
     let abs_path = args
@@ -85,13 +101,10 @@ pub fn run(socket: &Path, args: PinArgs, json: bool) -> Result<()> {
     }
 
     let started = Instant::now();
-    let data_root = match split_file(&abs_path, file_size, &tx, started) {
+    let data_root = match split_file(&abs_path, file_size, Some(&tx), Some(started)) {
         Ok(r) => r,
         Err(e) => {
             drop(tx);
-            // Drain workers to surface their error (likely the same
-            // socket failure that killed the splitter); only return
-            // the splitter error if workers ran cleanly.
             for w in workers {
                 if let Ok(Err(werr)) = w.join() {
                     return Err(werr);
@@ -124,13 +137,135 @@ pub fn run(socket: &Path, args: PinArgs, json: bool) -> Result<()> {
         );
     }
 
-    report(json, manifest_root, total_pinned, file_size, started.elapsed().as_secs_f64())
+    report_single(
+        json,
+        manifest_root,
+        total_pinned,
+        file_size,
+        started.elapsed().as_secs_f64(),
+    );
+    Ok(())
 }
 
-fn worker(
-    rx: Arc<Mutex<Receiver<SplitChunk>>>,
-    sock: PathBuf,
-) -> Result<u64> {
+/// Build a *collection* mantaray that exposes every input file under
+/// its in-manifest path, pin its chunks, and return the resulting
+/// bzz reference. Each input is `<path-in-manifest>=<local-file>`;
+/// the local file is *not* re-pinned (assume the operator already ran
+/// `antctl pin` for it earlier — collections only add the manifest
+/// node on top of pre-existing data trees).
+///
+/// `--index` (optional) is the manifest path that should resolve when
+/// the user fetches `bzz://<root>/` with no trailing path
+/// (`website-index-document` metadata).
+pub fn run_collection(socket: &Path, args: PinCollectionArgs, json: bool) -> Result<()> {
+    if args.entries.is_empty() {
+        bail!("at least one --entry / positional <path>=<file> is required");
+    }
+    let content_type = args
+        .content_type
+        .clone()
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+
+    let started = Instant::now();
+    let mut manifest_files: Vec<ManifestFile> = Vec::with_capacity(args.entries.len());
+    for entry in &args.entries {
+        let (manifest_path, local_path) = parse_entry(entry)?;
+        let abs = local_path
+            .canonicalize()
+            .with_context(|| format!("source path {}", local_path.display()))?;
+        let metadata =
+            std::fs::metadata(&abs).with_context(|| format!("stat source {}", abs.display()))?;
+        if !metadata.is_file() {
+            bail!("not a regular file: {}", abs.display());
+        }
+        eprintln!(
+            "computing data root for {} ({} bytes)",
+            manifest_path,
+            metadata.len()
+        );
+        let data_ref = split_file(&abs, metadata.len(), None, None)?;
+        eprintln!("  data root: 0x{}", hex::encode(data_ref));
+        manifest_files.push(ManifestFile {
+            path: manifest_path,
+            content_type: Some(content_type.clone()),
+            data_ref,
+        });
+    }
+
+    let result = build_collection_manifest(&manifest_files, args.index.as_deref())
+        .map_err(|e| anyhow!("build collection manifest: {e}"))?;
+
+    if let Some(expect_ref) = args.expect.as_ref() {
+        let expected = parse_reference(expect_ref)?;
+        if result.root != expected {
+            bail!(
+                "manifest root mismatch: derived 0x{} but --expect was 0x{}; check entry order / paths / --index / --content-type",
+                hex::encode(result.root),
+                hex::encode(expected),
+            );
+        }
+    }
+
+    // Collections produce a tiny number of chunks (≤ 5 for typical
+    // single-level collections), so a sequential dispatch is fine —
+    // no need for the 8-worker pool the file pin uses.
+    let mut chunks_pinned = 0u64;
+    for chunk in &result.chunks {
+        let req = Request::PutChunkLocal {
+            wire_hex: format!("0x{}", hex::encode(&chunk.wire)),
+        };
+        let resp = request_sync(socket, &req)
+            .map_err(|e| anyhow!("pin chunk 0x{}: {e}", hex::encode(chunk.address)))?;
+        match resp {
+            Response::Ok { .. } => chunks_pinned += 1,
+            Response::Error { message } => bail!("antd: {message}"),
+            other => bail!("unexpected response: {other:?}"),
+        }
+    }
+
+    let elapsed = started.elapsed().as_secs_f64();
+    if json {
+        let entries: Vec<_> = manifest_files
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "path": f.path,
+                    "data_ref": format!("0x{}", hex::encode(f.data_ref)),
+                    "content_type": f.content_type,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "reference": format!("0x{}", hex::encode(result.root)),
+                "chunks_pinned": chunks_pinned,
+                "entries": entries,
+                "index_document": args.index,
+                "elapsed_seconds": elapsed,
+            })
+        );
+    } else {
+        println!(
+            "collection manifest pinned: {chunks_pinned} chunks, {} entries, {elapsed:.1}s",
+            manifest_files.len()
+        );
+        println!("  reference: 0x{}", hex::encode(result.root));
+        if let Some(idx) = args.index.as_ref() {
+            println!("  index:     {idx}");
+        }
+        println!("  entries:");
+        for f in &manifest_files {
+            println!("    /{}  ->  0x{}", f.path, hex::encode(f.data_ref));
+        }
+    }
+    Ok(())
+}
+
+/// Worker thread loop: pull `SplitChunk` from `rx`, send each as a
+/// `PutChunkLocal` over a dedicated socket, count successes.
+fn worker(rx: Arc<Mutex<Receiver<SplitChunk>>>, sock: PathBuf) -> Result<u64> {
     let mut count = 0u64;
     loop {
         let chunk = {
@@ -154,14 +289,19 @@ fn worker(
     Ok(count)
 }
 
+/// Walk a file with the streaming splitter, optionally dispatching
+/// every produced chunk to `tx`. When `tx` is `None` the splitter
+/// runs in "compute-root only" mode (used by collection pinning,
+/// where the chunks are assumed pre-pinned and we only need the
+/// data-tree root). Constant memory regardless of file size.
 fn split_file(
     abs_path: &Path,
     file_size: u64,
-    tx: &SyncSender<SplitChunk>,
-    started: Instant,
+    tx: Option<&SyncSender<SplitChunk>>,
+    started: Option<Instant>,
 ) -> Result<[u8; 32]> {
-    let file = std::fs::File::open(abs_path)
-        .with_context(|| format!("open {}", abs_path.display()))?;
+    let file =
+        std::fs::File::open(abs_path).with_context(|| format!("open {}", abs_path.display()))?;
     let body: Option<Mmap> = if file_size == 0 {
         None
     } else {
@@ -180,7 +320,9 @@ fn split_file(
         let end = (cursor + CHUNK_SIZE).min(total);
         let leaf = &body_slice.expect("non-empty file mmap")[cursor..end];
         for chunk in splitter.push_leaf(leaf) {
-            tx.send(chunk).map_err(|_| anyhow!("pin worker died"))?;
+            if let Some(s) = tx {
+                s.send(chunk).map_err(|_| anyhow!("pin worker died"))?;
+            }
         }
         cursor = end;
         if last_report.elapsed() >= Duration::from_millis(500) {
@@ -189,15 +331,25 @@ fn split_file(
             } else {
                 100.0
             };
-            let mibps = cursor as f64 / started.elapsed().as_secs_f64() / (1024.0 * 1024.0);
-            eprint!("\rpin: {pct:6.2}%  {mibps:6.1} MiB/s  ");
+            let label = if tx.is_some() { "pin" } else { "scan" };
+            let mibps = if let Some(t0) = started {
+                cursor as f64 / t0.elapsed().as_secs_f64() / (1024.0 * 1024.0)
+            } else {
+                cursor as f64 / last_report.elapsed().as_secs_f64() / (1024.0 * 1024.0)
+            };
+            eprint!("\r{label}: {pct:6.2}%  {mibps:6.1} MiB/s  ");
             std::io::stderr().flush().ok();
             last_report = Instant::now();
         }
     }
     let (data_root, _bytes, tail) = splitter.finish();
-    for chunk in tail {
-        tx.send(chunk).map_err(|_| anyhow!("pin worker died"))?;
+    if let Some(s) = tx {
+        for chunk in tail {
+            s.send(chunk).map_err(|_| anyhow!("pin worker died"))?;
+        }
+    }
+    if started.is_some() {
+        eprintln!();
     }
     Ok(data_root)
 }
@@ -213,13 +365,13 @@ fn join_workers(workers: Vec<JoinHandle<Result<u64>>>) -> Result<u64> {
     Ok(total)
 }
 
-fn report(
+fn report_single(
     json: bool,
     manifest_root: [u8; 32],
     total_pinned: u64,
     file_size: u64,
     elapsed: f64,
-) -> Result<()> {
+) {
     if json {
         println!(
             "{}",
@@ -238,7 +390,26 @@ fn report(
         );
         println!("  reference: 0x{}", hex::encode(manifest_root));
     }
-    Ok(())
+}
+
+/// Parse a `<path-in-manifest>=<local-file>` entry. The path may not
+/// be empty and may not start with `/` (mantaray paths are
+/// relative). The local file part is anything after the *first* `=`
+/// — paths containing `=` are fine on the right-hand side.
+fn parse_entry(s: &str) -> Result<(String, PathBuf)> {
+    let (path, file) = s
+        .split_once('=')
+        .ok_or_else(|| anyhow!("entry must be <path>=<file>: {s}"))?;
+    if path.is_empty() {
+        bail!("entry path is empty: {s}");
+    }
+    if path.starts_with('/') {
+        bail!("entry path must be relative (no leading '/'): {s}");
+    }
+    if file.is_empty() {
+        bail!("entry file is empty: {s}");
+    }
+    Ok((path.to_string(), PathBuf::from(file)))
 }
 
 fn parse_reference(s: &str) -> Result<[u8; 32]> {

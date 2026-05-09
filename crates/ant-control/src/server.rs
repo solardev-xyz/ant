@@ -585,11 +585,10 @@ async fn handle_connection(
         }
         Ok(Request::PutChunkLocal { wire_hex }) => match parse_chunk_wire(&wire_hex) {
             Ok(wire) => {
-                let response =
-                    dispatch_oneshot(command_tx.as_ref(), FAST_COMMAND_TIMEOUT, |ack| {
-                        ControlCommand::PutChunkLocal { wire, ack }
-                    })
-                    .await;
+                let response = dispatch_oneshot(command_tx.as_ref(), FAST_COMMAND_TIMEOUT, |ack| {
+                    ControlCommand::PutChunkLocal { wire, ack }
+                })
+                .await;
                 write_response(&mut write_half, &response).await?;
             }
             Err(e) => {
