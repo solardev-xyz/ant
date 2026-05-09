@@ -52,6 +52,7 @@
 use crate::feed::{feed_from_metadata, resolve_sequence_feed, FeedError, FeedType};
 use crate::ChunkFetcher;
 use crate::{cac_valid, join, JoinError, DEFAULT_MAX_FILE_BYTES};
+use futures::stream::{self, StreamExt};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use thiserror::Error;
 use tracing::{debug, trace};
@@ -148,6 +149,13 @@ pub struct ManifestEntry {
     pub reference: Option<[u8; 32]>,
     /// Metadata attached to this entry or fork.
     pub metadata: BTreeMap<String, String>,
+    /// Total file size in bytes, derived from the 8-byte BMT span on the
+    /// data root chunk pointed to by `reference`. `None` means either the
+    /// entry has no `reference` (metadata-only fork) or the data root
+    /// chunk could not be fetched while listing the manifest. Populated
+    /// by [`list_manifest`] best-effort; callers that don't want the
+    /// extra round-trips per entry should use [`list_manifest_paths`].
+    pub size: Option<u64>,
 }
 
 /// If `root_addr` points at a *feed manifest* — a mantaray manifest
@@ -255,13 +263,40 @@ pub async fn lookup_path(
     .await
 }
 
-/// List paths and metadata stored in a mantaray manifest.
+/// Concurrent in-flight chunk fetches when populating per-entry sizes
+/// for a manifest listing. Each entry costs one extra fetch (the data
+/// root chunk, whose 8-byte BMT span is the file size). Bounded so a
+/// huge directory listing doesn't fan out hundreds of simultaneous
+/// retrieval streams against the same set of peers.
+const MANIFEST_SIZE_FANOUT: usize = 16;
+
+/// List paths and metadata stored in a mantaray manifest, populating
+/// each value entry's `size` from its data root chunk's BMT span.
 ///
 /// If `root_addr` is a feed manifest, the listing transparently
 /// dereferences it first and lists the *resolved* content root — this
 /// matches the behaviour callers expect from a "show me what's at this
 /// reference" API and what the gateway exposes at `/v0/manifest/<addr>`.
+///
+/// Sizes are best-effort: a chunk that can't be fetched (peer 404,
+/// timeout, ...) leaves `size` as `None` rather than failing the whole
+/// listing. The walker still surfaces every entry; only sizes go
+/// missing for unreachable data roots. If the caller doesn't need
+/// sizes, [`list_manifest_paths`] skips the per-entry round trips.
 pub async fn list_manifest(
+    fetcher: &dyn ChunkFetcher,
+    root_addr: [u8; 32],
+) -> Result<Vec<ManifestEntry>, ManifestError> {
+    let mut entries = list_manifest_paths(fetcher, root_addr).await?;
+    populate_sizes(fetcher, &mut entries).await;
+    Ok(entries)
+}
+
+/// Same as [`list_manifest`] but skips the per-entry data-root chunk
+/// fetch — `size` stays `None` on every entry. Useful when the caller
+/// only needs paths and metadata (e.g. `bzz://<ref>/` redirect logic
+/// that just wants to know whether a given path is in the manifest).
+pub async fn list_manifest_paths(
     fetcher: &dyn ChunkFetcher,
     root_addr: [u8; 32],
 ) -> Result<Vec<ManifestEntry>, ManifestError> {
@@ -280,6 +315,41 @@ pub async fn list_manifest(
     .await?;
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(entries)
+}
+
+/// Fetch every entry's data root chunk in parallel (capped at
+/// [`MANIFEST_SIZE_FANOUT`]) and stamp the resulting BMT span into
+/// `entry.size`. Best-effort — fetch failures leave `size` as `None`
+/// without failing the listing. Skips entries with no `reference`
+/// (metadata-only forks like `website-index-document`).
+async fn populate_sizes(fetcher: &dyn ChunkFetcher, entries: &mut [ManifestEntry]) {
+    let to_fetch: Vec<(usize, [u8; 32])> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| e.reference.map(|r| (i, r)))
+        .collect();
+
+    let results: Vec<(usize, Option<u64>)> = stream::iter(to_fetch)
+        .map(|(idx, addr)| async move {
+            let size = match fetcher.fetch(addr).await {
+                Ok(wire) if wire.len() >= 8 => {
+                    let mut span = [0u8; 8];
+                    span.copy_from_slice(&wire[..8]);
+                    Some(u64::from_le_bytes(span))
+                }
+                _ => None,
+            };
+            (idx, size)
+        })
+        .buffer_unordered(MANIFEST_SIZE_FANOUT)
+        .collect()
+        .await;
+
+    for (idx, size) in results {
+        if let Some(entry) = entries.get_mut(idx) {
+            entry.size = size;
+        }
+    }
 }
 
 /// Recursive walker. Loads nodes lazily from `fetcher` as it descends.
@@ -391,6 +461,7 @@ fn collect_entries<'a>(
                 },
                 reference: Some(reference),
                 metadata: metadata_to_btree(node_metadata),
+                size: None,
             });
         } else if !node_metadata.is_empty() {
             entries.push(ManifestEntry {
@@ -401,6 +472,7 @@ fn collect_entries<'a>(
                 },
                 reference: None,
                 metadata: metadata_to_btree(node_metadata),
+                size: None,
             });
         }
 
@@ -426,6 +498,7 @@ fn collect_entries<'a>(
                         },
                         reference: None,
                         metadata: metadata_to_btree(fork.metadata),
+                        size: None,
                     });
                 }
                 continue;
@@ -440,6 +513,7 @@ fn collect_entries<'a>(
                     },
                     reference: Some(fork.child_ref),
                     metadata: metadata_to_btree(fork.metadata),
+                    size: None,
                 });
                 continue;
             }
@@ -462,6 +536,7 @@ fn collect_entries<'a>(
                         },
                         reference: Some(fork.child_ref),
                         metadata: metadata_to_btree(fork.metadata),
+                        size: None,
                     });
                 }
             }

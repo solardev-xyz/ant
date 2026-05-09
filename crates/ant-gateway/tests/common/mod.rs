@@ -375,6 +375,7 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
                             path: entry.path,
                             reference: entry.reference.map(hex::encode),
                             metadata: entry.metadata,
+                            size: entry.size,
                         })
                         .collect(),
                 },
@@ -442,6 +443,16 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
             let _ = ack.send(ControlAck::PostageStatus(
                 ant_control::PostageStatusView::default(),
             ));
+        }
+        // Local chunk-cache writes are an antctl-only escape hatch
+        // (`antctl pin`) that doesn't go through the gateway HTTP
+        // path; the test fixture has no disk cache to mutate, so
+        // surface a clear "not implemented" rather than silently
+        // accepting bytes that wouldn't be retrievable.
+        ControlCommand::PutChunkLocal { ack, .. } => {
+            let _ = ack.send(ControlAck::Error {
+                message: "PutChunkLocal not supported in gateway test fixtures".into(),
+            });
         }
     }
 }

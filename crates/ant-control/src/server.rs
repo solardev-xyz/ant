@@ -320,6 +320,13 @@ pub struct ManifestEntryInfo {
     pub reference: Option<String>,
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
+    /// File size in bytes derived from the data root chunk's BMT span.
+    /// `None` means the entry is metadata-only (no data reference) or
+    /// the data root chunk could not be fetched while listing the
+    /// manifest. Skipped from the JSON wire when absent so older
+    /// clients keep deserializing newer responses unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
 }
 
 impl ControlAck {

@@ -2618,6 +2618,7 @@ async fn run_list_bzz(
                     path: entry.path,
                     reference: entry.reference.map(hex::encode),
                     metadata: entry.metadata,
+                    size: entry.size,
                 })
                 .collect(),
         },
