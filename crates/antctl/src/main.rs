@@ -1376,7 +1376,7 @@ async fn run_chequebook_async(cmd: ChequebookCommand, json: bool) -> Result<()> 
                 if let Some(d) = initial_deposit_plur {
                     println!("deposit          {d} PLUR");
                     if let (Some(h), Some(b)) = (deposit_tx, deposit_block) {
-                        println!("deposit tx       0x{}  (block {})", hex::encode(h), b,);
+                        println!("deposit tx       0x{}  (block {})", hex::encode(h), b);
                     }
                 }
                 if let Some(p) = write_env_file.as_ref() {
@@ -2045,8 +2045,7 @@ fn random_word32() -> [u8; 32] {
     // calls in the same second still produce distinct salts.
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
     out[..16].copy_from_slice(&nanos.to_be_bytes()[..16]);
     let _ = getrandom_fill(&mut out[16..]);
     out
@@ -2425,7 +2424,7 @@ fn format_progress_line(p: &GetProgress, ema_bps: Option<f64>, bypass_cache: boo
         },
     );
     let cache_tag = if bypass_cache { "[no-cache] " } else { "" };
-    format!("{cache_tag}↓ {chunks} chunks  {bytes}  {rate}  {sources}  {elapsed}",)
+    format!("{cache_tag}↓ {chunks} chunks  {bytes}  {rate}  {sources}  {elapsed}")
 }
 
 /// Render a compact, defrag-style block map plus a separate stats line
@@ -2923,8 +2922,7 @@ fn display_width(s: &str) -> usize {
 
 fn terminal_width() -> usize {
     terminal::size()
-        .map(|(width, _)| width as usize)
-        .unwrap_or(80)
+        .map_or(80, |(width, _)| width as usize)
         .max(20)
 }
 
@@ -4561,8 +4559,7 @@ fn fit(text: &str, width: usize) -> String {
 fn current_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn format_duration(secs: u64) -> String {

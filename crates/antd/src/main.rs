@@ -301,8 +301,7 @@ async fn main() -> Result<()> {
 
     let started_at_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     let initial_snapshot = StatusSnapshot {
         agent: AGENT.to_string(),
         protocol_version: PROTOCOL_VERSION,

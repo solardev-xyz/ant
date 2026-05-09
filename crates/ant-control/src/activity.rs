@@ -63,8 +63,7 @@ impl GatewayActivity {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let started_at_unix = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
         let entry = Entry {
             kind,
             path,

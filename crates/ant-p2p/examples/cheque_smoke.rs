@@ -185,7 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .with_behaviour(|_| behaviour)
         .expect("infallible behaviour")
-        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(120)))
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_mins(2)))
         .build();
 
     let mut control = swarm.behaviour().stream.new_control();

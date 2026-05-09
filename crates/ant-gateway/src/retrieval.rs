@@ -129,12 +129,12 @@ fn set_immutable_cache_headers(resp: &mut Response) {
 /// ant-p2p). 600 s is still a large envelope, but it keeps a wedged
 /// handler from pinning a hyper task indefinitely while allowing the
 /// concurrent media path to complete under normal mainnet latency.
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_mins(10);
 /// Single-chunk fetches are bounded by `ant-retrieval`'s internal
 /// timeout (20 s) plus the outer retry loop. 60 s leaves room for
 /// retries on a single chunk without inheriting the much larger
 /// multi-chunk envelope.
-const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Per-request body-size ceiling for `/bytes` and `/bzz`. Bee streams,
 /// so it imposes no cap at all; the joiner used to materialise the

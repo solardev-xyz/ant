@@ -190,7 +190,7 @@ pub struct AntBehaviour {
 }
 
 const MIN_BACKOFF: Duration = Duration::from_secs(2);
-const MAX_BACKOFF: Duration = Duration::from_secs(60);
+const MAX_BACKOFF: Duration = Duration::from_mins(1);
 /// Bee's inbound handshake handler waits for the peerstore to be populated
 /// via libp2p-identify (a 10 s timeout). Opening our BZZ stream before
 /// identify has round-tripped makes bee stall for the full 10 s, then disconnect.
@@ -967,7 +967,7 @@ fn build_peer_pipeline_entries(
 const PIPELINE_SYNC_INTERVAL: Duration = Duration::from_millis(100);
 
 fn sync_peer_pipeline(status: Option<&watch::Sender<StatusSnapshot>>, state: &mut SwarmState) {
-    const FAIL_TTL: Duration = Duration::from_secs(60);
+    const FAIL_TTL: Duration = Duration::from_mins(1);
     state.failed.retain(|f| f.at.elapsed() < FAIL_TTL);
     let Some(tx) = status else { return };
     let routing = routing_snapshot(&state.routing);
@@ -3503,8 +3503,7 @@ fn record_handshake(
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Sub-second breakdown for a completed **outbound** (dialer) pipeline.

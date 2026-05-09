@@ -43,7 +43,7 @@ const NETWORK_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 /// 2-3 intermediates; a manifest with one fork adds one more fetch on
 /// top. Real-world chunk fetches usually complete in <1 s, but pad for
 /// the unlucky path.
-const TREE_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+const TREE_COMMAND_TIMEOUT: Duration = Duration::from_mins(1);
 /// Buffer depth for the streaming ack channel. Sized big enough to
 /// hold a couple of progress emissions plus the terminal ack without
 /// the producer ever blocking, and small enough that a stalled writer
