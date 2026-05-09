@@ -26,6 +26,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -614,7 +615,7 @@ enum ChequebookCommand {
 
 fn main() -> Result<()> {
     let opt = Opt::parse();
-    let socket = resolve_socket(&opt)?;
+    let socket = resolve_socket(&opt);
 
     match opt.command {
         Command::Status => {
@@ -2256,7 +2257,7 @@ fn run_get(
     } else if let Some(p) = written {
         let mut msg = format!("wrote {} bytes to {}", data.len(), p.display());
         if let Some(ct) = &content_type {
-            msg.push_str(&format!(" ({ct})"));
+            write!(msg, " ({ct})").unwrap();
         }
         eprintln!("{msg}");
     } else if let Some(ct) = &content_type {
@@ -2834,57 +2835,62 @@ fn print_upload_table(items: &[UploadJobView]) {
 
 fn format_upload_view_block(view: &UploadJobView) -> String {
     let mut out = String::new();
-    out.push_str(&format!("job_id:    {}\n", view.job_id));
-    out.push_str(&format!(
-        "status:    {}\n",
+    writeln!(out, "job_id:    {}", view.job_id).unwrap();
+    writeln!(
+        out,
+        "status:    {}",
         format_upload_status_label(&view.status)
-    ));
-    out.push_str(&format!("source:    {}\n", view.source_path));
-    out.push_str(&format!(
-        "size:      {} ({} bytes)\n",
+    )
+    .unwrap();
+    writeln!(out, "source:    {}", view.source_path).unwrap();
+    writeln!(
+        out,
+        "size:      {} ({} bytes)",
         format_bytes(view.source_size),
         view.source_size,
-    ));
+    )
+    .unwrap();
     if view.source_size > 0 {
-        out.push_str(&format!(
-            "progress:  {} / {} ({:.1}%)\n",
+        writeln!(
+            out,
+            "progress:  {} / {} ({:.1}%)",
             format_bytes(view.bytes_pushed),
             format_bytes(view.source_size),
             (view.bytes_pushed as f64 * 100.0 / view.source_size as f64).min(100.0),
-        ));
+        )
+        .unwrap();
     }
     if let Some(t) = view.chunks_total {
-        out.push_str(&format!("chunks:    {} / {}\n", view.chunks_pushed, t,));
+        writeln!(out, "chunks:    {} / {}", view.chunks_pushed, t).unwrap();
     } else {
-        out.push_str(&format!("chunks:    {}\n", view.chunks_pushed));
+        writeln!(out, "chunks:    {}", view.chunks_pushed).unwrap();
     }
-    out.push_str(&format!(
-        "mode:      {}\n",
+    writeln!(
+        out,
+        "mode:      {}",
         if view.raw {
             "raw (/bytes)"
         } else {
             "manifest (/bzz)"
         }
-    ));
+    )
+    .unwrap();
     if let Some(b) = &view.batch_id {
-        out.push_str(&format!("batch:     {b}\n"));
+        writeln!(out, "batch:     {b}").unwrap();
     }
     if let Some(n) = &view.name {
-        out.push_str(&format!("name:      {n}\n"));
+        writeln!(out, "name:      {n}").unwrap();
     }
     if let Some(c) = &view.content_type {
-        out.push_str(&format!("type:      {c}\n"));
+        writeln!(out, "type:      {c}").unwrap();
     }
     if let Some(r) = &view.reference {
-        out.push_str(&format!("reference: {r}\n"));
+        writeln!(out, "reference: {r}").unwrap();
         let scheme = if view.raw { "bytes" } else { "bzz" };
-        out.push_str(&format!(
-            "url:       {scheme}://{}\n",
-            r.trim_start_matches("0x")
-        ));
+        writeln!(out, "url:       {scheme}://{}", r.trim_start_matches("0x")).unwrap();
     }
     if let Some(e) = &view.last_error {
-        out.push_str(&format!("error:     {e}\n"));
+        writeln!(out, "error:     {e}").unwrap();
     }
     // Drop the trailing newline.
     if out.ends_with('\n') {
@@ -3395,12 +3401,12 @@ fn should_quit(event: &Event) -> bool {
     }
 }
 
-fn resolve_socket(opt: &Opt) -> Result<PathBuf> {
+fn resolve_socket(opt: &Opt) -> PathBuf {
     if let Some(p) = &opt.socket {
-        return Ok(expand_tilde(p));
+        return expand_tilde(p);
     }
     let dir = expand_tilde(&opt.data_dir);
-    Ok(dir.join("antd.sock"))
+    dir.join("antd.sock")
 }
 
 fn expand_tilde(p: &Path) -> PathBuf {

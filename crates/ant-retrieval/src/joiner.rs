@@ -1243,7 +1243,7 @@ mod tests {
     /// and return the root wire bytes plus the expected joined body.
     /// Reused across the range tests below so each one stays focused on
     /// the slicing semantics rather than fixture construction.
-    async fn build_three_level_fixture(fetcher: &mut MapFetcher) -> (Vec<u8>, Vec<u8>) {
+    fn build_three_level_fixture(fetcher: &mut MapFetcher) -> (Vec<u8>, Vec<u8>) {
         let mut leaf_addrs = Vec::with_capacity(130);
         let mut expected: Vec<u8> = Vec::with_capacity(130 * CHUNK_SIZE);
         for i in 0..130u8 {
@@ -1300,7 +1300,7 @@ mod tests {
     #[tokio::test]
     async fn range_none_matches_full_join() {
         let mut fetcher = MapFetcher::new();
-        let (root_wire, expected) = build_three_level_fixture(&mut fetcher).await;
+        let (root_wire, expected) = build_three_level_fixture(&mut fetcher);
         let (tx, mut rx) = mpsc::channel(8);
         let join = tokio::spawn(async move {
             join_to_sender_range(
@@ -1323,7 +1323,7 @@ mod tests {
     #[tokio::test]
     async fn range_prefix_single_leaf() {
         let mut fetcher = MapFetcher::new();
-        let (root_wire, expected) = build_three_level_fixture(&mut fetcher).await;
+        let (root_wire, expected) = build_three_level_fixture(&mut fetcher);
         let (tx, mut rx) = mpsc::channel(8);
         let join = tokio::spawn(async move {
             join_to_sender_range(
@@ -1351,7 +1351,7 @@ mod tests {
     #[tokio::test]
     async fn range_crosses_subtree_boundary() {
         let mut fetcher = MapFetcher::new();
-        let (root_wire, expected) = build_three_level_fixture(&mut fetcher).await;
+        let (root_wire, expected) = build_three_level_fixture(&mut fetcher);
         // int1 covers [0, 128*4096); int2 starts at 128*4096.
         let pivot = 128 * CHUNK_SIZE as u64;
         let start = pivot - 1024;
@@ -1384,7 +1384,7 @@ mod tests {
     #[tokio::test]
     async fn range_tail_only() {
         let mut fetcher = MapFetcher::new();
-        let (root_wire, expected) = build_three_level_fixture(&mut fetcher).await;
+        let (root_wire, expected) = build_three_level_fixture(&mut fetcher);
         let total = expected.len() as u64;
         let start = total - 256;
         let end = total - 1;

@@ -89,8 +89,9 @@ pub const PROTOCOL_PSEUDOSETTLE: &str = "/swarm/pseudosettle/1.0.0/pseudosettle"
 /// (`refreshRate / lightFactor` with `refreshRate = 4_500_000` and
 /// `lightFactor = 10`). Sets the upper bound on how much debt one
 /// pseudosettle can clear, since bee clamps `amount` to
-/// `lightRefreshRate * elapsed_seconds`. We send `amount = lightRefreshRate
-/// * MAX_REFRESH_WINDOW_SECS`; bee will then clamp to the actual elapsed.
+/// `lightRefreshRate * elapsed_seconds`. We send
+/// `amount = lightRefreshRate * MAX_REFRESH_WINDOW_SECS`; bee will then
+/// clamp to the actual elapsed.
 pub const LIGHT_REFRESH_RATE_UNITS_PER_SEC: u64 = 450_000;
 
 /// How often [`run_driver`] wakes to scan active peers. Bee's per-peer

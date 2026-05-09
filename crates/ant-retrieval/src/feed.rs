@@ -68,6 +68,7 @@ use ant_crypto::{
 };
 use std::collections::HashMap;
 use std::error::Error as StdError;
+use std::hash::BuildHasher;
 use thiserror::Error;
 use tracing::{debug, trace};
 
@@ -156,7 +157,9 @@ pub enum FeedType {
 /// metadata *claims* to be a feed but is malformed (wrong hex length,
 /// unknown type), so callers can surface a clear error rather than
 /// silently treating a malformed feed as a regular content manifest.
-pub fn feed_from_metadata(meta: &HashMap<String, String>) -> Result<Option<Feed>, FeedError> {
+pub fn feed_from_metadata<S: BuildHasher>(
+    meta: &HashMap<String, String, S>,
+) -> Result<Option<Feed>, FeedError> {
     let owner_hex = match meta.get(FEED_OWNER_KEY) {
         Some(v) => v.trim_start_matches("0x"),
         None => return Ok(None),

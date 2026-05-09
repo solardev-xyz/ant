@@ -578,7 +578,7 @@ pub fn verify_stamp_owner(
     let digest_slice: &[u8] = digest_arr.as_ref();
     let vk = recover_public_key(sig, digest_slice)?;
 
-    bucket_check(chunk_addr, index, bucket_depth, depth)?;
+    bucket_check(chunk_addr, *index, bucket_depth, depth)?;
 
     let eth = ethereum_address_from_public_key(&vk);
     if eth != *expected_eth {
@@ -589,7 +589,7 @@ pub fn verify_stamp_owner(
 
 fn bucket_check(
     chunk_addr: &[u8; 32],
-    index: &[u8; 8],
+    index: [u8; 8],
     bucket_depth: u8,
     depth: u8,
 ) -> Result<(), PostageError> {

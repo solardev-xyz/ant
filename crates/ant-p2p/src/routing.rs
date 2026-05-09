@@ -67,9 +67,9 @@ pub fn distance_cmp(target: &Overlay, a: &Overlay, b: &Overlay) -> Ordering {
     for i in 0..OVERLAY_LEN {
         let da = a[i] ^ target[i];
         let db = b[i] ^ target[i];
-        match da.cmp(&db) {
-            Ordering::Equal => continue,
-            other => return other,
+        let ord = da.cmp(&db);
+        if ord != Ordering::Equal {
+            return ord;
         }
     }
     Ordering::Equal

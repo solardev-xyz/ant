@@ -308,7 +308,7 @@ async fn drain_stream(mut stream: Stream, max: usize) -> std::io::Result<Drained
                     body,
                 });
             }
-            Ok(_) => continue,
+            Ok(_) => {}
             Err(e)
                 if matches!(
                     e.kind(),

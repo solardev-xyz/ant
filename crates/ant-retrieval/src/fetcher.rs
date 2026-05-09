@@ -237,6 +237,7 @@ impl RoutingFetcher {
     /// Attach the process-wide retrieval counters. The daemon shares
     /// one `Arc<RetrievalCounters>` across every fetcher it builds;
     /// `antctl top` reads it from `StatusSnapshot::retrieval`.
+    #[must_use]
     pub fn with_counters(mut self, counters: Arc<RetrievalCounters>) -> Self {
         self.counters = Some(counters);
         self
@@ -249,6 +250,7 @@ impl RoutingFetcher {
     /// the same `Arc<Accounting>` must be shared across all
     /// fetchers built for one daemon process for the mirror to
     /// reflect cross-request debt.
+    #[must_use]
     pub fn with_accounting(mut self, accounting: Arc<Accounting>) -> Self {
         self.accounting = Some(accounting);
         self
@@ -273,6 +275,7 @@ impl RoutingFetcher {
     /// `Arc<InMemoryChunkCache>` to every fetcher built for the same
     /// daemon process is what makes the cache persist across retry
     /// attempts and across `antctl get` invocations.
+    #[must_use]
     pub fn with_cache(mut self, cache: Arc<InMemoryChunkCache>) -> Self {
         self.cache = Some(cache);
         self
@@ -286,6 +289,7 @@ impl RoutingFetcher {
     /// wide disk cache is disabled or when `bypass_cache` is set
     /// for the request — both bypass the disk read *and* the disk
     /// write, exactly per `PLAN.md` § 6.1.
+    #[must_use]
     pub fn with_disk_cache(mut self, disk_cache: Arc<DiskChunkCache>) -> Self {
         self.disk_cache = Some(disk_cache);
         self
@@ -298,6 +302,7 @@ impl RoutingFetcher {
     /// --record-chunks <dir>` (debug builds only); a `None` value (the
     /// default) is a no-op. The directory is *not* created here — the
     /// caller is responsible for that.
+    #[must_use]
     pub fn with_record_dir(mut self, dir: Option<PathBuf>) -> Self {
         self.record_dir = dir;
         self
@@ -309,6 +314,7 @@ impl RoutingFetcher {
     /// Pass the same `Arc<ProgressTracker>` to every fetcher built
     /// for the same `Get*` request — the retry-loop wrapper in
     /// `ant-p2p` already does this.
+    #[must_use]
     pub fn with_progress(mut self, tracker: Arc<ProgressTracker>) -> Self {
         self.progress = Some(tracker);
         self
@@ -318,6 +324,7 @@ impl RoutingFetcher {
     /// fetcher that shares this `Arc<Semaphore>`. Pass the same
     /// `Arc<Semaphore>` to every fetcher built within one daemon
     /// process — see `inflight_limit` on the struct for why.
+    #[must_use]
     pub fn with_inflight_limit(mut self, sem: Arc<Semaphore>) -> Self {
         self.inflight_limit = Some(sem);
         self
@@ -328,6 +335,7 @@ impl RoutingFetcher {
     /// process-wide cap: `ant-p2p` creates one fetcher per `GetBytes` /
     /// `GetBzz` command, so this keeps concurrent browser downloads fair
     /// while still allowing the daemon as a whole to use the network.
+    #[must_use]
     pub fn with_request_inflight_limit(mut self, limit: usize) -> Self {
         self.request_inflight_limit = Some(Arc::new(Semaphore::new(limit.max(1))));
         self
@@ -342,6 +350,7 @@ impl RoutingFetcher {
     /// — see the 0.3.0 streaming-regression appendix in `PLAN.md` for the
     /// full analysis. The channel is bounded; if it backs up the fetcher
     /// drops the notification rather than blocking the hot path.
+    #[must_use]
     pub fn with_payment_notify(mut self, notify_tx: mpsc::Sender<PeerId>) -> Self {
         self.payment_notify = Some(notify_tx);
         self
@@ -369,9 +378,8 @@ impl RoutingFetcher {
             for i in 0..32 {
                 let da = a[i] ^ target[i];
                 let db = b[i] ^ target[i];
-                match da.cmp(&db) {
-                    Ordering::Equal => continue,
-                    other => return other,
+                if da != db {
+                    return da.cmp(&db);
                 }
             }
             Ordering::Equal
@@ -426,9 +434,8 @@ impl RoutingFetcher {
                 for i in 0..32 {
                     let da = a[i] ^ chunk_addr[i];
                     let db = b[i] ^ chunk_addr[i];
-                    match da.cmp(&db) {
-                        Ordering::Equal => continue,
-                        other => return other,
+                    if da != db {
+                        return da.cmp(&db);
                     }
                 }
                 Ordering::Equal
@@ -727,7 +734,6 @@ impl ChunkFetcher for RoutingFetcher {
                                 "overdraft skip; trying next-closest peer",
                             );
                             overdraft_skip.insert(peer, now + crate::accounting::OVERDRAFT_REFRESH);
-                            continue;
                         }
                         None => return Some((peer, None)),
                     }
@@ -994,10 +1000,10 @@ impl ChunkFetcher for RoutingFetcher {
 /// same peer to behave any differently.
 const fn is_peer_fatal(err: &RetrievalError) -> bool {
     match err {
-        RetrievalError::Remote(_) => false,
-        RetrievalError::Timeout(_) => false,
-        RetrievalError::Io(_) => false,
-        RetrievalError::OpenStream(_) => false,
+        RetrievalError::Remote(_)
+        | RetrievalError::Timeout(_)
+        | RetrievalError::Io(_)
+        | RetrievalError::OpenStream(_) => false,
         RetrievalError::ProstEncode(_)
         | RetrievalError::ProstDecode(_)
         | RetrievalError::MessageTooLarge { .. }

@@ -10,7 +10,7 @@ pub mod tx;
 
 use serde::Deserialize;
 use serde_json::json;
-use std::borrow::Cow;
+use std::{borrow::Cow, fmt::Write};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -190,7 +190,7 @@ impl ChainClient {
         // balanceOf(address) 0x70a08231
         let mut data = String::with_capacity(2 + 8 + 64);
         data.push_str("0x70a08231");
-        data.push_str(&format!("{:0>64}", hex::encode(owner_eth)));
+        write!(data, "{:0>64}", hex::encode(owner_eth)).unwrap();
         let out = self.eth_call(token, &data).await?;
         abi_word_last_u128_be(&out)
     }

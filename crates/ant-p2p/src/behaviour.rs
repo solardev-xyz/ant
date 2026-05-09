@@ -332,7 +332,7 @@ impl ExternalAddrSource {
 fn record_external_address(
     state: &mut SwarmState,
     swarm: &mut Swarm<AntBehaviour>,
-    status: &Option<watch::Sender<StatusSnapshot>>,
+    status: Option<&watch::Sender<StatusSnapshot>>,
     addr: Multiaddr,
     source: ExternalAddrSource,
 ) {
@@ -361,7 +361,7 @@ fn record_external_address(
 fn forget_external_address(
     state: &mut SwarmState,
     swarm: &mut Swarm<AntBehaviour>,
-    status: &Option<watch::Sender<StatusSnapshot>>,
+    status: Option<&watch::Sender<StatusSnapshot>>,
     addr: &Multiaddr,
 ) {
     if state.external_addresses.remove(addr).is_none() {
@@ -381,7 +381,7 @@ fn forget_external_address(
 /// (a handful of entries even on long-running daemons) so we recompute
 /// from scratch on every change rather than try to track deltas.
 fn sync_external_addresses_status(
-    status: &Option<watch::Sender<StatusSnapshot>>,
+    status: Option<&watch::Sender<StatusSnapshot>>,
     state: &SwarmState,
 ) {
     let Some(tx) = status else { return };
@@ -466,7 +466,7 @@ fn maybe_warn_no_external_address(swarm: &Swarm<AntBehaviour>, configured: &[Mul
 fn handle_upnp_event(
     state: &mut SwarmState,
     swarm: &mut Swarm<AntBehaviour>,
-    status: &Option<watch::Sender<StatusSnapshot>>,
+    status: Option<&watch::Sender<StatusSnapshot>>,
     ev: libp2p::upnp::Event,
 ) {
     use libp2p::upnp::Event;
@@ -551,8 +551,7 @@ enum PendingPhase {
 impl PendingPhase {
     fn dialed_addr(&self) -> Multiaddr {
         match self {
-            Self::AwaitingIdentify { addr, .. } => addr.clone(),
-            Self::Handshaking { addr, .. } => addr.clone(),
+            Self::AwaitingIdentify { addr, .. } | Self::Handshaking { addr, .. } => addr.clone(),
         }
     }
 }
@@ -967,7 +966,7 @@ fn build_peer_pipeline_entries(
 /// starving `ant_control::serve` enough that `antctl top` reads time out.
 const PIPELINE_SYNC_INTERVAL: Duration = Duration::from_millis(100);
 
-fn sync_peer_pipeline(status: &Option<watch::Sender<StatusSnapshot>>, state: &mut SwarmState) {
+fn sync_peer_pipeline(status: Option<&watch::Sender<StatusSnapshot>>, state: &mut SwarmState) {
     const FAIL_TTL: Duration = Duration::from_secs(60);
     state.failed.retain(|f| f.at.elapsed() < FAIL_TTL);
     let Some(tx) = status else { return };
@@ -1039,7 +1038,7 @@ fn routing_snapshot(table: &RoutingTable) -> RoutingInfo {
 /// Push a routing-only update to the status snapshot. Used right after
 /// `routing.admit` so `antctl top` reflects new peers without waiting for
 /// the next pipeline-sync tick.
-fn sync_routing_snapshot(status: &Option<watch::Sender<StatusSnapshot>>, table: &RoutingTable) {
+fn sync_routing_snapshot(status: Option<&watch::Sender<StatusSnapshot>>, table: &RoutingTable) {
     let Some(tx) = status else { return };
     let routing = routing_snapshot(table);
     tx.send_modify(|st| st.peers.routing = routing);
@@ -1136,7 +1135,7 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
         record_external_address(
             &mut state,
             &mut swarm,
-            &cfg.status,
+            cfg.status.as_ref(),
             addr,
             ExternalAddrSource::Manual,
         );
@@ -1292,7 +1291,7 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
         )
         .await;
         if last_pipeline_sync.elapsed() >= PIPELINE_SYNC_INTERVAL {
-            sync_peer_pipeline(&cfg.status, &mut state);
+            sync_peer_pipeline(cfg.status.as_ref(), &mut state);
             last_pipeline_sync = Instant::now();
         }
         if let Some(deadline) = external_address_check_deadline {
@@ -1304,11 +1303,11 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
 
         tokio::select! {
             ev = swarm.select_next_some() => {
-                observe_event(&cfg.status, &mut peer_agents, &ev);
+                observe_event(cfg.status.as_ref(), &mut peer_agents, &ev);
                 handle_swarm_event(
                     &mut swarm,
                     &mut state,
-                    &cfg.status,
+                    cfg.status.as_ref(),
                     &mut control,
                     &hs_params,
                     &result_tx,
@@ -1835,32 +1834,12 @@ fn handle_control_command(
         // future caller ever bypasses the interceptor. Not reached
         // in production daemons; not exercised by tests beyond a
         // build check.
-        ControlCommand::UploadStart { ack, .. } => {
-            let _ = ack.send(ControlAck::Error {
-                message: "upload manager not wired into the swarm loop".into(),
-            });
-        }
-        ControlCommand::UploadList { ack } => {
-            let _ = ack.send(ControlAck::Error {
-                message: "upload manager not wired into the swarm loop".into(),
-            });
-        }
-        ControlCommand::UploadStatus { ack, .. } => {
-            let _ = ack.send(ControlAck::Error {
-                message: "upload manager not wired into the swarm loop".into(),
-            });
-        }
-        ControlCommand::UploadPause { ack, .. } => {
-            let _ = ack.send(ControlAck::Error {
-                message: "upload manager not wired into the swarm loop".into(),
-            });
-        }
-        ControlCommand::UploadResume { ack, .. } => {
-            let _ = ack.send(ControlAck::Error {
-                message: "upload manager not wired into the swarm loop".into(),
-            });
-        }
-        ControlCommand::UploadCancel { ack, .. } => {
+        ControlCommand::UploadStart { ack, .. }
+        | ControlCommand::UploadList { ack }
+        | ControlCommand::UploadStatus { ack, .. }
+        | ControlCommand::UploadPause { ack, .. }
+        | ControlCommand::UploadResume { ack, .. }
+        | ControlCommand::UploadCancel { ack, .. } => {
             let _ = ack.send(ControlAck::Error {
                 message: "upload manager not wired into the swarm loop".into(),
             });
@@ -2523,9 +2502,6 @@ async fn run_get_bytes(
                 );
                 return ControlAck::Bytes { data };
             }
-            Err(AttemptError::Permanent(message)) => {
-                return ControlAck::Error { message };
-            }
             Err(AttemptError::Transient(message)) if attempt < MAX_FETCH_ATTEMPTS => {
                 let backoff = RETRY_BACKOFF_BASE * attempt as u32;
                 warn!(
@@ -2536,7 +2512,7 @@ async fn run_get_bytes(
                 );
                 tokio::time::sleep(backoff).await;
             }
-            Err(AttemptError::Transient(message)) => {
+            Err(AttemptError::Permanent(message) | AttemptError::Transient(message)) => {
                 return ControlAck::Error { message };
             }
         }
@@ -2736,9 +2712,6 @@ async fn run_get_bzz(
                     filename,
                 };
             }
-            Err(AttemptError::Permanent(message)) => {
-                return ControlAck::Error { message };
-            }
             Err(AttemptError::Transient(message)) if attempt < MAX_FETCH_ATTEMPTS => {
                 let backoff = RETRY_BACKOFF_BASE * attempt as u32;
                 warn!(
@@ -2749,7 +2722,7 @@ async fn run_get_bzz(
                 );
                 tokio::time::sleep(backoff).await;
             }
-            Err(AttemptError::Transient(message)) => {
+            Err(AttemptError::Permanent(message) | AttemptError::Transient(message)) => {
                 return ControlAck::Error { message };
             }
         }
@@ -2984,7 +2957,7 @@ fn bump_backoff(backoff: Duration) -> Duration {
 fn handle_swarm_event(
     swarm: &mut Swarm<AntBehaviour>,
     state: &mut SwarmState,
-    status: &Option<watch::Sender<StatusSnapshot>>,
+    status: Option<&watch::Sender<StatusSnapshot>>,
     control: &mut Control,
     hs_params: &HandshakeParams,
     result_tx: &mpsc::Sender<(PeerId, DriveOutcome)>,
@@ -3230,14 +3203,19 @@ fn handle_drive_outcome(
             *backoff = MIN_BACKOFF;
             log_handshake_ok(&info, peer_set_size, pipeline_ms);
             record_peer_session_milestones(
-                &cfg.status,
+                cfg.status.as_ref(),
                 cfg.process_start,
                 first_bzz_in_session,
                 peer_set_size,
                 state.target_peers,
             );
-            record_handshake(&cfg.status, peer, &info, peer_agents.get(&peer).cloned());
-            sync_routing_snapshot(&cfg.status, &state.routing);
+            record_handshake(
+                cfg.status.as_ref(),
+                peer,
+                &info,
+                peer_agents.get(&peer).cloned(),
+            );
+            sync_routing_snapshot(cfg.status.as_ref(), &state.routing);
             // Persist the working dial address. We only ever record outbound
             // peers — for inbound connections we don't yet have a guaranteed-
             // reachable multiaddr, so we let those become hints via hive
@@ -3339,7 +3317,7 @@ fn spawn_handshake_driver(
 /// Side-channel: keep the status snapshot and the `peer_agents` map in sync
 /// without changing the flow of the main event loop.
 fn observe_event(
-    status: &Option<watch::Sender<StatusSnapshot>>,
+    status: Option<&watch::Sender<StatusSnapshot>>,
     peer_agents: &mut HashMap<PeerId, String>,
     ev: &SwarmEvent<AntBehaviourEvent>,
 ) {
@@ -3468,7 +3446,7 @@ fn peer_endpoint(endpoint: &ConnectedPoint) -> (String, String) {
 
 /// Record one-shot session timings for UIs (e.g. `antctl top`).
 fn record_peer_session_milestones(
-    status: &Option<watch::Sender<StatusSnapshot>>,
+    status: Option<&watch::Sender<StatusSnapshot>>,
     process_start: std::time::Instant,
     first_bzz_in_session: bool,
     peer_set_size: usize,
@@ -3490,7 +3468,7 @@ fn record_peer_session_milestones(
 }
 
 fn record_handshake(
-    status: &Option<watch::Sender<StatusSnapshot>>,
+    status: Option<&watch::Sender<StatusSnapshot>>,
     remote: PeerId,
     info: &HandshakeInfo,
     agent: Option<String>,
@@ -3515,7 +3493,7 @@ fn record_handshake(
             peer.full_node = Some(report.full_node);
             peer.last_bzz_at_unix = Some(report.at_unix);
             if peer.agent_version.is_empty() {
-                peer.agent_version = report.agent_version.clone();
+                peer.agent_version.clone_from(&report.agent_version);
             }
         }
         st.peers.last_handshake = Some(report);
@@ -3530,6 +3508,8 @@ fn unix_now() -> u64 {
 }
 
 /// Sub-second breakdown for a completed **outbound** (dialer) pipeline.
+// Every field is a millisecond duration; `_ms` is the unit, not redundant naming.
+#[allow(clippy::struct_field_names)]
 struct OutboundPipelineMs {
     dial_ms: Option<u64>,
     identifying_ms: u64,
@@ -3826,7 +3806,7 @@ mod tests {
             state.external_addresses_order.push(addr);
         }
 
-        sync_external_addresses_status(&Some(tx), &state);
+        sync_external_addresses_status(Some(&tx), &state);
 
         let snap = rx.borrow().external_addresses.clone();
         let actual: Vec<(String, String, u64)> = snap
@@ -3867,7 +3847,7 @@ mod tests {
 
         state.external_addresses.remove(&b);
         state.external_addresses_order.retain(|x| x != &b);
-        sync_external_addresses_status(&Some(tx), &state);
+        sync_external_addresses_status(Some(&tx), &state);
 
         let snap_addrs: Vec<String> = rx
             .borrow()

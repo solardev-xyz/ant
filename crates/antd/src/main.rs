@@ -1,7 +1,8 @@
 //! `antd` — Swarm light node daemon (M1.0: mainnet dial + BZZ handshake).
 
 use ant_control::{
-    ControlCommand, GatewayActivity, IdentityInfo, PeerInfo, StatusSnapshot, PROTOCOL_VERSION,
+    ControlCommand, GatewayActivity, IdentityInfo, PeerInfo, RetrievalInfo, StatusSnapshot,
+    PROTOCOL_VERSION,
 };
 use ant_crypto::{
     ethereum_address_from_public_key, overlay_from_ethereum_address, random_overlay_nonce,
@@ -240,7 +241,8 @@ async fn main() -> Result<()> {
     let process_start = Instant::now();
     let opt = Opt::parse();
     let data_dir = expand_tilde(&opt.data_dir);
-    std::fs::create_dir_all(&data_dir).with_context(|| format!("create data dir {data_dir:?}"))?;
+    std::fs::create_dir_all(&data_dir)
+        .with_context(|| format!("create data dir {}", data_dir.display()))?;
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -319,7 +321,7 @@ async fn main() -> Result<()> {
         listeners: Vec::new(),
         external_addresses: Vec::new(),
         control_socket: control_socket.display().to_string(),
-        retrieval: Default::default(),
+        retrieval: RetrievalInfo::default(),
     };
     let (status_tx, status_rx) = watch::channel(initial_snapshot);
 
@@ -653,7 +655,7 @@ fn resolve_chunk_record_dir(
         if let Some(p) = record_chunks {
             let dir = expand_tilde(p);
             std::fs::create_dir_all(&dir)
-                .with_context(|| format!("create --record-chunks dir {dir:?}"))?;
+                .with_context(|| format!("create --record-chunks dir {}", dir.display()))?;
             tracing::info!(
                 target: "antd",
                 "recording every fetched chunk to {} (--record-chunks)",
@@ -680,7 +682,7 @@ fn acquire_instance_lock(lock_path: &Path) -> Result<File> {
         .write(true)
         .truncate(false)
         .open(lock_path)
-        .with_context(|| format!("open instance lock {lock_path:?}"))?;
+        .with_context(|| format!("open instance lock {}", lock_path.display()))?;
     match FileExt::try_lock(&file) {
         Ok(()) => {}
         Err(TryLockError::WouldBlock) => {
@@ -698,7 +700,7 @@ fn acquire_instance_lock(lock_path: &Path) -> Result<File> {
             ));
         }
         Err(TryLockError::Error(e)) => {
-            return Err(anyhow!(e)).with_context(|| format!("flock {lock_path:?}"));
+            return Err(anyhow!(e)).with_context(|| format!("flock {}", lock_path.display()));
         }
     }
     let mut writable = &file;
@@ -756,7 +758,8 @@ fn load_or_create_identity(
     key_path: &std::path::Path,
 ) -> Result<([u8; SECP256K1_SECRET_LEN], [u8; 32], Keypair)> {
     if id_path.exists() {
-        let raw = std::fs::read_to_string(id_path).with_context(|| format!("read {id_path:?}"))?;
+        let raw = std::fs::read_to_string(id_path)
+            .with_context(|| format!("read {}", id_path.display()))?;
         let id: IdentityFile = serde_json::from_str(&raw).context("parse identity.json")?;
         let mut signing_secret = [0u8; SECP256K1_SECRET_LEN];
         hex::decode_to_slice(&id.signing_key, &mut signing_secret).context("decode signing_key")?;
@@ -785,7 +788,7 @@ fn load_or_create_identity(
         id_path,
         serde_json::to_string_pretty(&id).context("serialize identity")?,
     )
-    .with_context(|| format!("write {id_path:?}"))?;
+    .with_context(|| format!("write {}", id_path.display()))?;
 
     // Optional raw key file for tooling.
     let _ = std::fs::write(key_path, hex::encode(signing_secret));

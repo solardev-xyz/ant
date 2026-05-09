@@ -172,9 +172,8 @@ pub async fn resolve_feed_root(
     let Some(slash_fork) = root_node.forks.get(&b'/') else {
         return Ok(root_addr);
     };
-    let feed = match feed_from_metadata(&slash_fork.metadata)? {
-        Some(f) => f,
-        None => return Ok(root_addr),
+    let Some(feed) = feed_from_metadata(&slash_fork.metadata)? else {
+        return Ok(root_addr);
     };
     debug!(
         target: "ant_retrieval::mantaray",
@@ -454,17 +453,6 @@ fn collect_entries<'a>(
                     collect_entries(fetcher, child_node, child_path, entries, visited, depth + 1)
                         .await?;
                 }
-                Err(ManifestError::NotAManifest) => {
-                    entries.push(ManifestEntry {
-                        path: if fork_path.is_empty() {
-                            "/".to_string()
-                        } else {
-                            fork_path
-                        },
-                        reference: Some(fork.child_ref),
-                        metadata: metadata_to_btree(fork.metadata),
-                    });
-                }
                 Err(_) => {
                     entries.push(ManifestEntry {
                         path: if fork_path.is_empty() {
@@ -513,6 +501,9 @@ async fn load_node(fetcher: &dyn ChunkFetcher, addr: [u8; 32]) -> Result<Node, M
 }
 
 /// In-memory representation of a mantaray node after unmarshalling.
+// `node_type` is the on-wire type-tag bitfield (value/edge/with-metadata),
+// not a stuttering field name.
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone)]
 struct Node {
     /// Bee-side bitfield (value/edge/with-metadata). We parse it for
