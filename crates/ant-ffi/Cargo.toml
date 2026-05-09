@@ -13,8 +13,8 @@ edition.workspace = true
 # it behind a feature flag when the proper mobile artefact (UniFFI)
 # lands.
 [lib]
+crate-type = ["rlib", "staticlib"]
 name = "ant_ffi"
-crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 ant-control = { path = "../ant-control" }
