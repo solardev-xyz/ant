@@ -1442,56 +1442,76 @@ files, and the upper-bound assertion in
 `gateway_raises_joiner_max_bytes_above_cli_default` still
 passes (16 GiB > 32 MiB).
 
-##### Fresh-upload retrieval lag (NOT a bug)
+##### Fresh-upload retrieval lag — *measured*, not a bug
 
 Once the cap was raised and the daemon restarted, retrieval of
-the GGUF still timed out — but not because of the gateway. A
-direct `/chunks/0x<addr>` probe of an L1 intermediate
-(`487f1639…`) returned the bee-shaped error
-`{"code":404,"message":"retrieval from Qm…RosxR…: remote:
-retrieve chunk: storage: not found"}`. Some chunks are simply
-not yet retrievable from any of the 400 peers we route to.
+the GGUF still failed — but not because of the gateway. We
+have hard numbers:
+
+- Random sample of 21 chunks across the file's chunk tree (10
+  L2 intermediates uniformly across the 107-child root, plus
+  2 leaf samples per L2): **5 deterministic 404s = 23.8 %
+  miss rate at T+2 h 45 m post-completion**. Each missing
+  chunk re-tested twice; both retries 404'd with the same bee
+  error `"remote: retrieve chunk: storage: not found"`.
+- Full `/bzz/<ref>/` download attempt: 7 min 44 s spent on a
+  single chunk (`d1671a96…`) before the gateway gave up after
+  35 retries: `"all peers failed for chunk … after 35
+  attempts (last: remote: retrieve chunk: no peer found)"`.
+  End-to-end download impossible — any single missing chunk
+  fails the whole stream.
 
 This is intrinsic to Swarm's pushsync model:
 1. Pushsync delivers each chunk to **one** closest neighbour.
 2. Replication to the rest of the k-set happens over hours via
-   bee's separate sync protocols (`pullsync`,
-   neighborhood replication).
-3. Retrieval routes to whoever the routing layer thinks is
-   closest, which may not be the original receiver until the
-   neighbourhood has synced.
+   bee's separate sync protocols (`pullsync`, neighbourhood
+   replication).
+3. Retrieval routes to whoever *our* routing layer thinks is
+   closest, which often isn't the original pushsync receiver
+   until the neighbourhood has synced.
 
-So a 6.7 GiB upload that *just* finished pushsync has very low
-retrieval availability for the first hours, climbing as
-neighbourhoods sync. The upload is correct (manifest reads
-back, file root reachable, intermediates fetch in <30 ms each);
-the network just hasn't fanned the chunks out yet. Retrieval
-will become reliable on its own as bee's sync tick fires across
-the relevant neighbourhoods. No code change needed.
+So a 6.7 GiB upload that *just* finished pushsync has ~75-80 %
+chunk availability initially, with full availability arriving
+hours/days later. The upload itself is correct (manifest reads
+back, content-length matches, intermediates resolve in <30 ms);
+the network simply hasn't fanned the chunks out yet. We have
+to wait — there is no client-side fix.
 
-If we wanted to *force* faster availability we could:
-1. Write a small antctl re-push tool that walks the file from
-   the local source, derives every leaf address, and re-pushes
-   chunks whose `/chunks/0x<addr>` returns 404 — would speed
-   the first few hours but bee will eventually do this on its
-   own.
-2. Pin a high-fanout (≥600 peer) instance next to the upload
-   for the first 24 h to multiply the routing-layer reach.
-3. Raise our own `target_peers` further once the dial-pipeline
-   audit is in (above).
+**Action plan if `+72 h` doesn't recover availability** (not
+expected, but worth recording):
 
-Saving these as Phase 7h candidates, not blocking.
+1. **Phase 7h: `antctl upload reseed <job-id>`.** Walks the
+   local source file, derives every chunk address, queries
+   `/chunks/0x<addr>` for each, re-pushes any that 404. The
+   re-push lands on whichever peer is now the closest
+   neighbour (which may differ from the original receiver),
+   materially accelerating availability. Bandwidth bounded by
+   the miss rate: at 24 % miss × 1.76 M chunks × 4 KiB ≈
+   1.7 GiB to re-push.
+2. **Phase 7i: target-peers ≥ 600 + 24 h soak.** Raises the
+   probability that *our* routing table covers every k-bucket
+   at least once. Pre-req: the dial-pipeline audit listed
+   under Phase 7f's follow-ups.
+3. **Phase 7j: bee-side hand-off.** Drive a temporary
+   high-stake bee node next to antd, let pullsync replicate
+   our upload through it, then retire the bee node. Most
+   surgical option for forcing replication; needs SWAP plumbing
+   on bee that we deferred earlier.
+
+None of these are blocking. We re-sample at +6/+24/+72 h and
+escalate only if availability stalls.
 
 **Acceptance:** delivered.
 - 400 peers held cleanly through the rest of the GGUF upload.
 - gemma4:e2b GGUF reference:
   `0x0bf812fcbe8e25905711f82acaeabeedcb221e8f2384887b778d5649cd0c8537`.
-  Manifest (`/bzz`) and file-root (`/bytes`) HEAD return the
-  correct 7 162 394 016-byte content-length; intermediate
-  chunks reachable; leaf-level reliability waiting on bee's
-  network-side sync.
+- Manifest (`/bzz`) and file-root (`/bytes`) HEAD return the
+  correct 7 162 394 016-byte content-length.
+- Top-of-tree chunks reachable in <30 ms each.
+- Full body retrieval blocked by the network-side replication
+  lag described above. Re-test scheduled at +6/+24/+72 h.
 - Gateway cap fix prevents the same 502 for any future
-  multi-GiB upload.
+  multi-GiB upload, *whenever* retrieval becomes available.
 
 #### Phase 8 — On-device stamp lifecycle — ✅ shipped
 
