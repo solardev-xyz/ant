@@ -378,8 +378,7 @@ async fn drain_inbound(mut stream: Stream) -> std::io::Result<()> {
     // settlement attempt as concluded, and moves on without flagging us.
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs() as i64);
     let ack = PaymentAckPb {
         amount: Vec::new(),
         timestamp,
@@ -460,7 +459,7 @@ pub async fn run_driver(
     // and ~150 active peers during a busy fetch, this is ~4500 events
     // per summary — granular enough to spot a regression, sparse enough
     // to keep the log file readable.
-    let summary_every = Duration::from_secs(60);
+    let summary_every = Duration::from_mins(1);
     let mut last_summary = Instant::now();
     let mut last_metrics = DriverMetrics::default();
 

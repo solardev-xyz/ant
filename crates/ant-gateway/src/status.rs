@@ -211,8 +211,7 @@ pub async fn topology(State(handle): State<GatewayHandle>) -> Response {
     let connected: u32 = bin_counts.iter().sum();
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
 
     Json(TopologyBody {
         base_addr,

@@ -48,7 +48,7 @@ use tokio::sync::{mpsc, watch, Notify};
 /// lets the iOS smoke test pull sub-gigabyte bzz payloads end-to-end
 /// without hand-tuning per file. Phase-4's `UniFFI` surface will expose
 /// this so hosts can pick their own.
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(10);
 
 /// How often to retry a `GetBytes` / `GetBzz` that bounces off an
 /// empty BZZ peer set. iOS cold starts frequently hit this: the node
@@ -56,7 +56,7 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 /// finished the BZZ handshake yet. Letting the outer timeout cover
 /// the whole warmup window is friendlier than forcing the Swift
 /// side to poll.
-const NO_PEERS_RETRY_INTERVAL: Duration = Duration::from_millis(2000);
+const NO_PEERS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Per-request joiner size ceiling. `ant_retrieval::DEFAULT_MAX_FILE_BYTES`
 /// is 32 MiB, which is the right cap for interactive `antctl get` but
@@ -234,8 +234,7 @@ fn init_inner(data_dir: &Path) -> Result<AntHandle, FfiError> {
 
     let started_at_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     let initial_snapshot = StatusSnapshot {
         agent: format!("ant-ffi/{}", env!("CARGO_PKG_VERSION")),
         protocol_version: ant_control::PROTOCOL_VERSION,

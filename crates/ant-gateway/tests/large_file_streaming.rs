@@ -305,7 +305,7 @@ async fn ten_mib_full_get_streams_in_multiple_frames() {
     let first = first_at.expect("at least one frame");
     // Surface the timing in `--nocapture` output so a human can spot
     // streaming-vs-buffering at a glance.
-    println!("ten_mib_full_get: frames={frames}, first_byte_at={first:?}, full_body_at={total:?}",);
+    println!("ten_mib_full_get: frames={frames}, first_byte_at={first:?}, full_body_at={total:?}");
     assert!(
         frames >= 2,
         "expected the gateway to stream the body in multiple frames, got {frames} frame(s) in {total:?}",

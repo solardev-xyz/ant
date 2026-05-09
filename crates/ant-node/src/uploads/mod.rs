@@ -100,7 +100,7 @@ const CHECKPOINT_INTERVAL_CHUNKS: u64 = 256;
 
 /// Cap on outstanding `PushChunk` ack timeout. Mirrors what the
 /// gateway uses for `upload_bzz`.
-const PUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const PUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// Per-chunk retry budget before the job moves to `Failed`. Pushsync
 /// against a freshly-handshaked peer set occasionally fires a
@@ -493,8 +493,7 @@ impl UploadManager {
         let counter = self.inner.id_counter.fetch_add(1, Ordering::Relaxed);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_nanos() as u64);
         // 8 bytes of identity: low 40 bits of nanos XOR with the
         // counter (so two starts in the same nanosecond don't
         // collide). Hex-encoded for `antctl upload <id>` ergonomics.
@@ -875,7 +874,7 @@ impl UploadManager {
                     }
                     Err(_) => {
                         last_err =
-                            Some(format!("push timed out after {}s", PUSH_TIMEOUT.as_secs(),));
+                            Some(format!("push timed out after {}s", PUSH_TIMEOUT.as_secs()));
                     }
                 }
                 // Bounded back-off between retries: 100 ms × 2^n,
@@ -1129,8 +1128,7 @@ pub async fn run_follow(mgr: UploadManager, job_id: String, ack: mpsc::Sender<Co
 fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn mtime_unix_ms(meta: &std::fs::Metadata) -> u64 {

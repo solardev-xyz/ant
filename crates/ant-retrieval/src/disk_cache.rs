@@ -58,8 +58,7 @@ const LAST_ACCESS_REFRESH_MS: i64 = 60_000;
 /// cached prepared statements). Bounded to keep mobile FD use sane.
 fn read_worker_count() -> usize {
     std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(8)
+        .map_or(8, std::num::NonZero::get)
         .clamp(8, 32)
 }
 
@@ -696,8 +695,7 @@ fn evict_to_slack(
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 #[cfg(test)]

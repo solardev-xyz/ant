@@ -538,7 +538,7 @@ impl Wallet {
             secret,
             address,
             chain_id,
-            default_wait: Duration::from_secs(60),
+            default_wait: Duration::from_mins(1),
             default_gas_price_wei: DEFAULT_GAS_PRICE_WEI,
         })
     }
