@@ -412,7 +412,7 @@ impl RoutingFetcher {
     /// Does **not** mutate the retrieval blacklist; push uses its own
     /// skip list because a peer that rejects a stamped write may still
     /// serve retrieval traffic.
-    pub async fn push_stamped_cac(
+    pub async fn push_stamped_chunk(
         &self,
         chunk_addr: [u8; 32],
         wire: Vec<u8>,

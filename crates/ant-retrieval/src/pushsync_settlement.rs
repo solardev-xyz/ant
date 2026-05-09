@@ -2,7 +2,7 @@
 //!
 //! # Why this exists
 //!
-//! `RoutingFetcher::push_stamped_cac` opens a `/swarm/pushsync/1.3.1/pushsync`
+//! `RoutingFetcher::push_stamped_chunk` opens a `/swarm/pushsync/1.3.1/pushsync`
 //! stream to the closest peer for each chunk we upload. Bee runs accounting
 //! on its end of that stream: every chunk we push adds `chunk_price` PLUR to
 //! the receiver's view of *our* outbound debt to *them*
@@ -82,7 +82,7 @@ pub fn peer_chunk_price(peer_overlay: &[u8; 32], chunk_addr: &[u8; 32]) -> u64 {
 /// holds an `Arc<dyn PushsyncSettlement>` and calls `note_pushsync`
 /// after every accepted pushsync receipt; if the implementation decides
 /// it's time to emit a cheque, it does so synchronously *inside*
-/// `note_pushsync` so the next `push_stamped_cac` call observes the
+/// `note_pushsync` so the next `push_stamped_chunk` call observes the
 /// peer paid up.
 ///
 /// The trait is deliberately small (one method) to keep the fetcher
