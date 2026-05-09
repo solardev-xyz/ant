@@ -57,3 +57,30 @@ tokio = { version = "1.44.2", features = [
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 unsigned-varint = { version = "0.8.0", features = ["futures"] }
+
+[workspace.lints.clippy]
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+dbg_macro = "warn"
+fn_params_excessive_bools = "allow"
+items_after_statements = "allow"
+mem_forget = "warn"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+needless_pass_by_value = "allow"
+pedantic = { level = "warn", priority = -1 }
+similar_names = "allow"
+struct_excessive_bools = "allow"
+todo = "warn"
+too_many_lines = "allow"
+unimplemented = "warn"
+
+[workspace.lints.rust]
+elided_lifetimes_in_paths = "allow"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unreachable_pub = "allow"
+unsafe_op_in_unsafe_fn = "warn"
+unused_lifetimes = "warn"
+unused_macro_rules = "warn"

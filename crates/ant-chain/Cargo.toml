@@ -43,3 +43,6 @@ tracing = { workspace = true }
 [dev-dependencies]
 primitive-types = { version = "0.14.0", default-features = false }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

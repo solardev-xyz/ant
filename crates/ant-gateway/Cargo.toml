@@ -39,3 +39,6 @@ tower = { version = "0.5.3", features = ["util"] }
 [features]
 default = ["http-api"]
 http-api = ["dep:axum", "dep:hyper", "dep:tower"]
+
+[lints]
+workspace = true
