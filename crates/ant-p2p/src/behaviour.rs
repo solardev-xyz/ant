@@ -3674,8 +3674,15 @@ mod tests {
     /// 502s on multi-MiB media files.
     #[test]
     fn publish_peers_reflects_admit_and_forget() {
-        let mut state =
-            SwarmState::new(32, [0u8; 32], false, None, None, None, crate::PeerEthMap::new());
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
         let mut rx = state.peers_watch.subscribe();
         // Initial state: empty.
         assert!(rx.borrow_and_update().is_empty());
@@ -3710,8 +3717,15 @@ mod tests {
     /// then we shut up.
     #[test]
     fn bee_peerstore_stall_warning_is_one_shot() {
-        let mut state =
-            SwarmState::new(32, [0u8; 32], false, None, None, None, crate::PeerEthMap::new());
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
         let stall = OutboundPipelineMs {
             dial_ms: Some(50),
             identifying_ms: 50,
@@ -3745,8 +3759,15 @@ mod tests {
     /// changing one of these strings is a breaking-API event.
     #[test]
     fn external_addresses_status_attributes_source_in_order() {
-        let mut state =
-            SwarmState::new(32, [0u8; 32], false, None, None, None, crate::PeerEthMap::new());
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
         let (tx, rx) = watch::channel(StatusSnapshot::default());
 
         let manual: Multiaddr = "/ip4/203.0.113.10/tcp/1634".parse().unwrap();
@@ -3789,8 +3810,15 @@ mod tests {
     /// addresses on display long after the mapping is gone.
     #[test]
     fn external_addresses_status_drops_retracted_entry() {
-        let mut state =
-            SwarmState::new(32, [0u8; 32], false, None, None, None, crate::PeerEthMap::new());
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
         let (tx, rx) = watch::channel(StatusSnapshot::default());
 
         let a: Multiaddr = "/ip4/203.0.113.10/tcp/1634".parse().unwrap();
@@ -3834,8 +3862,15 @@ mod tests {
     /// fire when `identifying_ms` itself is past the threshold.
     #[test]
     fn bee_peerstore_stall_warning_skips_slow_identify() {
-        let mut state =
-            SwarmState::new(32, [0u8; 32], false, None, None, None, crate::PeerEthMap::new());
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
         let p = OutboundPipelineMs {
             dial_ms: Some(50),
             identifying_ms: 3_000,

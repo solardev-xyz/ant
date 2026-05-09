@@ -1269,12 +1269,7 @@ async fn run_chequebook_async(cmd: ChequebookCommand, json: bool) -> Result<()> 
                         deposit / 10_000_000_000_000_000u128,
                     );
                     let rcpt = wallet
-                        .erc20_transfer(
-                            &client,
-                            &GNOSIS_BZZ_TOKEN_BYTES,
-                            &cb,
-                            U256::from(deposit),
-                        )
+                        .erc20_transfer(&client, &GNOSIS_BZZ_TOKEN_BYTES, &cb, U256::from(deposit))
                         .await
                         .context("BZZ.transfer to new chequebook")?;
                     deposit_tx = Some(rcpt.tx_hash);
@@ -1318,10 +1313,7 @@ async fn run_chequebook_async(cmd: ChequebookCommand, json: bool) -> Result<()> 
                 );
                 obj.insert(
                     "tx_hash".into(),
-                    serde_json::Value::String(format!(
-                        "0x{}",
-                        hex::encode(receipt.tx_hash)
-                    )),
+                    serde_json::Value::String(format!("0x{}", hex::encode(receipt.tx_hash))),
                 );
                 obj.insert(
                     "block".into(),
@@ -1352,7 +1344,10 @@ async fn run_chequebook_async(cmd: ChequebookCommand, json: bool) -> Result<()> 
             } else {
                 println!("chequebook       {}", hex_addr(&cb));
                 println!("factory          {}", hex_addr(&factory_addr));
-                println!("issuer           {}  (factory-baked)", hex_addr(&issuer_addr));
+                println!(
+                    "issuer           {}  (factory-baked)",
+                    hex_addr(&issuer_addr)
+                );
                 println!("wallet           {}  (paid gas)", hex_addr(&wallet_addr));
                 println!("factory-verified {registered}");
                 println!("salt             0x{}", hex::encode(salt_bytes));
@@ -1364,15 +1359,15 @@ async fn run_chequebook_async(cmd: ChequebookCommand, json: bool) -> Result<()> 
                 if let Some(d) = initial_deposit_plur {
                     println!("deposit          {d} PLUR");
                     if let (Some(h), Some(b)) = (deposit_tx, deposit_block) {
-                        println!(
-                            "deposit tx       0x{}  (block {})",
-                            hex::encode(h),
-                            b,
-                        );
+                        println!("deposit tx       0x{}  (block {})", hex::encode(h), b,);
                     }
                 }
                 if let Some(p) = write_env_file.as_ref() {
-                    println!("wrote CHEQUEBOOK_ADDRESS=0x{} to {}", hex::encode(cb), p.display());
+                    println!(
+                        "wrote CHEQUEBOOK_ADDRESS=0x{} to {}",
+                        hex::encode(cb),
+                        p.display()
+                    );
                 }
                 println!();
                 println!("next step: restart antd so it picks up the new chequebook.");
@@ -1409,8 +1404,7 @@ fn update_env_file(path: &std::path::Path, key: &str, value: &str) -> Result<()>
     if !out.ends_with('\n') {
         out.push('\n');
     }
-    std::fs::write(path, out)
-        .with_context(|| format!("write {}", path.display()))?;
+    std::fs::write(path, out).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 

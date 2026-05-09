@@ -58,7 +58,6 @@ pub mod progress;
 pub mod splitter;
 
 pub use accounting::{Accounting, DebitGuard, HotHint, OVERDRAFT_REFRESH};
-pub use pushsync_settlement::{peer_chunk_price, PushsyncSettlement};
 pub use cache::{InMemoryChunkCache, DEFAULT_CAPACITY as DEFAULT_CACHE_CAPACITY};
 pub use counters::{ChunkSource, RetrievalCounters, RetrievalCountersSnapshot};
 pub use disk_cache::{DiskCacheError, DiskChunkCache, DEFAULT_DISK_CACHE_BYTES};
@@ -80,6 +79,7 @@ pub use mantaray::{
     MANTARAY_CONTENT_TYPE_KEY, MANTARAY_ERROR_DOC_KEY, MANTARAY_INDEX_DOC_KEY,
 };
 pub use progress::{estimate_total_chunks, ProgressSample, ProgressTracker};
+pub use pushsync_settlement::{peer_chunk_price, PushsyncSettlement};
 pub use splitter::{split_bytes, SplitChunk, SplitResult, StreamingSplitter, BRANCHES};
 
 use ant_crypto::{cac_valid, soc_valid, CHUNK_SIZE, SOC_HEADER_SIZE, SPAN_SIZE};

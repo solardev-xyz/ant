@@ -94,7 +94,7 @@ pub struct PeerEthMap {
 }
 
 impl PeerEthMap {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -122,7 +122,7 @@ impl PeerEthMap {
     /// handshake hasn't completed yet (rare — the fetcher only picks
     /// from peers it has handshaken) or if the entry has been
     /// evicted by [`Self::forget`].
-    #[must_use] 
+    #[must_use]
     pub fn get(&self, peer: &PeerId) -> Option<[u8; 20]> {
         self.inner.read().ok()?.get(peer).copied()
     }
@@ -167,7 +167,7 @@ pub struct PushsyncSwapConfig {
 
 impl PushsyncSwapConfig {
     /// Build a config with the default cheque trigger.
-    #[must_use] 
+    #[must_use]
     pub fn new(
         chequebook: [u8; 20],
         swap_secret: [u8; SECP256K1_SECRET_LEN],
@@ -259,7 +259,10 @@ pub struct PushsyncSwap {
 
 impl EmitCore {
     fn control_clone(&self) -> Control {
-        self.control.lock().expect("pushsync_swap control mutex").clone()
+        self.control
+            .lock()
+            .expect("pushsync_swap control mutex")
+            .clone()
     }
 
     fn accrue(&self, peer: PeerId, amount: u64) -> u64 {
@@ -321,7 +324,7 @@ impl PushsyncSwap {
     /// snapshot if `outbound_ledger_path` exists; missing or
     /// unparseable snapshots start empty (bee accepts our cheques
     /// from `cumulative = 0` upward, so a fresh start is harmless).
-    #[must_use] 
+    #[must_use]
     pub fn new(cfg: PushsyncSwapConfig, control: Control) -> Self {
         let outbound_ledger = OutboundLedger::open(Some(cfg.outbound_ledger_path.clone()));
         Self {
@@ -340,7 +343,7 @@ impl PushsyncSwap {
     /// See the doc comment on [`PushsyncSwap::hot_hint`] for the
     /// rationale; the wired-up production path lives in
     /// `ant_p2p::behaviour`'s swarm bootstrap.
-    #[must_use] 
+    #[must_use]
     pub fn with_hot_hint(mut self, tx: mpsc::Sender<HotHint>) -> Self {
         self.hot_hint = Some(tx);
         self
@@ -349,7 +352,7 @@ impl PushsyncSwap {
     /// Peek the current pending debt for `peer` (in PLUR). Useful for
     /// `antctl swap status`-style introspection. Returns 0 if peer is
     /// unknown or fully settled.
-    #[must_use] 
+    #[must_use]
     pub fn pending_debt_for(&self, peer: &PeerId) -> u64 {
         self.core
             .pending_debt
@@ -362,14 +365,14 @@ impl PushsyncSwap {
     /// Cumulative payout we've ever emitted to `beneficiary` — bee's
     /// view should match this exactly modulo cheques in flight. Used
     /// by smoke tests and (future) `antctl swap snapshot`.
-    #[must_use] 
+    #[must_use]
     pub fn cumulative_for(&self, beneficiary: &[u8; 20]) -> U256 {
         self.core.outbound_ledger.cumulative_for(beneficiary)
     }
 
     /// Borrow the underlying outbound ledger, e.g. for diagnostic
     /// dumping.
-    #[must_use] 
+    #[must_use]
     pub fn outbound_ledger(&self) -> &OutboundLedger {
         &self.core.outbound_ledger
     }
@@ -378,7 +381,7 @@ impl PushsyncSwap {
     /// `Arc<PushsyncSwap>` (e.g. an HTTP handler for `GET
     /// /chequebook/address`) can reach it without bypassing the
     /// abstraction.
-    #[must_use] 
+    #[must_use]
     pub fn chequebook(&self) -> [u8; 20] {
         self.core.cfg.chequebook
     }
