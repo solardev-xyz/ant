@@ -71,6 +71,7 @@ use libp2p::PeerId;
 ///
 /// Returns the chunk price in PLUR for `peer` retrieving / pushing
 /// `chunk_addr`.
+#[must_use] 
 pub fn peer_chunk_price(peer_overlay: &[u8; 32], chunk_addr: &[u8; 32]) -> u64 {
     crate::accounting::Accounting::peer_price(peer_overlay, chunk_addr)
 }

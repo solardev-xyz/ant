@@ -1244,14 +1244,13 @@ async fn run_chequebook_async(cmd: ChequebookCommand, json: bool) -> Result<()> 
                 .await
                 .context("factory.deploySimpleSwap")?;
 
-            let cb = match extract_deployed_chequebook(&receipt) {
-                Some(addr) => addr,
-                None => bail!(
+            let Some(cb) = extract_deployed_chequebook(&receipt) else {
+                bail!(
                     "factory tx 0x{} confirmed in block {} but emitted no SimpleSwapDeployed log; logs were {:?}",
                     hex::encode(receipt.tx_hash),
                     receipt.block_number,
                     receipt.logs,
-                ),
+                );
             };
 
             // Verify factory.deployedContracts(new_addr) == true
@@ -1372,7 +1371,7 @@ async fn run_chequebook_async(cmd: ChequebookCommand, json: bool) -> Result<()> 
                 println!("factory          {}", hex_addr(&factory_addr));
                 println!("issuer           {}  (factory-baked)", hex_addr(&issuer_addr));
                 println!("wallet           {}  (paid gas)", hex_addr(&wallet_addr));
-                println!("factory-verified {}", registered);
+                println!("factory-verified {registered}");
                 println!("salt             0x{}", hex::encode(salt_bytes));
                 println!(
                     "deploy tx        0x{}  (block {})",
@@ -1380,7 +1379,7 @@ async fn run_chequebook_async(cmd: ChequebookCommand, json: bool) -> Result<()> 
                     receipt.block_number,
                 );
                 if let Some(d) = initial_deposit_plur {
-                    println!("deposit          {} PLUR", d);
+                    println!("deposit          {d} PLUR");
                     if let (Some(h), Some(b)) = (deposit_tx, deposit_block) {
                         println!(
                             "deposit tx       0x{}  (block {})",
@@ -1408,14 +1407,14 @@ async fn run_chequebook_async(cmd: ChequebookCommand, json: bool) -> Result<()> 
 /// they always work).
 fn update_env_file(path: &std::path::Path, key: &str, value: &str) -> Result<()> {
     let body = std::fs::read_to_string(path).unwrap_or_default();
-    let mut lines: Vec<String> = body.lines().map(|s| s.to_string()).collect();
+    let mut lines: Vec<String> = body.lines().map(std::string::ToString::to_string).collect();
     let prefix = format!("{key}=");
     let new_line = format!("{key}={value}");
     let mut replaced = false;
-    for line in lines.iter_mut() {
+    for line in &mut lines {
         let trimmed = line.trim_start();
         if trimmed.starts_with(&prefix) {
-            *line = new_line.clone();
+            line.clone_from(&new_line);
             replaced = true;
             break;
         }

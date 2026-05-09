@@ -341,6 +341,7 @@ pub const SIMPLE_SWAP_DEPLOYED_TOPIC: [u8; 32] = [
 /// Returns 32 bytes; non-zero last byte means "deployed by us".
 /// Used both by `antctl chequebook verify` and by the `antd`
 /// startup factory check.
+#[must_use] 
 pub fn factory_deployed_contracts_calldata(chequebook: &[u8; 20]) -> Vec<u8> {
     let mut data = Vec::with_capacity(4 + 32);
     data.extend_from_slice(&keccak(b"deployedContracts(address)")[0..4]);
@@ -351,6 +352,7 @@ pub fn factory_deployed_contracts_calldata(chequebook: &[u8; 20]) -> Vec<u8> {
 /// Encode `SimpleSwapFactory.ERC20Address() -> address`. Lets the
 /// deploy path verify the factory was constructed for the BZZ
 /// token we expect, before we sign any tx.
+#[must_use] 
 pub fn factory_erc20_address_calldata() -> Vec<u8> {
     keccak(b"ERC20Address()")[0..4].to_vec()
 }
@@ -361,6 +363,7 @@ pub fn factory_erc20_address_calldata() -> Vec<u8> {
 /// doesn't collide with an existing chequebook (CREATE2 +
 /// identical args + identical salt → identical address). We do
 /// the same.
+#[must_use] 
 pub fn random_chequebook_salt() -> [u8; 32] {
     let mut salt = [0u8; 32];
     getrandom::fill(&mut salt).expect("OS RNG");
@@ -373,6 +376,7 @@ pub fn random_chequebook_salt() -> [u8; 32] {
 /// the first 32-byte word of `data`. Returns `None` if no matching
 /// log is in the receipt — the deploy probably reverted partway
 /// through, in which case the caller should dump the full receipt.
+#[must_use] 
 pub fn extract_deployed_chequebook(receipt: &crate::tx::TxReceipt) -> Option<[u8; 20]> {
     receipt
         .logs
@@ -556,7 +560,7 @@ mod tests {
 
     /// `deployedContracts(address)` selector + ABI layout. Used by
     /// the daemon startup factory check and `antctl chequebook
-    /// verify`. If the selector is wrong the eth_call returns
+    /// verify`. If the selector is wrong the `eth_call` returns
     /// "execution reverted" with no useful info — guard against
     /// that with a unit test rather than an embarrassing prod boot.
     #[test]
