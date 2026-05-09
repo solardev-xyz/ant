@@ -7,16 +7,18 @@
 
 use std::time::Instant;
 
-use axum::extract::Request;
+use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{get, on, post, MethodFilter, MethodRouter};
 use axum::Router;
+
 use tracing::Instrument;
 
 use crate::fallback::not_implemented;
 use crate::handle::GatewayHandle;
+use crate::retrieval::GATEWAY_MAX_UPLOAD_BYTES;
 use crate::{retrieval, status, stubs};
 
 const SERVER_HEADER: &str = concat!("ant-gateway/", env!("CARGO_PKG_VERSION"));
@@ -39,12 +41,11 @@ pub fn build(handle: GatewayHandle) -> Router {
         .route("/chequebook/address", get(stubs::chequebook_address))
         .route("/chequebook/balance", get(stubs::chequebook_balance))
         .route("/chunks", post(retrieval::upload_chunk))
+        .route("/soc/{owner}/{id}", post(retrieval::upload_soc))
         .route("/chunks/{addr}", get_or_head(retrieval::chunk))
         // Single-owner-chunk read: the address is derived as
         // `keccak256(id || owner)`, so callers that already know the
-        // `(owner, id)` pair can avoid computing it client-side. Read
-        // path only — publisher-side `POST /soc/{owner}/{id}` is out of
-        // scope for the Freedom Browser concern this branch addresses.
+        // `(owner, id)` pair can avoid computing it client-side.
         .route("/soc/{owner}/{id}", get_or_head(retrieval::download_soc))
         // Sequence-feed lookup. Returns the latest update's
         // `ts(8 BE) || ref(32)` body by default (matching bee), or a
@@ -73,6 +74,7 @@ pub fn build(handle: GatewayHandle) -> Router {
         .route("/bzz/{addr}/", get_or_head(retrieval::bzz_root))
         .route("/bzz/{addr}/{*path}", get_or_head(retrieval::bzz_with_path))
         .fallback(not_implemented)
+        .layer(DefaultBodyLimit::max(GATEWAY_MAX_UPLOAD_BYTES as usize))
         .layer(middleware::from_fn(request_span))
         .with_state(handle)
 }

@@ -948,6 +948,7 @@ struct SocFixture {
     owner: [u8; 20],
     id: [u8; 32],
     soc_address: [u8; 32],
+    signature: [u8; 65],
     wire: Vec<u8>,
     inner_cac_wire: Vec<u8>,
 }
@@ -985,6 +986,7 @@ fn signed_soc(secret: [u8; 32], id: [u8; 32], payload: &[u8]) -> SocFixture {
         owner,
         id,
         soc_address,
+        signature: sig,
         wire,
         inner_cac_wire,
     }
@@ -1854,4 +1856,443 @@ async fn head_feed_returns_headers_no_body() {
     );
     let body = body_bytes(resp).await;
     assert!(body.is_empty(), "HEAD body must be empty");
+}
+
+// `POST /soc/{owner}/{id}` SOC upload coverage.
+//
+// The SOC handler validates the path, header, and body before
+// dispatching `ControlCommand::PushSoc` to the node loop. Tests below
+// pin every branch:
+//
+// 1. Happy path: a properly signed SOC dispatches and returns the
+//    `keccak256(id || owner)` reference at status 201.
+// 2. Path, header, and body validation each rejects with 400 and a
+//    bee-shaped JSON error before the channel is touched.
+// 3. The dispatched `ControlCommand::PushSoc` carries the correct
+//    address and wire bytes (`id || sig || inner_cac`).
+// 4. Node-side errors map onto the right HTTP status (503 for
+//    unconfigured uploads, 502 for everything else).
+
+const SOC_SIGNATURE_HEADER: &str = "swarm-soc-signature";
+
+fn soc_uri(owner: &[u8; 20], id: &[u8; 32]) -> String {
+    format!("/soc/{}/{}", hex::encode(owner), hex::encode(id))
+}
+
+/// `POST /soc/{owner}/{id}` with a valid signature returns
+/// `{"reference": "<keccak256(id || owner) hex>"}` at 201. The fixture
+/// node's `PushSoc` arm trusts the gateway's `soc_valid` pre-check and
+/// echoes the SOC address, the same shape as the production `ant-p2p`
+/// handler, so a regression in either side trips the assertion.
+#[tokio::test]
+async fn post_soc_returns_bee_shaped_reference() {
+    let secret = [0xa1u8; 32];
+    let id = [0x11u8; 32];
+    let fx = signed_soc(secret, id, b"soc happy path");
+
+    let router = handle_with_fixture_node();
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::POST)
+            .uri(soc_uri(&fx.owner, &fx.id))
+            .header(SOC_SIGNATURE_HEADER, hex::encode(fx.signature))
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(Body::from(fx.inner_cac_wire))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert_eq!(
+        json["reference"].as_str().unwrap(),
+        hex::encode(fx.soc_address),
+        "reference must be bare lowercase 64-hex matching keccak256(id || owner)",
+    );
+}
+
+/// `0x` / `0X` prefixes on path components and the signature header
+/// are accepted (mirrors bee, which is lenient about prefixes).
+#[tokio::test]
+async fn post_soc_accepts_0x_prefixed_hex() {
+    let secret = [0x77u8; 32];
+    let id = [0x42u8; 32];
+    let fx = signed_soc(secret, id, b"prefixed hex");
+
+    let router = handle_with_fixture_node();
+    let uri = format!("/soc/0x{}/0X{}", hex::encode(fx.owner), hex::encode(fx.id));
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header(
+                SOC_SIGNATURE_HEADER,
+                format!("0x{}", hex::encode(fx.signature)),
+            )
+            .body(Body::from(fx.inner_cac_wire))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+/// `keccak256(id || owner)` must drive the dispatched `PushSoc.address`,
+/// and the wire must be the literal `id || sig || inner_cac` concatenation,
+/// not, e.g., a re-stamped CAC. Drives a custom dispatcher so we can
+/// inspect the exact `ControlCommand` the gateway emits.
+#[tokio::test]
+async fn post_soc_dispatches_expected_address_and_wire() {
+    let secret = [0x33u8; 32];
+    let id = [0x55u8; 32];
+    let fx = signed_soc(secret, id, b"dispatch shape");
+    let expected_wire = {
+        let mut w = Vec::with_capacity(32 + 65 + fx.inner_cac_wire.len());
+        w.extend_from_slice(&fx.id);
+        w.extend_from_slice(&fx.signature);
+        w.extend_from_slice(&fx.inner_cac_wire);
+        w
+    };
+
+    struct Captured {
+        wire: Vec<u8>,
+        address: [u8; 32],
+    }
+    let captured: Arc<Mutex<Option<Captured>>> = Arc::new(Mutex::new(None));
+    let captured_for_dispatch = captured.clone();
+    let router = router_with_dispatcher(move |cmd| {
+        let captured = captured_for_dispatch.clone();
+        async move {
+            if let ControlCommand::PushSoc { address, wire, ack } = cmd {
+                *captured.lock().await = Some(Captured { wire, address });
+                let _ = ack.send(ControlAck::ChunkUploaded {
+                    reference: format!("0x{}", hex::encode(address)),
+                });
+            }
+        }
+    });
+
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::POST)
+            .uri(soc_uri(&fx.owner, &fx.id))
+            .header(SOC_SIGNATURE_HEADER, hex::encode(fx.signature))
+            .body(Body::from(fx.inner_cac_wire.clone()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let guard = captured.lock().await;
+    let cap = guard.as_ref().expect("PushSoc must be dispatched");
+    assert_eq!(cap.address, fx.soc_address);
+    assert_eq!(cap.wire, expected_wire);
+}
+
+/// SOC writes are *mutable* at the address level (the owner can resign
+/// at the same id), so the handler must not emit `Cache-Control:
+/// immutable` the way `upload_chunk` does for CAC chunks.
+#[tokio::test]
+async fn post_soc_omits_immutable_cache_control() {
+    let secret = [0x12u8; 32];
+    let id = [0x34u8; 32];
+    let fx = signed_soc(secret, id, b"mutable address");
+
+    let router = handle_with_fixture_node();
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::POST)
+            .uri(soc_uri(&fx.owner, &fx.id))
+            .header(SOC_SIGNATURE_HEADER, hex::encode(fx.signature))
+            .body(Body::from(fx.inner_cac_wire))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let cc = resp.headers().get(header::CACHE_CONTROL);
+    assert!(
+        cc.is_none_or(|v| !v.to_str().unwrap().contains("immutable")),
+        "POST /soc must not advertise `immutable` (SOC addresses can be re-signed): {cc:?}",
+    );
+}
+
+/// Owner path component must decode to exactly 20 bytes; anything else
+/// is a 400 with a `bad owner:` message and never reaches the channel.
+#[tokio::test]
+async fn post_soc_rejects_bad_owner_hex() {
+    let id = [0u8; 32];
+    let body = vec![0u8; 16];
+    let captured: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    let captured_for_dispatch = captured.clone();
+    let router = router_with_dispatcher(move |_cmd| {
+        let captured = captured_for_dispatch.clone();
+        async move {
+            *captured.lock().await = true;
+        }
+    });
+
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::POST)
+            .uri(format!("/soc/deadbeef/{}", hex::encode(id)))
+            .header(SOC_SIGNATURE_HEADER, hex::encode([0u8; 65]))
+            .body(Body::from(body))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert_eq!(json["code"], 400);
+    assert!(
+        json["message"].as_str().unwrap().starts_with("bad owner:"),
+        "expected `bad owner:` prefix, got {}",
+        json["message"],
+    );
+    assert!(
+        !*captured.lock().await,
+        "validation must fail before the command channel is touched",
+    );
+}
+
+/// Id path component must decode to exactly 32 bytes; anything else is
+/// a 400 with a `bad id:` message.
+#[tokio::test]
+async fn post_soc_rejects_bad_id_hex() {
+    let owner = [0u8; 20];
+    let router = handle_with_fixture_node();
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::POST)
+            .uri(format!("/soc/{}/abc", hex::encode(owner)))
+            .header(SOC_SIGNATURE_HEADER, hex::encode([0u8; 65]))
+            .body(Body::from(vec![0u8; 16]))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert!(
+        json["message"].as_str().unwrap().starts_with("bad id:"),
+        "expected `bad id:` prefix, got {}",
+        json["message"],
+    );
+}
+
+/// A request without the `swarm-soc-signature` header is a 400.
+/// The signature is mandatory: there's no fall-back recovery path in
+/// bee.
+#[tokio::test]
+async fn post_soc_rejects_missing_signature_header() {
+    let owner = [0u8; 20];
+    let id = [0u8; 32];
+    let router = handle_with_fixture_node();
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::POST)
+            .uri(soc_uri(&owner, &id))
+            .body(Body::from(vec![0u8; 16]))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert_eq!(
+        json["message"].as_str().unwrap(),
+        "missing swarm-soc-signature header",
+    );
+}
+
+/// Non-ASCII bytes in the signature header are caught by `to_str()`
+/// before the hex parser sees them.
+#[tokio::test]
+async fn post_soc_rejects_non_ascii_signature_header() {
+    use axum::http::HeaderValue;
+
+    let owner = [0u8; 20];
+    let id = [0u8; 32];
+    let mut req = Request::builder()
+        .method(Method::POST)
+        .uri(soc_uri(&owner, &id))
+        .body(Body::from(vec![0u8; 16]))
+        .unwrap();
+    req.headers_mut().insert(
+        SOC_SIGNATURE_HEADER,
+        HeaderValue::from_bytes(&[0xC3, 0xA9]).expect("non-ascii header value"),
+    );
+
+    let router = handle_with_fixture_node();
+    let resp = send(router, req).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert_eq!(
+        json["message"].as_str().unwrap(),
+        "swarm-soc-signature must be ascii hex",
+    );
+}
+
+/// A signature header that's the wrong length, or contains non-hex
+/// characters, surfaces as `bad swarm-soc-signature: …`.
+#[tokio::test]
+async fn post_soc_rejects_malformed_signature_hex() {
+    let owner = [0u8; 20];
+    let id = [0u8; 32];
+    let router = handle_with_fixture_node();
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::POST)
+            .uri(soc_uri(&owner, &id))
+            .header(SOC_SIGNATURE_HEADER, "deadbeef")
+            .body(Body::from(vec![0u8; 16]))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("bad swarm-soc-signature:"),
+        "expected `bad swarm-soc-signature:` prefix, got {}",
+        json["message"],
+    );
+}
+
+/// Bodies smaller than the inner-CAC span (8 bytes) and larger than
+/// `8 + 4096` are rejected up-front so the gateway can't be coerced
+/// into stamping a malformed chunk.
+#[tokio::test]
+async fn post_soc_rejects_body_size_out_of_range() {
+    let secret = [0x66u8; 32];
+    let id = [0u8; 32];
+    let fx = signed_soc(secret, id, b"size check");
+
+    for (label, body) in [
+        ("under-span", vec![0u8; 7]),
+        ("over-cap", vec![0u8; 8 + 4097]),
+    ] {
+        let router = handle_with_fixture_node();
+        let resp = send(
+            router,
+            Request::builder()
+                .method(Method::POST)
+                .uri(soc_uri(&fx.owner, &fx.id))
+                .header(SOC_SIGNATURE_HEADER, hex::encode(fx.signature))
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{label}");
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("soc inner cac size out of range:"),
+            "{label}: expected size error, got {}",
+            json["message"],
+        );
+    }
+}
+
+/// `soc_valid` rejection (signature recovers a different owner than
+/// the path claims) maps to 400 with a self-binding error message.
+/// Constructed by signing with `secret` but submitting under another
+/// secret's owner address.
+#[tokio::test]
+async fn post_soc_rejects_self_binding_mismatch() {
+    let real_secret = [0x01u8; 32];
+    let id = [0u8; 32];
+    let fx_real = signed_soc(real_secret, id, b"valid sig");
+
+    // Compute a *different* owner from a second secret so the path
+    // mismatches the recovered signer.
+    let other_owner = signed_soc([0x02u8; 32], id, b"unused").owner;
+    assert_ne!(other_owner, fx_real.owner);
+
+    let router = handle_with_fixture_node();
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::POST)
+            .uri(soc_uri(&other_owner, &fx_real.id))
+            .header(SOC_SIGNATURE_HEADER, hex::encode(fx_real.signature))
+            .body(Body::from(fx_real.inner_cac_wire))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert_eq!(
+        json["message"].as_str().unwrap(),
+        "soc signature does not recover the supplied owner",
+    );
+}
+
+/// A node-side readiness signal (`uploads not configured`, "no peers
+/// yet") arrives as `ControlAck::NotReady` and must surface as 503 so
+/// publishers can distinguish "the daemon needs more startup" from
+/// "the daemon refused this request" — the same shape the SOC read
+/// path uses for missing-peer states.
+#[tokio::test]
+async fn post_soc_maps_not_ready_to_503() {
+    let secret = [0x88u8; 32];
+    let id = [0u8; 32];
+    let fx = signed_soc(secret, id, b"unconfigured");
+
+    let router = router_with_dispatcher(|cmd| async move {
+        if let ControlCommand::PushSoc { ack, .. } = cmd {
+            let _ = ack.send(ControlAck::NotReady {
+                message: "uploads not configured: pass --postage-batch and --wallet-key".into(),
+            });
+        }
+    });
+
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::POST)
+            .uri(soc_uri(&fx.owner, &fx.id))
+            .header(SOC_SIGNATURE_HEADER, hex::encode(fx.signature))
+            .body(Body::from(fx.inner_cac_wire))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// Generic node-side errors fall through to `502 Bad Gateway`. The
+/// `pushsync: …` shape is what `ant-p2p`'s real handler emits when
+/// the neighbourhood refuses the chunk.
+#[tokio::test]
+async fn post_soc_maps_pushsync_failure_to_502() {
+    let secret = [0x99u8; 32];
+    let id = [0u8; 32];
+    let fx = signed_soc(secret, id, b"pushsync fail");
+
+    let router = router_with_dispatcher(|cmd| async move {
+        if let ControlCommand::PushSoc { ack, .. } = cmd {
+            let _ = ack.send(ControlAck::Error {
+                message: "pushsync: no peers in neighbourhood".into(),
+            });
+        }
+    });
+
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::POST)
+            .uri(soc_uri(&fx.owner, &fx.id))
+            .header(SOC_SIGNATURE_HEADER, hex::encode(fx.signature))
+            .body(Body::from(fx.inner_cac_wire))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
 }
