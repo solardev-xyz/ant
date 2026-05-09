@@ -137,7 +137,7 @@ const RETRIEVE_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const HEADERS_MAX: usize = 8 * 1024;
 /// Max bytes for a `retrieval.Delivery` message. The data field tops out
 /// at `ChunkSize + SpanSize = 4104`; the postage stamp adds another
-/// ~149 bytes (BatchID 32 + Index 8 + Timestamp 8 + Sig 65 + frame).
+/// ~149 bytes (`BatchID` 32 + Index 8 + Timestamp 8 + Sig 65 + frame).
 /// 16 KiB gives plenty of headroom for protobuf framing without
 /// accepting obviously-malicious payloads.
 const DELIVERY_MAX: usize = 16 * 1024;
@@ -215,6 +215,7 @@ pub struct RetrievedChunk {
 
 impl RetrievedChunk {
     /// Payload bytes (without the span prefix), ready for the caller.
+    #[must_use]
     pub fn payload(&self) -> &[u8] {
         &self.data[SPAN_SIZE..]
     }
@@ -222,6 +223,7 @@ impl RetrievedChunk {
     /// Raw little-endian span bytes (the first 8 bytes of the wire chunk).
     /// Useful when feeding the chunk back into the joiner, which expects
     /// `span || payload`.
+    #[must_use]
     pub fn span_bytes(&self) -> [u8; SPAN_SIZE] {
         let mut out = [0u8; SPAN_SIZE];
         out.copy_from_slice(&self.data[..SPAN_SIZE]);

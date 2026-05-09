@@ -47,7 +47,7 @@ struct Opt {
     #[arg(long, value_delimiter = ',')]
     bootnodes: Option<Vec<String>>,
 
-    /// Log level (RUST_LOG syntax), e.g. `info`, `debug`.
+    /// Log level (`RUST_LOG` syntax), e.g. `info`, `debug`.
     #[arg(long, default_value = "info")]
     log_level: String,
 
@@ -158,7 +158,7 @@ struct Opt {
     #[arg(long)]
     gnosis_rpc_url: Option<String>,
 
-    /// PostageStamp contract address (mainnet default keeps matching
+    /// `PostageStamp` contract address (mainnet default keeps matching
     /// upstream bee). Override only when running against a fork.
     #[arg(long, default_value = "0x45a1502382541Cd610CC9068e88727426b696293")]
     postage_contract: String,
@@ -170,7 +170,7 @@ struct Opt {
     postage_batch: Option<String>,
 
     /// 32-byte secp256k1 secret of the batch owner (the address
-    /// returned by `batchOwner(batch_id)` on the PostageStamp
+    /// returned by `batchOwner(batch_id)` on the `PostageStamp`
     /// contract). Required to sign stamps. Falls back to
     /// `STORAGE_STAMP_PRIVATE_KEY` env. The bee node mnemonic at
     /// derivation path `m/44'/60'/0'/0/1` produces this key for the
@@ -295,8 +295,7 @@ async fn main() -> Result<()> {
     let control_socket = opt
         .control_socket
         .clone()
-        .map(|p| expand_tilde(&p))
-        .unwrap_or_else(|| data_dir.join("antd.sock"));
+        .map_or_else(|| data_dir.join("antd.sock"), |p| expand_tilde(&p));
 
     let started_at_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -330,8 +329,7 @@ async fn main() -> Result<()> {
         Some(
             opt.peers_file
                 .clone()
-                .map(|p| expand_tilde(&p))
-                .unwrap_or_else(|| data_dir.join("peers.json")),
+                .map_or_else(|| data_dir.join("peers.json"), |p| expand_tilde(&p)),
         )
     };
     if let Some(p) = &peerstore_path {
@@ -389,8 +387,7 @@ async fn main() -> Result<()> {
         let path = opt
             .disk_cache_path
             .clone()
-            .map(|p| expand_tilde(&p))
-            .unwrap_or_else(|| data_dir.join("chunks.sqlite"));
+            .map_or_else(|| data_dir.join("chunks.sqlite"), |p| expand_tilde(&p));
         // Convert the GB cap to bytes once at startup. Saturating mul
         // means a hypothetical operator typo of `--disk-cache-max-gb
         // 18446744073` (a u64 GB count that overflows on multiplication)
@@ -801,7 +798,7 @@ fn load_or_create_identity(
 /// `STORAGE_STAMP_BATCH_ID`), so `antd` keeps booting in read-only mode.
 ///
 /// On success, fetches `batchOwner / batchDepth / batchBucketDepth /
-/// batchImmutableFlag` from the on-chain PostageStamp contract,
+/// batchImmutableFlag` from the on-chain `PostageStamp` contract,
 /// cross-checks the configured signing key against the chain-recorded
 /// owner, and opens the persistent [`StampIssuer`] at
 /// `<data_dir>/postage/<batch_id>.bin`. The store is created on first

@@ -29,7 +29,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 /// little headroom so the client doesn't bail before the daemon does.
 const TREE_TIMEOUT: Duration = Duration::from_secs(75);
 
-fn timeout_for(request: &Request) -> Duration {
+const fn timeout_for(request: &Request) -> Duration {
     match request {
         Request::GetBytes { .. } | Request::GetBzz { .. } | Request::UploadFollow { .. } => {
             TREE_TIMEOUT
@@ -43,7 +43,7 @@ fn timeout_for(request: &Request) -> Duration {
 /// progress samples is what the timer measures, not the total request
 /// wall time), so we hand the daemon's tree timeout to the underlying
 /// stream regardless of whether progress was actually requested.
-fn is_streamable(request: &Request) -> bool {
+const fn is_streamable(request: &Request) -> bool {
     matches!(
         request,
         Request::GetBytes { .. } | Request::GetBzz { .. } | Request::UploadFollow { .. },
@@ -51,6 +51,7 @@ fn is_streamable(request: &Request) -> bool {
 }
 
 /// Round-trip one request to the daemon and return its terminal response.
+///
 /// Any streaming `Progress` updates the daemon emits before the terminal
 /// response are silently dropped; callers that want to render them
 /// should use [`request_streaming`] instead.

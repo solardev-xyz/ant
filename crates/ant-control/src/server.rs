@@ -310,14 +310,14 @@ pub struct ManifestEntryInfo {
 }
 
 impl ControlAck {
-    fn is_terminal(&self) -> bool {
+    const fn is_terminal(&self) -> bool {
         !matches!(
             self,
-            ControlAck::Progress(_)
-                | ControlAck::BytesStreamStart { .. }
-                | ControlAck::BzzStreamStart { .. }
-                | ControlAck::BytesChunk { .. }
-                | ControlAck::UploadProgress(_)
+            Self::Progress(_)
+                | Self::BytesStreamStart { .. }
+                | Self::BzzStreamStart { .. }
+                | Self::BytesChunk { .. }
+                | Self::UploadProgress(_)
         )
     }
 }
@@ -325,6 +325,7 @@ impl ControlAck {
 /// Build the `mpsc` ack channel handed to streaming-capable
 /// `ControlCommand`s. Public so the node loop's tests can wire one up
 /// without reaching into the server module's internals.
+#[must_use]
 pub fn streaming_ack_channel() -> (mpsc::Sender<ControlAck>, mpsc::Receiver<ControlAck>) {
     mpsc::channel(STREAM_ACK_CAPACITY)
 }

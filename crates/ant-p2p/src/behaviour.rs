@@ -196,11 +196,11 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// identify has round-tripped makes bee stall for the full 10 s, then disconnect.
 /// This cap is the longest we'll wait before opening the BZZ stream anyway.
 const HANDSHAKE_IDENTIFY_WAIT: Duration = Duration::from_secs(3);
-/// Grace window we give libp2p-identify auto-promotion and the UPnP behaviour
+/// Grace window we give libp2p-identify auto-promotion and the `UPnP` behaviour
 /// to settle before warning the operator that no globally-routable external
-/// address has been registered. UPnP's SSDP search round-trip is typically
+/// address has been registered. `UPnP`'s SSDP search round-trip is typically
 /// ~1 s on a cooperative router and up to a few seconds on slower ones; 10 s
-/// is enough for both UPnP and the first inbound `NewExternalAddrCandidate`
+/// is enough for both `UPnP` and the first inbound `NewExternalAddrCandidate`
 /// from a bootnode without being so long that the warning misses the operator.
 const EXTERNAL_ADDRESS_CHECK_DELAY: Duration = Duration::from_secs(10);
 /// Hive sinks → swarm-loop channel depth. Bee sends Peers messages with up to
@@ -208,7 +208,7 @@ const EXTERNAL_ADDRESS_CHECK_DELAY: Duration = Duration::from_secs(10);
 /// hundred slots is enough to avoid backpressure without being wasteful.
 const HINT_CHAN_CAP: usize = 512;
 /// Per-loop iteration cap on how many hint dials we fan out. Keeps the
-/// ConnectionEstablished → handshake pipeline from being drowned in parallel
+/// `ConnectionEstablished` → handshake pipeline from being drowned in parallel
 /// dials when a fresh bootnode dumps its full neighbourhood at once.
 const HINT_DIAL_BATCH: usize = 4;
 /// Minimum gap between two consecutive peer top-ups. Sustained connection
@@ -220,6 +220,7 @@ const HINT_DIAL_BATCH: usize = 4;
 /// region can't turn the recovery path into a hot loop.
 const PEER_TOP_UP_INTERVAL: Duration = Duration::from_secs(15);
 /// Default target peer count if `RunConfig::target_peers` is left at zero.
+///
 /// Bee's mainnet neighbourhood typically fans out to a few hundred peers
 /// once kademlia stabilises; 100 keeps us connected to a useful slice of
 /// that fan-out while staying cheap on CPU/FDs and well under the raised
@@ -232,7 +233,7 @@ pub const DEFAULT_TARGET_PEERS: usize = 100;
 const PEERSTORE_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Build the [`sinks::SwapWiring`] from `RunConfig::swap` (if set).
-/// Returns `None` when SWAP is unconfigured — sinks::spawn then
+/// Returns `None` when SWAP is unconfigured — `sinks::spawn` then
 /// installs a drain-only handler so the protocol is still
 /// negotiated.
 fn build_swap_wiring(cfg: &RunConfig) -> Option<sinks::SwapWiring> {
@@ -304,7 +305,7 @@ enum ExternalAddrSource {
     Listener,
     /// Promoted from a remote peer's libp2p-identify `observed_addr`.
     /// Catches NAT-punched IPv6 / full-cone IPv4 cases where outside
-    /// peers see us at a routable address even without UPnP.
+    /// peers see us at a routable address even without `UPnP`.
     Observed,
     /// Mapped via `libp2p-upnp` talking to a local IGD gateway. Most
     /// common on home routers.
@@ -312,12 +313,12 @@ enum ExternalAddrSource {
 }
 
 impl ExternalAddrSource {
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
-            ExternalAddrSource::Manual => "manual",
-            ExternalAddrSource::Listener => "listener",
-            ExternalAddrSource::Observed => "observed",
-            ExternalAddrSource::Upnp => "upnp",
+            Self::Manual => "manual",
+            Self::Listener => "listener",
+            Self::Observed => "observed",
+            Self::Upnp => "upnp",
         }
     }
 }
@@ -325,7 +326,7 @@ impl ExternalAddrSource {
 /// Centralized add: registers `addr` as an external on the swarm, tracks
 /// the source + insertion time in `state`, emits a single attributed
 /// `info!` line, and pushes the new set into the status snapshot. No-op
-/// when the address is already known — UPnP renews mappings every 30 min
+/// when the address is already known — `UPnP` renews mappings every 30 min
 /// and we don't want flapping log lines, and re-promoting an address
 /// should not silently change its recorded source.
 fn record_external_address(
@@ -355,7 +356,7 @@ fn record_external_address(
 
 /// Centralized remove: drops `addr` from the swarm + the tracker, emits
 /// a single `info!` line, and pushes the new set into the status
-/// snapshot. No-op when the address isn't tracked (e.g. a UPnP expiry
+/// snapshot. No-op when the address isn't tracked (e.g. a `UPnP` expiry
 /// for a mapping we never accepted because it failed the public-IP filter).
 fn forget_external_address(
     state: &mut SwarmState,
@@ -418,10 +419,10 @@ fn our_identify_useful_for_bee(swarm: &Swarm<AntBehaviour>) -> bool {
 }
 
 /// One-shot operator nudge: ~10 s into the run, if neither
-/// `cfg.external_addrs`, `NewListenAddr` auto-promotion, nor UPnP have
+/// `cfg.external_addrs`, `NewListenAddr` auto-promotion, nor `UPnP` have
 /// produced a globally-routable external address, warn that bee will burn
 /// its 10 s `peerMultiaddrs` window on every handshake. We wait the grace
-/// period rather than warning eagerly because UPnP's SSDP search and
+/// period rather than warning eagerly because `UPnP`'s SSDP search and
 /// listener auto-promotion both happen asynchronously after `run` starts
 /// — an eager check would always fire on home networks where things work
 /// out a moment later.
@@ -455,12 +456,12 @@ fn maybe_warn_no_external_address(swarm: &Swarm<AntBehaviour>, configured: &[Mul
     }
 }
 
-/// React to events from the bundled UPnP behaviour. Successful mappings
+/// React to events from the bundled `UPnP` behaviour. Successful mappings
 /// get promoted to confirmed external addresses (subject to the same
 /// public-IP filter bee uses), so the very first outbound identify push
 /// after bootstrap already carries our public multiaddr. Renewal failures
 /// retract the address. Gateway-search failures are routine on hosts
-/// without UPnP (most cloud VMs, corporate NAT, CGNAT) and we log them at
+/// without `UPnP` (most cloud VMs, corporate NAT, CGNAT) and we log them at
 /// `debug` rather than nagging the operator.
 fn handle_upnp_event(
     state: &mut SwarmState,
@@ -550,8 +551,8 @@ enum PendingPhase {
 impl PendingPhase {
     fn dialed_addr(&self) -> Multiaddr {
         match self {
-            PendingPhase::AwaitingIdentify { addr, .. } => addr.clone(),
-            PendingPhase::Handshaking { addr, .. } => addr.clone(),
+            Self::AwaitingIdentify { addr, .. } => addr.clone(),
+            Self::Handshaking { addr, .. } => addr.clone(),
         }
     }
 }
@@ -615,7 +616,7 @@ struct SwarmState {
     /// Process-wide persistent chunk cache. `Some` when the daemon
     /// has been configured with `--disk-cache-path`; cloned into
     /// every `RoutingFetcher` we build (modulo `bypass_cache`).
-    /// Lifetime matches the daemon process; the underlying SQLite
+    /// Lifetime matches the daemon process; the underlying `SQLite`
     /// connection is shared via `Arc` so we don't pay a new open
     /// per request.
     disk_cache: Option<Arc<ant_retrieval::DiskChunkCache>>,
@@ -690,7 +691,7 @@ struct SwarmState {
     external_addresses: HashMap<Multiaddr, (ExternalAddrSource, u64)>,
     /// Insertion order for `external_addresses` so renders are stable.
     /// Wide enough to keep one slot per address ever advertised in this
-    /// process; UPnP / listener churn keeps this very small in practice.
+    /// process; `UPnP` / listener churn keeps this very small in practice.
     external_addresses_order: Vec<Multiaddr>,
     /// Shared `peer_id -> ethereum_address` map. Populated in the
     /// BZZ-handshake-success branch of `apply_drive_outcome`; consumed
@@ -984,11 +985,7 @@ fn sync_peer_pipeline(status: &Option<watch::Sender<StatusSnapshot>>, state: &mu
 /// snapshot grabs one Mutex per call but the entry count is small
 /// (typically ≤ a few dozen) so it never shows up in profiles.
 fn build_retrieval_info(state: &SwarmState) -> RetrievalInfo {
-    let cache_used = state
-        .chunk_cache
-        .as_ref()
-        .map(|c| c.len() as u32)
-        .unwrap_or(0);
+    let cache_used = state.chunk_cache.as_ref().map_or(0, |c| c.len() as u32);
     let in_flight = (RETRIEVAL_INFLIGHT_CAP - state.retrieval_inflight.available_permits()) as u32;
     let counters = state.retrieval_counters.snapshot();
     let gateway_requests = state
@@ -1035,7 +1032,7 @@ fn routing_snapshot(table: &RoutingTable) -> RoutingInfo {
     RoutingInfo {
         base_overlay: format!("0x{}", hex::encode(table.base())),
         size: table.len() as u32,
-        bins: counts.iter().map(|c| *c as u32).collect(),
+        bins: counts.iter().map(|c| u32::from(*c)).collect(),
     }
 }
 
@@ -1583,7 +1580,7 @@ fn handle_control_command(
             } else {
                 None
             };
-            let tracker_for_run = tracker.clone();
+            let tracker_for_run = tracker;
             tokio::spawn(async move {
                 let reply = run_get_bytes(
                     control,
@@ -1644,7 +1641,7 @@ fn handle_control_command(
             // acks already flow.
             let started = Instant::now();
             let emitter = spawn_progress_emitter(tracker.clone(), ack.clone(), started);
-            let tracker_for_run = tracker.clone();
+            let tracker_for_run = tracker;
             tokio::spawn(async move {
                 run_stream_bytes(
                     control,
@@ -1701,7 +1698,7 @@ fn handle_control_command(
             // acks, so the streaming path always runs the emitter.
             let started = Instant::now();
             let emitter = spawn_progress_emitter(tracker.clone(), ack.clone(), started);
-            let tracker_for_run = tracker.clone();
+            let tracker_for_run = tracker;
             tokio::spawn(async move {
                 run_stream_bzz(
                     control,
@@ -1765,7 +1762,7 @@ fn handle_control_command(
             } else {
                 None
             };
-            let tracker_for_run = tracker.clone();
+            let tracker_for_run = tracker;
             tokio::spawn(async move {
                 let reply = run_get_bzz(
                     control,
@@ -2207,7 +2204,7 @@ async fn stream_root_chunk_with_range(
         ant_retrieval::JoinOptions::default(),
         ack,
     )
-    .await
+    .await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2251,27 +2248,24 @@ async fn stream_root_chunk_inner(
                 join_result = Some(result);
             }
             maybe_chunk = chunk_rx.recv() => {
-                match maybe_chunk {
-                    Some(data) => {
-                        if ack.send(ControlAck::BytesChunk { data }).await.is_err() {
-                            return;
-                        }
-                    }
-                    None => {
-                        match join_result.unwrap_or(Ok(())) {
-                            Ok(()) => {
-                                let _ = ack.send(ControlAck::StreamDone).await;
-                            }
-                            Err(e) => {
-                                let _ = ack
-                                    .send(ControlAck::Error {
-                                        message: format!("join {}: {e}", hex::encode(reference)),
-                                    })
-                                    .await;
-                            }
-                        }
+                if let Some(data) = maybe_chunk {
+                    if ack.send(ControlAck::BytesChunk { data }).await.is_err() {
                         return;
                     }
+                } else {
+                    match join_result.unwrap_or(Ok(())) {
+                        Ok(()) => {
+                            let _ = ack.send(ControlAck::StreamDone).await;
+                        }
+                        Err(e) => {
+                            let _ = ack
+                                .send(ControlAck::Error {
+                                    message: format!("join {}: {e}", hex::encode(reference)),
+                                })
+                                .await;
+                        }
+                    }
+                    return;
                 }
             }
         }
@@ -2340,7 +2334,7 @@ fn send_terminal_ack(ack: &mpsc::Sender<ControlAck>, reply: ControlAck) {
     });
 }
 
-/// Max number of full pipeline attempts (lookup_path + fetch + join)
+/// Max number of full pipeline attempts (`lookup_path` + fetch + join)
 /// per user-visible `get` command. Successful chunks are written through
 /// to the daemon cache, so later attempts usually skip straight to the
 /// sparse tail chunks that still need a working peer. Live gateway
@@ -2393,7 +2387,7 @@ enum AttemptError {
 /// variants (oversize span, malformed intermediate, RS / encryption)
 /// describe data-shape problems that would re-fail identically on a
 /// retry, so we mark them permanent.
-fn is_join_transient(e: &ant_retrieval::JoinError) -> bool {
+const fn is_join_transient(e: &ant_retrieval::JoinError) -> bool {
     matches!(e, ant_retrieval::JoinError::FetchChunk { .. })
 }
 
@@ -2401,7 +2395,7 @@ fn is_join_transient(e: &ant_retrieval::JoinError) -> bool {
 /// during the trie walk? The wire/encoding variants (bad version hash,
 /// invalid metadata, descend-past-leaf, …) and the lookup-miss are all
 /// terminal.
-fn is_manifest_transient(e: &ant_retrieval::ManifestError) -> bool {
+const fn is_manifest_transient(e: &ant_retrieval::ManifestError) -> bool {
     matches!(
         e,
         ant_retrieval::ManifestError::Fetch(inner) if is_join_transient(inner)
@@ -2804,7 +2798,10 @@ fn derive_filename_from_path(path: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    trimmed.rsplit('/').next().map(|s| s.to_string())
+    trimmed
+        .rsplit('/')
+        .next()
+        .map(std::string::ToString::to_string)
 }
 
 /// Drain the hint queue into live libp2p dials until we hit either the peer
@@ -3086,17 +3083,18 @@ fn handle_swarm_event(
                     state.peer_set_size(),
                 );
             } else if was_pending {
-                match cause {
-                    Some(err) => debug!(
+                if let Some(err) = cause {
+                    debug!(
                         target: "ant_p2p",
                         %peer_id,
                         "connection closed during handshake: {err}",
-                    ),
-                    None => debug!(
+                    );
+                } else {
+                    debug!(
                         target: "ant_p2p",
                         %peer_id,
                         "connection closed during handshake",
-                    ),
+                    );
                 }
             }
         }
@@ -3547,12 +3545,10 @@ fn log_handshake_ok(
     if let Some(p) = pipeline_ms {
         let dial = p
             .dial_ms
-            .map(|d| d.to_string())
-            .unwrap_or_else(|| "n/a".to_string());
-        let total_ms = p
-            .dial_ms
-            .map(|d| d + p.identifying_ms + p.handshake_ms)
-            .unwrap_or(p.identifying_ms + p.handshake_ms);
+            .map_or_else(|| "n/a".to_string(), |d| d.to_string());
+        let total_ms = p.dial_ms.map_or(p.identifying_ms + p.handshake_ms, |d| {
+            d + p.identifying_ms + p.handshake_ms
+        });
         debug!(
             target: "ant_p2p",
             "outbound peer_pipeline_ms peer_set_size={peer_set_size} dial_ms={dial} \
@@ -3564,7 +3560,7 @@ fn log_handshake_ok(
 }
 
 /// Expand every `/dnsaddr/` entry into concrete peer multiaddrs, group by
-/// PeerId, then hand each group to libp2p as a single [`DialOpts`] with
+/// `PeerId`, then hand each group to libp2p as a single [`DialOpts`] with
 /// IPv6-first ordering and a concurrency factor sized to the address count.
 /// Swarm's `mainnet.ethswarm.org` TXT tree fans out into several regional
 /// bootnodes; dialing them concurrently makes bootstrap tolerant of any
@@ -3654,7 +3650,7 @@ fn build_swarm(keypair: Keypair) -> Result<Swarm<AntBehaviour>, RunError> {
     // rather than on the next 5-minute identify interval. External address
     // additions don't trigger push in libp2p-identify 0.47, so the first
     // connection to a fresh bee still eats the 10 s `peerMultiaddrs` wait.
-    let id_cfg = identify::Config::new(AGENT.to_string(), keypair.public().clone())
+    let id_cfg = identify::Config::new(AGENT.to_string(), keypair.public())
         .with_agent_version(AGENT.to_string())
         .with_push_listen_addr_updates(true);
     let behaviour = AntBehaviour {
@@ -3807,7 +3803,7 @@ mod tests {
     }
 
     /// Drop one entry and verify the snapshot reflects it without disturbing
-    /// the ordering of the remaining ones. This is the path UPnP renewal
+    /// the ordering of the remaining ones. This is the path `UPnP` renewal
     /// failures take (`Event::ExpiredExternalAddr` →
     /// `forget_external_address`); regressing it would silently keep stale
     /// addresses on display long after the mapping is gone.

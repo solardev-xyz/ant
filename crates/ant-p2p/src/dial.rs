@@ -16,7 +16,7 @@ use libp2p::{Multiaddr, PeerId};
 
 /// For UI: first IP literal or DNS label in a multiaddr.
 pub fn endpoint_host(ma: &Multiaddr) -> String {
-    for p in ma.iter() {
+    for p in ma {
         match p {
             Protocol::Ip4(ip) => return ip.to_string(),
             Protocol::Ip6(ip) => return ip.to_string(),

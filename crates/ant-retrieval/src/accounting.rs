@@ -156,6 +156,7 @@ pub const OVERDRAFT_LIMIT: u64 = LIGHT_DISCONNECT_LIMIT;
 pub const HOT_DEBT_THRESHOLD: u64 = LIGHT_DISCONNECT_LIMIT / 2;
 
 /// Per-chunk skip TTL for peers that fail [`Accounting::try_reserve`].
+///
 /// Mirrors bee's `overDraftRefresh = time.Millisecond * 600` in
 /// `pkg/retrieval/retrieval.go`. The fetcher's per-chunk skip
 /// list lifts the entry after this elapses, so the same peer
@@ -226,6 +227,7 @@ impl Default for Accounting {
 }
 
 impl Accounting {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             peers: Arc::new(Mutex::new(HashMap::new())),
@@ -233,6 +235,7 @@ impl Accounting {
         }
     }
 
+    #[must_use]
     pub fn with_hot_hint(mut self, tx: mpsc::Sender<HotHint>) -> Self {
         self.hot_hint = Some(tx);
         self
@@ -250,6 +253,7 @@ impl Accounting {
     /// charge less; far peers charge more, because the far peer's
     /// forwarding chain is longer and more nodes earn along the
     /// way.
+    #[must_use]
     pub fn peer_price(peer_overlay: &Overlay, chunk_addr: &[u8; 32]) -> u64 {
         const MAX_PO: u64 = 31;
         const BASE_PRICE: u64 = 10_000;
@@ -268,6 +272,7 @@ impl Accounting {
     /// [`OVERDRAFT_REFRESH`] and try the next-closest one. This
     /// matches bee's
     /// `pkg/retrieval/retrieval.go::case ErrOverdraft` arm.
+    #[must_use]
     pub fn try_reserve(&self, peer: PeerId, price: u64) -> Option<DebitGuard> {
         let mut peers = self.peers.lock().ok()?;
         let now = Instant::now();
@@ -341,6 +346,7 @@ impl Accounting {
 
     /// Snapshot a peer's balance for diagnostic logging. Returns
     /// `(balance, reserved)`. Cheap (single lock acquisition).
+    #[must_use]
     pub fn debug_snapshot(&self, peer: &PeerId) -> Option<(u64, u64)> {
         let peers = self.peers.lock().ok()?;
         peers.get(peer).map(|b| (b.balance, b.reserved))
@@ -391,7 +397,8 @@ impl DebitGuard {
     }
 
     /// Peer this guard is for. Useful for logging.
-    pub fn peer(&self) -> PeerId {
+    #[must_use]
+    pub const fn peer(&self) -> PeerId {
         self.peer
     }
 }
@@ -436,7 +443,7 @@ fn proximity(a: &[u8; 32], b: &[u8; 32]) -> u64 {
             }
             continue;
         }
-        po = po.saturating_add(x.leading_zeros() as u64);
+        po = po.saturating_add(u64::from(x.leading_zeros()));
         return po.min(MAX_PO);
     }
     MAX_PO

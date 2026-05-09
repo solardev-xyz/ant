@@ -2,7 +2,7 @@
 //! (PLAN.md § 9, "iOS download smoke test (pre-FFI)").
 //!
 //! Four entry points — deliberately small, deliberately C-shaped, no
-//! UniFFI, no `.udl`, no codegen. The full mobile artefact in Phase 4
+//! `UniFFI`, no `.udl`, no codegen. The full mobile artefact in Phase 4
 //! replaces this with a UniFFI-generated `.xcframework`; this crate is
 //! expected to be deleted (or promoted) when that lands.
 //!
@@ -46,7 +46,7 @@ use tokio::sync::{mpsc, watch, Notify};
 /// is comfortably above mainnet-from-scratch observations (~5-20 s
 /// warmup, then 50–200 KiB/s until the hot chunk set settles) and
 /// lets the iOS smoke test pull sub-gigabyte bzz payloads end-to-end
-/// without hand-tuning per file. Phase-4's UniFFI surface will expose
+/// without hand-tuning per file. Phase-4's `UniFFI` surface will expose
 /// this so hosts can pick their own.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -64,7 +64,7 @@ const NO_PEERS_RETRY_INTERVAL: Duration = Duration::from_millis(2000);
 /// Match `ant-gateway`'s 1 GiB ceiling here — it keeps the
 /// "malformed span claims 10 TiB" safety net intact while letting
 /// browser-shaped files through. The Phase-4 artefact will expose
-/// this through the UniFFI surface so hosts can tune it per app.
+/// this through the `UniFFI` surface so hosts can tune it per app.
 const MAX_DOWNLOAD_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Opaque handle returned to the Swift side. Lives for as long as the
@@ -125,7 +125,7 @@ impl DownloadProgressState {
         }
     }
 
-    fn apply(&mut self, p: &GetProgress) {
+    const fn apply(&mut self, p: &GetProgress) {
         self.in_progress = true;
         self.bytes_done = p.bytes_done;
         self.total_bytes = p.total_bytes_estimate;
@@ -137,7 +137,7 @@ impl DownloadProgressState {
         self.cache_hits = p.cache_hits;
     }
 
-    fn finish(&mut self) {
+    const fn finish(&mut self) {
         self.in_progress = false;
         self.in_flight = 0;
     }
@@ -396,7 +396,7 @@ fn parse_reference(input: &str) -> Result<ParsedRef, FfiError> {
 fn decode_bzz_path(raw: &str) -> Result<String, FfiError> {
     percent_encoding::percent_decode_str(raw)
         .decode_utf8()
-        .map(|cow| cow.into_owned())
+        .map(std::borrow::Cow::into_owned)
         .map_err(|e| FfiError::Reference(format!("invalid percent-encoding in bzz path: {e}")))
 }
 
@@ -460,8 +460,8 @@ fn download_inner(handle: &AntHandle, reference: &str) -> Result<Vec<u8>, FfiErr
                     // to stare at a 2 s backoff after hitting Stop.
                     tokio::select! {
                         biased;
-                        _ = cancel_notify.notified() => {}
-                        _ = tokio::time::sleep(wait) => {}
+                        () = cancel_notify.notified() => {}
+                        () = tokio::time::sleep(wait) => {}
                     }
                     if cancel_flag.load(Ordering::SeqCst) {
                         return Err(FfiError::Download("download canceled".to_string()));
@@ -534,13 +534,13 @@ async fn attempt_download(
         // before an ack.
         let next = tokio::select! {
             biased;
-            _ = cancel_notify.notified() => {
+            () = cancel_notify.notified() => {
                 return Err(FfiError::Download("download canceled".to_string()));
             }
             r = tokio::time::timeout_at(deadline, ack_rx.recv()) => r,
         };
         match next {
-            Ok(Some(ControlAck::Bytes { data })) | Ok(Some(ControlAck::BzzBytes { data, .. })) => {
+            Ok(Some(ControlAck::Bytes { data } | ControlAck::BzzBytes { data, .. })) => {
                 return Ok(data)
             }
             Ok(Some(ControlAck::Error { message })) => return Err(FfiError::Download(message)),
@@ -550,18 +550,20 @@ async fn attempt_download(
                 }
                 continue;
             }
-            Ok(Some(ControlAck::Ok { .. }))
-            | Ok(Some(ControlAck::Manifest { .. }))
-            | Ok(Some(ControlAck::BytesStreamStart { .. }))
-            | Ok(Some(ControlAck::BzzStreamStart { .. }))
-            | Ok(Some(ControlAck::BytesChunk { .. }))
-            | Ok(Some(ControlAck::StreamDone))
-            | Ok(Some(ControlAck::ChunkUploaded { .. }))
-            | Ok(Some(ControlAck::UploadStarted { .. }))
-            | Ok(Some(ControlAck::UploadJob(_)))
-            | Ok(Some(ControlAck::UploadList(_)))
-            | Ok(Some(ControlAck::UploadProgress(_)))
-            | Ok(Some(ControlAck::PostageStatus(_))) => continue,
+            Ok(Some(
+                ControlAck::Ok { .. }
+                | ControlAck::Manifest { .. }
+                | ControlAck::BytesStreamStart { .. }
+                | ControlAck::BzzStreamStart { .. }
+                | ControlAck::BytesChunk { .. }
+                | ControlAck::StreamDone
+                | ControlAck::ChunkUploaded { .. }
+                | ControlAck::UploadStarted { .. }
+                | ControlAck::UploadJob(_)
+                | ControlAck::UploadList(_)
+                | ControlAck::UploadProgress(_)
+                | ControlAck::PostageStatus(_),
+            )) => continue,
             Ok(None) => {
                 return Err(FfiError::Download(
                     "node dropped the ack channel without a terminal response".to_string(),
@@ -692,7 +694,7 @@ pub unsafe extern "C" fn ant_download_progress(
         Err(poisoned) => *poisoned.into_inner(),
     };
     *out = AntProgress {
-        in_progress: if snapshot.in_progress { 1 } else { 0 },
+        in_progress: u8::from(snapshot.in_progress),
         bytes_done: snapshot.bytes_done,
         total_bytes: snapshot.total_bytes,
         chunks_done: snapshot.chunks_done,
@@ -722,7 +724,7 @@ pub unsafe extern "C" fn ant_free_buffer(ptr: *mut u8, len: usize) {
         return;
     }
     let slice = std::slice::from_raw_parts_mut(ptr, len);
-    drop(Box::from_raw(slice as *mut [u8]));
+    drop(Box::from_raw(std::ptr::from_mut::<[u8]>(slice)));
 }
 
 /// Free a NUL-terminated string written by the FFI into an `out_err`
@@ -957,8 +959,8 @@ mod tests {
     impl std::fmt::Debug for ParsedRef {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
-                ParsedRef::Bytes(root) => write!(f, "Bytes(0x{})", hex::encode(root)),
-                ParsedRef::Bzz { root, path } => {
+                Self::Bytes(root) => write!(f, "Bytes(0x{})", hex::encode(root)),
+                Self::Bzz { root, path } => {
                     write!(f, "Bzz(0x{}, {path:?})", hex::encode(root))
                 }
             }

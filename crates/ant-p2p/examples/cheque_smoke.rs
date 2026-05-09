@@ -61,20 +61,20 @@
 //! Re-running this smoke with the corrected digest is the obvious
 //! next step. If bee accepts the cheque this time, the cold-peer
 //! hypothesis was wrong and Phase 7 is essentially closed; if the
-//! Reset() is still immediate, the cold-peer / Addressbook story
+//! `Reset()` is still immediate, the cold-peer / Addressbook story
 //! probably stands and we proceed to wire the auto-settlement trigger
 //! into `ant-retrieval::accounting` (PLAN.md §9.0 M3 Phase 7
 //! outstanding item).
 //!
 //! Required env:
-//!   STORAGE_STAMP_PRIVATE_KEY  - 32-byte secp256k1 secret (chequebook issuer)
-//!   CHEQUEBOOK_ADDRESS         - 20-byte address (0x… hex)
+//!   `STORAGE_STAMP_PRIVATE_KEY`  - 32-byte secp256k1 secret (chequebook issuer)
+//!   `CHEQUEBOOK_ADDRESS`         - 20-byte address (0x… hex)
 //! Optional env:
-//!   ANT_NETWORK_ID             - default 1 (mainnet)
-//!   ANT_CHAIN_ID               - default 100 (gnosis mainnet)
-//!   ANT_FULL_NODE              - default true; set to "false" to
+//!   `ANT_NETWORK_ID`             - default 1 (mainnet)
+//!   `ANT_CHAIN_ID`               - default 100 (gnosis mainnet)
+//!   `ANT_FULL_NODE`              - default true; set to "false" to
 //!                                advertise as light node
-//!   RUST_LOG                   - tracing filter; default "ant_p2p=info"
+//!   `RUST_LOG`                   - tracing filter; default "`ant_p2p=info`"
 
 use ant_p2p::swap::{emit_cheque, issue_cheque};
 use ant_p2p::{handshake_outbound_with_role, PROTOCOL_HANDSHAKE};
@@ -104,7 +104,7 @@ const POST_EMIT_OBSERVE: Duration = Duration::from_secs(10);
 /// handshake completes. Until that finishes our peer isn't in
 /// bee's swap accounting and the `headler` will error
 /// (returning empty headers, which still works) — but bee's
-/// EmitCheque handler also looks the peer up and rejects if
+/// `EmitCheque` handler also looks the peer up and rejects if
 /// missing. Sleep long enough that the registration completes.
 const POST_BZZ_SETTLE: Duration = Duration::from_secs(5);
 
@@ -164,7 +164,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  network_id:          {network_id}");
     println!("  chain_id:            {chain_id}");
 
-    let id_cfg = identify::Config::new("bee/2.7.0".into(), kp.public().clone())
+    let id_cfg = identify::Config::new("bee/2.7.0".into(), kp.public())
         .with_agent_version("ant-cheque-smoke/0.1.0".into());
     let behaviour = B {
         stream: StreamBehaviour::default(),

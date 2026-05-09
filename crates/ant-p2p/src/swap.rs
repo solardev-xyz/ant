@@ -108,7 +108,7 @@ use tracing::{debug, info, trace, warn};
 /// `pkg/settlement/swap/swapprotocol/swapprotocol.go`).
 pub const PROTOCOL_SWAP: &str = "/swarm/swap/1.0.0/swap";
 
-/// Hard cap on the protobuf body of an EmitCheque. The JSON cheque
+/// Hard cap on the protobuf body of an `EmitCheque`. The JSON cheque
 /// inside is ~250 bytes (3 × 0x-hex 20-byte addresses + decimal int +
 /// base64 65-byte sig + JSON quoting). 4 KiB gives a generous
 /// headroom for any future schema growth without risking a malicious
@@ -138,7 +138,7 @@ pub enum SwapError {
 }
 
 /// Bee `swapprotocol/pb/swap.proto::EmitCheque`.
-#[derive(Clone, PartialEq, Message)]
+#[derive(Clone, PartialEq, Eq, Message)]
 pub struct EmitChequePb {
     /// JSON-encoded `chequebook.SignedCheque`.
     #[prost(bytes = "vec", tag = "1")]
@@ -170,6 +170,7 @@ struct SignedChequeJson {
 /// JSON-encode a [`SignedCheque`] into the wire bytes carried inside
 /// an `EmitCheque.Cheque` field. Lossless round-trip with
 /// [`decode_signed_cheque_json`].
+#[must_use]
 pub fn encode_signed_cheque_json(signed: &SignedCheque) -> Vec<u8> {
     let body = SignedChequeJson {
         chequebook: format!("0x{}", hex::encode(signed.cheque.chequebook)),
@@ -653,6 +654,7 @@ pub async fn drain_inbound_unconfigured(mut incoming: IncomingStreams) {
 // --- listener ---
 
 /// Outcome surfaced by the inbound listener for each accepted cheque.
+///
 /// Currently advisory — operators can subscribe to log a one-line
 /// "credited X PLUR from peer Y" event without re-parsing the
 /// ledger snapshot.
@@ -666,7 +668,7 @@ pub struct InboundCheque {
 }
 
 /// Spawn the long-lived inbound listener. For each accepted stream
-/// it: drains the bee headers preamble, reads the EmitCheque frame,
+/// it: drains the bee headers preamble, reads the `EmitCheque` frame,
 /// parses the JSON cheque, and applies it to the ledger. Successful
 /// accepts publish to `events_tx` (best-effort: drops on backpressure).
 ///
@@ -885,7 +887,7 @@ mod tests {
         assert_eq!(ledger.cumulative_for(&[0x77u8; 20]), U256::from(100u64));
 
         // Strictly-larger follow-up accepted.
-        let mut cheque2 = cheque1.clone();
+        let mut cheque2 = cheque1;
         cheque2.cumulative_payout = U256::from(150u64);
         let signed2 = sign_cheque(&issuer_secret, &cheque2, 100).unwrap();
         let prev2 = ledger.record_accepted(&signed2).unwrap();
@@ -936,7 +938,7 @@ mod tests {
         }
 
         // The legit issuer can still issue a strictly-larger cheque.
-        let mut cheque3 = cheque2.clone();
+        let mut cheque3 = cheque2;
         cheque3.cumulative_payout = U256::from(300u64);
         let signed3 = sign_cheque(&issuer_secret, &cheque3, 100).unwrap();
         let prev3 = ledger.record_accepted(&signed3).unwrap();
@@ -969,7 +971,7 @@ mod tests {
         }
 
         // "Restart" — new ledger reads the snapshot.
-        let ledger2 = CreditLedger::open(Some(path.clone()), 100, our_eoa);
+        let ledger2 = CreditLedger::open(Some(path), 100, our_eoa);
         assert_eq!(
             ledger2.cumulative_for(&[0x77u8; 20]),
             U256::from(500u64),
@@ -994,11 +996,11 @@ mod tests {
             assert_eq!(ob.cumulative_for(&beneficiary), U256::zero());
             ob.record_issued(&beneficiary, U256::from(42u64)).unwrap();
         }
-        let ob2 = OutboundLedger::open(Some(path.clone()));
+        let ob2 = OutboundLedger::open(Some(path));
         assert_eq!(ob2.cumulative_for(&beneficiary), U256::from(42u64));
     }
 
-    /// EmitChequePb round-trips through prost, so any future change
+    /// `EmitChequePb` round-trips through prost, so any future change
     /// to the protobuf shape is caught by tests instead of by bee.
     #[test]
     fn emit_cheque_pb_round_trip() {

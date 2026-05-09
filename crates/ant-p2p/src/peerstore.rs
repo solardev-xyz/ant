@@ -3,13 +3,13 @@
 //! again on shutdown. Loaded at startup so the next run skips the multi-hop
 //! hive bootstrap when our previous neighbourhood is still alive.
 //!
-//! # Why JSON, not SQLite
+//! # Why JSON, not `SQLite`
 //!
-//! `ant-plan.md` ultimately puts the peer table inside SQLite (§6, M1.1) once
+//! `ant-plan.md` ultimately puts the peer table inside `SQLite` (§6, M1.1) once
 //! `ant-store` exists. Until then a JSON snapshot is sufficient: writes are
 //! incremental in-memory and flushed in one shot, the data is small (a few
 //! hundred entries × a few hundred bytes), and atomicity is one `rename`
-//! away. When the SQLite layer lands, this module gets replaced wholesale —
+//! away. When the `SQLite` layer lands, this module gets replaced wholesale —
 //! the public API is small enough that the swap is cheap.
 //!
 //! # Eviction policy
@@ -296,7 +296,11 @@ impl PeerStore {
                 .iter()
                 .map(|(peer_id, e)| PeerEntry {
                     peer_id: peer_id.to_string(),
-                    addrs: e.addrs.iter().map(|a| a.to_string()).collect(),
+                    addrs: e
+                        .addrs
+                        .iter()
+                        .map(std::string::ToString::to_string)
+                        .collect(),
                     overlay: format!("0x{}", hex::encode(e.overlay)),
                     last_seen_unix: e.last_seen_unix,
                     fail_count: e.fail_count,
@@ -407,7 +411,7 @@ mod tests {
     fn warm_hints_orders_newest_first() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("peers.json");
-        let mut store = PeerStore::load(path.clone());
+        let mut store = PeerStore::load(path);
         let older = fake_peer(1);
         let newer = fake_peer(2);
         store.record_success(older, vec![fake_addr(1)], [0; 32]);

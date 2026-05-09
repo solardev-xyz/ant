@@ -89,10 +89,10 @@ enum Profile {
 }
 
 impl Profile {
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
-            Profile::Debug => "debug",
-            Profile::Release => "release",
+            Self::Debug => "debug",
+            Self::Release => "release",
         }
     }
 }

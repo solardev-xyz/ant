@@ -19,6 +19,7 @@ pub const OVERLAY_NONCE_LEN: usize = 32;
 pub const SECP256K1_SECRET_LEN: usize = 32;
 
 /// Keccak-256 as used by Ethereum / Swarm (`LegacyKeccak256` in Bee).
+#[must_use]
 pub fn keccak256(data: &[u8]) -> [u8; 32] {
     let mut h = Keccak256::new();
     h.update(data);
@@ -26,6 +27,7 @@ pub fn keccak256(data: &[u8]) -> [u8; 32] {
 }
 
 /// Uncompressed SEC1 public key bytes without the `0x04` prefix (64 bytes), for hashing.
+#[must_use]
 pub fn uncompressed_pubkey_xy(pk: &VerifyingKey) -> [u8; 64] {
     let ep = pk.to_encoded_point(false);
     let s = ep.as_bytes();
@@ -36,6 +38,7 @@ pub fn uncompressed_pubkey_xy(pk: &VerifyingKey) -> [u8; 64] {
 }
 
 /// Ethereum address (20 bytes) from a secp256k1 public key (matches Bee `NewEthereumAddress`).
+#[must_use]
 pub fn ethereum_address_from_public_key(pk: &VerifyingKey) -> [u8; 20] {
     let xy = uncompressed_pubkey_xy(pk);
     let hash = keccak256(&xy);
@@ -45,6 +48,7 @@ pub fn ethereum_address_from_public_key(pk: &VerifyingKey) -> [u8; 20] {
 }
 
 /// Swarm overlay address: `keccak256(eth_address ‖ network_id_le ‖ nonce)` (Bee `NewOverlayFromEthereumAddress`).
+#[must_use]
 pub fn overlay_from_ethereum_address(
     eth_address: &[u8; 20],
     network_id: u64,
@@ -58,6 +62,7 @@ pub fn overlay_from_ethereum_address(
 }
 
 /// Payload signed in the BZZ handshake: `bee-handshake- ‖ underlay ‖ overlay ‖ network_id_be`.
+#[must_use]
 pub fn handshake_sign_data(underlay: &[u8], overlay: &[u8; 32], network_id: u64) -> Vec<u8> {
     let mut v = Vec::with_capacity(15 + underlay.len() + 32 + 8);
     v.extend_from_slice(b"bee-handshake-");
@@ -77,6 +82,7 @@ fn ethereum_prefixed_sign_data(sign_data: &[u8]) -> Vec<u8> {
 }
 
 /// Keccak256 hash of the EIP-191–wrapped payload (Bee `hashWithEthereumPrefix`).
+#[must_use]
 pub fn ethereum_signed_message_hash(sign_data: &[u8]) -> [u8; 32] {
     keccak256(&ethereum_prefixed_sign_data(sign_data))
 }
@@ -170,6 +176,7 @@ pub fn verify_bzz_address_signature(
 }
 
 /// Random 32-byte overlay nonce.
+#[must_use]
 pub fn random_overlay_nonce() -> [u8; OVERLAY_NONCE_LEN] {
     let mut n = [0u8; OVERLAY_NONCE_LEN];
     getrandom::fill(&mut n).expect("OS RNG");
@@ -177,6 +184,7 @@ pub fn random_overlay_nonce() -> [u8; OVERLAY_NONCE_LEN] {
 }
 
 /// Random secp256k1 signing key bytes (32 bytes).
+#[must_use]
 pub fn random_secp256k1_secret() -> [u8; SECP256K1_SECRET_LEN] {
     let mut s = [0u8; SECP256K1_SECRET_LEN];
     getrandom::fill(&mut s).expect("OS RNG");

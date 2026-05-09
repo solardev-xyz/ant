@@ -111,6 +111,7 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
+    #[must_use]
     pub fn mainnet_default(
         signing_secret: [u8; SECP256K1_SECRET_LEN],
         overlay_nonce: [u8; OVERLAY_NONCE_LEN],
@@ -140,51 +141,61 @@ impl NodeConfig {
         }
     }
 
+    #[must_use]
     pub fn with_status(mut self, status: watch::Sender<StatusSnapshot>) -> Self {
         self.status = Some(status);
         self
     }
 
+    #[must_use]
     pub fn with_external_addrs(mut self, addrs: Vec<Multiaddr>) -> Self {
         self.external_addrs = addrs;
         self
     }
 
+    #[must_use]
     pub fn with_peerstore_path(mut self, path: Option<PathBuf>) -> Self {
         self.peerstore_path = path;
         self
     }
 
+    #[must_use]
     pub fn with_commands(mut self, commands: mpsc::Receiver<ControlCommand>) -> Self {
         self.commands = Some(commands);
         self
     }
 
-    pub fn with_target_peers(mut self, target_peers: Option<usize>) -> Self {
+    #[must_use]
+    pub const fn with_target_peers(mut self, target_peers: Option<usize>) -> Self {
         self.target_peers = target_peers;
         self
     }
 
-    pub fn with_process_start(mut self, t: Instant) -> Self {
+    #[must_use]
+    pub const fn with_process_start(mut self, t: Instant) -> Self {
         self.process_start = t;
         self
     }
 
-    pub fn with_per_request_chunk_cache(mut self, per_request: bool) -> Self {
+    #[must_use]
+    pub const fn with_per_request_chunk_cache(mut self, per_request: bool) -> Self {
         self.per_request_chunk_cache = per_request;
         self
     }
 
+    #[must_use]
     pub fn with_chunk_record_dir(mut self, dir: Option<PathBuf>) -> Self {
         self.chunk_record_dir = dir;
         self
     }
 
+    #[must_use]
     pub fn with_gateway_activity(mut self, activity: Option<Arc<GatewayActivity>>) -> Self {
         self.gateway_activity = activity;
         self
     }
 
+    #[must_use]
     pub fn with_disk_cache(
         mut self,
         disk_cache: Option<Arc<ant_retrieval::DiskChunkCache>>,
@@ -193,21 +204,25 @@ impl NodeConfig {
         self
     }
 
+    #[must_use]
     pub fn with_upload(mut self, upload: Option<Arc<UploadRuntime>>) -> Self {
         self.upload = upload;
         self
     }
 
+    #[must_use]
     pub fn with_swap(mut self, swap: Option<SwapConfig>) -> Self {
         self.swap = swap;
         self
     }
 
+    #[must_use]
     pub fn with_pushsync_swap(mut self, cfg: Option<PushsyncSwapConfig>) -> Self {
         self.pushsync_swap = cfg;
         self
     }
 
+    #[must_use]
     pub fn with_upload_manager(mut self, mgr: Option<UploadManager>) -> Self {
         self.upload_manager = mgr;
         self

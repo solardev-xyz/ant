@@ -10,7 +10,7 @@
 //!   cargo run --release --example litter_disk_cache_bench -p ant-retrieval
 //! ```
 //!
-//! Compare with bee's sharky + LevelDB retrieval path (same dataset) via
+//! Compare with bee's sharky + `LevelDB` retrieval path (same dataset) via
 //! `scripts/run_bee_sharky_litter_bench.sh` after checking out bee.
 
 use ant_crypto::{cac_new, CHUNK_SIZE};
@@ -27,8 +27,7 @@ const POPULATE_BATCH: usize = 8192;
 #[tokio::main(flavor = "multi_thread", worker_threads = 32)]
 async fn main() {
     let base = std::env::var("LITTER_BENCH_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp/litter_bench"));
+        .map_or_else(|_| PathBuf::from("/tmp/litter_bench"), PathBuf::from);
 
     let mut files = Vec::new();
     collect_files(&base, &mut files).expect("walk litter bench dir");

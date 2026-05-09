@@ -305,7 +305,7 @@ struct PostageChainArgs {
     /// Used to sign the on-chain transaction.
     #[arg(long, env = "POSTAGE_OWNER_KEY")]
     owner_key: String,
-    /// Address of the deployed PostageStamp contract on Gnosis. Reads
+    /// Address of the deployed `PostageStamp` contract on Gnosis. Reads
     /// `POSTAGE_CONTRACT` if absent. Default is the Swarm mainnet
     /// stamp contract.
     #[arg(
@@ -334,9 +334,9 @@ struct PostageChainArgs {
 
 #[derive(Subcommand, Debug)]
 enum PostageCommand {
-    /// Create a new postage batch. Approves BZZ for the PostageStamp
+    /// Create a new postage batch. Approves BZZ for the `PostageStamp`
     /// contract first, then issues `createBatch`. Prints the new
-    /// batch id (extracted from the BatchCreated event) on success.
+    /// batch id (extracted from the `BatchCreated` event) on success.
     Create {
         #[command(flatten)]
         chain: PostageChainArgs,
@@ -401,7 +401,7 @@ enum PostageCommand {
         /// Gnosis RPC URL.
         #[arg(long, env = "GNOSIS_RPC_URL")]
         gnosis_rpc_url: String,
-        /// PostageStamp contract address.
+        /// `PostageStamp` contract address.
         #[arg(
             long,
             env = "POSTAGE_CONTRACT",
@@ -545,8 +545,8 @@ enum ChequebookCommand {
     },
     /// Tier-1 SWAP self-test: sign a tiny EIP-712 cheque with the
     /// chequebook's issuer key, beneficiary = our own
-    /// `WALLET_PRIVATE_KEY` address, then either eth_call (default)
-    /// or eth_sendRawTransaction (`--submit`) `cashChequeBeneficiary`
+    /// `WALLET_PRIVATE_KEY` address, then either `eth_call` (default)
+    /// or `eth_sendRawTransaction` (`--submit`) `cashChequeBeneficiary`
     /// against the chequebook contract.
     ///
     /// Proves end-to-end that our EIP-712 digest, ECDSA recid, and
@@ -741,13 +741,13 @@ impl FetchMode {
     /// scheme on the reference can override these defaults.
     fn from_flags(bytes: bool, bzz: bool, bzz_path: Option<&str>) -> Self {
         if bzz {
-            FetchMode::Bzz {
+            Self::Bzz {
                 path: bzz_path.unwrap_or("").to_string(),
             }
         } else if bytes {
-            FetchMode::Bytes
+            Self::Bytes
         } else {
-            FetchMode::Chunk
+            Self::Chunk
         }
     }
 }
@@ -883,9 +883,9 @@ async fn run_chequebook_async(cmd: ChequebookCommand, json: bool) -> Result<()> 
             } else {
                 println!("chequebook         {}", hex_addr(&cb));
                 println!("  issuer           {}", hex_addr(&issuer));
-                println!("  balance          {} PLUR", balance);
-                println!("  total_paid_out   {} PLUR", total_paid_out);
-                println!("  liquid_balance   {} PLUR", liquid);
+                println!("  balance          {balance} PLUR");
+                println!("  total_paid_out   {total_paid_out} PLUR");
+                println!("  liquid_balance   {liquid} PLUR");
                 if let Some(addr) = beneficiary_addr {
                     println!("  beneficiary      {}", hex_addr(&addr));
                     println!("  paid_out         {} PLUR", paid_out.unwrap());
@@ -1720,19 +1720,18 @@ async fn run_postage_async(cmd: PostageCommand, json: bool) -> Result<()> {
             address,
             bzz_token,
         } => {
-            let addr = match address {
-                Some(s) => parse_addr(&s)?,
-                None => {
-                    let key = std::env::var("POSTAGE_OWNER_KEY")
-                        .or_else(|_| std::env::var("STORAGE_STAMP_PRIVATE_KEY"))
-                        .context(
-                            "no --address and POSTAGE_OWNER_KEY / STORAGE_STAMP_PRIVATE_KEY \
-                             not set",
-                        )?;
-                    let secret = parse_secret(&key)?;
-                    let wallet = Wallet::new(secret, GNOSIS_CHAIN_ID).context("derive wallet")?;
-                    *wallet.address()
-                }
+            let addr = if let Some(s) = address {
+                parse_addr(&s)?
+            } else {
+                let key = std::env::var("POSTAGE_OWNER_KEY")
+                    .or_else(|_| std::env::var("STORAGE_STAMP_PRIVATE_KEY"))
+                    .context(
+                        "no --address and POSTAGE_OWNER_KEY / STORAGE_STAMP_PRIVATE_KEY \
+                         not set",
+                    )?;
+                let secret = parse_secret(&key)?;
+                let wallet = Wallet::new(secret, GNOSIS_CHAIN_ID).context("derive wallet")?;
+                *wallet.address()
             };
             let client = ChainClient::new(gnosis_rpc_url);
             let xdai = client
@@ -1758,7 +1757,7 @@ async fn run_postage_async(cmd: PostageCommand, json: bool) -> Result<()> {
                 println!("  BZZ    {} PLUR ({})", bzz, format_eth_16(bzz));
             }
         }
-        PostageCommand::Status { .. } => {
+        PostageCommand::Status => {
             // Routed via `main` -> `run_postage_status` so we don't
             // pay the cost of building a tokio runtime + chain
             // context for a pure local socket round-trip. This arm
@@ -1942,7 +1941,7 @@ fn preflight_postage(socket: &Path, source_size: u64, raw: bool) -> Result<()> {
 /// pre-flight chunk count. Must stay byte-compatible with the
 /// daemon's estimator; the unit test below pins both formulas to
 /// the same canonical inputs.
-fn estimate_chunk_count(source_size: u64, raw: bool) -> u64 {
+const fn estimate_chunk_count(source_size: u64, raw: bool) -> u64 {
     /// Mantaray fan-out matching `ant_retrieval::BRANCHES`. Hard
     /// constant in the splitter; would only change as part of a
     /// chunk-format break that bumps the protocol version.
@@ -2063,7 +2062,7 @@ fn format_eth_18(plur: u128) -> String {
     if frac == 0 {
         format!("{whole} xDAI")
     } else {
-        let frac_str = format!("{:018}", frac);
+        let frac_str = format!("{frac:018}");
         let trimmed = frac_str.trim_end_matches('0');
         let trimmed = if trimmed.len() > 6 {
             &trimmed[..6]
@@ -2082,7 +2081,7 @@ fn format_eth_16(plur: u128) -> String {
     if frac == 0 {
         format!("{whole} BZZ")
     } else {
-        let frac_str = format!("{:016}", frac);
+        let frac_str = format!("{frac:016}");
         let trimmed = frac_str.trim_end_matches('0');
         let trimmed = if trimmed.len() > 6 {
             &trimmed[..6]
@@ -2102,7 +2101,7 @@ fn format_eth_16(plur: u128) -> String {
 fn decode_bzz_url_path(raw: &str) -> Result<String> {
     percent_encoding::percent_decode_str(raw)
         .decode_utf8()
-        .map(|cow| cow.into_owned())
+        .map(std::borrow::Cow::into_owned)
         .map_err(|e| anyhow!("invalid percent-encoding in bzz path: {e}"))
 }
 
@@ -2295,7 +2294,7 @@ struct ProgressRenderer {
 }
 
 impl ProgressRenderer {
-    fn new(bypass_cache: bool, style: ProgressStyle) -> Self {
+    const fn new(bypass_cache: bool, style: ProgressStyle) -> Self {
         Self {
             style,
             ema_bps: None,
@@ -2319,7 +2318,7 @@ impl ProgressRenderer {
             if dt_ms > 0 && dbytes > 0 {
                 let bps = (dbytes as f64) * 1000.0 / dt_ms as f64;
                 self.ema_bps = Some(match self.ema_bps {
-                    Some(prev) => prev * (1.0 - PROGRESS_EMA_ALPHA) + bps * PROGRESS_EMA_ALPHA,
+                    Some(prev) => prev.mul_add(1.0 - PROGRESS_EMA_ALPHA, bps * PROGRESS_EMA_ALPHA),
                     None => bps,
                 });
             }
@@ -2461,8 +2460,9 @@ fn format_visual_progress_lines_for_width(
     let total = visual_total_chunks(p);
     let done_blocks = visual_done_blocks(p.chunks_done, total, blocks);
     let previous_done_blocks = previous
-        .map(|prev| visual_done_blocks(prev.chunks_done, total, blocks))
-        .unwrap_or(0)
+        .map_or(0, |prev| {
+            visual_done_blocks(prev.chunks_done, total, blocks)
+        })
         .min(done_blocks);
     let cache_blocks =
         visual_done_blocks(p.cache_hits.min(p.chunks_done), total, blocks).min(done_blocks);
@@ -2876,7 +2876,7 @@ fn format_upload_view_block(view: &UploadJobView) -> String {
     out
 }
 
-fn format_upload_status_label(s: &str) -> &str {
+const fn format_upload_status_label(s: &str) -> &str {
     s
 }
 
@@ -2972,8 +2972,7 @@ fn wait_for_peers(socket: &Path, min_peers: u32, timeout: Duration) {
         }
         if Instant::now() >= deadline {
             eprintln!(
-                "antctl: --wait-peers={} not reached in {:?}; issuing request anyway",
-                min_peers, timeout,
+                "antctl: --wait-peers={min_peers} not reached in {timeout:?}; issuing request anyway",
             );
             return;
         }
@@ -3087,7 +3086,7 @@ impl BandwidthTracker {
     /// stream.
     const ALPHA: f64 = 0.3;
 
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             last_sample: None,
             ema_bps: None,
@@ -3120,7 +3119,7 @@ impl BandwidthTracker {
         }
         let rate = (bytes - prev_bytes) as f64 / dt;
         self.ema_bps = Some(match self.ema_bps {
-            Some(prev) => Self::ALPHA * rate + (1.0 - Self::ALPHA) * prev,
+            Some(prev) => Self::ALPHA.mul_add(rate, (1.0 - Self::ALPHA) * prev),
             None => rate,
         });
         if rate > self.peak_bps {
@@ -3128,11 +3127,11 @@ impl BandwidthTracker {
         }
     }
 
-    fn current_bps(&self) -> Option<f64> {
+    const fn current_bps(&self) -> Option<f64> {
         self.ema_bps
     }
 
-    fn peak_bps(&self) -> f64 {
+    const fn peak_bps(&self) -> f64 {
         self.peak_bps
     }
 }
@@ -3146,11 +3145,11 @@ fn clamp_selection(selected: usize, len: usize) -> usize {
 }
 
 /// Rows shown in the Nodes table (pipeline view when the daemon populates it).
-fn peer_list_len(s: &StatusSnapshot) -> usize {
-    if !s.peers.peer_pipeline.is_empty() {
-        s.peers.peer_pipeline.len()
-    } else {
+const fn peer_list_len(s: &StatusSnapshot) -> usize {
+    if s.peers.peer_pipeline.is_empty() {
         s.peers.connected_peers.len()
+    } else {
+        s.peers.peer_pipeline.len()
     }
 }
 
@@ -3206,7 +3205,7 @@ fn short_peer_id(id: &str) -> String {
     format!("{pre}…{suf}")
 }
 
-fn pipeline_state_label(st: PeerConnectionState) -> &'static str {
+const fn pipeline_state_label(st: PeerConnectionState) -> &'static str {
     match st {
         PeerConnectionState::Dialing => "Dialing",
         PeerConnectionState::Identifying => "Identifying",
@@ -3254,14 +3253,14 @@ fn pipeline_view_order(s: &StatusSnapshot) -> Vec<usize> {
 }
 
 fn ready_count_for_gauge(s: &StatusSnapshot) -> u32 {
-    if !s.peers.peer_pipeline.is_empty() {
+    if s.peers.peer_pipeline.is_empty() {
+        s.peers.connected_peers.len() as u32
+    } else {
         s.peers
             .peer_pipeline
             .iter()
             .filter(|p| p.state == PeerConnectionState::Ready)
             .count() as u32
-    } else {
-        s.peers.connected_peers.len() as u32
     }
 }
 
@@ -3299,17 +3298,17 @@ enum TopPage {
 }
 
 impl TopPage {
-    const ALL: [TopPage; 3] = [TopPage::Nodes, TopPage::Retrieval, TopPage::Status];
+    const ALL: [Self; 3] = [Self::Nodes, Self::Retrieval, Self::Status];
 
     fn index(self) -> usize {
         Self::ALL.iter().position(|p| *p == self).unwrap_or(0)
     }
 
-    fn title(self) -> &'static str {
+    const fn title(self) -> &'static str {
         match self {
-            TopPage::Nodes => "Nodes",
-            TopPage::Retrieval => "Retrieval",
-            TopPage::Status => "Status",
+            Self::Nodes => "Nodes",
+            Self::Retrieval => "Retrieval",
+            Self::Status => "Status",
         }
     }
 
@@ -3352,7 +3351,7 @@ impl TopTerminal {
         Ok(Self { terminal })
     }
 
-    fn terminal_mut(&mut self) -> &mut Terminal<CrosstermBackend<Stdout>> {
+    const fn terminal_mut(&mut self) -> &mut Terminal<CrosstermBackend<Stdout>> {
         &mut self.terminal
     }
 }
@@ -3372,10 +3371,8 @@ impl Drop for TopTerminal {
 fn should_quit(event: &Event) -> bool {
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
-            matches!(
-                key.code,
-                KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc
-            ) || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+            matches!(key.code, KeyCode::Char('q' | 'Q') | KeyCode::Esc)
+                || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
         }
         _ => false,
     }
@@ -3794,7 +3791,7 @@ fn draw_retrieval_metrics(
         "{}/{} chunks ({})  · {} hits",
         r.cache.used,
         r.cache.capacity,
-        format_percentage(r.cache.used as u64, r.cache.capacity as u64),
+        format_percentage(u64::from(r.cache.used), u64::from(r.cache.capacity)),
         format_count(r.mem_hits_total),
     );
     let disk_cache = if r.disk.enabled {
@@ -3817,8 +3814,7 @@ fn draw_retrieval_metrics(
     );
     let bw_now = bandwidth
         .current_bps()
-        .map(format_byte_rate)
-        .unwrap_or_else(|| "—".to_string());
+        .map_or_else(|| "—".to_string(), format_byte_rate);
     let bw_peak = if bandwidth.peak_bps() > 0.0 {
         format_byte_rate(bandwidth.peak_bps())
     } else {
@@ -3868,7 +3864,7 @@ const GATEWAY_HEADER: [&str; 6] = ["Kind", "Path", "Age", "Done", "Infl", "Bytes
 /// inter-column spacing goes to it; the other five columns stay at
 /// their constant `Length` so numbers don't bounce around as the
 /// terminal resizes.
-fn gateway_constraints() -> [Constraint; 6] {
+const fn gateway_constraints() -> [Constraint; 6] {
     [
         Constraint::Length(GATEWAY_FIXED_WIDTHS[0]),
         Constraint::Min(GATEWAY_PATH_MIN_WIDTH),
@@ -3996,7 +3992,7 @@ fn format_byte_rate(bps: f64) -> String {
     } else if bps >= KIB {
         format!("{:.1} KiB/s", bps / KIB)
     } else {
-        format!("{:.0} B/s", bps)
+        format!("{bps:.0} B/s")
     }
 }
 
@@ -4035,7 +4031,7 @@ fn draw_connected_progress(frame: &mut Frame, area: TuiRect, s: &StatusSnapshot)
 
     let limit = s.peers.node_limit.max(1);
     let connected = ready_count_for_gauge(s).min(limit);
-    let ratio = connected as f64 / limit as f64;
+    let ratio = f64::from(connected) / f64::from(limit);
     draw_gauge_line(frame, bar_area, &progress_label(connected, limit), ratio);
 
     let m = peer_milestone_line(s);
@@ -4061,10 +4057,10 @@ fn peer_milestone_line(s: &StatusSnapshot) -> String {
     let n = s.peers.node_limit.max(1);
     let mut parts = Vec::new();
     if let Some(t) = s.peers.time_to_first_peer_s {
-        parts.push(format!("Time to first peer: {:.3}s", t));
+        parts.push(format!("Time to first peer: {t:.3}s"));
     }
     if let Some(t) = s.peers.time_to_node_limit_s {
-        parts.push(format!("Time to {n} nodes: {:.3}s", t));
+        parts.push(format!("Time to {n} nodes: {t:.3}s"));
     }
     parts.join("  ")
 }
@@ -4119,7 +4115,7 @@ fn draw_gauge_line(frame: &mut Frame, area: TuiRect, label: &str, ratio: f64) {
 
 fn progress_label(connected: u32, limit: u32) -> String {
     let width = limit.to_string().len();
-    format!("{connected:0width$}/{limit}", width = width)
+    format!("{connected:0width$}/{limit}")
 }
 
 fn draw_disconnected_nodes_page(frame: &mut Frame, area: TuiRect, error: &str) {
@@ -4206,7 +4202,7 @@ fn nodes_header_row() -> Row<'static> {
     )
 }
 
-fn node_kind_label(full: Option<bool>) -> &'static str {
+const fn node_kind_label(full: Option<bool>) -> &'static str {
     match full {
         Some(true) => "full",
         Some(false) => "light",
@@ -4249,7 +4245,7 @@ fn dash_if_empty(s: &str) -> String {
     }
 }
 
-fn nodes_constraints() -> [Constraint; 7] {
+const fn nodes_constraints() -> [Constraint; 7] {
     [
         Constraint::Length(NODES_COLUMN_WIDTHS[0]),
         Constraint::Length(NODES_COLUMN_WIDTHS[1]),
@@ -4318,7 +4314,7 @@ fn draw_nodes_table(frame: &mut Frame, area: TuiRect, s: &StatusSnapshot, select
                 let p = &s.peers.peer_pipeline[order[idx]];
                 let conn = by_id.get(p.peer_id.as_str()).copied();
                 let (agent, version) =
-                    parse_agent_version(conn.map(|c| c.agent_version.as_str()).unwrap_or(""));
+                    parse_agent_version(conn.map_or("", |c| c.agent_version.as_str()));
                 let ready_in = match p.ready_in_ms {
                     Some(ms) => format_ready_in_ms(ms),
                     None => "-".to_string(),
@@ -4413,8 +4409,7 @@ fn draw_node_details(
                     kv(
                         "Ready in",
                         &row.ready_in_ms
-                            .map(format_ready_in_ms)
-                            .unwrap_or_else(|| "-".to_string()),
+                            .map_or_else(|| "-".to_string(), format_ready_in_ms),
                     ),
                     kv(
                         "IP",
@@ -4504,7 +4499,7 @@ fn detail_rows_from_connection(peer: &PeerConnectionInfo, now: u64) -> Vec<Panel
     rows
 }
 
-fn unknown_if_empty(value: &str) -> &str {
+const fn unknown_if_empty(value: &str) -> &str {
     if value.is_empty() {
         "(unknown)"
     } else {

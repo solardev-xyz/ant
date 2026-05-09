@@ -60,7 +60,7 @@ impl ChainClient {
     /// `tx` submodule so its write-side helpers can reuse the same
     /// pooled connection without each handler instantiating its own
     /// client.
-    pub(crate) fn http(&self) -> &reqwest::Client {
+    pub(crate) const fn http(&self) -> &reqwest::Client {
         &self.http
     }
 

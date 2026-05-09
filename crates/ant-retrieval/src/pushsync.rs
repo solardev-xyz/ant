@@ -61,7 +61,7 @@ pub(crate) struct PbPushReceipt {
 
 /// Push one CAC chunk to a single peer — headers + protobuf `Delivery` + read `Receipt`.
 ///
-/// Returns `Ok(())` when the peer ACKed the chunk address; the receipt
+/// Returns `Ok(())` when the peer `ACKed` the chunk address; the receipt
 /// signature is currently dropped because we don't yet keep cheques.
 pub async fn push_chunk_to_peer(
     control: &mut Control,

@@ -52,6 +52,7 @@ pub const SOC_MIN_CHUNK_SIZE: usize = SOC_HEADER_SIZE + SPAN_SIZE;
 /// The outer chunk fetcher passes the SOC's claimed address; if a
 /// different owner had produced this id+sig combination, the address
 /// would not match.
+#[must_use]
 pub fn soc_valid(expected_addr: &[u8; 32], wire: &[u8]) -> bool {
     if wire.len() < SOC_MIN_CHUNK_SIZE {
         return false;
@@ -220,7 +221,7 @@ mod tests {
     /// fetched verbatim from the public Bee gateway. This pins the SOC
     /// wire layout exactly as the network delivers it (no outer span)
     /// and our exact recovery + self-binding maths against bee's.
-    /// 145 bytes total = 32 id + 65 sig + 8 inner_span + 40 v1 payload.
+    /// 145 bytes total = 32 id + 65 sig + 8 `inner_span` + 40 v1 payload.
     #[test]
     fn real_blog_swarm_eth_feed_update() {
         // SOC chunk for owner=f77a13dc..., topic=861f23d3..., index=0.

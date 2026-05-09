@@ -203,6 +203,7 @@ impl UploadManager {
 
     /// State-dir path so the daemon can log it / surface it in
     /// `antctl status`.
+    #[must_use]
     pub fn state_dir(&self) -> &Path {
         &self.inner.state_dir
     }
@@ -311,8 +312,9 @@ impl UploadManager {
     }
 
     /// Snapshot every known job. Stable insertion order is not
-    /// guaranteed (HashMap), so callers that want a deterministic
+    /// guaranteed (`HashMap`), so callers that want a deterministic
     /// list sort by `created_at_unix`.
+    #[must_use]
     pub fn list(&self) -> Vec<UploadJobInfo> {
         self.inner
             .jobs
@@ -905,7 +907,7 @@ struct LeafIter<'a> {
 }
 
 impl<'a> LeafIter<'a> {
-    fn new(body: Option<&'a [u8]>, total: u64) -> Self {
+    const fn new(body: Option<&'a [u8]>, total: u64) -> Self {
         Self {
             body,
             cursor: 0,
@@ -914,7 +916,7 @@ impl<'a> LeafIter<'a> {
         }
     }
 
-    fn is_done(&self) -> bool {
+    const fn is_done(&self) -> bool {
         self.done
     }
 }
@@ -956,7 +958,7 @@ struct AckLog {
 }
 
 impl AckLog {
-    fn new(resume_cursor: u64) -> Self {
+    const fn new(resume_cursor: u64) -> Self {
         Self {
             resume_cursor,
             cursor: resume_cursor,
@@ -980,12 +982,12 @@ impl AckLog {
         }
     }
 
-    fn cursor(&self) -> u64 {
+    const fn cursor(&self) -> u64 {
         self.cursor
     }
 
     /// Best-effort estimate of source bytes covered by the pushed
-    /// prefix. Counts each chunk index ≤ source_chunks as
+    /// prefix. Counts each chunk index ≤ `source_chunks` as
     /// `CHUNK_SIZE` bytes, capping at `source_size`. This is
     /// approximate (intermediates carry no source bytes themselves
     /// but advance the cursor) and is intended for the progress UI
@@ -1016,7 +1018,8 @@ impl AckLog {
 /// upload completes, so a slight under-count here only affects
 /// the UX percentage during the last few hundred milliseconds of
 /// the run.
-pub fn estimate_chunk_count(source_size: u64, raw: bool) -> u64 {
+#[must_use]
+pub const fn estimate_chunk_count(source_size: u64, raw: bool) -> u64 {
     if source_size == 0 {
         // An empty raw upload still has a single (empty) data
         // leaf; an empty manifested upload has the leaf + a
@@ -1043,6 +1046,7 @@ pub fn estimate_chunk_count(source_size: u64, raw: bool) -> u64 {
 /// JSON shape `antctl` expects on the wire. Kept as a free function
 /// so `ant-control` doesn't take a build-graph dependency on
 /// `ant-node`.
+#[must_use]
 pub fn to_view(info: UploadJobInfo) -> UploadJobView {
     UploadJobView {
         job_id: info.job_id,
@@ -1071,6 +1075,7 @@ pub fn to_view(info: UploadJobInfo) -> UploadJobView {
 }
 
 /// Drive a `ControlCommand::UploadFollow` connection to completion.
+///
 /// Subscribes to the job's progress watch, emits one
 /// [`ControlAck::UploadProgress`] per state change, and finishes
 /// with a terminal [`ControlAck::UploadJob`] (the final snapshot)
@@ -1132,8 +1137,7 @@ fn mtime_unix_ms(meta: &std::fs::Metadata) -> u64 {
     meta.modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 #[cfg(test)]
@@ -1153,7 +1157,7 @@ mod tests {
         /// `total_dispatches` for payloads with content that
         /// collides at chunk boundaries.
         unique_addresses: HashSet<[u8; 32]>,
-        /// Every accepted PushChunk, including duplicates produced
+        /// Every accepted `PushChunk`, including duplicates produced
         /// by content collisions.
         total_dispatches: u64,
     }

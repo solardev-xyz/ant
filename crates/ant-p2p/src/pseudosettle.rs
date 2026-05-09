@@ -419,7 +419,7 @@ struct DriverMetrics {
     ok: u64,
     /// Refreshes that bee acknowledged with a non-zero `accepted`.
     /// Useful as a cheap signal of "pseudosettle is actually clearing
-    /// debt, not just NAKing".
+    /// debt, not just `NAKing`".
     ok_nonzero: u64,
     /// Sum of `accepted` units across all successful round trips.
     units_accepted: u128,
@@ -575,8 +575,7 @@ pub async fn run_driver(
                 walk.sort_by_key(|p| {
                     state
                         .get(p)
-                        .map(|s| if s.hot { 0u8 } else { 1u8 })
-                        .unwrap_or(1)
+                        .map_or(1, |s| u8::from(!s.hot))
                 });
                 for peer in walk {
                     if !live.contains(&peer) {
@@ -615,7 +614,7 @@ pub async fn run_driver(
                                     m.ok_nonzero += 1;
                                     m.units_accepted = m
                                         .units_accepted
-                                        .saturating_add(ok.accepted as u128);
+                                        .saturating_add(u128::from(ok.accepted));
                                     if let Some(acc) = accounting.as_ref() {
                                         acc.credit(peer, ok.accepted);
                                     }
@@ -693,7 +692,7 @@ mod tests {
             0x100,
             12345,
             450_000,
-            u32::MAX as u64,
+            u64::from(u32::MAX),
             u64::MAX,
         ] {
             let bytes = big_int_be_bytes(v);

@@ -43,6 +43,7 @@ pub type Overlay = [u8; OVERLAY_LEN];
 ///
 /// Mirrors `bee` `swarm.Proximity` byte-for-byte for any input where both
 /// sides are 32-byte overlays.
+#[must_use]
 pub fn proximity(a: &Overlay, b: &Overlay) -> u8 {
     for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
         let xor = x ^ y;
@@ -61,6 +62,7 @@ pub fn proximity(a: &Overlay, b: &Overlay) -> u8 {
 /// `Ordering` of two overlays' XOR distance to a target. `Less` means `a`
 /// is closer (smaller XOR) than `b`. Equivalent to `bee` `DistanceCmp` with
 /// inverted return values (Go uses `+1` for closer; Rust uses `Less`).
+#[must_use]
 pub fn distance_cmp(target: &Overlay, a: &Overlay, b: &Overlay) -> Ordering {
     for i in 0..OVERLAY_LEN {
         let da = a[i] ^ target[i];
@@ -97,6 +99,7 @@ pub struct RoutingTable {
 }
 
 impl RoutingTable {
+    #[must_use]
     pub fn new(base: Overlay) -> Self {
         Self {
             base,
@@ -107,15 +110,18 @@ impl RoutingTable {
 
     /// Local overlay (our base address). Useful for diagnostics and for
     /// the ant-control snapshot.
-    pub fn base(&self) -> &Overlay {
+    #[must_use]
+    pub const fn base(&self) -> &Overlay {
         &self.base
     }
 
     /// Number of peers currently in the table.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -150,6 +156,7 @@ impl RoutingTable {
 
     /// Number of peers per bin — used by `antctl top` to visualise the
     /// routing table fan-out at a glance. Length is always `NUM_BINS`.
+    #[must_use]
     pub fn bin_counts(&self) -> [u8; NUM_BINS] {
         let mut out = [0u8; NUM_BINS];
         for (i, b) in self.bins.iter().enumerate() {
@@ -171,10 +178,12 @@ impl RoutingTable {
     /// Snapshot all current `(peer, overlay)` entries. Used by the node
     /// loop to hand a stable peer list to a spawned fetch task without
     /// holding a borrow of the live table for the whole tree walk.
+    #[must_use]
     pub fn snapshot(&self) -> Vec<(PeerId, Overlay)> {
         self.entries.iter().map(|(p, e)| (*p, e.overlay)).collect()
     }
 
+    #[must_use]
     pub fn closest_peer(&self, target: &Overlay, skip: &[PeerId]) -> Option<(PeerId, Overlay)> {
         let mut best: Option<(PeerId, Overlay)> = None;
         for (peer, entry) in &self.entries {

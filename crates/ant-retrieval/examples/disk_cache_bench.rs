@@ -6,7 +6,7 @@
 //!
 //! Run with:
 //!
-//!   cargo run --release --example disk_cache_bench -p ant-retrieval
+//!   cargo run --release --example `disk_cache_bench` -p ant-retrieval
 
 use ant_crypto::cac_new;
 use ant_retrieval::DiskChunkCache;

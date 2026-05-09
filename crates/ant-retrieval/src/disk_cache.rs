@@ -58,7 +58,7 @@ const LAST_ACCESS_REFRESH_MS: i64 = 60_000;
 /// cached prepared statements). Bounded to keep mobile FD use sane.
 fn read_worker_count() -> usize {
     std::thread::available_parallelism()
-        .map(|n| n.get())
+        .map(std::num::NonZero::get)
         .unwrap_or(8)
         .clamp(8, 32)
 }
@@ -67,7 +67,7 @@ fn read_worker_count() -> usize {
 /// Larger batches amortise WAL fsync against bursty write-through.
 const WRITE_BATCH_MAX: usize = 256;
 
-/// Target mmap size per SQLite connection (256 MiB).
+/// Target mmap size per `SQLite` connection (256 MiB).
 const MMAP_BYTES: i64 = 512 * 1024 * 1024;
 
 /// Negative `cache_size` pragma value = KiB of page cache per connection
@@ -94,13 +94,13 @@ pub enum DiskCacheError {
 
 impl From<rusqlite::Error> for DiskCacheError {
     fn from(e: rusqlite::Error) -> Self {
-        DiskCacheError::Sqlite(e.to_string())
+        Self::Sqlite(e.to_string())
     }
 }
 
 impl From<std::io::Error> for DiskCacheError {
     fn from(e: std::io::Error) -> Self {
-        DiskCacheError::Io(e.to_string())
+        Self::Io(e.to_string())
     }
 }
 
@@ -240,14 +240,17 @@ impl DiskChunkCache {
         })
     }
 
+    #[must_use]
     pub fn path(&self) -> &Path {
         &self.inner.path
     }
 
+    #[must_use]
     pub fn capacity_bytes(&self) -> u64 {
         self.inner.max_bytes
     }
 
+    #[must_use]
     pub fn used_bytes(&self) -> u64 {
         self.inner.total_bytes.load(Ordering::Relaxed)
     }

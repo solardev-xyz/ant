@@ -50,6 +50,7 @@ impl GatewayActivity {
     /// Build an empty registry. The daemon constructs exactly one and
     /// shares the `Arc` with both the gateway handle and the status
     /// publisher.
+    #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
@@ -173,6 +174,7 @@ impl ActiveRequestGuard {
     /// that outlives the handler frame. The handle does *not* extend
     /// the registry slot's lifetime — when the guard drops, the slot
     /// is removed and the handle's `update` calls become no-ops.
+    #[must_use]
     pub fn handle(&self) -> GatewayActivityHandle {
         GatewayActivityHandle {
             id: self.id,
@@ -190,6 +192,7 @@ impl Drop for ActiveRequestGuard {
 }
 
 /// Cheap, `Send`-able update channel into a single registry slot.
+///
 /// Cloned into the streaming-body unfold state so updates keep
 /// flowing while the handler frame's [`ActiveRequestGuard`] holds
 /// the slot alive.
