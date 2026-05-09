@@ -59,7 +59,7 @@ pub const POSTAGE_INCREASE_DEPTH_GAS: u64 = 800_000;
 /// 0-balance fail still has runway.
 pub const CHEQUEBOOK_CASH_GAS: u64 = 200_000;
 /// `SimpleSwapFactory.deploySimpleSwap` gas limit. The factory does
-/// a CREATE2 of the SimpleSwap proxy, calls `setIssuer` on it, and
+/// a CREATE2 of the `SimpleSwap` proxy, calls `setIssuer` on it, and
 /// flips a `deployedContracts[swap]` storage slot. Empirically
 /// ~700 K on Gnosis; we cap at 1.5 M for headroom against future
 /// EIP gas-cost bumps. A successful tx still only burns the actual
@@ -216,9 +216,10 @@ pub fn erc20_approve_calldata(spender: &[u8; 20], value: &U256) -> Vec<u8> {
 
 /// `IERC20.transfer(address to, uint256 value)` calldata. Used by
 /// `Wallet::erc20_transfer` to fund a freshly-deployed chequebook
-/// directly from the operator's wallet (the SimpleSwap contract
+/// directly from the operator's wallet (the `SimpleSwap` contract
 /// has no `deposit()` view; its `balance()` is just
 /// `BZZ.balanceOf(swap)`, so a plain transfer is the funding path).
+#[must_use] 
 pub fn erc20_transfer_calldata(to: &[u8; 20], value: &U256) -> Vec<u8> {
     let mut data = Vec::with_capacity(4 + 32 + 32);
     data.extend_from_slice(&keccak256(b"transfer(address,uint256)")[0..4]);

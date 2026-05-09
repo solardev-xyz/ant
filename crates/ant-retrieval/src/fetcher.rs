@@ -226,6 +226,7 @@ impl RoutingFetcher {
     /// does not fail the upload, just causes the next pushsync against
     /// the same peer to potentially be RST'd by bee. See
     /// [`PushsyncSettlement`] for the rationale.
+    #[must_use]
     pub fn with_pushsync_settlement(
         mut self,
         settlement: Arc<dyn PushsyncSettlement>,
@@ -518,9 +519,7 @@ impl RoutingFetcher {
         }
         Err(crate::pushsync::PushSyncError::Remote(format!(
             "exhausted pushsync peers (last: {})",
-            last_err
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "unknown".to_string()),
+            last_err.map_or_else(|| "unknown".to_string(), |e| e.to_string()),
         )))
     }
 }
