@@ -1,6 +1,6 @@
 [package]
 name = "ant-p2p"
-version = "0.3.11"
+version = "0.3.17"
 edition.workspace = true
 
 [dependencies]
@@ -9,6 +9,7 @@ ant-control = { path = "../ant-control" }
 ant-crypto = { path = "../ant-crypto" }
 ant-postage = { path = "../ant-postage" }
 ant-retrieval = { path = "../ant-retrieval" }
+async-trait = "0.1.89"
 base64 = "0.22.1"
 primitive-types = { version = "0.14.0", default-features = false }
 libp2p.workspace = true

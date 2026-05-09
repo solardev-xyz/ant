@@ -10,7 +10,7 @@ use ant_crypto::{
 use ant_gateway::{Gateway, GatewayHandle, GatewayIdentity};
 use ant_node::{run_node, NodeConfig};
 use ant_p2p::UploadRuntime;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use fs4::{FileExt, TryLockError};
 use k256::ecdsa::SigningKey;
@@ -92,6 +92,17 @@ struct Opt {
     /// through the bootnodes; useful for diagnosing peer-discovery issues.
     #[arg(long, default_value_t = false)]
     no_peerstore: bool,
+
+    /// Override the peer-set target — how many BZZ-handshake-complete peers
+    /// the swarm loop tries to keep online. Default (`None`) leaves
+    /// `ant-p2p`'s baked-in `DEFAULT_TARGET_PEERS` (100), which is the
+    /// right size for cheap-CPU light-mode operation. Override (e.g. 200)
+    /// to widen the network-wide credit budget for long uploads — bee
+    /// grants each peer ~5 K PLUR/sec of pseudosettle credit, so doubling
+    /// the peer set roughly doubles per-second debit headroom and shaves
+    /// the throughput-throttling wall.
+    #[arg(long)]
+    target_peers: Option<usize>,
 
     /// Delete `<data-dir>/peers.json` (or `--peers-file`) before startup.
     /// One-shot equivalent of `antctl peers reset` for when the daemon isn't
@@ -176,6 +187,41 @@ struct Opt {
     /// expectation and is what most operators want.
     #[arg(long, default_value_t = false)]
     no_resume_uploads: bool,
+
+    /// 20-byte chequebook contract address (`0x` + 40 hex). When set
+    /// alongside `--swap-key`, the daemon enables outbound SWAP
+    /// settlement (Phase 7b): every successful pushsync push accrues
+    /// debt against the receiver's beneficiary EOA, and an EIP-712
+    /// cheque is emitted automatically once the per-peer debt crosses
+    /// `LIGHT_PAYMENT_THRESHOLD / 2` (≈ 675 K PLUR). Required for
+    /// sustained uploads — without it pushsync stalls after a few
+    /// hundred chunks per peer (bee paymentTolerance). Falls back to
+    /// `CHEQUEBOOK_ADDRESS` env. The chequebook's on-chain
+    /// `issuer()` view must return the EOA derived from `--swap-key`.
+    #[arg(long)]
+    chequebook: Option<String>,
+
+    /// 32-byte secp256k1 secret of the chequebook's issuer EOA
+    /// (`0x` + 64 hex). Falls back to `SWAP_OWNER_KEY` and then
+    /// `WALLET_PRIVATE_KEY`. Same key bee derives at
+    /// `m/44'/60'/0'/0/0` of the node mnemonic by default; we keep
+    /// the convention that the wallet key is also the chequebook
+    /// owner. Required when `--chequebook` is set; ignored otherwise.
+    #[arg(long)]
+    swap_key: Option<String>,
+
+    /// Skip the startup `factory.deployedContracts(chequebook)`
+    /// sanity check. Bee silently rejects cheques drawn on
+    /// chequebooks that aren't registered with the official
+    /// `SimpleSwapFactory`, so by default we refuse to enable
+    /// outbound SWAP settlement against an unregistered
+    /// chequebook (the daemon still starts, but with pushsync-swap
+    /// disabled, so we don't waste bandwidth signing cheques
+    /// peers will silently drop). Pass this flag for devnet /
+    /// custom-factory scenarios where the check is the wrong
+    /// answer.
+    #[arg(long, default_value_t = false)]
+    chequebook_allow_unverified: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -428,17 +474,95 @@ async fn main() -> Result<()> {
 
     // SWAP listener always-on. Inbound cheques don't require us to own
     // a chequebook (we're the beneficiary, not the issuer), so the
-    // only inputs we need are our EOA and the chain id. Outbound
-    // emission is a separate concern: it requires a chequebook the
-    // operator controls — added via a future `--chequebook` flag.
-    // The ledger persists at `<data-dir>/swap_credits.json`; cheque
-    // monotonicity survives restarts.
+    // only inputs we need are our EOA and the chain id. The ledger
+    // persists at `<data-dir>/swap_credits.json`; cheque monotonicity
+    // survives restarts.
     let swap_cfg = ant_p2p::SwapConfig {
         our_beneficiary: eth,
         chain_id: ant_chain::tx::GNOSIS_CHAIN_ID,
         ledger_path: data_dir.join("swap_credits.json"),
         events_tx: None,
     };
+
+    // Outbound SWAP settlement (Phase 7b). Built when the operator has
+    // configured both `--chequebook` and `--swap-key` (or their env
+    // fallbacks). Without it, sustained pushsync uploads stall after
+    // a few hundred chunks per peer.
+    let pushsync_swap_cfg = build_pushsync_swap_config(
+        opt.chequebook.clone(),
+        opt.swap_key.clone(),
+        data_dir.clone(),
+    )?;
+
+    // Pre-flight: every cheque we issue is rejected by bee's
+    // `chequeStore.ReceiveCheque` if `factory.deployedContracts(addr)`
+    // returns false, and the rejection is silent (just a closed
+    // pushsync stream from the peer's side). Catch it loudly here
+    // — turning pushsync-swap off when the check fails is strictly
+    // better than wasting bandwidth on cheques nobody honours.
+    let pushsync_swap_cfg = match (
+        pushsync_swap_cfg,
+        opt.gnosis_rpc_url
+            .clone()
+            .or_else(|| std::env::var("GNOSIS_RPC_URL").ok()),
+    ) {
+        (Some(cfg), Some(rpc)) => {
+            match verify_chequebook_with_factory(&rpc, &cfg.chequebook).await {
+                Ok(true) => {
+                    tracing::info!(
+                        target: "antd",
+                        chequebook = %format!("0x{}", hex::encode(cfg.chequebook)),
+                        "factory check passed — chequebook is registered with the Swarm chequebook factory",
+                    );
+                    Some(cfg)
+                }
+                Ok(false) if opt.chequebook_allow_unverified => {
+                    tracing::warn!(
+                        target: "antd",
+                        chequebook = %format!("0x{}", hex::encode(cfg.chequebook)),
+                        "chequebook is NOT registered with the Swarm chequebook factory, but --chequebook-allow-unverified was set; bee will reject cheques drawn on this chequebook",
+                    );
+                    Some(cfg)
+                }
+                Ok(false) => {
+                    tracing::error!(
+                        target: "antd",
+                        chequebook = %format!("0x{}", hex::encode(cfg.chequebook)),
+                        "chequebook is NOT registered with the Swarm chequebook factory; \
+                         bee will silently reject every cheque we emit. \
+                         Disabling outbound SWAP settlement. \
+                         Run `antctl chequebook deploy` to deploy a new factory-registered chequebook, \
+                         or pass --chequebook-allow-unverified to override (devnet only).",
+                    );
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "antd",
+                        chequebook = %format!("0x{}", hex::encode(cfg.chequebook)),
+                        error = %e,
+                        "factory.deployedContracts call failed; skipping startup factory check",
+                    );
+                    Some(cfg)
+                }
+            }
+        }
+        (cfg, _) => cfg,
+    };
+
+    if pushsync_swap_cfg.is_some() {
+        tracing::info!(
+            target: "antd",
+            "outbound SWAP settlement configured — pushsync will emit cheques",
+        );
+    } else {
+        tracing::warn!(
+            target: "antd",
+            "outbound SWAP settlement NOT configured — pushsync uploads will stall \
+             after ~20K chunks across the peer set; pass --chequebook + --swap-key \
+             (or set CHEQUEBOOK_ADDRESS + WALLET_PRIVATE_KEY in the environment) to enable",
+        );
+    }
 
     let node_fut = run_node(
         NodeConfig::mainnet_default(signing_secret, overlay_nonce, bootnodes, libp2p_keypair)
@@ -447,12 +571,14 @@ async fn main() -> Result<()> {
             .with_external_addrs(external_addrs)
             .with_peerstore_path(peerstore_path)
             .with_commands(cmd_rx)
+            .with_target_peers(opt.target_peers)
             .with_per_request_chunk_cache(opt.per_request_chunk_cache)
             .with_chunk_record_dir(chunk_record_dir)
             .with_gateway_activity(Some(gateway_activity.clone()))
             .with_disk_cache(disk_cache)
             .with_upload(upload)
             .with_swap(Some(swap_cfg))
+            .with_pushsync_swap(pushsync_swap_cfg)
             .with_upload_manager(Some(upload_manager)),
     );
 
@@ -769,10 +895,106 @@ async fn build_upload_runtime(
     })))
 }
 
+/// Build a [`PushsyncSwapConfig`] from the `--chequebook` /
+/// `--swap-key` flags, falling back to env. Returns `Ok(None)` when
+/// neither side is configured (the operator is consciously running
+/// without outbound settlement). Returns `Err` if exactly one side is
+/// configured (mismatch is almost certainly an operator bug — silent
+/// fallback would hide it).
+fn build_pushsync_swap_config(
+    cli_chequebook: Option<String>,
+    cli_swap_key: Option<String>,
+    data_dir: PathBuf,
+) -> Result<Option<ant_p2p::PushsyncSwapConfig>> {
+    let cb_hex = cli_chequebook.or_else(|| std::env::var("CHEQUEBOOK_ADDRESS").ok());
+    let key_hex = cli_swap_key
+        .or_else(|| std::env::var("SWAP_OWNER_KEY").ok())
+        .or_else(|| std::env::var("WALLET_PRIVATE_KEY").ok());
+    match (cb_hex, key_hex) {
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(anyhow!(
+            "--chequebook is set but no --swap-key / SWAP_OWNER_KEY / WALLET_PRIVATE_KEY found; \
+             outbound SWAP settlement needs both",
+        )),
+        (None, Some(_)) => {
+            // Swap key alone (e.g. WALLET_PRIVATE_KEY in the dev env)
+            // is the common case; logging at info level instead of
+            // failing is the friendlier UX. Without a chequebook we
+            // can't sign cheques, so disable settlement.
+            tracing::info!(
+                target: "antd",
+                "swap key found but no --chequebook / CHEQUEBOOK_ADDRESS; outbound SWAP settlement disabled",
+            );
+            Ok(None)
+        }
+        (Some(cb), Some(key)) => {
+            let mut chequebook = [0u8; 20];
+            hex::decode_to_slice(strip_0x(&cb), &mut chequebook)
+                .with_context(|| format!("decode --chequebook {cb}"))?;
+            let mut swap_secret = [0u8; SECP256K1_SECRET_LEN];
+            hex::decode_to_slice(strip_0x(&key), &mut swap_secret)
+                .context("decode --swap-key")?;
+            let swap_eoa = {
+                let sk = SigningKey::from_bytes((&swap_secret).into())
+                    .context("--swap-key invalid")?;
+                ethereum_address_from_public_key(sk.verifying_key())
+            };
+            tracing::info!(
+                target: "antd",
+                chequebook = %format!("0x{}", hex::encode(chequebook)),
+                issuer_eoa = %format!("0x{}", hex::encode(swap_eoa)),
+                "outbound SWAP settlement: chequebook + issuer key configured",
+            );
+            // Use a placeholder PeerEthMap; `ant-node::run_node`
+            // overwrites the field with the live one shared with the
+            // swarm loop before the config reaches `run`.
+            Ok(Some(ant_p2p::PushsyncSwapConfig::new(
+                chequebook,
+                swap_secret,
+                ant_chain::tx::GNOSIS_CHAIN_ID,
+                data_dir.join("pushsync_outbound.json"),
+                ant_p2p::PeerEthMap::new(),
+            )))
+        }
+    }
+}
+
 fn strip_0x(s: &str) -> &str {
     s.strip_prefix("0x")
         .or_else(|| s.strip_prefix("0X"))
         .unwrap_or(s)
+}
+
+/// One `eth_call` to the Swarm chequebook factory's
+/// `deployedContracts(address)` view. Returns `Ok(true)` iff the
+/// factory has a record of having deployed `chequebook` itself —
+/// which is exactly the predicate bee's `chequeStore.ReceiveCheque`
+/// uses to decide whether to accept a cheque drawn on it. Any RPC
+/// failure surfaces as `Err`, distinguishable from the legitimate
+/// "no, that contract is unknown to us" answer.
+async fn verify_chequebook_with_factory(
+    rpc_url: &str,
+    chequebook: &[u8; 20],
+) -> Result<bool> {
+    use ant_chain::chequebook::{
+        factory_deployed_contracts_calldata, GNOSIS_CHEQUEBOOK_FACTORY,
+    };
+    use ant_chain::ChainClient;
+
+    let client = ChainClient::new(rpc_url);
+    let calldata = factory_deployed_contracts_calldata(chequebook);
+    let v = client
+        .eth_call(
+            &format!("0x{}", hex::encode(GNOSIS_CHEQUEBOOK_FACTORY)),
+            &format!("0x{}", hex::encode(&calldata)),
+        )
+        .await
+        .context("factory.deployedContracts eth_call")?;
+    if v.len() < 32 {
+        bail!("factory.deployedContracts returned <32 bytes (got {} bytes)", v.len());
+    }
+    let last_word = &v[v.len() - 32..];
+    Ok(last_word.iter().any(|&b| b != 0))
 }
 
 fn secp256k1_keypair_from_signing_secret(secret: &[u8; SECP256K1_SECRET_LEN]) -> Result<Keypair> {

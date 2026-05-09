@@ -1,6 +1,6 @@
 [package]
 name = "ant-chain"
-version = "0.3.11"
+version = "0.3.17"
 edition.workspace = true
 
 [[example]]
@@ -36,3 +36,7 @@ primitive-types = { version = "0.14.0", default-features = false }
 # transitive dep through ant-crypto, brought in directly here so the
 # module's signing path stays explicit.
 k256 = { version = "0.13.4", default-features = false, features = ["ecdsa"] }
+# OS RNG for CREATE2 salts when deploying a chequebook through
+# the factory. Same version `ant-crypto` pulls so we stay on a
+# single getrandom across the workspace.
+getrandom = "0.3.2"

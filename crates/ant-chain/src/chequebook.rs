@@ -279,6 +279,100 @@ pub fn chequebook_paid_out_calldata(beneficiary: &[u8; 20]) -> Vec<u8> {
     data
 }
 
+// --- SimpleSwapFactory ABI helpers ---
+
+/// Mainnet (Gnosis chain) Swarm chequebook factory address —
+/// `SimpleSwapFactory` at
+/// <https://gnosisscan.io/address/0xC2d5A532cf69AA9A1378737D8ccDEF884B6E7420>.
+/// Bee's `chequeStore.ReceiveCheque` only accepts cheques drawn on
+/// chequebooks where `factory.deployedContracts(chequebook) == true`,
+/// so `antd` MUST deploy through this contract for its cheques to
+/// be honoured by mainnet bee peers.
+pub const GNOSIS_CHEQUEBOOK_FACTORY: [u8; 20] = [
+    0xc2, 0xd5, 0xa5, 0x32, 0xcf, 0x69, 0xaa, 0x9a, 0x13, 0x78, 0x73, 0x7d, 0x8c, 0xcd, 0xef, 0x88,
+    0x4b, 0x6e, 0x74, 0x20,
+];
+
+/// BZZ token contract address on Gnosis mainnet — the only ERC-20
+/// the chequebook factory's deployed swaps will denominate
+/// payouts in. We expose it as 20 raw bytes (siblings of the
+/// `0x...` `&'static str` `crate::GNOSIS_BZZ_TOKEN`) for the
+/// deploy + funding paths to avoid round-tripping
+/// `factory.ERC20Address()` for something that's effectively
+/// constant on mainnet, while still allowing callers to verify
+/// against the factory if they want.
+pub const GNOSIS_BZZ_TOKEN_BYTES: [u8; 20] = [
+    0xdb, 0xf3, 0xea, 0x6f, 0x5b, 0xee, 0x45, 0xc0, 0x22, 0x55, 0xb2, 0xc2, 0x6a, 0x16, 0xf3, 0x00,
+    0x50, 0x2f, 0x68, 0xda,
+];
+
+/// Bee's hard-deposit timeout default, in seconds (24 h). Matches
+/// `pkg/node/devnode.go::FactoryDefaultDepositTimeoutDuration` and
+/// the value bee's own `chequebook.Init` uses when bootstrapping a
+/// new node. Picked deliberately so a chequebook deployed by `antd`
+/// looks indistinguishable from one deployed by bee itself.
+pub const DEFAULT_HARD_DEPOSIT_TIMEOUT_SECS: u64 = 86_400;
+
+/// Topic[0] of `SimpleSwapDeployed(address)`. Pinned as a literal
+/// (not computed at runtime) so the tests below can fail loudly if
+/// anyone ever changes the event signature in the factory ABI.
+/// This exact value is verifiable by inspecting the runtime
+/// bytecode at <https://gnosisscan.io/address/0xC2d5A532cf69AA9A1378737D8ccDEF884B6E7420#code>:
+/// the literal appears as a `PUSH32` immediately preceding `LOG1`
+/// at the end of `deploySimpleSwap`.
+pub const SIMPLE_SWAP_DEPLOYED_TOPIC: [u8; 32] = [
+    0xc0, 0xff, 0xc5, 0x25, 0xa1, 0xc7, 0x68, 0x95, 0x49, 0xd7, 0xf7, 0x9b, 0x49, 0xec, 0xa9, 0x00,
+    0xe6, 0x1a, 0xc4, 0x9b, 0x43, 0xd9, 0x77, 0xf6, 0x80, 0xbc, 0xc3, 0xb3, 0x62, 0x24, 0xc0, 0x04,
+];
+
+/// Encode `SimpleSwapFactory.deployedContracts(address) -> bool`.
+/// Returns 32 bytes; non-zero last byte means "deployed by us".
+/// Used both by `antctl chequebook verify` and by the `antd`
+/// startup factory check.
+pub fn factory_deployed_contracts_calldata(chequebook: &[u8; 20]) -> Vec<u8> {
+    let mut data = Vec::with_capacity(4 + 32);
+    data.extend_from_slice(&keccak(b"deployedContracts(address)")[0..4]);
+    data.extend_from_slice(&pad_word_address(chequebook));
+    data
+}
+
+/// Encode `SimpleSwapFactory.ERC20Address() -> address`. Lets the
+/// deploy path verify the factory was constructed for the BZZ
+/// token we expect, before we sign any tx.
+pub fn factory_erc20_address_calldata() -> Vec<u8> {
+    keccak(b"ERC20Address()")[0..4].to_vec()
+}
+
+/// Generate a random 32-byte CREATE2 salt for a chequebook
+/// deploy. Bee picks a fresh salt on every deploy so a re-run
+/// against the same `(issuer, default_hard_deposit_timeout)` pair
+/// doesn't collide with an existing chequebook (CREATE2 +
+/// identical args + identical salt → identical address). We do
+/// the same.
+pub fn random_chequebook_salt() -> [u8; 32] {
+    let mut salt = [0u8; 32];
+    getrandom::fill(&mut salt).expect("OS RNG");
+    salt
+}
+
+/// Decode a `SimpleSwapDeployed(address)` log emitted by the
+/// factory in the same tx as a `deploySimpleSwap` call. The
+/// parameter is non-indexed, so the address sits right-padded in
+/// the first 32-byte word of `data`. Returns `None` if no matching
+/// log is in the receipt — the deploy probably reverted partway
+/// through, in which case the caller should dump the full receipt.
+pub fn extract_deployed_chequebook(receipt: &crate::tx::TxReceipt) -> Option<[u8; 20]> {
+    receipt
+        .logs
+        .iter()
+        .find(|l| l.topics.first() == Some(&SIMPLE_SWAP_DEPLOYED_TOPIC) && l.data.len() >= 32)
+        .map(|l| {
+            let mut addr = [0u8; 20];
+            addr.copy_from_slice(&l.data[12..32]);
+            addr
+        })
+}
+
 fn pad_word_address(addr: &[u8; 20]) -> [u8; 32] {
     let mut w = [0u8; 32];
     w[12..32].copy_from_slice(addr);
@@ -446,5 +540,88 @@ mod tests {
             chequebook_paid_out_selector().to_vec(),
             keccak(b"paidOut(address)")[0..4].to_vec()
         );
+    }
+
+    /// `deployedContracts(address)` selector + ABI layout. Used by
+    /// the daemon startup factory check and `antctl chequebook
+    /// verify`. If the selector is wrong the eth_call returns
+    /// "execution reverted" with no useful info — guard against
+    /// that with a unit test rather than an embarrassing prod boot.
+    #[test]
+    fn factory_deployed_contracts_selector() {
+        let cb = [0x11u8; 20];
+        let calldata = factory_deployed_contracts_calldata(&cb);
+        let want_sel = &keccak(b"deployedContracts(address)")[0..4];
+        assert_eq!(&calldata[0..4], want_sel);
+        assert_eq!(calldata.len(), 4 + 32);
+        // Address is right-padded to 32 bytes.
+        assert_eq!(&calldata[4..16], &[0u8; 12][..]);
+        assert_eq!(&calldata[16..36], &cb[..]);
+    }
+
+    #[test]
+    fn factory_erc20_address_selector_matches() {
+        let calldata = factory_erc20_address_calldata();
+        assert_eq!(calldata.len(), 4);
+        assert_eq!(&calldata[..], &keccak(b"ERC20Address()")[0..4]);
+    }
+
+    /// The literal we pinned for `SimpleSwapDeployed(address)` must
+    /// equal keccak256 of the canonical event signature. If bee
+    /// ever rev's the factory ABI this assertion catches it.
+    #[test]
+    fn simple_swap_deployed_topic_matches_keccak() {
+        let want = keccak(b"SimpleSwapDeployed(address)");
+        assert_eq!(SIMPLE_SWAP_DEPLOYED_TOPIC, want);
+    }
+
+    /// `extract_deployed_chequebook` pulls the right address out of a
+    /// hand-crafted log mimicking the factory's emit.
+    #[test]
+    fn extract_deployed_chequebook_finds_address() {
+        let cb = [0xab; 20];
+        let mut data = vec![0u8; 32];
+        data[12..32].copy_from_slice(&cb);
+        let receipt = crate::tx::TxReceipt {
+            tx_hash: [0u8; 32],
+            block_number: 1,
+            logs: vec![crate::tx::EventLog {
+                address: GNOSIS_CHEQUEBOOK_FACTORY,
+                topics: vec![SIMPLE_SWAP_DEPLOYED_TOPIC],
+                data,
+            }],
+        };
+        assert_eq!(extract_deployed_chequebook(&receipt), Some(cb));
+    }
+
+    /// Receipt without the factory's `SimpleSwapDeployed` log →
+    /// `None`, so the caller can dump a useful error.
+    #[test]
+    fn extract_deployed_chequebook_none_without_topic() {
+        let receipt = crate::tx::TxReceipt {
+            tx_hash: [0u8; 32],
+            block_number: 1,
+            logs: vec![crate::tx::EventLog {
+                address: [0u8; 20],
+                topics: vec![[0xff; 32]],
+                data: vec![0u8; 32],
+            }],
+        };
+        assert_eq!(extract_deployed_chequebook(&receipt), None);
+    }
+
+    #[test]
+    fn gnosis_factory_address_literal() {
+        assert_eq!(
+            hex::encode(GNOSIS_CHEQUEBOOK_FACTORY),
+            "c2d5a532cf69aa9a1378737d8ccdef884b6e7420"
+        );
+    }
+
+    #[test]
+    fn gnosis_bzz_token_bytes_matches_string_const() {
+        let s = crate::GNOSIS_BZZ_TOKEN.trim_start_matches("0x");
+        let want = hex::decode(s).unwrap();
+        assert_eq!(GNOSIS_BZZ_TOKEN_BYTES.to_vec(), want);
     }
 }

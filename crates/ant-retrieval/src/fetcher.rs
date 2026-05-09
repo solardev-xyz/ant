@@ -22,6 +22,7 @@ use crate::accounting::{Accounting, DebitGuard};
 use crate::counters::RetrievalCounters;
 use crate::disk_cache::DiskChunkCache;
 use crate::progress::ProgressTracker;
+use crate::pushsync_settlement::{peer_chunk_price, PushsyncSettlement};
 use crate::{retrieve_chunk, ChunkFetcher, InMemoryChunkCache, RetrievalError, RetrievedChunk};
 use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -170,6 +171,17 @@ pub struct RoutingFetcher {
     /// delta. `None` in unit tests (no daemon); the daemon clones
     /// one shared `Arc` into every fetcher.
     counters: Option<Arc<RetrievalCounters>>,
+    /// Optional pushsync-side settlement hook. When `Some`, every
+    /// accepted pushsync receipt is reported via
+    /// [`PushsyncSettlement::note_pushsync`] so the implementation
+    /// can decide whether the per-peer outbound debt has crossed a
+    /// SWAP-cheque trigger. The fetcher itself stays ignorant of
+    /// SWAP / chequebook concerns; the implementation lives in
+    /// `ant-p2p::pushsync_swap`. `None` keeps the legacy
+    /// "push without settlement" behaviour for unit tests and the
+    /// ultra-light read-only build (where the daemon never opens a
+    /// pushsync stream anyway).
+    pushsync_settlement: Option<Arc<dyn PushsyncSettlement>>,
 }
 
 impl RoutingFetcher {
@@ -202,7 +214,23 @@ impl RoutingFetcher {
             payment_notify: None,
             accounting: None,
             counters: None,
+            pushsync_settlement: None,
         }
+    }
+
+    /// Attach a pushsync-side settlement hook. After every accepted
+    /// pushsync receipt we call `settlement.note_pushsync(peer, price)`
+    /// so the hook can decide whether to emit a SWAP cheque before the
+    /// next push lands. The hook is best-effort: a settlement failure
+    /// does not fail the upload, just causes the next pushsync against
+    /// the same peer to potentially be RST'd by bee. See
+    /// [`PushsyncSettlement`] for the rationale.
+    pub fn with_pushsync_settlement(
+        mut self,
+        settlement: Arc<dyn PushsyncSettlement>,
+    ) -> Self {
+        self.pushsync_settlement = Some(settlement);
+        self
     }
 
     /// Attach the process-wide retrieval counters. The daemon shares
@@ -403,9 +431,24 @@ impl RoutingFetcher {
                 }
                 Ordering::Equal
             });
-            let Some((peer, _)) = ranked.first().copied() else {
+            let Some((peer, peer_overlay)) = ranked.first().copied() else {
                 return Err(crate::pushsync::PushSyncError::Remote("no peers".into()));
             };
+            let chunk_price = peer_chunk_price(&peer_overlay, &chunk_addr);
+
+            // Settle before pushing if the implementation wants to. The
+            // hook is allowed to (and will) block on opening a swap
+            // stream, so this serialises pushsync against settlement
+            // for THIS peer — bee accepts the cheque, credits us, then
+            // accepts the chunk on the same connection. Without this
+            // pre-settle, the very next pushsync after a threshold
+            // crossing would land before the cheque and bee would RST
+            // it. Reporting `0` here is a no-op for the threshold check
+            // (we haven't accrued anything new) but lets the hook
+            // re-emit a pending cheque from a previous failed attempt.
+            if let Some(s) = self.pushsync_settlement.as_ref() {
+                s.note_pushsync(peer, 0).await;
+            }
 
             let mut err = match push_chunk_to_peer(
                 &mut control,
@@ -416,7 +459,12 @@ impl RoutingFetcher {
             )
             .await
             {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    if let Some(s) = self.pushsync_settlement.as_ref() {
+                        s.note_pushsync(peer, chunk_price).await;
+                    }
+                    return Ok(());
+                }
                 Err(e) => e,
             };
 
@@ -440,7 +488,12 @@ impl RoutingFetcher {
                 )
                 .await
                 {
-                    Ok(_) => return Ok(()),
+                    Ok(_) => {
+                        if let Some(s) = self.pushsync_settlement.as_ref() {
+                            s.note_pushsync(peer, chunk_price).await;
+                        }
+                        return Ok(());
+                    }
                     Err(e) => err = e,
                 }
             }

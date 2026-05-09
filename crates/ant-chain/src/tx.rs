@@ -58,6 +58,16 @@ pub const POSTAGE_INCREASE_DEPTH_GAS: u64 = 800_000;
 /// production; we round up to 200k so a cold paidOut slot or a
 /// 0-balance fail still has runway.
 pub const CHEQUEBOOK_CASH_GAS: u64 = 200_000;
+/// `SimpleSwapFactory.deploySimpleSwap` gas limit. The factory does
+/// a CREATE2 of the SimpleSwap proxy, calls `setIssuer` on it, and
+/// flips a `deployedContracts[swap]` storage slot. Empirically
+/// ~700 K on Gnosis; we cap at 1.5 M for headroom against future
+/// EIP gas-cost bumps. A successful tx still only burns the actual
+/// gas used, so over-capping costs nothing.
+pub const FACTORY_DEPLOY_CHEQUEBOOK_GAS: u64 = 1_500_000;
+/// Plain `IERC20.transfer(to, value)` to fund a freshly-deployed
+/// chequebook. Same shape as `approve`, so 100 K is plenty.
+pub const ERC20_TRANSFER_GAS: u64 = 100_000;
 
 #[derive(Debug, Error)]
 pub enum TxError {
@@ -199,6 +209,19 @@ pub fn erc20_approve_calldata(spender: &[u8; 20], value: &U256) -> Vec<u8> {
     let mut data = Vec::with_capacity(4 + 32 + 32);
     data.extend_from_slice(&keccak256(b"approve(address,uint256)")[0..4]);
     data.extend_from_slice(&pad_word_address(spender));
+    data.extend_from_slice(&u256_be_word(value));
+    data
+}
+
+/// `IERC20.transfer(address to, uint256 value)` calldata. Used by
+/// `Wallet::erc20_transfer` to fund a freshly-deployed chequebook
+/// directly from the operator's wallet (the SimpleSwap contract
+/// has no `deposit()` view; its `balance()` is just
+/// `BZZ.balanceOf(swap)`, so a plain transfer is the funding path).
+pub fn erc20_transfer_calldata(to: &[u8; 20], value: &U256) -> Vec<u8> {
+    let mut data = Vec::with_capacity(4 + 32 + 32);
+    data.extend_from_slice(&keccak256(b"transfer(address,uint256)")[0..4]);
+    data.extend_from_slice(&pad_word_address(to));
     data.extend_from_slice(&u256_be_word(value));
     data
 }
@@ -622,6 +645,49 @@ impl Wallet {
         );
         self.send_signed(client, *chequebook, data, CHEQUEBOOK_CASH_GAS)
             .await
+    }
+
+    /// `SimpleSwapFactory.deploySimpleSwap(issuer, defaultHardDepositTimeoutDuration, salt)`.
+    /// Returns the receipt; pull the new chequebook address with
+    /// [`crate::chequebook::extract_deployed_chequebook`]. The
+    /// wallet (`self`) just pays gas — the *issuer* baked into the
+    /// chequebook is the `issuer` argument, which can be any EOA
+    /// (so the operator can run cold-storage issuer keys without
+    /// ever exposing them to a Gnosis RPC node).
+    pub async fn deploy_chequebook(
+        &self,
+        client: &ChainClient,
+        factory: &[u8; 20],
+        issuer: &[u8; 20],
+        default_hard_deposit_timeout: U256,
+        salt: &[u8; 32],
+    ) -> Result<TxReceipt, TxError> {
+        let data = crate::chequebook::deploy_chequebook_calldata(
+            issuer,
+            default_hard_deposit_timeout,
+            salt,
+        );
+        self.send_signed(client, *factory, data, FACTORY_DEPLOY_CHEQUEBOOK_GAS)
+            .await
+    }
+
+    /// `IERC20.transfer(to, value)` against `token`. The chequebook
+    /// `balance()` view just reads `BZZ.balanceOf(swap)`, so
+    /// funding a chequebook is literally a token transfer.
+    pub async fn erc20_transfer(
+        &self,
+        client: &ChainClient,
+        token: &[u8; 20],
+        to: &[u8; 20],
+        value: U256,
+    ) -> Result<TxReceipt, TxError> {
+        self.send_signed(
+            client,
+            *token,
+            erc20_transfer_calldata(to, &value),
+            ERC20_TRANSFER_GAS,
+        )
+        .await
     }
 
     async fn send_signed(

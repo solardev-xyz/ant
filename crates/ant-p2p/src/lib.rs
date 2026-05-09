@@ -6,12 +6,17 @@ pub mod dnsaddr;
 mod handshake;
 mod peerstore;
 pub mod pseudosettle;
+pub mod pushsync_swap;
 pub mod routing;
 mod sinks;
 pub mod swap;
 mod underlay;
 
 pub use behaviour::{run, RunConfig, RunError, SwapConfig, UploadRuntime, DEFAULT_TARGET_PEERS};
+pub use pushsync_swap::{
+    NoopPushsyncSettlement, PeerEthMap, PushsyncSwap, PushsyncSwapConfig, DEFAULT_CHEQUE_TRIGGER,
+    LIGHT_PAYMENT_THRESHOLD,
+};
 pub use handshake::{
     handshake_outbound, handshake_outbound_with_role, HandshakeError, HandshakeInfo,
     PROTOCOL_HANDSHAKE,

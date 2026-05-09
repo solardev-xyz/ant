@@ -71,11 +71,10 @@ const SWARM_COLLECTION: HeaderName = HeaderName::from_static("swarm-collection")
 const SWARM_INDEX_DOCUMENT: HeaderName = HeaderName::from_static("swarm-index-document");
 
 /// Concurrency cap on outbound `PushChunk` commands during a `POST /bzz`
-/// upload. Each command opens (potentially) one libp2p stream into the
-/// chunk's neighbourhood; a 1 K-chunk file at unbounded fan-out would
-/// queue 1 K simultaneous streams against the same daemon and starve
-/// other handlers. 32 matches the daemon's `RETRIEVAL_INFLIGHT_CAP` so
-/// retrieval and pushsync share roughly the same worst-case fan-out.
+/// upload. Matched to the daemon-side
+/// `ant_node::uploads::MAX_PUSH_CONCURRENCY`. See the doc comment
+/// there for sizing rationale: bee's per-peer stream acceptance is
+/// the bottleneck, not our concurrency cap.
 const MAX_PUSH_CONCURRENCY: usize = 32;
 
 /// Hard cap on a single `POST /bzz` request body. Sized to comfortably
@@ -138,16 +137,29 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Per-request body-size ceiling for `/bytes` and `/bzz`. Bee streams,
-/// so it imposes no cap at all; we materialise the joined body in
-/// memory before responding, so an unbounded ceiling would let one
-/// pathological manifest exhaust process RAM. 1 GiB covers every
-/// realistic web/media payload (videos, archives, large image sets)
-/// while still rejecting a malicious root chunk that claims a
-/// multi-terabyte span. Each in-flight request costs at most this much
-/// resident memory until the response drains. The CLI keeps the much
-/// tighter `ant_retrieval::DEFAULT_MAX_FILE_BYTES` (32 MiB) since its
-/// audience is interactive `antctl get`, not a browser.
-pub(crate) const GATEWAY_MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024;
+/// so it imposes no cap at all; the joiner used to materialise the
+/// whole body before responding (hence the original 1 GiB sizing),
+/// but `dispatch_bzz`/`dispatch_bytes` now go through
+/// `join_to_sender_range`, which streams via a bounded
+/// (`FETCH_FANOUT * STREAM_PIPE_DEPTH * CHUNK_SIZE` ≈ 4 MiB) pipeline
+/// regardless of declared span. The cap is therefore a "sanity bound
+/// on the declared span" rather than a memory cap: it stops a
+/// pathological manifest claiming a petabyte from making us walk
+/// trillions of intermediate chunks before failing.
+///
+/// 16 GiB sized to cover the largest AI model weights we expect to
+/// host (e.g. 70B-parameter LLMs at 4-bit quantisation are ~35-50 GB
+/// — those still need a higher ceiling, but at that point the
+/// operator should opt in explicitly), and to comfortably swallow
+/// modern AV1 long-form video and disk images. The CLI keeps the
+/// much tighter `ant_retrieval::DEFAULT_MAX_FILE_BYTES` (32 MiB)
+/// since its audience is interactive `antctl get`, not a browser.
+///
+/// Pre-2026-05-09 this was 1 GiB; raised after the gemma4:e2b
+/// 6.7 GiB GGUF upload surfaced "file too large: span 7162394016
+/// bytes, cap 1073741824 bytes" on the very first retrieval (see
+/// PLAN.md Phase 7g).
+pub(crate) const GATEWAY_MAX_FILE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 /// `GET /chunks/{addr}` and `HEAD /chunks/{addr}`. Returns the chunk's
 /// **wire bytes** (`span(8 LE) || payload`) — bee's `chunkstore.Get`

@@ -69,10 +69,27 @@ pub use state::{UploadJobInfo, UploadStatus};
 /// Re-exported from `ant_retrieval` if outside callers need it.
 const CHUNK_SIZE: usize = 4096;
 
-/// Maximum simultaneous in-flight `PushChunk` futures per job. Same
-/// value as the gateway's `MAX_PUSH_CONCURRENCY` so a single upload
-/// can saturate the daemon's pushsync capacity without unfairly
-/// dwarfing concurrent reads.
+/// Maximum simultaneous in-flight `PushChunk` futures per job.
+///
+/// # Sizing experiments (Phase 7e, 2026-05-08)
+///
+/// We tried raising this to 256 to multiply throughput. The 256 MiB
+/// smoke test **failed at 27 %** with `push timed out after 60s`
+/// across the peer set: bee's per-peer stream-acceptance rate is
+/// strict, and 256 concurrent open-stream attempts trigger
+/// `units_accepted = 0` from the pseudosettle path (bee deciding our
+/// debt picture is inconsistent with what it expects) and yamux
+/// disconnects in droves. 32 reproducibly completes the same upload.
+///
+/// The real bottleneck is bee-side accounting: at ~100 active peers
+/// the network-wide credit budget is roughly
+/// `100 peers × lightRefreshRate (5 K PLUR/s) + cheques`, which caps
+/// chunk acceptance at ~30-50 chunks/s regardless of how many
+/// streams we open. Pushing harder just causes bee to RST our
+/// streams. So we keep 32 — it saturates the network path without
+/// upsetting bee. Future throughput gains will come from emitting
+/// cheques pre-emptively (see below) or expanding the active peer
+/// set, not from raising this constant.
 const MAX_PUSH_CONCURRENCY: usize = 32;
 
 /// Re-checkpoint the on-disk job manifest every N successful pushes.

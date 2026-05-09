@@ -4,7 +4,7 @@ pub mod uploads;
 
 use ant_control::{ControlCommand, GatewayActivity, StatusSnapshot};
 use ant_crypto::{OVERLAY_NONCE_LEN, SECP256K1_SECRET_LEN};
-use ant_p2p::{run, RunConfig, SwapConfig, UploadRuntime};
+use ant_p2p::{run, PeerEthMap, PushsyncSwapConfig, RunConfig, SwapConfig, UploadRuntime};
 use libp2p::identity::Keypair;
 use libp2p::multiaddr::Multiaddr;
 use std::path::PathBuf;
@@ -38,6 +38,15 @@ pub struct NodeConfig {
     /// mutating `antctl` subcommands (`peers reset`, …) will fail with a
     /// "channel not wired up" error.
     pub commands: Option<mpsc::Receiver<ControlCommand>>,
+    /// Peer-set target — how many BZZ-handshake-complete peers the swarm
+    /// loop tries to keep online. `None` falls back to
+    /// `ant_p2p::DEFAULT_TARGET_PEERS` (100), which is the right size
+    /// for cheap-CPU light-mode operation. Override (e.g. 200) to widen
+    /// the network-wide credit budget for long uploads — bee grants each
+    /// peer ~5 K PLUR/sec of pseudosettle credit, so doubling peers
+    /// roughly doubles per-second debit headroom. Mostly a knob for
+    /// upload throughput experiments.
+    pub target_peers: Option<usize>,
     /// Baseline for `PeerInfo` cold-start timings (`antctl top` milestones).
     pub process_start: Instant,
     /// Scope the in-memory chunk cache to a single request. Default
@@ -78,6 +87,14 @@ pub struct NodeConfig {
     /// the protocol is still negotiated but every received cheque is
     /// dropped silently.
     pub swap: Option<SwapConfig>,
+    /// Outbound SWAP settlement (Phase 7b). When `Some`, every
+    /// successful pushsync push reports into a per-peer cumulative
+    /// debit mirror, and an EIP-712 cheque is emitted automatically
+    /// once the per-peer debt crosses the configured trigger. Required
+    /// for sustained uploads to Bee mainnet — without it pushsync
+    /// stalls after a few hundred chunks per peer (bee
+    /// `paymentTolerance`). See PLAN.md § Phase 7b.
+    pub pushsync_swap: Option<PushsyncSwapConfig>,
     /// `antctl upload` job manager. When `Some`, `run_node` installs
     /// a command interceptor in front of `ant-p2p` that catches
     /// `ControlCommand::Upload*` variants and dispatches them to
@@ -110,6 +127,7 @@ impl NodeConfig {
             status: None,
             peerstore_path: None,
             commands: None,
+            target_peers: None,
             process_start: Instant::now(),
             per_request_chunk_cache: false,
             chunk_record_dir: None,
@@ -117,6 +135,7 @@ impl NodeConfig {
             disk_cache: None,
             upload: None,
             swap: None,
+            pushsync_swap: None,
             upload_manager: None,
         }
     }
@@ -138,6 +157,11 @@ impl NodeConfig {
 
     pub fn with_commands(mut self, commands: mpsc::Receiver<ControlCommand>) -> Self {
         self.commands = Some(commands);
+        self
+    }
+
+    pub fn with_target_peers(mut self, target_peers: Option<usize>) -> Self {
+        self.target_peers = target_peers;
         self
     }
 
@@ -179,6 +203,11 @@ impl NodeConfig {
         self
     }
 
+    pub fn with_pushsync_swap(mut self, cfg: Option<PushsyncSwapConfig>) -> Self {
+        self.pushsync_swap = cfg;
+        self
+    }
+
     pub fn with_upload_manager(mut self, mgr: Option<UploadManager>) -> Self {
         self.upload_manager = mgr;
         self
@@ -205,6 +234,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<(), NodeError> {
         (commands, _) => (commands, None),
     };
 
+    let peer_eth = PeerEthMap::new();
     run(RunConfig {
         signing_secret: cfg.signing_secret,
         overlay_nonce: cfg.overlay_nonce,
@@ -213,7 +243,11 @@ pub async fn run_node(cfg: NodeConfig) -> Result<(), NodeError> {
         libp2p_keypair: cfg.libp2p_keypair,
         external_addrs: cfg.external_addrs,
         status: cfg.status,
-        target_peers: 0,
+        // `None` → 0 → `ant_p2p` falls back to `DEFAULT_TARGET_PEERS = 100`.
+        // `Some(n)` is forwarded literally; values above bee's typical
+        // neighbourhood fan-out (~few hundred) just plateau at the
+        // achievable peer count without harm.
+        target_peers: cfg.target_peers.unwrap_or(0),
         peerstore_path: cfg.peerstore_path,
         commands: forward_rx,
         process_start: cfg.process_start,
@@ -223,6 +257,11 @@ pub async fn run_node(cfg: NodeConfig) -> Result<(), NodeError> {
         disk_cache: cfg.disk_cache,
         upload: cfg.upload,
         swap: cfg.swap,
+        pushsync_swap: cfg.pushsync_swap.map(|mut c| {
+            c.peer_eth = peer_eth.clone();
+            c
+        }),
+        peer_eth,
     })
     .await?;
     Ok(())

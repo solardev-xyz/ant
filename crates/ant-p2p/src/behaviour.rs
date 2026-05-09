@@ -134,6 +134,24 @@ pub struct RunConfig {
     /// — so peers don't see a libp2p disconnect when they emit a
     /// cheque — but every received cheque is silently dropped.
     pub swap: Option<SwapConfig>,
+    /// Optional outbound SWAP settlement configuration (Phase 7b).
+    /// When `Some`, every accepted pushsync receipt is reported into
+    /// a [`crate::PushsyncSwap`] which tracks per-peer cumulative
+    /// debt and emits an EIP-712 cheque to the peer's BZZ-handshake
+    /// EOA when the debt crosses [`crate::DEFAULT_CHEQUE_TRIGGER`].
+    /// Without this, sustained pushsync uploads stall after a few
+    /// hundred chunks per peer (bee's paymentTolerance) — see the
+    /// 2026-05-08 production failure write-up in `PLAN.md` § Phase 7b.
+    pub pushsync_swap: Option<crate::PushsyncSwapConfig>,
+    /// Shared `peer_id -> ethereum_address` registry. The swarm
+    /// loop populates this in the BZZ-handshake-success branch
+    /// (with `HandshakeInfo::remote_eth_address`) so the pushsync
+    /// settlement subsystem can recover the cheque beneficiary EOA
+    /// for any peer it just pushed to. Always present so the
+    /// daemon can install a record without a runtime check; the
+    /// pushsync settlement code only consults it when
+    /// `pushsync_swap` is configured.
+    pub peer_eth: crate::PeerEthMap,
 }
 
 /// Inputs needed to spin up the SWAP inbound listener.
@@ -674,9 +692,25 @@ struct SwarmState {
     /// Wide enough to keep one slot per address ever advertised in this
     /// process; UPnP / listener churn keeps this very small in practice.
     external_addresses_order: Vec<Multiaddr>,
+    /// Shared `peer_id -> ethereum_address` map. Populated in the
+    /// BZZ-handshake-success branch of `apply_drive_outcome`; consumed
+    /// by [`crate::PushsyncSwap`] to look up the cheque beneficiary
+    /// for a libp2p peer. Cloned from `RunConfig::peer_eth` so the
+    /// owner outside the swarm loop (e.g. a future `antctl swap
+    /// snapshot` HTTP handler) can read the same registry.
+    peer_eth: crate::PeerEthMap,
+    /// Outbound SWAP settlement service. Built once at swarm startup
+    /// from `RunConfig::pushsync_swap` (if set) using the swarm's
+    /// `libp2p_stream::Control`, then cloned into every
+    /// `RoutingFetcher` for `PushChunk` requests so the per-peer
+    /// debt counter is shared across uploads. `None` keeps the
+    /// legacy "push without settlement" behaviour for ultra-light
+    /// reads + tests.
+    pushsync_swap: Option<Arc<crate::PushsyncSwap>>,
 }
 
 impl SwarmState {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         target_peers: usize,
         base_overlay: Overlay,
@@ -684,6 +718,7 @@ impl SwarmState {
         chunk_record_dir: Option<PathBuf>,
         gateway_activity: Option<Arc<GatewayActivity>>,
         disk_cache: Option<Arc<ant_retrieval::DiskChunkCache>>,
+        peer_eth: crate::PeerEthMap,
     ) -> Self {
         let chunk_cache = if per_request_chunk_cache {
             None
@@ -719,6 +754,8 @@ impl SwarmState {
             bee_peerstore_stall_warning_emitted: false,
             external_addresses: HashMap::new(),
             external_addresses_order: Vec::new(),
+            peer_eth,
+            pushsync_swap: None,
         }
     }
 
@@ -1086,6 +1123,7 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
         cfg.chunk_record_dir.clone(),
         cfg.gateway_activity.clone(),
         cfg.disk_cache.clone(),
+        cfg.peer_eth.clone(),
     );
 
     // Advertise any user-supplied external addresses so bee's peerstore sees
@@ -1129,6 +1167,14 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     let (hot_hint_tx, hot_hint_rx) = mpsc::channel::<ant_retrieval::accounting::HotHint>(
         crate::pseudosettle::HOT_HINT_CHANNEL_CAP,
     );
+    // Phase 7d: same `HotHint` channel feeds both retrieval-side
+    // accounting and pushsync-side debt accumulation. The driver
+    // doesn't care which subsystem produced the hint; it only acts
+    // on the (peer, hot=true) flag. Clone the sender so we can pass
+    // a copy into `PushsyncSwap` further down — the channel is
+    // reference-counted internally so cloning is cheap and only
+    // the last drop closes the receiver side.
+    let hot_hint_tx_for_pushsync = hot_hint_tx.clone();
     let accounting =
         Arc::new(ant_retrieval::accounting::Accounting::new().with_hot_hint(hot_hint_tx));
     tokio::spawn(crate::pseudosettle::run_driver(
@@ -1140,6 +1186,38 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     ));
     state.payment_notify = Some(payment_notify_for_state);
     state.accounting = Some(accounting);
+    // Phase 7b: outbound SWAP settlement. Built once we have a `Control`
+    // for opening swap streams and the shared peer-EOA registry. When
+    // `cfg.pushsync_swap` is `None` (operator hasn't configured a
+    // chequebook), we leave `state.pushsync_swap` as `None` and the
+    // fetcher silently falls back to the legacy "push without
+    // settlement" behaviour — fine for ultra-light read-only builds,
+    // and in failure-mode for upload-heavy ones (uploads run for ~20K
+    // chunks then stall, surfacing the obvious error). The
+    // `OutboundLedger` snapshot lives at the configured path so
+    // cumulative cheque amounts survive restarts.
+    if let Some(swap_cfg) = cfg.pushsync_swap.clone() {
+        // Phase 7d: thread the shared hot-hint sender into the SWAP
+        // service so each `note_pushsync` queues a pseudosettle
+        // refresh on the same driver that retrieval-side debt uses.
+        let svc = Arc::new(
+            crate::PushsyncSwap::new(swap_cfg, control.clone())
+                .with_hot_hint(hot_hint_tx_for_pushsync),
+        );
+        info!(
+            target: "ant_p2p::pushsync_swap",
+            chequebook = %hex::encode(svc.chequebook()),
+            "outbound SWAP settlement enabled (with pseudosettle hot-hint integration)",
+        );
+        state.pushsync_swap = Some(svc);
+    } else {
+        info!(
+            target: "ant_p2p::pushsync_swap",
+            "outbound SWAP settlement DISABLED — uploads will stall \
+             after ~20K chunks across the peer set; configure \
+             --chequebook + --swap-key to enable",
+        );
+    }
     let mut peerstore = match cfg.peerstore_path.clone() {
         Some(p) => PeerStore::load(p),
         None => PeerStore::disabled(),
@@ -1407,8 +1485,13 @@ fn handle_control_command(
                 return;
             }
             let control = control.clone();
+            let pushsync_swap = state.pushsync_swap.clone();
             tokio::spawn(async move {
-                let fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx);
+                let mut fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx);
+                if let Some(svc) = pushsync_swap {
+                    let s: Arc<dyn ant_retrieval::PushsyncSettlement> = svc;
+                    fetcher = fetcher.with_pushsync_settlement(s);
+                }
                 let reply = match fetcher.push_stamped_cac(addr, wire, stamp).await {
                     Ok(()) => ControlAck::ChunkUploaded {
                         reference: format!("0x{}", hex::encode(addr)),
@@ -2978,6 +3061,21 @@ fn handle_swarm_event(
             if let Some(acc) = state.accounting.as_ref() {
                 acc.forget(&peer_id);
             }
+            // Same logic for the pushsync-side outbound debt mirror
+            // (Phase 7b): bee resets its view of our debt on
+            // reconnect, so any local pending PLUR for this peer is
+            // stale and would otherwise either over-pay (we re-emit
+            // a cheque the receiver has already cashed in their
+            // mind) or skip cheque emission until a much higher
+            // threshold than necessary.
+            if let Some(s) = state.pushsync_swap.as_ref() {
+                ant_retrieval::PushsyncSettlement::forget(s.as_ref(), &peer_id);
+            }
+            // Drop the EOA registry entry too — a reconnected peer
+            // re-runs the BZZ handshake and re-records its beneficiary,
+            // so a stale entry can only mislead. Idempotent on peers
+            // we never had a handshake for.
+            state.peer_eth.forget(&peer_id);
             state.publish_peers();
             if was_bzz {
                 info!(
@@ -3080,6 +3178,12 @@ fn handle_drive_outcome(
             // (signature recovers to an Ethereum address whose overlay
             // matches the declared one), so admitting it is safe.
             state.routing.admit(peer, info.remote_overlay);
+            // Record the peer's beneficiary EOA in the shared registry
+            // so the pushsync-side SWAP settlement (Phase 7b) can look
+            // it up later when emitting cheques. Cheap (one HashMap
+            // insert behind RwLock); harmless on builds where SWAP is
+            // unconfigured (registry has no consumers in that case).
+            state.peer_eth.record(peer, info.remote_eth_address);
             state.publish_peers();
             let peer_set_size = state.peer_set_size();
             state.failed.retain(|f| f.peer != peer);
@@ -3594,7 +3698,8 @@ mod tests {
     /// 502s on multi-MiB media files.
     #[test]
     fn publish_peers_reflects_admit_and_forget() {
-        let mut state = SwarmState::new(32, [0u8; 32], false, None, None, None);
+        let mut state =
+            SwarmState::new(32, [0u8; 32], false, None, None, None, crate::PeerEthMap::new());
         let mut rx = state.peers_watch.subscribe();
         // Initial state: empty.
         assert!(rx.borrow_and_update().is_empty());
@@ -3629,7 +3734,8 @@ mod tests {
     /// then we shut up.
     #[test]
     fn bee_peerstore_stall_warning_is_one_shot() {
-        let mut state = SwarmState::new(32, [0u8; 32], false, None, None, None);
+        let mut state =
+            SwarmState::new(32, [0u8; 32], false, None, None, None, crate::PeerEthMap::new());
         let stall = OutboundPipelineMs {
             dial_ms: Some(50),
             identifying_ms: 50,
@@ -3663,7 +3769,8 @@ mod tests {
     /// changing one of these strings is a breaking-API event.
     #[test]
     fn external_addresses_status_attributes_source_in_order() {
-        let mut state = SwarmState::new(32, [0u8; 32], false, None, None, None);
+        let mut state =
+            SwarmState::new(32, [0u8; 32], false, None, None, None, crate::PeerEthMap::new());
         let (tx, rx) = watch::channel(StatusSnapshot::default());
 
         let manual: Multiaddr = "/ip4/203.0.113.10/tcp/1634".parse().unwrap();
@@ -3706,7 +3813,8 @@ mod tests {
     /// addresses on display long after the mapping is gone.
     #[test]
     fn external_addresses_status_drops_retracted_entry() {
-        let mut state = SwarmState::new(32, [0u8; 32], false, None, None, None);
+        let mut state =
+            SwarmState::new(32, [0u8; 32], false, None, None, None, crate::PeerEthMap::new());
         let (tx, rx) = watch::channel(StatusSnapshot::default());
 
         let a: Multiaddr = "/ip4/203.0.113.10/tcp/1634".parse().unwrap();
@@ -3750,7 +3858,8 @@ mod tests {
     /// fire when `identifying_ms` itself is past the threshold.
     #[test]
     fn bee_peerstore_stall_warning_skips_slow_identify() {
-        let mut state = SwarmState::new(32, [0u8; 32], false, None, None, None);
+        let mut state =
+            SwarmState::new(32, [0u8; 32], false, None, None, None, crate::PeerEthMap::new());
         let p = OutboundPipelineMs {
             dial_ms: Some(50),
             identifying_ms: 3_000,

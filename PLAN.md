@@ -555,7 +555,7 @@ Workspace is at **`0.3.4`** across all live crates (`antd`, `antctl`, `ant-contr
 | **M2 / Phase 4** — Ultra-light packaging | 🚧 partial | Tier-A `ant-gateway` live on 127.0.0.1:1633 with `--api-addr` / `--no-http-api` (Appendix D); bee-js / curl / browser smoke passes. **Mobile artefact (xcframework / aar) not started yet.** `antctl get` streams progress but the download body is still terminal, not byte-streamed (Appendix E Phase 5). |
 | **M3 / Phase 5** — Chain plumbing (reads + writes) | ✅ shipped | New `ant-chain` crate. JSON-RPC client (`eth_call`, `eth_getLogs`, `eth_getBalance`, `eth_estimateGas`, `eth_sendRawTransaction`, `eth_getTransactionReceipt`). ABI calldata builders for ERC-20 (`balanceOf`, `approve`), `PostageStamp` (`createBatch`, `topUp`, `increaseDepth`, `batchOwner`, `batchDepth`, `batchBucketDepth`, `batchImmutableFlag`), and `SimpleSwap` chequebook (`issuer`, `balance`, `liquidBalance`, `totalPaidOut`, `cashChequeBeneficiary`). EIP-155 legacy tx signing with `ant_crypto::sign_prehash`. Receipt polling. `dry_run_wallet` example. |
 | **M3 / Phase 6** — First uploads (pre-provisioned batch) | ✅ shipped | New `ant-postage` (`StampIssuer`, EIP-191 stamp signing, bucket counters with crash-safe `write tmp + fsync + rename` persistence) + new `ant-retrieval::pushsync` (`/swarm/pushsync/1.3.1/pushsync` client, receipt verification, storer-signature recovery). Wired through `antd` → `UploadRuntime` → gateway `POST /chunks`. Live mainnet smoke: single-chunk push + retrieve via fresh fetcher. |
-| **M3 / Phase 7** — SWAP / payment | 🚧 partial | EIP-712 cheque signing + verification primitives (`ant-chain::chequebook`), with the chequebook EIP-712 domain matching bee's `EIP712DomainType` (`name / version / chainId`, no `verifyingContract`). Bee-compatible `/swarm/swap/1.0.0/swap` listener + dialer (`ant-p2p::swap`) — JSON-encoded `SignedCheque` inside protobuf `EmitCheque`, signature verified, monotonic, sticky issuer-EOA pinning, crash-safe on-disk credit ledger. BZZ handshake now exposes the peer's Ethereum EOA + welcome string in `HandshakeInfo` (and a new `handshake_outbound_with_role` lets the smoke binary advertise as a full node). Outbound `OutboundLedger` + `issue_and_emit` helpers in place. **Tier-1 on-chain cheque round-trip ✅** — `antctl chequebook cash-self --submit` proves bit-exact bee compatibility on Gnosis mainnet (block `46019699`, tx `0x643bb08e…e308`); the chequebook contract recovered our issuer from our EIP-712 cheque and debited 1 PLUR. **Outstanding:** automatic settlement trigger from `ant-retrieval::accounting`; re-run the live `cheque_smoke` mainnet binary now that the digest is fixed (the previous "cold-peer rejection" diagnosis is currently unconfirmed — bee may have just been rejecting our broken EIP-712 digest); automatic chequebook factory deploy. |
+| **M3 / Phase 7** — SWAP / payment | 🚧 partial | EIP-712 cheque signing + verification primitives (`ant-chain::chequebook`), with the chequebook EIP-712 domain matching bee's `EIP712DomainType` (`name / version / chainId`, no `verifyingContract`). Bee-compatible `/swarm/swap/1.0.0/swap` listener + dialer (`ant-p2p::swap`) — JSON-encoded `SignedCheque` inside protobuf `EmitCheque`, signature verified, monotonic, sticky issuer-EOA pinning, crash-safe on-disk credit ledger. BZZ handshake now exposes the peer's Ethereum EOA + welcome string in `HandshakeInfo` (and a new `handshake_outbound_with_role` lets the smoke binary advertise as a full node). Outbound `OutboundLedger` + `issue_and_emit` helpers in place. **Tier-1 on-chain cheque round-trip ✅** — `antctl chequebook cash-self --submit` proves bit-exact bee compatibility on Gnosis mainnet (block `46019699`, tx `0x643bb08e…e308`); the chequebook contract recovered our issuer from our EIP-712 cheque and debited 1 PLUR. **2026-05-08 production blocker:** real-world GGUF upload attempt confirmed that pushsync today **pays nobody** — the dialer in `ant_retrieval::pushsync` has no debit hook and no cheque emission, so peers silently RST us after their `paymentTolerance` is exceeded (~20-30 K successful chunks across the peer set). Phase 7 polish was already aware of "auto-settlement trigger missing", but the original plan-list framed it as a retrieval-side accounting hook (the existing `Accounting` mirror); in fact the missing piece is upload-side outbound accounting — captured as the new **Phase 7b — Pushsync-side outbound accounting** below. **Outstanding:** Phase 7b (in progress); re-run the live `cheque_smoke` mainnet binary now that the digest is fixed (the previous "cold-peer rejection" diagnosis is currently unconfirmed — bee may have just been rejecting our broken EIP-712 digest); automatic chequebook factory deploy. |
 | **M3 / Phase 8** — Stamp lifecycle | ✅ shipped | `antctl postage create / top-up / dilute / show / balance` subcommands talk straight to Gnosis (no daemon required). Bucket counters persisted per batch at `<data_dir>/postage/<batch_id>.bin`, reloaded on restart so we don't reissue indices. Approve-then-create flow handled automatically. **Outstanding:** expiry monitoring + app-level events, on-device dilute/topup orchestration with per-batch budgets. |
 | **M3 / Phase 9** — Streaming uploads + Mantaray construction | ✅ shipped | `ant-retrieval::splitter` (bytes → balanced k-ary chunk tree, inverse of the joiner) + recursive `ant-retrieval::manifest_writer` (Mantaray v0.2 radix trie that fits one CAC chunk per node, deepens the tree as collections grow, and chains 30-byte forks for long path segments). Gateway `POST /bzz?name=…` (single file) and `POST /bzz` (tar collection) live. Live mainnet smoke: single-file + tar collection upload, fresh-fetcher round-trip. **`beeMode`** still reports `"ultra-light"` until the auto-settlement trigger lands. |
 | **Hardening / Phase 10–11** | ⏳ not started | Mobile suspend/resume, upload resumption, beta. |
@@ -703,6 +703,795 @@ Goal: everything in M2, plus honest on-device uploading with on-chain postage-st
 - Hook into `ant-retrieval::accounting` so that crossing the per-peer payment threshold automatically calls `swap::issue_and_emit` with a fresh cheque (the helper exists; the trigger doesn't). This is the production path that actually drives the swap state machine end-to-end.
 - Re-run the live `cheque_smoke` mainnet binary now that the EIP-712 digest is bee-compatible (Tier-1 proved it on-chain). If bee accepts the cheque this time, the cold-peer hypothesis was wrong and rung B is closed. If bee still Resets the stream, the cold-peer hypothesis stands and we proceed to the auto-settlement trigger above.
 - `antctl chequebook deploy` (factory deploy). Cash-out (`cash-self`) shipped with Tier 1.
+
+##### Phase 7b — Pushsync-side outbound accounting (NEW — 2026-05-08)
+
+The 2026-05-08 production attempt to upload a 6.7 GiB GGUF model
+exposed a concrete blocker that the original Phase 7 polish list
+did not name: **today the pushsync dialer pays nobody.**
+`ant_retrieval::pushsync::push_chunk_to_peer` opens the stream,
+sends `Delivery { address, data, stamp }`, reads `Receipt`. There
+is no debit, no threshold check, and no cheque emission. The
+existing `ant_retrieval::accounting::Accounting` mirror is wired
+into `ant_retrieval::fetcher` (the *download* path) only — bee
+credits us with chunks on retrieval and we throttle ourselves
+against `LIGHT_DISCONNECT_LIMIT` to avoid being RST'd. The
+*upload* path has no analogue.
+
+That is exactly what bit us on production. Live data from the
+2026-05-08 GGUF push (job `00000487fb4d9dcb`):
+
+- Burned 40,368 stamps to land 19,729 chunks (≈ 49 % stamping
+  efficiency — every stamp committed bucket index is "spent" even
+  when the receiver silently rejects the chunk).
+- Sustained pushsync throughput collapsed to <2 chunks/sec
+  network-wide after ~20K successful pushes; stalled and failed
+  with `push chunk failed: exhausted 5 retries: push timed out
+  after 60s` at 1.12 % of the file.
+- The 15-minute journal showed pushsync rejection load distributed
+  evenly across all ~100 peers (~3,800 retries/peer, ~3,700-3,975
+  retries/chunk for the worst chunks). Every peer in the set was
+  refusing every chunk — not a peer-set quality problem, a
+  systemic "we pay nobody so everyone has us in payment-debt."
+- The earlier same-session 313 MB job (`00000069be4427fc`) failed
+  the same way at 38 % with the more honest error
+  `pushsync: exhausted pushsync peers`.
+- The local node API confirms it: `GET /chequebook/balance →
+  {"totalBalance":"0","availableBalance":"0"}`,
+  `GET /chequebook/address → 0x0…0`. `antd-ant --help` exposes no
+  chequebook flag at all. `antd` is honestly running as
+  ultra-light + stamps-only; bee peers correctly treat it as a
+  freeloader after the initial paymentTolerance burst.
+
+The rough refresh-rate ceiling we observed (~20-30K chunks across
+~100 peers per peer-session) matches bee's
+`paymentThreshold = 13.5 M units` divided by typical chunk price
+(~240 K units at PO 8): **~56 chunks per peer before the
+threshold trips.** With 100 peers and re-routing on cold rejection,
+we get a few hundred lucky retries beyond the cap and then it's
+over. There is no slow path that gets us through 1.76 M chunks;
+without cheques we cannot upload a model.
+
+**Phase 7b deliverable:** the pushsync dialer issues SWAP cheques
+proactively, before the receiver decides to RST us. Concretely:
+
+1. **Outbound debit mirror.**
+   New `ant_retrieval::pushsync_accounting::PushsyncAccounting`
+   sibling of `Accounting` (intentionally a separate type — the
+   debit semantics are different). Tracks per-peer
+   `cumulative_debit_units` for our outbound pushsync only.
+   `accrue_debit(peer, price)` is called once per successful push
+   (after the peer ACKs the receipt). `peer_price()` reuses the
+   existing `Accounting::peer_price` helper.
+2. **Cheque-trigger hook.** When `accrue_debit` causes
+   `cumulative_debit_units` to cross
+   `paymentThreshold - earlyPayment` (= 50 % of
+   `LIGHT_DISCONNECT_LIMIT`, i.e. 843,750 units — same boundary as
+   the retrieval-side `HOT_DEBT_THRESHOLD`), we call
+   `swap::issue_and_emit(peer, cumulative_debit_units +
+   safety_margin)` from `OutboundLedger`. The existing helper
+   already takes the cumulative-payout amount in PLUR and signs
+   an EIP-712 cheque against our chequebook. We zero our local
+   debit (it's been settled by the cheque). On bee's side, the
+   `EmitCheque` arrives over `/swarm/swap/1.0.0/swap`, bee credits
+   `chequebook → peer` and clears our debt; subsequent pushsyncs
+   are accepted.
+3. **PLUR units wiring.** Bee's accounting unit is
+   "chunk-price" (10⁴ units per `BASE_PRICE`). Cheques are in PLUR
+   (BZZ smallest unit, 10¹⁶ PLUR per BZZ). The conversion is
+   bee's `pricer.go::PeerPrice` → PLUR: `units * 1` (pricer units
+   ARE PLUR — bee's `BASE_PRICE = 10000` is already 10000 PLUR).
+   So the cumulative debit in units is the cumulative-payout
+   integer in `Cheque.cumulative_payout`. No conversion needed.
+4. **Pre-flight chequebook readiness.** Before `antd` accepts the
+   first upload, the daemon checks: (a) we have a chequebook
+   address from the config, (b) `eth_call → balance()` is enough
+   to cover at least N peers' worth of `paymentThreshold` debt.
+   On failure, the upload control verb returns a clear
+   "no_chequebook" / "chequebook_underfunded" error rather than
+   "succeeding" silently as today.
+5. **`antd` flags / config.** Add three new `antd-ant` flags:
+   - `--chequebook <addr>` (32-byte hex), env `CHEQUEBOOK_ADDRESS`.
+   - `--swap-key <hex>` (32-byte secp256k1, owns the chequebook),
+     env `SWAP_OWNER_KEY` *or* fall back to `WALLET_PRIVATE_KEY`
+     for the test setup. Bee derives this from the same node
+     mnemonic at path `m/44'/60'/0'/0/0`; we keep the existing
+     "wallet key = chequebook owner" convention from `.env`.
+   - `--swap-min-balance-bzz <decimal>` (default 0.01) — the
+     chequebook liquid-balance floor below which uploads pre-flight
+     fails. Operator-actionable: top up the chequebook on-chain
+     and restart.
+6. **Bee-shaped `/chequebook` HTTP endpoints (read).** Wire the
+   gateway's `chequebook/balance` and `chequebook/address`
+   endpoints to the configured chequebook (currently both return
+   zero stubs). Read-only first — the writes (`/chequebook/cashout`,
+   `/chequebook/withdraw`, `/chequebook/deposit`) can stay on the
+   501 catch-all until they're needed.
+7. **`bee_mode` flip.** `/node` reports `"light"` instead of
+   `"ultra-light"` once a chequebook is configured AND the
+   `PushsyncAccounting` ↔ `OutboundLedger` wire is in place.
+8. **Smoke + Acceptance.** New `cheque_smoke_pushsync` mainnet
+   binary that uploads N=100 distinct random chunks under a real
+   stamp and confirms (a) at least one `EmitCheque` was sent to
+   each unique forwarder, (b) all 100 chunks retrieved fresh by
+   a second daemon, (c) chequebook `total_paid_out` increased
+   by ≥ N × MIN_CHUNK_PRICE on-chain. The existing single-cheque
+   `cheque_smoke` becomes a unit-level prerequisite of this one.
+9. **Tonight's specific verification (the one that prompted
+   this section):** with phase 7b live, restart the
+   `gemma4:e2b` GGUF upload (job restart, fresh stamps acceptable
+   since we never finished). Acceptance is bit-identical
+   `bzz://<root>/model.json` round-trip per the production task,
+   not a synthetic smoke test.
+
+**Cost / schedule sanity check.** The chequebook in
+`.env` (`0xfEecbb9a…20D`) is funded; 36.99 BZZ in the wallet, of
+which the chequebook holds an unknown deposit (the `cash-self`
+test only debited 1 PLUR, so liquid balance is essentially the
+full deposit). At bee's `paymentThreshold = 13.5 M units` per
+peer-session and ~100 peers, an upload cycle pays out at most
+`100 × 13.5 M = 1.35 B PLUR ≈ 1.35 × 10⁻⁷ BZZ`. The full
+1.76 M chunk push, even with worst-case 100 % cheque emission per
+threshold cross, costs <0.001 BZZ. We're nowhere near a chequebook
+funding limit.
+
+**Out of scope for 7b** (already enumerated elsewhere or
+deliberately deferred):
+
+- Reverse direction (us *receiving* cheques and crediting peers
+  for chunks they push to us) — not relevant for upload-only
+  M1.0 / M3, peers don't push to a non-storer.
+- Cash-out / withdraw automation — manual `antctl chequebook
+  cash-self` is fine for now, only matters for storer
+  economics not covered by the M3 light-node spec.
+
+##### Phase 7b — 2026-05-08 first run results & remaining blocker
+
+The Phase 7b code landed in 0.3.12 and is wire-compatible with bee:
+1,500+ cheques emitted to 800+ unique peers across a 20 MiB / 6 GB
+test sequence, all with bee-shaped EIP-712 + JSON, all logged with
+the correct `(chequebook, beneficiary, cumulative_payout)` triples
+into `<data_dir>/pushsync_outbound.json`.
+
+**Two real bugs were caught and fixed in-session:**
+
+1. **Wrong issuer key fallback.** The first version of
+   `build_pushsync_swap_config` fell back to `WALLET_PRIVATE_KEY`
+   when `--swap-key` was unset; in our `.env` the chequebook
+   `0xfEecbb9a…20D` is owned by the EOA derived from
+   `STORAGE_STAMP_PRIVATE_KEY` (path `m/44'/60'/0'/0/1`), not the
+   one derived from `WALLET_PRIVATE_KEY` (path `m/44'/60'/0'/0/0`).
+   Every cheque was signed with the wrong key and bee's
+   `chequeStore.ReceiveCheque` rejected them with `ErrChequeInvalid`
+   (`if issuer != expectedIssuer`). Fixed by setting
+   `SWAP_OWNER_KEY=$STORAGE_STAMP_PRIVATE_KEY` in `.env` (and the
+   `--swap-key` flag honours that env name first, before falling
+   back to `WALLET_PRIVATE_KEY`).
+
+2. **Chequebook not factory-deployed.** Even with the right issuer
+   key, bee's `chequeStore.ReceiveCheque` calls
+   `factory.VerifyChequebook(cheque.Chequebook)` on first sight and
+   rejects the cheque if the chequebook isn't registered via the
+   official Swarm chequebook factory at
+   `0xC2d5A532cf69AA9A1378737D8ccDEF884B6E7420`. Our
+   `0xfEec…920D` chequebook returns `null` (call reverts) for
+   `factory.deployedContracts(0xfEec…920D)` — i.e. it was deployed
+   independently of the factory and therefore has zero standing in
+   bee's swap layer. **Every cheque we emit from this chequebook
+   is silently rejected at the `factory.VerifyChequebook` step**,
+   even though the cumulative-payout math, EIP-712 signature, and
+   beneficiary checks all pass. Pushsync stalls again at ~9 K
+   chunks because bee accrues unsettleable debt from us.
+
+   Confirmation that this is the only remaining blocker:
+   - `antctl chequebook show` reports
+     `issuer = 0x9c66…fd5c` (matches our key) and
+     `balance = 999999999999999 PLUR`,
+     `total_paid_out = 1 PLUR` (from the prior `cash-self` test).
+   - On-chain check (Gnosis mainnet block ≥ 46019699):
+     `factory.deployedContracts(0xfEec…920D) → null` (revert).
+
+**The remaining work for Phase 7b to be production-complete:**
+
+1. **`antctl chequebook deploy` (was deferred from Phase 7
+   polish; now blocking).** New subcommand that calls the
+   official factory's `deployChequebook(issuer, defaultHardDeposit)`,
+   deposits BZZ from the wallet (after an `approve` if needed),
+   and stores the resulting chequebook address back into
+   `.env` / `data_dir/chequebook.txt` for the daemon to pick up.
+   Encode `deployChequebook` per
+   `bee/pkg/settlement/swap/chequebook/factory.go::Deploy`. The
+   factory's
+   [`SimpleSwapFactory`](https://gnosisscan.io/address/0xC2d5A532cf69AA9A1378737D8ccDEF884B6E7420#code)
+   ABI is small: `deployChequebook(address issuer, uint256 defaultHardDepositTimeoutDuration)`
+   returns the chequebook address as the second `Deploy` event log
+   topic, so we read the deployed address from the receipt logs.
+2. **Factory verification on the read-side too.** Add the same
+   `factory.deployedContracts(addr)` check as a daemon startup
+   sanity check: if `--chequebook` points at an unregistered
+   contract, fail fast with a clear error rather than launching
+   into "uploads will work" mode and silently emitting rejected
+   cheques.
+3. **(Optional) `antctl chequebook deposit / withdraw` for
+   on-chain liquidity moves once deploy is live.**
+
+Once a factory-deployed chequebook is live, the existing Phase 7b
+code path is expected to carry the GGUF upload to completion — bee
+will accept the cheques (factory check passes, signature recovers
+to `issuer()`, cumulative monotonic), credit our outbound debt back
+to zero per peer, and let pushsync run unimpeded. The threshold
+logic, ledger persistence, peer-EOA registry, and the `--swap-key`
+plumbing are all already validated against live mainnet bee.
+
+##### Phase 7c — chequebook deploy via factory (NEW — 2026-05-08)
+
+**Status:** in flight — implementation landing in 0.3.13.
+
+**Why this exists.** Phase 7b proved every layer of our SWAP stack
+is wire-compatible with mainnet bee *except* one — bee rejects
+cheques drawn on chequebooks that aren't registered with the
+official `SimpleSwapFactory` at `0xC2d5A532cf69AA9A1378737D8ccDEF884B6E7420`
+(see `bee/pkg/settlement/swap/chequebook/cheque.go::ReceiveCheque` →
+`factory.VerifyChequebook`). Our existing
+`0xfEecbb9a…20D` is a stand-alone `SimpleSwap` deployment, so
+`factory.deployedContracts(0xfEec…20D) → false` and every cheque
+we issue from it is silently dropped. We must deploy a *new*
+chequebook through the factory, transfer ownership of the BZZ
+balance over, and point `antd` at the new address.
+
+**What "factory-deployed" means in code.** Factory ABI (verified on
+Gnosisscan, source at the address above):
+
+```
+deploySimpleSwap(address issuer, uint256 defaultHardDepositTimeoutDuration, bytes32 salt) → address
+deployedContracts(address) → bool
+ERC20Address() → address    // returns the BZZ token (0xdBF3Ea6F5beE45c02255B2c26a16F300502F68da on Gnosis)
+event SimpleSwapDeployed(address contractAddress)   // non-indexed
+```
+
+The factory creates the new `SimpleSwap` via CREATE2 from a
+hard-coded master template, calls `setIssuer(issuer, factory)` on
+it, marks `deployedContracts[swap] = true`, and emits
+`SimpleSwapDeployed(swap)`. The event topic[0] is
+`0xc0ffc525a1c7689549d7f79b49eca900e61ac49b43d977f680bcc3b36224c004`
+(verifiable from the verified bytecode at the gnosisscan factory
+page; the topic literal appears in the runtime bytecode immediately
+before the `LOG1` opcode at the end of `deploySimpleSwap`). The
+deployed address sits right-padded in `data[12..32]` of that log
+because the event parameter is non-indexed.
+
+**Deliverable:** `antctl chequebook deploy` subcommand and an
+`antd` startup-time factory-registration check. Step list:
+
+1. **`ant-chain::chequebook` helpers** *(crate-internal)*:
+   - rename `deploy_chequebook_calldata` → keep, but document that
+     the third argument is the CREATE2 salt (32 random bytes,
+     mined client-side; bee uses a per-deploy random salt — see
+     `chequebook/factory.go::Deploy` — to avoid collisions if the
+     same issuer ever wants two chequebooks);
+   - add `simple_swap_deployed_event_topic() -> [u8; 32]` returning
+     the literal `0xc0ffc525a1c7689549d7f79b49eca900e61ac49b43d977f680bcc3b36224c004`
+     so `antctl` doesn't have to spell it out;
+   - add `extract_deployed_chequebook(receipt: &TxReceipt) -> Option<[u8; 20]>`
+     that finds the `SimpleSwapDeployed` log emitted by the factory
+     and pulls the address out of `data`. Mirror
+     `extract_created_batch_id` exactly;
+   - add `factory_deployed_contracts_calldata(addr: &[u8; 20]) -> Vec<u8>`
+     for the `deployedContracts(address)` view — used by `antd`
+     startup verification and by `antctl chequebook deploy --verify`;
+   - add `factory_erc20_address_calldata() -> Vec<u8>` so we don't
+     hard-code the BZZ token address client-side (the factory is
+     the source of truth — it was constructed with the BZZ token
+     pinned in storage). Test: against Gnosis mainnet, the call
+     returns `0xdBF3Ea6F5beE45c02255B2c26a16F300502F68da`.
+   - constants: `pub const GNOSIS_CHEQUEBOOK_FACTORY: [u8; 20]`
+     for the mainnet address, plus
+     `pub const DEFAULT_HARD_DEPOSIT_TIMEOUT_SECS: u64 = 86_400`
+     (bee's default in `pkg/node/devnode.go::FactoryDefaultDepositTimeoutDuration`).
+
+2. **`Wallet::deploy_chequebook` in `ant-chain::tx`**:
+   ```rust
+   pub async fn deploy_chequebook(
+       &self,
+       client: &ChainClient,
+       factory: &[u8; 20],
+       issuer: &[u8; 20],
+       default_hard_deposit_timeout: U256,
+       salt: &[u8; 32],
+   ) -> Result<TxReceipt, TxError> {
+       let data = deploy_chequebook_calldata(issuer, default_hard_deposit_timeout, salt);
+       self.send_signed(client, *factory, data, FACTORY_DEPLOY_GAS).await
+   }
+   ```
+   Gas: empirically ~700 K (the master template `setIssuer` call
+   plus the CREATE2 + storage writes); use `FACTORY_DEPLOY_GAS = 1_500_000`
+   to leave headroom. Issuer doesn't have to be `self.address` —
+   the factory takes it as an argument, so an operator can deploy
+   *for* a different issuer key (handy for cold-storage issuer
+   keys).
+
+3. **`antctl chequebook deploy` subcommand** *(`antctl/src/main.rs`)*:
+   ```
+   antctl chequebook deploy
+       --gnosis-rpc-url <url>     [env GNOSIS_RPC_URL]
+       --wallet-key <hex>          [env WALLET_PRIVATE_KEY]   # pays gas + (optionally) the initial deposit
+       --issuer-address <hex>      [env STORAGE_STAMP_OWNER_ADDRESS]
+       --hard-deposit-timeout-secs <u64>  [default 86400]
+       [--initial-deposit-plur <u128>]    # if set, ERC20.approve + chequebook.deposit afterwards
+       [--salt <32-byte hex>]             # if unset, generate randomly
+       [--factory <hex>]                  [default GNOSIS_CHEQUEBOOK_FACTORY]
+       [--gas-price-gwei <u64>]
+       [--wait-secs <u64>]                [default 90]
+       [--write-env-file <path>]          # if set, append CHEQUEBOOK_ADDRESS=0x… (or replace existing line)
+   ```
+   Flow:
+   - Derive the wallet from `--wallet-key`; print `wallet_addr`.
+   - Resolve `--issuer-address` (must be a 20-byte hex EOA; we
+     don't require the *key* here, only the address — the wallet
+     pays gas, the issuer just gets baked into the chequebook).
+   - Sanity: `factory.ERC20Address()` matches our expected BZZ
+     token; abort otherwise (defense against `--factory` typos).
+   - Optional `--salt`; if missing, fill from `OsRng`.
+   - Submit `deployChequebook(issuer, timeout, salt)` via the
+     wallet, await receipt with `default_wait`.
+   - `extract_deployed_chequebook(&receipt)` → new chequebook
+     address; if `None`, dump the full receipt logs and bail.
+   - Verify with `factory.deployedContracts(new_addr) == true`.
+   - If `--initial-deposit-plur` was set:
+     - read `wallet.bzz_balance` and assert it covers the deposit;
+     - `approve_bzz(token=BZZ, spender=new_addr, value=deposit)`;
+     - call `Chequebook.deposit(uint256)` (selector
+       `0xb6b55f25`); on success the chequebook's `balance()` now
+       reflects the deposit;
+     - dry-run a `cash-self` 1 PLUR cheque against the new
+       chequebook to prove end-to-end interop *before* declaring
+       success.
+   - Print human + JSON output:
+     ```
+     chequebook       0x…
+     issuer           0x…   (factory-baked)
+     wallet           0x…   (paid gas)
+     factory-verified true
+     deposited        N PLUR
+     tx_hash          0x…
+     block            46…
+     ```
+   - If `--write-env-file` was given, atomically rewrite the file
+     so the next `antd` restart picks up the new address. Match
+     existing `CHEQUEBOOK_ADDRESS=` line via simple regex; append
+     if absent. Don't touch other lines.
+
+4. **`antctl chequebook verify` subcommand** *(small but high
+   value — saves a round-trip to gnosisscan)*:
+   ```
+   antctl chequebook verify --gnosis-rpc-url <url> --chequebook <hex>
+                            [--factory <hex>]
+   ```
+   Calls `factory.deployedContracts(chequebook)` and prints the
+   bool. Used by `antd` startup, by ops, and by anyone diagnosing a
+   pushsync stall. Doesn't sign or submit anything, so it's safe
+   to run with any RPC URL.
+
+5. **`antd` startup factory check** *(`antd/src/main.rs`)*:
+   When `--chequebook` is configured, before constructing the
+   `PushsyncSwapConfig`, fire one `eth_call` to
+   `factory.deployedContracts(chequebook)`; if false, log
+   `error!("chequebook 0x… is not registered with the Swarm chequebook factory; cheques will be rejected by bee. Run \`antctl chequebook deploy\` to deploy a new one.")`
+   and either:
+   - **strict mode (default for production):** refuse to start
+     pushsync-swap (boot the daemon with a `NoopPushsyncSettlement`
+     so we don't waste bandwidth pushing cheques nobody accepts,
+     and surface the failure prominently in `antctl status`); or
+   - **`--chequebook-allow-unverified` flag:** start anyway
+     (escape hatch for testnets / local devnets without a factory).
+   The check is also re-run every 60 s in the background so a
+   freshly-deployed chequebook can be picked up without a restart
+   (we just flip a flag in `SwarmState`).
+
+6. **Tests** (no live mainnet required):
+   - unit: `simple_swap_deployed_event_topic` matches keccak of
+     the literal selector string;
+   - unit: `extract_deployed_chequebook` returns the right address
+     given a hand-crafted receipt with the right topic[0] and a
+     20-byte address right-padded in `data`;
+   - unit: `factory_deployed_contracts_calldata(addr)` is exactly
+     `0xc70242ad` ‖ pad32(addr);
+   - integration (offline, with a recorded RPC fixture): the full
+     `chequebook deploy` happy-path against a mocked RPC.
+   - smoke (live, manual): on Gnosis mainnet against the real
+     factory, deploy a chequebook for a brand-new throwaway issuer
+     EOA, deposit 0.1 BZZ, run `cash-self`. Tracks ~$0.0003 in xDAI.
+
+**Acceptance for Phase 7c done:** `antctl chequebook deploy` on
+Gnosis mainnet succeeds end-to-end (returns a new address,
+`deployedContracts` reads `true`, `cash-self` round-trips), and
+`antd` started against that chequebook lets a 1 GiB pushsync upload
+to mainnet bee peers run past the 20 K-chunk wall without any
+`pushsync attempt failed; connection is closed` errors caused by
+cheque rejection.
+
+##### Phase 7c — 2026-05-08 corrected diagnosis (the real blocker)
+
+**Status:** Phase 7c (`antctl chequebook deploy`) **landed in 0.3.13**
+(see commits in `crates/ant-chain/src/chequebook.rs`,
+`crates/ant-chain/src/tx.rs`, `crates/antctl/src/main.rs`,
+`crates/antd/src/main.rs`). It is **functional** but turned out to
+**not** be the upload blocker.
+
+**What we discovered when 0.3.13 landed:** running the new
+`antctl chequebook verify` against our existing `0xfEec…920D`
+chequebook returned `registered = yes` — i.e. the chequebook **was
+already registered** with the official factory. Direct
+`eth_call` confirms:
+
+```
+factory.deployedContracts(0xfEec…920D) → 0x…01 (true)
+```
+
+So the previous "not factory-deployed" diagnosis (which itself
+came from a transient `eth_call` failure during the previous
+session) was wrong. With a correct `SWAP_OWNER_KEY` and a
+factory-registered chequebook, **bee accepts our cheques**.
+
+But pushsync still stalls. Re-running the production journal at
+the libp2p layer reveals the *real* cause:
+
+1. **Cheques are emitted.** Logs show >1500 `emitted pushsync cheque`
+   lines per minute, with monotonically growing per-peer
+   `cumulative_payout`. Outbound ledger has 875 peers,
+   `cumulative_payout` per peer ranges 800K–37M PLUR (well under
+   the chequebook's `999 999 999 999 999 PLUR` liquid balance).
+2. **Bee closes pushsync streams within ~250 ms of the very first
+   chunk push to a freshly-connected peer**, before any
+   meaningful debt could possibly accumulate. Error is always
+   shaped as `unexpected end of file` / `connection is closed` /
+   `Connection reset by peer` — i.e. bee's stream-handler is
+   resetting (`stream.Reset()`), not writing a `pb.Receipt{Err:…}`
+   back. That's bee's `handler` error path *after* `attemptedWrite
+   == false` failed to write a receipt — the stream is already
+   broken.
+3. **The reason bee's handler returns an error is bee's
+   `accounting.PrepareDebit`** rejecting the chunk. That
+   rejection happens when our balance with bee is below
+   `-disconnectLimit`. For a light-mode connection,
+   `lightDisconnectLimit = 1.25 * lightPaymentThreshold = 1.25 *
+   1 350 000 = 1 687 500 PLUR`.
+4. **Our cheques aren't crediting bee's accounting because we're
+   not honouring bee's `pseudosettle` protocol on pushsync paths.**
+   Bee's `accounting.settle()` runs `refreshFunction` (pseudosettle)
+   *first*, then `payFunction` (swap cheque). Without pseudosettle
+   refreshments from us, bee never resets our debt back to zero
+   even if our SWAP cheques arrive. Pseudosettle is a time-based
+   "allowance" mechanism: bee grants us `lightRefreshRate * elapsed
+   seconds` PLUR of automatic credit per peer if we open the
+   `/swarm/pseudosettle/1.0.0/pseudosettle` stream and announce it.
+5. **We have a pseudosettle dialer, but it's only wired to
+   retrieval-side debt** (`ant-retrieval::Accounting::HotHint`).
+   The pushsync path doesn't fire `HotHint`s, so pseudosettle
+   never refreshes pushsync peers, so bee's pushsync accounting
+   never sees a refresh, so we hit `disconnectLimit` after a
+   handful of chunks per peer.
+
+#### Phase 7d — Pushsync-side pseudosettle (DELIVERED, 2026-05-08, antd 0.3.14)
+
+**Status:** done. First sustained mainnet upload past the 20 K
+wall in `antd`'s history.
+
+**Implementation:**
+
+1. **`PushsyncSwap` now owns an optional `mpsc::Sender<HotHint>`.**
+   Set in `crates/ant-p2p/src/pushsync_swap.rs` via the new
+   builder method `with_hot_hint`. Its [`PushsyncSettlement::note_pushsync`]
+   fires a `HotHint { peer }` on every chunk push (cheap
+   `try_send`, drops on backpressure — driver has a 256-slot
+   buffer; pseudosettle's per-peer `MIN_REFRESH_INTERVAL = 1.1s`
+   rate-limits the actual stream traffic).
+2. **The retrieval and pushsync paths share one `HotHint`
+   channel.** No fan-in — `crates/ant-p2p/src/behaviour.rs`
+   clones the same `mpsc::Sender<HotHint>` into both
+   `Accounting::with_hot_hint(...)` and
+   `PushsyncSwap::with_hot_hint(...)` before construction. The
+   driver doesn't care which subsystem produced the hint.
+3. **Bee's allowance math worked out as predicted in the smoke
+   test.** Steady state at 100 active peers under load: `ok ≈
+   4 700` refreshes/min, `units_accepted ≈ 600 M PLUR/min`
+   (~107 K PLUR/sec/peer once concurrency lifts the per-peer
+   `lightRefreshRate = 5 K/sec` floor). Cheques continued
+   firing at ~750/min on top of pseudosettle, providing the
+   bulk credit; pseudosettle filled the per-second slack that
+   used to push us across `lightDisconnectLimit`.
+4. **Smoke test: 256 MiB / 66 056 chunks delivered end to
+   end.** Started 20:37 UTC, completed 20:58 UTC (~21 min,
+   sustained ~52 chunks/sec average). No collapse — the whole
+   upload pushed through, including the final reference. URL:
+   `bzz://2f3a4a7372ba6c325d07054d1ffd7cae79ebbb7ece1c18ee6b7c592142568809`.
+   Per-minute progress: 7.3 % → 21.5 % → 38.2 % → 69.7 % →
+   100 % (linear, no degradation past the previous 20 K wall).
+
+**Why this isn't Phase 7b/7c:** Phase 7b set up the cheque-issuing
+infrastructure correctly. Phase 7c added the factory-deploy +
+verify tooling so we can rule out the chequebook-registration
+class of bugs cheaply. Phase 7d delivered the *missing*
+settlement layer: driving bee's combined (refreshment +
+cheque) accounting, not just half of it.
+
+**Acceptance:** ✅ 66 056-chunk upload completed; no
+`pushsync attempt failed; connection is closed` flood past
+the 20 K wall. The 6.7 GiB `gemma4:e2b` upload is now
+unblocked — our throughput math says ~13 hours at the
+observed 35-50 chunks/sec.
+
+#### Phase 7e — Throughput experiments (NEGATIVE RESULT, 2026-05-08, antd 0.3.15)
+
+**Status:** done; nothing shipped. The two changes we tried both
+made things worse, so we reverted to Phase 7d's behaviour. The
+useful output is the diagnosis below; the code change kept is
+the small `EmitCore`-Arc refactor in `pushsync_swap.rs`, which is
+behaviour-preserving and just makes the module's state shareable
+for future experiments.
+
+**What we tried:**
+
+1. **Raise `MAX_PUSH_CONCURRENCY` 32 → 256** in
+   `crates/ant-node/src/uploads/mod.rs` and the gateway's
+   `crates/ant-gateway/src/retrieval.rs`. The hypothesis was
+   that pushsync throughput is concurrency-bound: 32 in-flight
+   pushes × ~400 ms RTT = ~80 chunks/s ceiling, observed ~50.
+2. **Detach cheque emission from the pushsync hot path.**
+   `note_pushsync(peer, price)` previously awaited the SWAP
+   stream RTT (~250-500 ms) inline whenever `pending` crossed
+   `cheque_trigger_plur`. We changed it to spawn an
+   `Arc<EmitCore>`-borrowing background task with a per-peer
+   `try_claim_emit` coalescing flag, returning immediately so
+   the next chunk's pushsync could fire.
+
+**What happened:**
+
+- **256 concurrency.** Smoke test failed at 27 % with `push
+  timed out after 60s`. Pseudosettle's `units_accepted`
+  collapsed to ~30 K PLUR/min (vs. ~600 M baseline) and
+  `failed`/`timed_out` counts surged. Bee-side accounting
+  rejects floods of concurrent stream opens, and yamux disconnects
+  cascade. The same upload at 32 concurrency had completed
+  cleanly the day before.
+- **Detached cheques.** Smoke test failed at 24.5 % with the
+  same timeout error, this time with concurrency back at 32.
+  The hypothesis-killer: bee's `accounting.PrepareDebit` runs
+  synchronously per chunk forward and rejects when debt
+  exceeds `disconnectLimit`. With awaited cheques the credit
+  *always* lands at bee before the chunk debit (we serialise
+  per-peer at the fetcher level). With detached cheques the
+  ordering becomes non-deterministic — chunks can arrive at
+  bee before the cheque that was supposed to credit the debt
+  they incur, and bee rejects the chunk. Cumulative cheques
+  are monotonic in the long run, but ordering matters at the
+  moment-by-moment debt-check granularity.
+- **Network memory.** A nasty side effect: after either
+  failed experiment the bee peer set takes ~10-30 minutes to
+  forget our overlay. Subsequent uploads (even with the
+  reverted code) showed degraded throughput (~17-22 chunks/s
+  vs. the 50 baseline) until enough peers cycled their
+  `accountingPeer` state. Lesson: throughput experiments are
+  expensive — each negative result costs real warm-up time
+  before we can measure the next attempt cleanly.
+
+**Where the actual bottleneck is** (clearer now than before
+Phase 7d): bee's per-peer `lightRefreshRate = 5 000 PLUR/sec`
+caps how fast each peer's view of our debt can be cleared by
+pseudosettle. Cheques top up the bulk, but the `PrepareDebit`
+admission check is per chunk and synchronous, so a fast burst
+of pushes that outruns the credit pipeline gets rejected. With
+~100 active peers and a per-chunk price ranging 50 K-300 K
+PLUR, the network-wide chunk-acceptance budget settles at
+~30-50 chunks/s, irrespective of antd's concurrency cap.
+
+**Things that *would* help, but are out of scope:**
+
+1. **Run as `full_node = true`** in our handshake. That bumps
+   bee's `paymentThreshold` 10× (and `lightRefreshRate` does
+   not apply — bee uses the full `refreshRate = 50 K
+   PLUR/sec`). But it requires antd to actually serve
+   retrieval/pushsync as a forwarder for other peers — i.e. be
+   a real Bee-equivalent node, not a light client. Order of
+   magnitude more code; not Phase 7.
+2. **Expand the active peer set 5-10×.** Network-wide credit
+   budget scales linearly with peer count. We currently keep
+   ~100 peers warm; the routing layer could carry 500-1000
+   without changing topology. Would need an audit of yamux /
+   tcp connection budgets and the routing watch's churn
+   handling. Plausible Phase 8 work.
+3. **Lower per-chunk price** on the wire — but that's the
+   neighbourhood-proximity-based price bee enforces; we can't
+   unilaterally change it.
+
+**Acceptance:** none. Both attempts reverted. 0.3.15 ships with
+the `EmitCore` refactor (behaviour-identical to 0.3.14) and the
+honest version-bump for traceability. Future throughput work
+needs a clean, repeatable bench (one upload per fresh peer set,
+with at least 30 minutes between runs) and the network-shape
+expansion above to be worth the engineering cost.
+
+#### Phase 7f — Configurable target-peers (antd 0.3.16, 2026-05-09)
+
+**Status:** delivered. Cheapest of the Phase 7e follow-up levers
+(option #2 in the negative-result writeup): widen the per-second
+credit budget by widening the peer set, since bee grants every
+peer ~5 K PLUR/sec of pseudosettle credit independently. At the
+default 100 peers we're soaking ~500 K PLUR/sec network-wide
+which is barely above the 32-concurrent-pushsync working set's
+ask. Doubling peers should lift the ceiling roughly linearly
+until we run into yamux/TCP budgets (separate audit).
+
+**Implementation:**
+
+- `NodeConfig::target_peers: Option<usize>` plus
+  `with_target_peers()`. `None` keeps the existing
+  `ant_p2p::DEFAULT_TARGET_PEERS = 100` fallback (`RunConfig`
+  treats `0` as "use the default"); `Some(n)` is forwarded
+  literally.
+- `antd --target-peers <N>` CLI flag wired through to
+  `NodeConfig`. No new env var, no config-file plumbing — this
+  is an experimental knob we want to make trivial to revert by
+  restarting without the flag.
+- No changes to ant-p2p itself: the swarm loop already honours
+  whatever `target_peers` it's handed, and dial budgets /
+  routing churn at 200 peers were stable in earlier
+  reconnect-storm testing (`crates/ant-p2p/tests/`).
+
+**Validation result (2026-05-09 08:26 UTC, GGUF job
+`000002119b4e1fd1` mid-flight):**
+
+- Baseline at 100 peers, 30-min sustained average:
+  **15.3 chunks/sec**.
+- After pause/restart with `--target-peers 200`, peer set
+  saturated to 200 within ~30 s. Resumed job; 10-min sustained
+  average: **45.2 chunks/sec = 2.9× speedup**. No stalls, no
+  disconnects, no peer-set churn.
+- The first 2-min window registered 76.9 chunks/sec — partly
+  catch-up from the resume drain, but the 10-min figure is the
+  steady-state we're keeping in our heads going forward.
+- ETA on the GGUF revised from ~30 h to ~11 h.
+
+**Acceptance:** delivered. Keeping the flag in production with
+`--target-peers 200`. Phase 7e's negative result on
+`MAX_PUSH_CONCURRENCY` is now contextualised: bee's per-peer
+credit is the bottleneck, so the right lever is *more peers*
+(more independent credit budgets), not more chunks per peer.
+
+**Follow-ups (Phase 7g, not blocking):**
+
+1. Sweep target-peers values (300, 400, 500) once the GGUF
+   completes and the network has 30 min of forgiveness. Expect
+   diminishing returns past ~400 (yamux/TCP fan-out, peer-table
+   churn, pseudosettle driver tick-rate).
+2. Audit peer-table watcher and dial-pipeline behaviour at
+   target_peers ≥ 500 — last reconnect-storm test was at the
+   100-peer default.
+3. Surface this knob in the future config-file plumbing
+   (Phase 11 polish), so it's reachable without editing
+   `antd.service`.
+
+#### Phase 7g — target-peers sweep + gateway max-bytes raise (DELIVERED, 2026-05-09, antd 0.3.17)
+
+**Status:** delivered as a single restart-cycle while the GGUF
+upload was mid-flight. Two distinct problems addressed:
+
+##### Throughput sweep (300, 400)
+
+Picked up #1 of the Phase 7f follow-ups while the GGUF job was
+running with `--target-peers 200`. Each step paused the job,
+restarted antd with the new `--target-peers` value, waited for
+the peer set to fill, resumed, sampled throughput over a
+10-minute window, and decided whether to keep going.
+
+| peers | 10-min sustained | speedup vs 100 baseline |
+|---:|---:|---:|
+| 100 | 15.3 chunks/sec | 1.0× |
+| 200 | 45.2 chunks/sec | 2.9× |
+| 300 | 84.7 chunks/sec | 5.5× |
+| 400 | 105.3 chunks/sec | 6.9× |
+
+200 → 300 was 1.87× (almost linear). 300 → 400 was 1.24× (clear
+diminishing returns). Health stayed clean at 400: full peer set
+held, no stalls, no peer-set churn, only routine pushsync
+skip-and-retry warnings (which are expected per chunk and just
+scale linearly with throughput). Settled on 400 for the rest of
+the GGUF upload. End-to-end the GGUF (1.76 M chunks, 6.7 GiB)
+completed in ~2 h of pushsync wall-clock; without the
+target-peers lift the same job would have taken ~30 h, on the
+back of the same Phase 7d / 7f code.
+
+The PLAN-time prediction (300 → "50-60 chunks/s, diminishing
+returns") was wrong by ~50 %: the per-peer credit budget really
+is the dominant ceiling, and we hadn't pinned the obvious
+fan-out / dial-budget side-effects yet. We *will* hit a wall —
+yamux stream caps, peer-table churn at 500+, the pseudosettle
+driver tick-rate — but 400 is still on the upward part of the
+curve. Future sweep at 500/600 is reasonable; 800+ should wait
+for an audit of the dial pipeline.
+
+##### Gateway max-file-bytes (1 GiB → 16 GiB)
+
+Surfaced *immediately* on the very first retrieval attempt of
+the completed GGUF: HEAD returned the right span
+(`content-length: 7162394016`), but `GET /bzz/<ref>/` returned
+HTTP 502 with body `{"code":502,"message":"join f75f2bfd...:
+file too large: span 7162394016 bytes, cap 1073741824 bytes"}`.
+
+The 1 GiB ceiling in `crates/ant-gateway/src/retrieval.rs`
+(`GATEWAY_MAX_FILE_BYTES`) was sized in the era when the joiner
+materialised the whole body in `Vec<u8>` before responding. The
+gateway is now wholly streaming
+(`dispatch_bzz`/`dispatch_bytes` → `join_to_sender_range` →
+`Body::from_stream`), with peak resident memory bounded by
+`FETCH_FANOUT * STREAM_PIPE_DEPTH * CHUNK_SIZE ≈ 4 MiB`
+regardless of declared span. The cap is therefore now a
+"sanity bound on the declared span" — it stops a pathological
+manifest from making us walk billions of intermediate chunks —
+not a memory cap.
+
+Raised to 16 GiB. Covers all current AI model weights (e.g.
+gemma3:27B-q4 ≈ 16 GB; Llama-3-70B-q4 still wouldn't fit but
+those operators can opt in via a follow-up env-var override).
+Doc comments at lines 28-30 and 139-149 of
+`crates/ant-gateway/src/retrieval.rs` synchronised: the latter
+was stale and still claimed the joiner materialised the body.
+The CLI's `DEFAULT_MAX_FILE_BYTES` (32 MiB) is unchanged —
+interactive `antctl get` is still the wrong tool for multi-GiB
+files, and the upper-bound assertion in
+`gateway_raises_joiner_max_bytes_above_cli_default` still
+passes (16 GiB > 32 MiB).
+
+##### Fresh-upload retrieval lag (NOT a bug)
+
+Once the cap was raised and the daemon restarted, retrieval of
+the GGUF still timed out — but not because of the gateway. A
+direct `/chunks/0x<addr>` probe of an L1 intermediate
+(`487f1639…`) returned the bee-shaped error
+`{"code":404,"message":"retrieval from Qm…RosxR…: remote:
+retrieve chunk: storage: not found"}`. Some chunks are simply
+not yet retrievable from any of the 400 peers we route to.
+
+This is intrinsic to Swarm's pushsync model:
+1. Pushsync delivers each chunk to **one** closest neighbour.
+2. Replication to the rest of the k-set happens over hours via
+   bee's separate sync protocols (`pullsync`,
+   neighborhood replication).
+3. Retrieval routes to whoever the routing layer thinks is
+   closest, which may not be the original receiver until the
+   neighbourhood has synced.
+
+So a 6.7 GiB upload that *just* finished pushsync has very low
+retrieval availability for the first hours, climbing as
+neighbourhoods sync. The upload is correct (manifest reads
+back, file root reachable, intermediates fetch in <30 ms each);
+the network just hasn't fanned the chunks out yet. Retrieval
+will become reliable on its own as bee's sync tick fires across
+the relevant neighbourhoods. No code change needed.
+
+If we wanted to *force* faster availability we could:
+1. Write a small antctl re-push tool that walks the file from
+   the local source, derives every leaf address, and re-pushes
+   chunks whose `/chunks/0x<addr>` returns 404 — would speed
+   the first few hours but bee will eventually do this on its
+   own.
+2. Pin a high-fanout (≥600 peer) instance next to the upload
+   for the first 24 h to multiply the routing-layer reach.
+3. Raise our own `target_peers` further once the dial-pipeline
+   audit is in (above).
+
+Saving these as Phase 7h candidates, not blocking.
+
+**Acceptance:** delivered.
+- 400 peers held cleanly through the rest of the GGUF upload.
+- gemma4:e2b GGUF reference:
+  `0x0bf812fcbe8e25905711f82acaeabeedcb221e8f2384887b778d5649cd0c8537`.
+  Manifest (`/bzz`) and file-root (`/bytes`) HEAD return the
+  correct 7 162 394 016-byte content-length; intermediate
+  chunks reachable; leaf-level reliability waiting on bee's
+  network-side sync.
+- Gateway cap fix prevents the same 502 for any future
+  multi-GiB upload.
 
 #### Phase 8 — On-device stamp lifecycle — ✅ shipped
 

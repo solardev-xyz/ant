@@ -43,6 +43,7 @@
 //! deliberately don't here.
 
 pub mod pushsync;
+pub mod pushsync_settlement;
 
 pub mod accounting;
 pub mod cache;
@@ -57,6 +58,7 @@ pub mod progress;
 pub mod splitter;
 
 pub use accounting::{Accounting, DebitGuard, HotHint, OVERDRAFT_REFRESH};
+pub use pushsync_settlement::{peer_chunk_price, PushsyncSettlement};
 pub use cache::{InMemoryChunkCache, DEFAULT_CAPACITY as DEFAULT_CACHE_CAPACITY};
 pub use counters::{ChunkSource, RetrievalCounters, RetrievalCountersSnapshot};
 pub use disk_cache::{DiskCacheError, DiskChunkCache, DEFAULT_DISK_CACHE_BYTES};

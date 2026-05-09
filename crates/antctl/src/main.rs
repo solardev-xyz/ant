@@ -459,6 +459,90 @@ enum ChequebookCommand {
         #[arg(long, env = "WALLET_ADDRESS")]
         beneficiary: Option<String>,
     },
+    /// Deploy a brand-new chequebook through the official Swarm
+    /// chequebook factory (`SimpleSwapFactory` at
+    /// `0xC2d5A532cf69AA9A1378737D8ccDEF884B6E7420` on Gnosis
+    /// mainnet), so bee peers will accept cheques drawn on it.
+    ///
+    /// **Why this exists:** bee's `chequeStore.ReceiveCheque`
+    /// silently rejects cheques whose chequebook isn't registered
+    /// with the factory (it calls `factory.deployedContracts(addr)`
+    /// before recovering the signature). A `SimpleSwap` contract
+    /// deployed independently of the factory will have all its
+    /// cheques dropped by mainnet bee, and pushsync will stall.
+    ///
+    /// The wallet (`--wallet-key`) pays gas; the *issuer* baked
+    /// into the chequebook is `--issuer-address`. They can be the
+    /// same EOA (simple) or different (cold-storage issuer key,
+    /// hot wallet pays gas). After deploy, optionally fund the
+    /// chequebook with `--initial-deposit-plur` (a plain
+    /// ERC-20 transfer of BZZ).
+    Deploy {
+        /// Gnosis RPC URL.
+        #[arg(long, env = "GNOSIS_RPC_URL")]
+        gnosis_rpc_url: String,
+        /// Wallet private key — pays gas + (optionally) the initial
+        /// BZZ deposit. Defaults to `WALLET_PRIVATE_KEY`.
+        #[arg(long, env = "WALLET_PRIVATE_KEY")]
+        wallet_key: String,
+        /// Issuer EOA address to bake into the chequebook. Bee
+        /// recovers cheque signatures and compares to this — only
+        /// the holder of the matching private key can sign valid
+        /// cheques. Defaults to `STORAGE_STAMP_OWNER_ADDRESS` so
+        /// the chequebook lines up with the existing postage
+        /// owner without operator gymnastics.
+        #[arg(long, env = "STORAGE_STAMP_OWNER_ADDRESS")]
+        issuer_address: String,
+        /// Hard-deposit timeout, in seconds. Bee uses 86 400 (24 h)
+        /// as its default in `pkg/node/devnode.go`. Increase if
+        /// you plan to use hard deposits and want the lock-up
+        /// window longer; leave at default for normal SWAP usage.
+        #[arg(long, default_value_t = ant_chain::chequebook::DEFAULT_HARD_DEPOSIT_TIMEOUT_SECS)]
+        hard_deposit_timeout_secs: u64,
+        /// Optional initial BZZ deposit, in PLUR (1 BZZ = 1e16
+        /// PLUR). If set, after a successful deploy we transfer
+        /// this amount from the wallet to the new chequebook.
+        #[arg(long)]
+        initial_deposit_plur: Option<u128>,
+        /// Optional CREATE2 salt (32-byte hex). If unset, generated
+        /// from `OsRng` so a fresh deploy never collides with an
+        /// existing one. Specify explicitly to make the deploy
+        /// deterministic across operator runs.
+        #[arg(long)]
+        salt: Option<String>,
+        /// Override the factory address (only useful on devnets;
+        /// mainnet uses the pinned address). Defaults to the
+        /// Gnosis mainnet factory.
+        #[arg(long)]
+        factory: Option<String>,
+        /// Per-tx confirmation timeout (seconds).
+        #[arg(long, default_value_t = 120)]
+        wait_secs: u64,
+        /// Gas price override (gwei). Defaults to 2 gwei.
+        #[arg(long)]
+        gas_price_gwei: Option<u64>,
+        /// If set, append/replace `CHEQUEBOOK_ADDRESS=0x…` in this
+        /// `.env` file so the next `antd` restart picks up the
+        /// new chequebook. Other lines are left untouched.
+        #[arg(long)]
+        write_env_file: Option<PathBuf>,
+    },
+    /// Verify a chequebook is registered with the Swarm chequebook
+    /// factory. Cheap (one `eth_call`) and offline-safe — useful
+    /// for diagnosing a pushsync stall without involving
+    /// gnosisscan.
+    Verify {
+        /// Gnosis RPC URL.
+        #[arg(long, env = "GNOSIS_RPC_URL")]
+        gnosis_rpc_url: String,
+        /// Chequebook contract address.
+        #[arg(long, env = "CHEQUEBOOK_ADDRESS")]
+        chequebook: String,
+        /// Override the factory address (mainnet uses the pinned
+        /// `SimpleSwapFactory`).
+        #[arg(long)]
+        factory: Option<String>,
+    },
     /// Tier-1 SWAP self-test: sign a tiny EIP-712 cheque with the
     /// chequebook's issuer key, beneficiary = our own
     /// `WALLET_PRIVATE_KEY` address, then either eth_call (default)
@@ -723,7 +807,10 @@ async fn run_chequebook_async(cmd: ChequebookCommand, json: bool) -> Result<()> 
     use ant_chain::chequebook::{
         cash_cheque_beneficiary_calldata, cheque_digest, chequebook_balance_selector,
         chequebook_issuer_selector, chequebook_liquid_balance_selector,
-        chequebook_paid_out_calldata, chequebook_total_paid_out_selector, sign_cheque, Cheque,
+        chequebook_paid_out_calldata, chequebook_total_paid_out_selector,
+        extract_deployed_chequebook, factory_deployed_contracts_calldata,
+        factory_erc20_address_calldata, random_chequebook_salt, sign_cheque, Cheque,
+        GNOSIS_BZZ_TOKEN_BYTES, GNOSIS_CHEQUEBOOK_FACTORY,
     };
     use ant_chain::tx::{Wallet, GNOSIS_CHAIN_ID};
     use ant_chain::ChainClient;
@@ -1005,7 +1092,325 @@ async fn run_chequebook_async(cmd: ChequebookCommand, json: bool) -> Result<()> 
                 }
             }
         }
+        ChequebookCommand::Verify {
+            gnosis_rpc_url,
+            chequebook,
+            factory,
+        } => {
+            let cb = parse_addr(&chequebook)?;
+            let factory_addr = match factory {
+                Some(s) => parse_addr(&s)?,
+                None => GNOSIS_CHEQUEBOOK_FACTORY,
+            };
+            let client = ChainClient::new(gnosis_rpc_url);
+            let calldata = factory_deployed_contracts_calldata(&cb);
+            let v = client
+                .eth_call(
+                    &format!("0x{}", hex::encode(factory_addr)),
+                    &format!("0x{}", hex::encode(&calldata)),
+                )
+                .await
+                .context("factory.deployedContracts")?;
+            let word = ant_chain_padded_last_word(&v)?;
+            let registered = word.iter().any(|&b| b != 0);
+
+            if json {
+                let mut obj = serde_json::Map::new();
+                obj.insert(
+                    "chequebook".into(),
+                    serde_json::Value::String(hex_addr(&cb)),
+                );
+                obj.insert(
+                    "factory".into(),
+                    serde_json::Value::String(hex_addr(&factory_addr)),
+                );
+                obj.insert("registered".into(), serde_json::Value::Bool(registered));
+                println!("{}", serde_json::Value::Object(obj));
+            } else {
+                println!("chequebook  {}", hex_addr(&cb));
+                println!("factory     {}", hex_addr(&factory_addr));
+                println!(
+                    "registered  {}",
+                    if registered {
+                        "yes — bee will accept cheques drawn on this chequebook"
+                    } else {
+                        "NO — bee silently rejects cheques from this chequebook; deploy a new one with `antctl chequebook deploy`"
+                    }
+                );
+            }
+        }
+        ChequebookCommand::Deploy {
+            gnosis_rpc_url,
+            wallet_key,
+            issuer_address,
+            hard_deposit_timeout_secs,
+            initial_deposit_plur,
+            salt,
+            factory,
+            wait_secs,
+            gas_price_gwei,
+            write_env_file,
+        } => {
+            let wallet_secret = parse_secret(&wallet_key)?;
+            let issuer_addr = parse_addr(&issuer_address)?;
+            let factory_addr = match factory {
+                Some(s) => parse_addr(&s)?,
+                None => GNOSIS_CHEQUEBOOK_FACTORY,
+            };
+            let salt_bytes: [u8; 32] = match salt {
+                Some(s) => {
+                    let raw = hex::decode(s.trim_start_matches("0x"))
+                        .context("--salt must be 32-byte hex")?;
+                    if raw.len() != 32 {
+                        bail!("--salt must be exactly 32 bytes (64 hex chars)");
+                    }
+                    let mut out = [0u8; 32];
+                    out.copy_from_slice(&raw);
+                    out
+                }
+                None => random_chequebook_salt(),
+            };
+
+            let client = ChainClient::new(gnosis_rpc_url);
+            let mut wallet = Wallet::new(wallet_secret, GNOSIS_CHAIN_ID)
+                .context("derive wallet from --wallet-key")?
+                .wait_for(Duration::from_secs(wait_secs));
+            if let Some(g) = gas_price_gwei {
+                wallet.default_gas_price_wei = g.saturating_mul(1_000_000_000);
+            }
+            let wallet_addr = *wallet.address();
+
+            // Sanity: factory's pinned BZZ token must match what we
+            // expect. Catches `--factory` typos before we sign anything.
+            let bzz_ret = client
+                .eth_call(
+                    &format!("0x{}", hex::encode(factory_addr)),
+                    &format!("0x{}", hex::encode(factory_erc20_address_calldata())),
+                )
+                .await
+                .context("factory.ERC20Address()")?;
+            let bzz_word = ant_chain_padded_last_word(&bzz_ret)?;
+            let mut bzz_addr = [0u8; 20];
+            bzz_addr.copy_from_slice(&bzz_word[12..32]);
+            if bzz_addr != GNOSIS_BZZ_TOKEN_BYTES {
+                bail!(
+                    "factory at {} returns ERC20Address={}, expected mainnet BZZ {}; refusing to deploy against the wrong factory",
+                    hex_addr(&factory_addr),
+                    hex_addr(&bzz_addr),
+                    hex_addr(&GNOSIS_BZZ_TOKEN_BYTES),
+                );
+            }
+
+            eprintln!(
+                "deploying chequebook…\n\
+                 factory             {}\n\
+                 wallet (gas payer)  {}\n\
+                 issuer              {}\n\
+                 hard_deposit_to     {}s\n\
+                 salt                0x{}",
+                hex_addr(&factory_addr),
+                hex_addr(&wallet_addr),
+                hex_addr(&issuer_addr),
+                hard_deposit_timeout_secs,
+                hex::encode(salt_bytes),
+            );
+
+            let receipt = wallet
+                .deploy_chequebook(
+                    &client,
+                    &factory_addr,
+                    &issuer_addr,
+                    U256::from(hard_deposit_timeout_secs),
+                    &salt_bytes,
+                )
+                .await
+                .context("factory.deploySimpleSwap")?;
+
+            let cb = match extract_deployed_chequebook(&receipt) {
+                Some(addr) => addr,
+                None => bail!(
+                    "factory tx 0x{} confirmed in block {} but emitted no SimpleSwapDeployed log; logs were {:?}",
+                    hex::encode(receipt.tx_hash),
+                    receipt.block_number,
+                    receipt.logs,
+                ),
+            };
+
+            // Verify factory.deployedContracts(new_addr) == true
+            // before declaring success — paranoia, but cheap.
+            let verify_calldata = factory_deployed_contracts_calldata(&cb);
+            let v = client
+                .eth_call(
+                    &format!("0x{}", hex::encode(factory_addr)),
+                    &format!("0x{}", hex::encode(&verify_calldata)),
+                )
+                .await
+                .context("post-deploy factory.deployedContracts")?;
+            let word = ant_chain_padded_last_word(&v)?;
+            let registered = word.iter().any(|&b| b != 0);
+            if !registered {
+                bail!(
+                    "deploy succeeded (chequebook = {}) but factory.deployedContracts returned false; this should be impossible — refuse to proceed",
+                    hex_addr(&cb),
+                );
+            }
+
+            // Optional initial deposit: plain ERC-20 transfer of
+            // BZZ from wallet to chequebook. The chequebook's
+            // `balance()` view is `BZZ.balanceOf(swap)`, so this
+            // is functionally a chequebook deposit.
+            let mut deposit_tx: Option<[u8; 32]> = None;
+            let mut deposit_block: Option<u64> = None;
+            if let Some(deposit) = initial_deposit_plur {
+                if deposit > 0 {
+                    eprintln!(
+                        "depositing {} PLUR ({} BZZ) into the chequebook via ERC-20 transfer…",
+                        deposit,
+                        deposit / 10_000_000_000_000_000u128,
+                    );
+                    let rcpt = wallet
+                        .erc20_transfer(
+                            &client,
+                            &GNOSIS_BZZ_TOKEN_BYTES,
+                            &cb,
+                            U256::from(deposit),
+                        )
+                        .await
+                        .context("BZZ.transfer to new chequebook")?;
+                    deposit_tx = Some(rcpt.tx_hash);
+                    deposit_block = Some(rcpt.block_number);
+                }
+            }
+
+            // If the operator asked us to update an .env file,
+            // splice the new CHEQUEBOOK_ADDRESS in. Match the
+            // `KEY=VALUE` shape that bash sources cleanly.
+            if let Some(path) = write_env_file.as_ref() {
+                update_env_file(path, "CHEQUEBOOK_ADDRESS", &hex_addr(&cb))
+                    .with_context(|| format!("update {}", path.display()))?;
+            }
+
+            if json {
+                let mut obj = serde_json::Map::new();
+                obj.insert(
+                    "chequebook".into(),
+                    serde_json::Value::String(hex_addr(&cb)),
+                );
+                obj.insert(
+                    "factory".into(),
+                    serde_json::Value::String(hex_addr(&factory_addr)),
+                );
+                obj.insert(
+                    "issuer".into(),
+                    serde_json::Value::String(hex_addr(&issuer_addr)),
+                );
+                obj.insert(
+                    "wallet".into(),
+                    serde_json::Value::String(hex_addr(&wallet_addr)),
+                );
+                obj.insert(
+                    "factory_verified".into(),
+                    serde_json::Value::Bool(registered),
+                );
+                obj.insert(
+                    "salt".into(),
+                    serde_json::Value::String(format!("0x{}", hex::encode(salt_bytes))),
+                );
+                obj.insert(
+                    "tx_hash".into(),
+                    serde_json::Value::String(format!(
+                        "0x{}",
+                        hex::encode(receipt.tx_hash)
+                    )),
+                );
+                obj.insert(
+                    "block".into(),
+                    serde_json::Value::Number(receipt.block_number.into()),
+                );
+                if let Some(d) = initial_deposit_plur {
+                    obj.insert(
+                        "deposit_plur".into(),
+                        serde_json::Value::String(d.to_string()),
+                    );
+                }
+                if let Some(h) = deposit_tx {
+                    obj.insert(
+                        "deposit_tx".into(),
+                        serde_json::Value::String(format!("0x{}", hex::encode(h))),
+                    );
+                }
+                if let Some(b) = deposit_block {
+                    obj.insert("deposit_block".into(), serde_json::Value::Number(b.into()));
+                }
+                if let Some(p) = write_env_file.as_ref() {
+                    obj.insert(
+                        "env_file".into(),
+                        serde_json::Value::String(p.display().to_string()),
+                    );
+                }
+                println!("{}", serde_json::Value::Object(obj));
+            } else {
+                println!("chequebook       {}", hex_addr(&cb));
+                println!("factory          {}", hex_addr(&factory_addr));
+                println!("issuer           {}  (factory-baked)", hex_addr(&issuer_addr));
+                println!("wallet           {}  (paid gas)", hex_addr(&wallet_addr));
+                println!("factory-verified {}", registered);
+                println!("salt             0x{}", hex::encode(salt_bytes));
+                println!(
+                    "deploy tx        0x{}  (block {})",
+                    hex::encode(receipt.tx_hash),
+                    receipt.block_number,
+                );
+                if let Some(d) = initial_deposit_plur {
+                    println!("deposit          {} PLUR", d);
+                    if let (Some(h), Some(b)) = (deposit_tx, deposit_block) {
+                        println!(
+                            "deposit tx       0x{}  (block {})",
+                            hex::encode(h),
+                            b,
+                        );
+                    }
+                }
+                if let Some(p) = write_env_file.as_ref() {
+                    println!("wrote CHEQUEBOOK_ADDRESS=0x{} to {}", hex::encode(cb), p.display());
+                }
+                println!();
+                println!("next step: restart antd so it picks up the new chequebook.");
+            }
+        }
     }
+    Ok(())
+}
+
+/// Append-or-replace `key=value` in a `.env`-style file. Touches
+/// only the line that starts with `key=`; preserves comments,
+/// blank lines, and ordering of unrelated keys. The new value is
+/// written un-quoted (callers are responsible for picking values
+/// that don't need quoting — Ethereum addresses are pure hex, so
+/// they always work).
+fn update_env_file(path: &std::path::Path, key: &str, value: &str) -> Result<()> {
+    let body = std::fs::read_to_string(path).unwrap_or_default();
+    let mut lines: Vec<String> = body.lines().map(|s| s.to_string()).collect();
+    let prefix = format!("{key}=");
+    let new_line = format!("{key}={value}");
+    let mut replaced = false;
+    for line in lines.iter_mut() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with(&prefix) {
+            *line = new_line.clone();
+            replaced = true;
+            break;
+        }
+    }
+    if !replaced {
+        lines.push(new_line);
+    }
+    let mut out = lines.join("\n");
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    std::fs::write(path, out)
+        .with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
