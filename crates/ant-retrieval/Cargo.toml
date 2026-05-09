@@ -7,20 +7,20 @@ edition.workspace = true
 ant-crypto = { path = "../ant-crypto" }
 ant-postage = { path = "../ant-postage" }
 async-trait = "0.1.89"
-libp2p.workspace = true
-libp2p-stream = "0.4.0-alpha"
-tokio.workspace = true
-tracing.workspace = true
-thiserror.workspace = true
-prost.workspace = true
-unsigned-varint.workspace = true
+crossbeam-channel = "0.5"
 futures = "0.3.31"
 hex.workspace = true
+libp2p.workspace = true
+libp2p-stream = "0.4.0-alpha"
 lru = "0.17.0"
-crossbeam-channel = "0.5"
+prost.workspace = true
 rusqlite = { version = "0.39.0", features = ["bundled"] }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+unsigned-varint.workspace = true
 
 [dev-dependencies]
-sha2 = "0.11.0"
 k256.workspace = true
+sha2 = "0.11.0"
 tempfile = "3.27.0"
