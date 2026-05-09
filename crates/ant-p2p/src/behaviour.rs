@@ -1488,7 +1488,7 @@ fn handle_control_command(
                     let s: Arc<dyn ant_retrieval::PushsyncSettlement> = svc;
                     fetcher = fetcher.with_pushsync_settlement(s);
                 }
-                let reply = match fetcher.push_stamped_cac(addr, wire, stamp).await {
+                let reply = match fetcher.push_stamped_chunk(addr, wire, stamp).await {
                     Ok(()) => ControlAck::ChunkUploaded {
                         reference: format!("0x{}", hex::encode(addr)),
                     },
