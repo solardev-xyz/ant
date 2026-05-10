@@ -237,6 +237,19 @@ pub enum ControlCommand {
         wire: Vec<u8>,
         ack: oneshot::Sender<ControlAck>,
     },
+    /// Resolve a sequence feed `(owner, topic)` to its latest update.
+    /// Backs the gateway's `GET /feeds/{owner}/{topic}` endpoint. The
+    /// handler uses the same `RoutingFetcher` machinery `GetBytes` does,
+    /// so the lookup is bounded by `ant_retrieval::feed`'s scan limits
+    /// and tolerates transient peer flakiness. Epoch feeds aren't a
+    /// supported variant: the gateway short-circuits `?type=epoch` with
+    /// `501 Not Implemented` before sending the command, so the wire
+    /// here is sequence-only.
+    GetFeed {
+        owner: [u8; 20],
+        topic: [u8; 32],
+        ack: oneshot::Sender<ControlAck>,
+    },
 }
 
 /// Inclusive byte range used by [`ControlCommand::StreamBytes`] and
@@ -308,6 +321,31 @@ pub enum ControlAck {
     /// Local postage stamp issuer snapshot. Terminal ack on
     /// `PostageStatus`.
     PostageStatus(PostageStatusView),
+    /// Successful feed resolution: the SOC `id`
+    /// (`keccak256(topic ‖ index_be8)`) of the resolved update, the
+    /// reference its CAC payload points at, the sequence index it lived
+    /// at, and the v1 timestamp embedded in that CAC payload. The `id`
+    /// is what bee surfaces in the `swarm-feed-index` HTTP header on
+    /// `GET /feeds/{owner}/{topic}`. Carrying it through the ack keeps
+    /// the gateway from recomputing `keccak256` for the header.
+    FeedResolved {
+        id: [u8; 32],
+        reference: [u8; 32],
+        index: u64,
+        ts: u64,
+    },
+    /// Empty-feed signal from `GetFeed`. Distinct from
+    /// [`Self::Error`] so the gateway can map it to `404 Not Found`
+    /// without substring-matching an error message.
+    FeedNotFound,
+    /// The node loop accepted the command but isn't ready to serve it
+    /// (most commonly: zero connected peers). Distinct from
+    /// [`Self::Error`] so the gateway can map it to `503 Service
+    /// Unavailable` rather than the `502 Bad Gateway` it returns for
+    /// genuine I/O failures.
+    NotReady {
+        message: String,
+    },
     Error {
         message: String,
     },
@@ -771,7 +809,21 @@ fn ack_to_response(ack: ControlAck) -> Response {
         ControlAck::UploadList(views) => Response::UploadList { jobs: views },
         ControlAck::UploadProgress(view) => Response::UploadProgress(view),
         ControlAck::PostageStatus(view) => Response::PostageStatus(view),
-        ControlAck::Error { message } => Response::Error { message },
+        // The Unix-socket protocol used by `antctl` doesn't expose feed
+        // reads today; the control surface is just for renderers and
+        // ops tooling, and feed lookup lives on the gateway HTTP API.
+        // If a future client wants to drive `GetFeed` over the control
+        // socket we'll add `Response::FeedResolved` / `FeedNotFound`
+        // variants; for now surface a clear error so the seam is visible.
+        ControlAck::FeedResolved { .. } | ControlAck::FeedNotFound => Response::Error {
+            message: "feed resolution is only supported by ant-gateway".to_string(),
+        },
+        // `NotReady` exists for the gateway HTTP path so it can return
+        // `503 Service Unavailable`; collapsing to a generic error here
+        // keeps the Unix-socket surface unchanged.
+        ControlAck::NotReady { message } | ControlAck::Error { message } => {
+            Response::Error { message }
+        }
     }
 }
 

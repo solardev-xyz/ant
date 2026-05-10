@@ -454,6 +454,19 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
                 message: "PutChunkLocal not supported in gateway test fixtures".into(),
             });
         }
+        // Feed lookups don't go through the on-disk `DirFetcher`
+        // fixture: the feed tests stage SOC updates in memory and use
+        // `router_with_dispatcher` directly. Surfacing a clear "not
+        // implemented in this fixture" error keeps any new test that
+        // accidentally hits the standard fixture from silently
+        // succeeding against an empty corpus.
+        ControlCommand::GetFeed { ack, .. } => {
+            let _ = ack.send(ControlAck::Error {
+                message: "GetFeed is not wired through the standard test fixture; \
+                         use router_with_dispatcher to stage feed updates"
+                    .into(),
+            });
+        }
     }
 }
 

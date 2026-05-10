@@ -565,7 +565,10 @@ async fn attempt_download(
                 | ControlAck::UploadJob(_)
                 | ControlAck::UploadList(_)
                 | ControlAck::UploadProgress(_)
-                | ControlAck::PostageStatus(_),
+                | ControlAck::PostageStatus(_)
+                | ControlAck::FeedResolved { .. }
+                | ControlAck::FeedNotFound
+                | ControlAck::NotReady { .. },
             )) => {}
             Ok(None) => {
                 return Err(FfiError::Download(

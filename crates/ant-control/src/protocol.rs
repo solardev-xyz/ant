@@ -712,6 +712,8 @@ pub enum GatewayRequestKind {
     /// Distinct from [`Self::Chunk`] so operators can tell SOC reads
     /// apart from CAC reads in `antctl top`.
     Soc,
+    /// `GET /feeds/{owner}/{topic}` — sequence-feed resolution.
+    Feed,
     /// `GET /v0/manifest/{addr}` — Ant-specific manifest enumeration.
     Manifest,
 }
@@ -721,8 +723,8 @@ impl GatewayRequestKind {
     /// ASCII characters so the table's `Kind` column stays narrow
     /// while still being self-explanatory: each label is the bee /
     /// Ant endpoint name (`/bytes`, `/bzz`, `/chunks`, `/soc`,
-    /// `/v0/manifest`) either spelled in full or trimmed to the same
-    /// root.
+    /// `/feeds`, `/v0/manifest`) either spelled in full or trimmed
+    /// to the same root.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -730,6 +732,7 @@ impl GatewayRequestKind {
             Self::Bzz => "BZZ",
             Self::Chunk => "Chunk",
             Self::Soc => "SOC",
+            Self::Feed => "Feed",
             Self::Manifest => "Manif",
         }
     }

@@ -1505,7 +1505,7 @@ fn handle_control_command(
             // serve `/chunks/{addr}` byte-for-byte the way bee does.
             let candidate = state.routing.closest_peer(&reference, &[]);
             let Some((peer, _overlay)) = candidate else {
-                let _ = ack.send(ControlAck::Error {
+                let _ = ack.send(ControlAck::NotReady {
                     message: "no peers available; wait for handshakes to complete".to_string(),
                 });
                 return;
@@ -1888,6 +1888,44 @@ fn handle_control_command(
         }
         ControlCommand::PutChunkLocal { wire, ack } => {
             handle_put_chunk_local(state, wire, ack);
+        }
+        ControlCommand::GetFeed { owner, topic, ack } => {
+            // Feed reads share their fetch path with `GetBytes`: spin up a
+            // routing-aware fetcher backed by the live peer-snapshot
+            // watch and let `resolve_sequence_feed_full` walk the
+            // sequence indices. The handler does not consult the disk
+            // cache because feed updates rarely repeat — every probe
+            // hits a unique SOC address — so the cache lookup would
+            // pay for itself only on retries.
+            let peers_rx = state.peers_watch.subscribe();
+            if peers_rx.borrow().is_empty() {
+                let _ = ack.send(ControlAck::NotReady {
+                    message: "no peers available; wait for handshakes to complete".to_string(),
+                });
+                return;
+            }
+            let control = control.clone();
+            tokio::spawn(async move {
+                let fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx);
+                let feed = ant_retrieval::Feed {
+                    owner,
+                    topic,
+                    kind: ant_retrieval::FeedType::Sequence,
+                };
+                let reply = match ant_retrieval::resolve_sequence_feed_full(&fetcher, &feed).await {
+                    Ok(resolution) => ControlAck::FeedResolved {
+                        id: ant_retrieval::sequence_update_id(&topic, resolution.index),
+                        reference: resolution.reference,
+                        index: resolution.index,
+                        ts: resolution.ts,
+                    },
+                    Err(ant_retrieval::FeedError::NoUpdates { .. }) => ControlAck::FeedNotFound,
+                    Err(e) => ControlAck::Error {
+                        message: format!("feed lookup: {e}"),
+                    },
+                };
+                let _ = ack.send(reply);
+            });
         }
     }
 }
