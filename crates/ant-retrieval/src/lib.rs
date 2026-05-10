@@ -62,8 +62,9 @@ pub use cache::{InMemoryChunkCache, DEFAULT_CAPACITY as DEFAULT_CACHE_CAPACITY};
 pub use counters::{ChunkSource, RetrievalCounters, RetrievalCountersSnapshot};
 pub use disk_cache::{DiskCacheError, DiskChunkCache, DEFAULT_DISK_CACHE_BYTES};
 pub use feed::{
-    feed_from_metadata, resolve_sequence_feed, sequence_update_address, Feed, FeedError, FeedType,
-    FEED_OWNER_KEY, FEED_TOPIC_KEY, FEED_TYPE_KEY,
+    feed_from_metadata, resolve_sequence_feed, resolve_sequence_feed_full, sequence_update_address,
+    sequence_update_id, Feed, FeedError, FeedResolution, FeedType, FEED_OWNER_KEY, FEED_TOPIC_KEY,
+    FEED_TYPE_KEY,
 };
 pub use fetcher::{Overlay, RoutingFetcher};
 pub use joiner::{

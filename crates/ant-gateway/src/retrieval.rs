@@ -223,6 +223,9 @@ pub async fn chunk(
 
     let bytes = match ack {
         ControlAck::Bytes { data } => data,
+        ControlAck::NotReady { message } => {
+            return json_error(StatusCode::SERVICE_UNAVAILABLE, message);
+        }
         ControlAck::Error { message } => {
             return json_error(StatusCode::NOT_FOUND, message);
         }
@@ -303,6 +306,9 @@ pub async fn download_soc(
 
     let bytes = match ack {
         ControlAck::Bytes { data } => data,
+        ControlAck::NotReady { message } => {
+            return json_error(StatusCode::SERVICE_UNAVAILABLE, message);
+        }
         ControlAck::Error { message } => {
             return json_error(StatusCode::NOT_FOUND, message);
         }
@@ -1837,6 +1843,293 @@ fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Response {
         HeaderValue::from_static("application/json"),
     );
     resp
+}
+
+/// `swarm-feed-index` HTTP response header carrying the SOC `id` of
+/// the resolved feed update (`keccak256(topic ‖ index_be8)`,
+/// hex-encoded as 64 lowercase chars). Matches bee's
+/// `GET /feeds/{owner}/{topic}` response, see
+/// `bee/pkg/api/feed.go::feedGetHandler`.
+const SWARM_FEED_INDEX: HeaderName = HeaderName::from_static("swarm-feed-index");
+
+/// `?type=` query parameter on `GET /feeds/{owner}/{topic}`. Default is
+/// `sequence`. Epoch feeds aren't implemented; the gateway returns
+/// `501` for them so client probes can distinguish "feed type not
+/// supported" from "feed not found".
+#[derive(Debug, Deserialize, Default)]
+pub struct FeedQuery {
+    #[serde(default)]
+    r#type: Option<String>,
+}
+
+/// `GET /feeds/{owner}/{topic}` — resolve a sequence feed to its latest
+/// update. Mirrors bee's endpoint shape: octet-stream body
+/// (`ts(8 BE) || ref(32)`), `swarm-feed-index` header carrying the
+/// 64-hex SOC `id`, `Cache-Control: no-cache` because feed contents are
+/// mutable. The body shape is content-negotiated by the `Accept` header
+/// so JSON / XML clients can read structured fields without needing a
+/// feed parser of their own. `HEAD` is supported by the same handler;
+/// it dispatches the same lookup and returns headers with an empty body.
+pub async fn download_feed(
+    State(handle): State<GatewayHandle>,
+    Path((owner_hex, topic_hex)): Path<(String, String)>,
+    Query(query): Query<FeedQuery>,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
+    let owner = match parse_hex_fixed::<20>(&owner_hex) {
+        Ok(o) => o,
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("bad owner: {e}")),
+    };
+    let topic = match parse_hex_fixed::<32>(&topic_hex) {
+        Ok(t) => t,
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("bad topic: {e}")),
+    };
+
+    if let Some(kind) = query.r#type.as_deref() {
+        match kind.to_ascii_lowercase().as_str() {
+            "sequence" => {}
+            "epoch" => {
+                return json_error(StatusCode::NOT_IMPLEMENTED, "epoch feeds are not supported");
+            }
+            other => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown feed type: {other}"),
+                );
+            }
+        }
+    }
+
+    let guard = handle.activity.begin(
+        GatewayRequestKind::Feed,
+        short_reference(&hex::encode(topic)),
+    );
+
+    let timeout = request_timeout(&headers, CHUNK_REQUEST_TIMEOUT);
+
+    let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
+    let cmd = ControlCommand::GetFeed {
+        owner,
+        topic,
+        ack: ack_tx,
+    };
+    if handle.commands.send(cmd).await.is_err() {
+        return node_unavailable();
+    }
+    guard.update(0, 1, 1, 0);
+
+    let ack = match tokio::time::timeout(timeout, ack_rx).await {
+        Ok(Ok(ack)) => ack,
+        Ok(Err(_)) => return node_unavailable(),
+        Err(_) => {
+            return json_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("feed lookup timed out after {}s", timeout.as_secs()),
+            );
+        }
+    };
+
+    let (id, reference, index, ts) = match ack {
+        ControlAck::FeedResolved {
+            id,
+            reference,
+            index,
+            ts,
+        } => (id, reference, index, ts),
+        ControlAck::FeedNotFound => {
+            return json_error(StatusCode::NOT_FOUND, "no feed updates found");
+        }
+        ControlAck::NotReady { message } => {
+            return json_error(StatusCode::SERVICE_UNAVAILABLE, message);
+        }
+        ControlAck::Error { message } => {
+            // Detailed retrieval errors (peer addresses, internal
+            // failure modes) belong in the operator log, not in the
+            // public response body. Match the bee feed handler, which
+            // returns a generic "feed lookup failed" body.
+            warn!(target: "ant_gateway", %message, "feed lookup failed");
+            return json_error(StatusCode::BAD_GATEWAY, "feed lookup failed");
+        }
+        other => {
+            warn!(target: "ant_gateway", ?other, "unexpected ack from GetFeed");
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "unexpected node ack");
+        }
+    };
+    guard.update(1, 1, 0, 40);
+
+    let preferred = preferred_feed_format(&headers);
+    let body_bytes = render_feed_body(preferred, &reference, ts, index);
+    let body_len = body_bytes.len();
+    let body = if method == Method::HEAD {
+        Body::empty()
+    } else {
+        Body::from(body_bytes)
+    };
+    let mut resp = Response::new(body);
+    let _ = resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(preferred.content_type()),
+    );
+    let _ = resp
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, HeaderValue::from(body_len));
+    let _ = resp
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, MUTABLE_CACHE_CONTROL);
+    if let Ok(v) = HeaderValue::from_str(&hex::encode(id)) {
+        let _ = resp.headers_mut().insert(SWARM_FEED_INDEX, v);
+    }
+    resp
+}
+
+/// Body shape for `GET /feeds/{owner}/{topic}`. Bee returns the v1 inner
+/// CAC payload (`ts(8 BE) || ref(32)`); we add JSON and XML for
+/// structured clients that don't want to parse the binary layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FeedFormat {
+    OctetStream,
+    Json,
+    Xml,
+}
+
+impl FeedFormat {
+    const fn content_type(self) -> &'static str {
+        match self {
+            Self::OctetStream => "application/octet-stream",
+            Self::Json => "application/json",
+            Self::Xml => "application/xml",
+        }
+    }
+}
+
+/// Pick the best body format from the `Accept` request header. Unknown
+/// or absent values fall back to bee-shaped octet-stream so existing
+/// bee clients keep working byte-for-byte. Q-values are honored
+/// (`text/html;q=0.5, application/json` returns JSON); a malformed
+/// header falls back to octet-stream rather than failing the request.
+///
+/// Q-values are parsed as integer thousandths (RFC 7231 caps them at
+/// three decimal places) so the comparison is exact and we don't drag
+/// in a float-ordering helper.
+fn preferred_feed_format(headers: &HeaderMap) -> FeedFormat {
+    let Some(accept) = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()) else {
+        return FeedFormat::OctetStream;
+    };
+    let mut best: (FeedFormat, u16) = (FeedFormat::OctetStream, 0);
+    let mut saw_explicit = false;
+    for entry in accept.split(',') {
+        let mut parts = entry.split(';').map(str::trim);
+        let Some(media) = parts.next() else { continue };
+        let media = media.to_ascii_lowercase();
+        let mut q = 1_000_u16;
+        let mut q_invalid = false;
+        for param in parts {
+            // RFC 7231 §3.1.1.1: parameter names are case-insensitive,
+            // so accept `Q=` as well as `q=`. Split on the first `=` and
+            // compare the name in lowercase rather than relying on
+            // `strip_prefix`, which would only match one casing.
+            let Some((name, rest)) = param.split_once('=') else {
+                continue;
+            };
+
+            if !name.eq_ignore_ascii_case("q") {
+                continue;
+            }
+
+            if let Some(parsed) = parse_q_thousandths(rest) {
+                q = parsed;
+            } else {
+                q_invalid = true;
+                break;
+            }
+        }
+        // RFC 7231 §5.3.1: a malformed q-value disqualifies the entry
+        // entirely. Without this guard a value like `q=abc` would fall
+        // through to the default 1.0 and outrank well-formed
+        // alternatives, which is the opposite of what the client asked
+        // for.
+        if q_invalid {
+            continue;
+        }
+        let format = match media.as_str() {
+            "application/json" | "text/json" => Some(FeedFormat::Json),
+            "application/xml" | "text/xml" => Some(FeedFormat::Xml),
+            "application/octet-stream" => Some(FeedFormat::OctetStream),
+            // `*/*` and unknown types don't bump the explicit choice.
+            _ => None,
+        };
+        if let Some(f) = format {
+            saw_explicit = true;
+            if q > best.1 {
+                best = (f, q);
+            }
+        }
+    }
+    if saw_explicit {
+        best.0
+    } else {
+        FeedFormat::OctetStream
+    }
+}
+
+/// Parse an RFC 7231 q-value (`0`, `1`, `0.5`, `0.250`) as integer
+/// thousandths, capped at `1000`. Anything else is rejected so the
+/// caller falls back to the default `1.0`.
+fn parse_q_thousandths(s: &str) -> Option<u16> {
+    let s = s.trim();
+    let (whole_str, frac_str) = match s.split_once('.') {
+        Some((w, f)) => (w, f),
+        None => (s, ""),
+    };
+    let whole: u16 = whole_str.parse().ok()?;
+    if whole > 1 {
+        return None;
+    }
+    if frac_str.len() > 3 || !frac_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mut frac: u16 = 0;
+    for b in frac_str.bytes() {
+        frac = frac * 10 + u16::from(b - b'0');
+    }
+    for _ in frac_str.len()..3 {
+        frac *= 10;
+    }
+    let total = whole * 1_000 + frac;
+    (total <= 1_000).then_some(total)
+}
+
+fn render_feed_body(format: FeedFormat, reference: &[u8; 32], ts: u64, index: u64) -> Vec<u8> {
+    match format {
+        FeedFormat::OctetStream => {
+            // Bee's `feedGetHandler` returns the inner CAC payload
+            // verbatim: `ts(8 BE) || ref(32)`. Mirror that.
+            let mut out = Vec::with_capacity(40);
+            out.extend_from_slice(&ts.to_be_bytes());
+            out.extend_from_slice(reference);
+            out
+        }
+        FeedFormat::Json => {
+            let body = serde_json::json!({
+                "reference": hex::encode(reference),
+                "ts": ts,
+                "index": index,
+            });
+            serde_json::to_vec(&body).expect("serialize feed json")
+        }
+        FeedFormat::Xml => {
+            // Hand-rolled to avoid pulling in an XML crate; the field
+            // values are all hex / decimal so they need no escaping.
+            let xml = format!(
+                "<feed><reference>{}</reference><ts>{}</ts><index>{}</index></feed>",
+                hex::encode(reference),
+                ts,
+                index,
+            );
+            xml.into_bytes()
+        }
+    }
 }
 
 /// Tiny `humantime`-shaped duration parser so we don't pull in a whole

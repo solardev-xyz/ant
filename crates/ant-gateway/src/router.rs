@@ -46,6 +46,14 @@ pub fn build(handle: GatewayHandle) -> Router {
         // path only — publisher-side `POST /soc/{owner}/{id}` is out of
         // scope for the Freedom Browser concern this branch addresses.
         .route("/soc/{owner}/{id}", get_or_head(retrieval::download_soc))
+        // Sequence-feed lookup. Returns the latest update's
+        // `ts(8 BE) || ref(32)` body by default (matching bee), or a
+        // structured JSON / XML body when the client opts in via the
+        // `Accept` request header.
+        .route(
+            "/feeds/{owner}/{topic}",
+            get_or_head(retrieval::download_feed),
+        )
         .route("/bzz", post(retrieval::upload_bzz))
         .route("/bytes/{addr}", get_or_head(retrieval::bytes))
         // Ant-specific extension (not part of bee Tier-A): list paths in

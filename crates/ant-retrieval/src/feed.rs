@@ -200,15 +200,40 @@ pub fn feed_from_metadata<S: BuildHasher>(
 /// `index`. Mirrors `bee/pkg/feeds/feed.go::Update.Address`.
 #[must_use]
 pub fn sequence_update_address(feed: &Feed, index: u64) -> [u8; 32] {
-    let mut id_input = Vec::with_capacity(32 + 8);
-    id_input.extend_from_slice(&feed.topic);
-    id_input.extend_from_slice(&index.to_be_bytes());
-    let id = keccak256(&id_input);
+    let id = sequence_update_id(&feed.topic, index);
 
     let mut addr_input = Vec::with_capacity(32 + 20);
     addr_input.extend_from_slice(&id);
     addr_input.extend_from_slice(&feed.owner);
     keccak256(&addr_input)
+}
+
+/// SOC `id` for sequence-feed update at `index`:
+/// `keccak256(topic ‖ index_be8)`. Bee surfaces this id in the
+/// `swarm-feed-index` HTTP response header on `GET /feeds/...`, so the
+/// node-side feed handler exposes it for the gateway to echo without
+/// recomputing keccak.
+#[must_use]
+pub fn sequence_update_id(topic: &[u8; 32], index: u64) -> [u8; 32] {
+    let mut id_input = Vec::with_capacity(32 + 8);
+    id_input.extend_from_slice(topic);
+    id_input.extend_from_slice(&index.to_be_bytes());
+    keccak256(&id_input)
+}
+
+/// Resolved feed update: the reference the latest update points at,
+/// the sequence index that update was found at, and the timestamp
+/// embedded in its v1 payload (big-endian unix seconds, exactly as
+/// bee writes; see `bee/pkg/feeds/feed.go::Update`).
+///
+/// Callers that only want the reference can use [`resolve_sequence_feed`];
+/// callers that need to render bee-shaped feed responses (e.g. the
+/// gateway's `GET /feeds/{owner}/{topic}` handler) need all three fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeedResolution {
+    pub reference: [u8; 32],
+    pub index: u64,
+    pub ts: u64,
 }
 
 /// Resolve a feed to its current content root.
@@ -228,7 +253,18 @@ pub async fn resolve_sequence_feed(
     fetcher: &dyn ChunkFetcher,
     feed: &Feed,
 ) -> Result<[u8; 32], FeedError> {
-    let mut last: Option<(u64, [u8; 32])> = None;
+    Ok(resolve_sequence_feed_full(fetcher, feed).await?.reference)
+}
+
+/// Same scan as [`resolve_sequence_feed`] but returns the full update
+/// metadata (index + ts) alongside the reference. Used by the gateway
+/// to render bee-shaped feed responses with `swarm-feed-index` headers
+/// and JSON / XML bodies that include the embedded timestamp.
+pub async fn resolve_sequence_feed_full(
+    fetcher: &dyn ChunkFetcher,
+    feed: &Feed,
+) -> Result<FeedResolution, FeedError> {
+    let mut last: Option<FeedResolution> = None;
     let mut consecutive_misses: u64 = 0;
     let mut probed: u64 = 0;
 
@@ -238,14 +274,18 @@ pub async fn resolve_sequence_feed(
         match fetcher.fetch(addr).await {
             Ok(chunk_wire) => {
                 consecutive_misses = 0;
-                let reference = decode_sequence_update(&chunk_wire, addr, feed)?;
+                let (ts, reference) = decode_sequence_update(&chunk_wire, addr, feed)?;
                 trace!(
                     target: "ant_retrieval::feed",
                     index,
                     addr = %hex::encode(addr),
                     "feed update fetched and verified",
                 );
-                last = Some((index, reference));
+                last = Some(FeedResolution {
+                    reference,
+                    index,
+                    ts,
+                });
             }
             Err(e) => {
                 // Distinguish "chunk not present in network" (a normal
@@ -269,15 +309,15 @@ pub async fn resolve_sequence_feed(
     }
 
     match last {
-        Some((index, reference)) => {
+        Some(resolution) => {
             debug!(
                 target: "ant_retrieval::feed",
-                latest_index = index,
-                reference = %hex::encode(reference),
+                latest_index = resolution.index,
+                reference = %hex::encode(resolution.reference),
                 probed,
                 "feed resolved",
             );
-            Ok(reference)
+            Ok(resolution)
         }
         None => Err(FeedError::NoUpdates { probed }),
     }
@@ -304,7 +344,7 @@ fn decode_sequence_update(
     chunk_wire: &[u8],
     expected_soc_addr: [u8; 32],
     feed: &Feed,
-) -> Result<[u8; 32], FeedError> {
+) -> Result<(u64, [u8; 32]), FeedError> {
     if chunk_wire.len() < SOC_MIN_CHUNK_SIZE {
         return Err(FeedError::SocTooShort(chunk_wire.len()));
     }
@@ -364,11 +404,16 @@ fn decode_sequence_update(
     let cac_total = inner_cac.len();
     match cac_total {
         48 => {
-            // Unencrypted v1: ts(8) at offset SPAN_SIZE..SPAN_SIZE+8;
-            // reference is the next 32 bytes.
+            // Unencrypted v1: ts(8 BE) at offset SPAN_SIZE..SPAN_SIZE+8;
+            // reference is the next 32 bytes. Bee writes ts as
+            // big-endian unix seconds; see
+            // `bee/pkg/feeds/feed.go::Update`.
+            let mut ts_bytes = [0u8; 8];
+            ts_bytes.copy_from_slice(&inner_cac[SPAN_SIZE..SPAN_SIZE + 8]);
+            let ts = u64::from_be_bytes(ts_bytes);
             let mut reference = [0u8; 32];
             reference.copy_from_slice(&inner_cac[SPAN_SIZE + 8..SPAN_SIZE + 8 + 32]);
-            Ok(reference)
+            Ok((ts, reference))
         }
         56 => Err(FeedError::EncryptedPayloadNotSupported),
         _ => {
