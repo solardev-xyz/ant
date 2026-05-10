@@ -1887,7 +1887,14 @@ fn content_type_from_extension(filename: &str) -> Option<&'static str> {
         "pdf" => Some("application/pdf"),
         "txt" => Some("text/plain; charset=utf-8"),
         "html" | "htm" => Some("text/html; charset=utf-8"),
-        "json" => Some("application/json"),
+        "map" | "json" => Some("application/json"),
+        "js" | "mjs" => Some("text/javascript; charset=utf-8"),
+        "css" => Some("text/css; charset=utf-8"),
+        "wasm" => Some("application/wasm"),
+        "woff" => Some("font/woff"),
+        "woff2" => Some("font/woff2"),
+        "ico" => Some("image/x-icon"),
+        "xml" => Some("application/xml; charset=utf-8"),
         _ => None,
     }
 }
@@ -1908,6 +1915,13 @@ fn extension_for_content_type(content_type: &str) -> Option<&'static str> {
         "text/plain" => Some("txt"),
         "text/html" => Some("html"),
         "application/json" => Some("json"),
+        "text/javascript" | "application/javascript" => Some("js"),
+        "text/css" => Some("css"),
+        "application/wasm" => Some("wasm"),
+        "font/woff" => Some("woff"),
+        "font/woff2" => Some("woff2"),
+        "image/x-icon" => Some("ico"),
+        "application/xml" | "text/xml" => Some("xml"),
         _ => None,
     }
 }
