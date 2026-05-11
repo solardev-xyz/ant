@@ -103,8 +103,8 @@ final class AntNode: ObservableObject {
         status = .idle
     }
 
-    /// Poll `ant_peer_count` once a second so the UI row tracks the
-    /// BZZ handshake progress. `watch::Receiver` is not friendly to a
+    /// Poll `ant_peer_count` 5×/s so the UI row tracks the BZZ
+    /// handshake progress. `watch::Receiver` is not friendly to a
     /// C-ABI boundary, so polling is the simplest stable shape — and
     /// cheap: each call is a `RwLock` read of the shared snapshot.
     private func startPollingPeers(handle: OpaquePointer) {
@@ -116,7 +116,7 @@ final class AntNode: ObservableObject {
                     guard let self = self, self.handle == handle else { return }
                     self.peerCount = max(0, count)
                 }
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                try? await Task.sleep(nanoseconds: 200_000_000)
             }
         }
     }

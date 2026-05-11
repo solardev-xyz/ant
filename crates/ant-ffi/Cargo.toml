@@ -19,8 +19,14 @@ name = "ant_ffi"
 [dependencies]
 ant-control = { path = "../ant-control" }
 ant-crypto = { path = "../ant-crypto" }
-ant-node = { path = "../ant-node" }
-ant-p2p = { path = "../ant-p2p" }
+# `default-features = false` removes the `chain-rpc` feature from the
+# transitive ant-chain dep, dropping `reqwest` (and its `hyper-rustls`
+# / `ring` chain) from the iOS slice. Mobile light-clients only
+# download chunks; the postage / chequebook JSON-RPC writers belong
+# to desktop / antd, which keep the feature on through their own
+# default-features = true import of ant-chain.
+ant-node = { path = "../ant-node", default-features = false }
+ant-p2p = { path = "../ant-p2p", default-features = false }
 ant-retrieval = { path = "../ant-retrieval" }
 hex.workspace = true
 k256.workspace = true

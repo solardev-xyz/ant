@@ -6,7 +6,12 @@ edition.workspace = true
 [dependencies]
 ant-control = { path = "../ant-control" }
 ant-crypto = { path = "../ant-crypto" }
-ant-p2p = { path = "../ant-p2p" }
+# Propagate `default-features = false` so the iOS slice (via ant-ffi)
+# can opt out of the `reqwest`/`hyper-rustls`/`ring` chain used only by
+# the JSON-RPC writer side of ant-chain. Desktop binaries (`antd`,
+# `antctl`) keep the default `chain-rpc` feature on so nothing changes
+# for them.
+ant-p2p = { path = "../ant-p2p", default-features = false }
 ant-retrieval = { path = "../ant-retrieval" }
 futures = "0.3.31"
 hex.workspace = true
@@ -20,6 +25,10 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[features]
+default = ["chain-rpc"]
+chain-rpc = ["ant-p2p/chain-rpc"]
 
 [lints]
 workspace = true

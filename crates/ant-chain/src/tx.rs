@@ -18,14 +18,17 @@
 //! returns a 65-byte `r ‖ s ‖ v` signature over a raw digest — exactly
 //! what RLP-encoded EIP-155 expects.
 
+#[cfg(feature = "chain-rpc")]
 use std::time::{Duration, Instant};
 
 use ant_crypto::{sign_prehash, SECP256K1_SECRET_LEN};
 use primitive_types::U256;
+#[cfg(feature = "chain-rpc")]
 use serde_json::json;
 use sha3::{Digest, Keccak256};
 use thiserror::Error;
 
+#[cfg(feature = "chain-rpc")]
 use crate::{ChainClient, RpcError};
 
 /// Gnosis chain id (mainnet xDai). Used as the EIP-155 replay prefix
@@ -71,6 +74,7 @@ pub const ERC20_TRANSFER_GAS: u64 = 100_000;
 
 #[derive(Debug, Error)]
 pub enum TxError {
+    #[cfg(feature = "chain-rpc")]
     #[error("rpc: {0}")]
     Rpc(#[from] RpcError),
     #[error("crypto: {0}")]
@@ -301,6 +305,7 @@ fn u256_be_word(v: &U256) -> [u8; 32] {
 
 // --- RPC helpers (write side) ---
 
+#[cfg(feature = "chain-rpc")]
 impl ChainClient {
     /// Get the next nonce (`pending` block tag, so two back-to-back tx
     /// submissions don't collide on the same nonce).
@@ -430,6 +435,7 @@ impl ChainClient {
     }
 }
 
+#[cfg(feature = "chain-rpc")]
 fn parse_log(v: &serde_json::Value) -> Result<EventLog, RpcError> {
     let address_hex = v
         .get("address")
@@ -468,6 +474,7 @@ fn parse_log(v: &serde_json::Value) -> Result<EventLog, RpcError> {
     })
 }
 
+#[cfg(feature = "chain-rpc")]
 fn parse_hex_u64(s: &str) -> Option<u64> {
     let s = s.trim_start_matches("0x");
     let s = if s.is_empty() { "0" } else { s };
@@ -512,6 +519,12 @@ pub fn extract_created_batch_id(receipt: &TxReceipt) -> Option<[u8; 32]> {
 /// (`approve_bzz`, `create_batch`, `top_up`, `increase_depth`)
 /// pipeline nonce-fetch → calldata → sign → send → wait so the
 /// operator only deals with a `Result<TxReceipt, TxError>`.
+///
+/// The whole struct is `chain-rpc`-only — without that feature the
+/// crate exposes only the offline tx-construction helpers
+/// (`sign_legacy_tx`, RLP, calldata builders), which is all the iOS
+/// download client needs.
+#[cfg(feature = "chain-rpc")]
 pub struct Wallet {
     secret: [u8; SECP256K1_SECRET_LEN],
     address: [u8; 20],
@@ -526,6 +539,7 @@ pub struct Wallet {
     pub default_gas_price_wei: u64,
 }
 
+#[cfg(feature = "chain-rpc")]
 impl Wallet {
     /// Build a wallet from a 32-byte secret. Derives the Ethereum
     /// address locally so the operator can cross-check it before
@@ -554,7 +568,10 @@ impl Wallet {
         self.default_wait = d;
         self
     }
+}
 
+#[cfg(feature = "chain-rpc")]
+impl Wallet {
     /// `IERC20.approve(spender, value)` against `token`. Returns the
     /// receipt once the tx has confirmed. Use this before
     /// `create_batch` / `top_up` so the `PostageStamp` contract has
@@ -723,6 +740,7 @@ impl Wallet {
     }
 }
 
+#[cfg(any(feature = "chain-rpc", test))]
 fn k256_signing_key(
     secret: &[u8; SECP256K1_SECRET_LEN],
 ) -> Result<k256::ecdsa::SigningKey, TxError> {

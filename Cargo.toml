@@ -85,3 +85,23 @@ unreachable_pub = "allow"
 unsafe_op_in_unsafe_fn = "warn"
 unused_lifetimes = "warn"
 unused_macro_rules = "warn"
+
+# Release profile tuned for size on the iOS slice without making
+# desktop builds noticeably slower:
+#  - `lto = "thin"` cross-crate inlining without the multi-minute link
+#    time of full `lto = true`.
+#  - `codegen-units = 1` lets thin-LTO see the whole graph as a single
+#    unit; +5–10 % link time for ~3–5 % smaller code.
+#  - `panic = "abort"` drops the unwinding tables (`__eh_frame` +
+#    `__gcc_except_tab` were 1.4 MB combined in the unstripped iOS
+#    binary). Release-profile panics terminate immediately, which is
+#    what every consumer here already wants — `antd` panics are bugs,
+#    not flow control.
+#  - `strip = "symbols"` removes the symbol table from the static
+#    libraries cargo emits; xcodebuild's own strip then has nothing
+#    left to do but the Swift glue.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

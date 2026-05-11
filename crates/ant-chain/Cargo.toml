@@ -6,6 +6,7 @@ edition.workspace = true
 [[example]]
 name = "dry_run_wallet"
 path = "examples/dry_run_wallet.rs"
+required-features = ["chain-rpc"]
 
 [dependencies]
 ant-crypto = { path = "../ant-crypto" }
@@ -25,7 +26,7 @@ primitive-types = { version = "0.14.0", default-features = false }
 reqwest = { version = "0.12.23", default-features = false, features = [
   "json",
   "rustls-tls"
-] }
+], optional = true }
 # RLP encoding for raw transactions; tiny no_std-friendly crate so we
 # don't pull in the whole alloy / ethers stack just for one struct.
 rlp = "0.6.1"
@@ -43,6 +44,16 @@ tracing = { workspace = true }
 [dev-dependencies]
 primitive-types = { version = "0.14.0", default-features = false }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+# `chain-rpc` brings in `reqwest` and the `ChainClient` / `Wallet` async
+# methods that drive a JSON-RPC node. Off-by-default for embedders that
+# only need the local-compute helpers (EIP-712 cheque signing,
+# transaction RLP, calldata builders) — `ant-ffi` is the canonical such
+# embedder, since the iOS smoke-test app only downloads chunks and
+# never publishes a tx.
+[features]
+default = ["chain-rpc"]
+chain-rpc = ["dep:reqwest"]
 
 [lints]
 workspace = true

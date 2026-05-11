@@ -8,7 +8,13 @@ name = "cheque_smoke"
 path = "examples/cheque_smoke.rs"
 
 [dependencies]
-ant-chain = { path = "../ant-chain" }
+# `default-features = false` cuts the `chain-rpc` chain (reqwest +
+# hyper-rustls + ring) for embedders that only need ant-chain's
+# pure-compute helpers (cheque signing, EIP-712 hashes, calldata
+# builders) — `ant-ffi` is the canonical such embedder. The
+# `chain-rpc` feature below propagates the cut back on for any consumer
+# that does need a JSON-RPC client.
+ant-chain = { path = "../ant-chain", default-features = false }
 ant-control = { path = "../ant-control" }
 ant-crypto = { path = "../ant-crypto" }
 ant-postage = { path = "../ant-postage" }
@@ -37,6 +43,10 @@ unsigned-varint.workspace = true
 [dev-dependencies]
 tempfile = "3.27.0"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+
+[features]
+default = ["chain-rpc"]
+chain-rpc = ["ant-chain/chain-rpc"]
 
 [lints]
 workspace = true

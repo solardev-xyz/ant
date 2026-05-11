@@ -8,13 +8,17 @@
 pub mod chequebook;
 pub mod tx;
 
+#[cfg(feature = "chain-rpc")]
 use serde::Deserialize;
+#[cfg(feature = "chain-rpc")]
 use serde_json::json;
+#[cfg(feature = "chain-rpc")]
 use std::{borrow::Cow, fmt::Write};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum RpcError {
+    #[cfg(feature = "chain-rpc")]
     #[error("http: {0}")]
     Http(#[from] reqwest::Error),
     #[error("rpc: {0}")]
@@ -23,12 +27,14 @@ pub enum RpcError {
     Decode(String),
 }
 
+#[cfg(feature = "chain-rpc")]
 #[derive(Deserialize)]
 struct RpcResp<'a> {
     result: Option<Cow<'a, str>>,
     error: Option<RpcErr>,
 }
 
+#[cfg(feature = "chain-rpc")]
 #[derive(Deserialize)]
 struct RpcErr {
     message: Option<String>,
@@ -40,11 +46,13 @@ pub const GNOSIS_POSTAGE_STAMP: &str = "0x45a1502382541Cd610CC9068e88727426b6962
 /// xBZZ on Gnosis.
 pub const GNOSIS_BZZ_TOKEN: &str = "0xdBF3Ea6F5beE45c02255B2c26a16F300502F68da";
 
+#[cfg(feature = "chain-rpc")]
 pub struct ChainClient {
     url: String,
     http: reqwest::Client,
 }
 
+#[cfg(feature = "chain-rpc")]
 impl ChainClient {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
@@ -205,6 +213,7 @@ pub struct PostageBatchMeta {
     pub batch_owner_eth: [u8; 20],
 }
 
+#[cfg(feature = "chain-rpc")]
 pub async fn fetch_postage_batch_meta(
     client: &ChainClient,
     postage_contract: &str,
@@ -234,15 +243,18 @@ pub async fn fetch_postage_batch_meta(
     })
 }
 
+#[cfg(feature = "chain-rpc")]
 fn encode_word32_call(selector4: &str, word32: &[u8; 32]) -> String {
     format!("0x{selector4}{}", hex::encode(word32))
 }
 
+#[cfg(feature = "chain-rpc")]
 fn decode_hex_prefixed_bytes(s: &str) -> Result<Vec<u8>, hex::FromHexError> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     hex::decode(s)
 }
 
+#[cfg(feature = "chain-rpc")]
 fn padded_last_word(data: &[u8]) -> Result<[u8; 32], RpcError> {
     if data.len() < 32 {
         return Err(RpcError::Decode("ABI return shorter than word".into()));
@@ -252,6 +264,7 @@ fn padded_last_word(data: &[u8]) -> Result<[u8; 32], RpcError> {
     Ok(w)
 }
 
+#[cfg(feature = "chain-rpc")]
 fn last_word_eth_address(ret: &[u8]) -> Result<(), RpcError> {
     let w = padded_last_word(ret)?;
     if !w[..12].iter().all(|&b| b == 0) {
@@ -260,6 +273,7 @@ fn last_word_eth_address(ret: &[u8]) -> Result<(), RpcError> {
     Ok(())
 }
 
+#[cfg(feature = "chain-rpc")]
 fn abi_word_tail_u256_as_u64(ret: &[u8]) -> Result<u64, RpcError> {
     let w = padded_last_word(ret)?;
     if w[..24].iter().any(|&b| b != 0) {
@@ -268,6 +282,7 @@ fn abi_word_tail_u256_as_u64(ret: &[u8]) -> Result<u64, RpcError> {
     Ok(u64::from_be_bytes(w[24..].try_into().unwrap()))
 }
 
+#[cfg(feature = "chain-rpc")]
 fn abi_word_last_u128_be(ret: &[u8]) -> Result<u128, RpcError> {
     let w = padded_last_word(ret)?;
     Ok(u128::from_be_bytes(w[16..32].try_into().unwrap()))
