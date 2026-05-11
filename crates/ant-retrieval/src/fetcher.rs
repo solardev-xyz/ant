@@ -234,7 +234,7 @@ impl RoutingFetcher {
 
     /// Attach the process-wide retrieval counters. The daemon shares
     /// one `Arc<RetrievalCounters>` across every fetcher it builds;
-    /// `antctl top` reads it from `StatusSnapshot::retrieval`.
+    /// `antop` reads it from `StatusSnapshot::retrieval`.
     #[must_use]
     pub fn with_counters(mut self, counters: Arc<RetrievalCounters>) -> Self {
         self.counters = Some(counters);
@@ -1412,7 +1412,7 @@ mod tests {
         // stay at zero. A second fetch then comes out of the
         // freshly-warmed in-memory tier, so it bumps `mem_hits`
         // without re-incrementing `disk_hits`. This pins the
-        // tier-attribution rule the `antctl top` Disk-cache row
+        // tier-attribution rule the `antop` Disk-cache row
         // depends on.
         let snap = counters.snapshot();
         assert_eq!(snap.disk_hits, 1, "disk delivery must record disk_hits");

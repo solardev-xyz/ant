@@ -62,6 +62,6 @@ pub struct GatewayHandle {
     /// Live registry the gateway writes every in-flight retrieval
     /// request into. The same `Arc` is held by the daemon's status
     /// publisher, which snapshots it for `StatusSnapshot::retrieval`
-    /// so `antctl top` can render the Retrieval tab.
+    /// so `antop` can render the Retrieval tab.
     pub activity: Arc<GatewayActivity>,
 }

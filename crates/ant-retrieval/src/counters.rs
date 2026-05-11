@@ -4,7 +4,7 @@
 //! into every [`crate::RoutingFetcher`] it builds. Each successful
 //! chunk delivery (network or cache) bumps the counters once, and the
 //! status publisher reads cumulative totals from them when populating
-//! [`StatusSnapshot::retrieval`] for `antctl top`.
+//! [`StatusSnapshot::retrieval`] for `antop`.
 //!
 //! Only the *winning* fetch is counted toward `bytes_fetched_total` —
 //! losing hedge dispatches that the drain task pulls to completion
@@ -14,7 +14,7 @@
 //! daemon actually delivered.
 //!
 //! Cumulative-counter design (rather than a windowed average kept in
-//! the daemon) is deliberate: the consumer (`antctl top`) already polls
+//! the daemon) is deliberate: the consumer (`antop`) already polls
 //! at a known cadence, so it can derive instantaneous throughput by
 //! diff'ing two consecutive snapshots and apply whatever smoothing /
 //! peak-tracking it wants without burning daemon CPU on a sliding
@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// "cache hits" gauge into per-tier counts.
 ///
 /// Splitting tier 1 (in-memory LRU) from tier 2 (`SQLite`) matters for
-/// `antctl top`'s diagnostic value: a hot daemon with a large warm
+/// `antop`'s diagnostic value: a hot daemon with a large warm
 /// disk cache should show non-zero `disk` even right after restart,
 /// while the same daemon serving repeat requests should drive `mem`
 /// up and leave `disk` flat. Surfacing the two together makes a
@@ -82,7 +82,7 @@ pub struct RetrievalCountersSnapshot {
 
 impl RetrievalCountersSnapshot {
     /// Total cache hits (memory + disk). Convenience for the
-    /// `antctl top` "x cache hits" overall summary so the renderer
+    /// `antop` "x cache hits" overall summary so the renderer
     /// doesn't have to add the two fields itself everywhere.
     #[must_use]
     pub const fn cache_hits(&self) -> u64 {

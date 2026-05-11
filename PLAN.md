@@ -549,7 +549,7 @@ Workspace is at **`0.3.4`** across all live crates (`antd`, `antctl`, `ant-contr
 | Milestone | Status | Notes |
 |---|---|---|
 | **M1.0** — Basic mainnet connection | ✅ shipped | `antd` joins mainnet via `/dnsaddr/mainnet.ethswarm.org`, BZZ handshake on `/swarm/handshake/14.0.0`, holds ~100-peer warm set across restarts. |
-| **M1.1** — Stable neighborhood | ✅ shipped | Hive v2 peer exchange, forwarding-Kademlia routing bins, signed BZZ address verification; persistent `peers.json` snapshot, `antctl top` peer/routing dashboard. 24 h soak clean. |
+| **M1.1** — Stable neighborhood | ✅ shipped | Hive v2 peer exchange, forwarding-Kademlia routing bins, signed BZZ address verification; persistent `peers.json` snapshot, `antop` peer/routing dashboard. 24 h soak clean. |
 | **M2 / Phase 2** — Retrieval | ✅ shipped | `ant-retrieval`: bee-parity fetcher with cancel-tolerant hedging (Appendix G), admission-control mirror (Appendix H), pseudosettle-backed accounting (Appendix F), two-tier chunk cache (in-mem LRU + SQLite-backed `DiskChunkCache`, Appendix §6). |
 | **M2 / Phase 3** — Mantaray + download API | ✅ shipped | Mantaray walker + `/v0/manifest` + `bzz://` path resolution, Swarm-feed dereferencing, ordered streaming joiner with single-range and HEAD support (Appendix E). |
 | **M2 / Phase 4** — Ultra-light packaging | 🚧 partial | Tier-A `ant-gateway` live on 127.0.0.1:1633 with `--api-addr` / `--no-http-api` (Appendix D); bee-js / curl / browser smoke passes. **Mobile artefact (xcframework / aar) not started yet.** `antctl get` streams progress but the download body is still terminal, not byte-streamed (Appendix E Phase 5). |
@@ -590,7 +590,7 @@ Keep the workspace tiny: only the crates needed to dial bee peers, survive the B
   - Drain bee post-handshake pricing streams and parse Hive peer broadcasts into dial hints.
   - Persist a temporary JSON peer snapshot for warm restarts until `ant-store` replaces it.
 - `antd`: CLI with `--data-dir`, `--network-id`, `--bootnodes`, `--log-level`, `--key-file`, `--external-address`, control-socket, and peerstore options; generates a persistent node key + nonce on first run; `tracing-subscriber` for human-readable logs.
-- `antctl`: `status`, `top`, `version`, and `peers reset` for live daemon inspection.
+- `antctl`: `status`, `version`, and `peers reset` for live daemon inspection; `antop` for the auto-refreshing peer/routing dashboard.
 
 **Exit (M1.0):** `antd` running on a laptop connects to live mainnet bee peers, completes the BZZ handshake, fills at least a small peer set from bootnode/Hive hints, survives a restart from the JSON peer snapshot, and stays connected across network blips. Log output matches roughly:
 
@@ -612,7 +612,7 @@ INFO ant_p2p: peer set size=1
 - `ant-node`: orchestrator wiring that owns the node loop, applies backpressure, and surfaces status.
 - Foundational cross-compile pipeline: produce stub `.xcframework` + `.aar` from a "hello-world" UniFFI crate so M2 can hit the ground running on mobile.
 - Operator acceptance:
-  - `antctl top` shows connected peers, selected-peer detail, last BZZ handshake, and routing/neighborhood summary.
+  - `antop` shows connected peers, selected-peer detail, last BZZ handshake, and routing/neighborhood summary.
   - `antctl peers reset` and daemon startup `--reset-peerstore` remain supported after the SQLite migration.
   - A 24-hour soak script writes a compact acceptance report: peer count over time, routing-bin coverage, reconnects, handshakes, and disconnect reasons.
 

@@ -424,7 +424,7 @@ async fn main() -> Result<()> {
     // Single shared registry for in-flight gateway HTTP requests.
     // Built unconditionally so the node loop can read from it; only
     // the gateway side ever writes when `--no-http-api` is set, in
-    // which case `gateway_activity` stays empty and `antctl top`
+    // which case `gateway_activity` stays empty and `antop`
     // shows zero gateway rows. Empty registry costs one `Arc` and
     // a `Mutex<HashMap>` — well below a rounding error.
     let gateway_activity: Arc<GatewayActivity> = GatewayActivity::new();

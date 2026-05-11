@@ -47,7 +47,7 @@ pub struct NodeConfig {
     /// roughly doubles per-second debit headroom. Mostly a knob for
     /// upload throughput experiments.
     pub target_peers: Option<usize>,
-    /// Baseline for `PeerInfo` cold-start timings (`antctl top` milestones).
+    /// Baseline for `PeerInfo` cold-start timings (`antop` milestones).
     pub process_start: Instant,
     /// Scope the in-memory chunk cache to a single request. Default
     /// (`false`) keeps one process-wide cache so consecutive
@@ -66,7 +66,7 @@ pub struct NodeConfig {
     /// Live registry of in-flight gateway HTTP requests, shared with
     /// `ant-gateway`. Wired up by `antd::main` when the HTTP API is
     /// enabled; `None` for headless deployments
-    /// (`antd --no-http-api`). Surfaces in `antctl top`'s Retrieval
+    /// (`antd --no-http-api`). Surfaces in `antop`'s Retrieval
     /// tab.
     pub gateway_activity: Option<Arc<GatewayActivity>>,
     /// Persistent (SQLite-backed) chunk cache, opened by the daemon

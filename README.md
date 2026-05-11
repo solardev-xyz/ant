@@ -87,7 +87,7 @@ the still-open items.
   also talks directly to Gnosis (no daemon required) and exposes:
   - `antctl chequebook show`                                — reads `issuer / balance / totalPaidOut / liquidBalance / paidOut(beneficiary)`.
   - `antctl chequebook cash-self [--submit]`                — Tier-1 SWAP self-test: signs a 1-PLUR EIP-712 cheque against `CHEQUEBOOK_ADDRESS`, eth_call's `cashChequeBeneficiary` from our own EOA (free), and with `--submit` actually broadcasts the tx (~$0.0001 in xDAI). Proves bit-exact bee EIP-712 / ECDSA compatibility — first live run on Gnosis mainnet at block `46019699`, tx `0x643bb08e…e308`.
-- **Operator tooling — local.** `antctl status`, `antctl top` (live TUI
+- **Operator tooling — local.** `antctl status`, `antop` (live TUI
   with Peers / Routing / Retrieval / Gateway / Requests tabs), `antctl
   version`, `antctl peers reset`, and `antctl get` for downloads with
   live progress.

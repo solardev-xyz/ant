@@ -1,0 +1,19 @@
+[package]
+name = "antop"
+version = "0.4.0"
+edition.workspace = true
+
+[[bin]]
+name = "antop"
+path = "src/main.rs"
+
+[dependencies]
+ant-control = { path = "../ant-control" }
+anyhow.workspace = true
+clap = { workspace = true, features = ["env"] }
+crossterm = "0.29.0"
+dirs = "6.0.0"
+ratatui = "0.30.0"
+
+[lints]
+workspace = true

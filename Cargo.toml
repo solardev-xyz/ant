@@ -12,6 +12,7 @@ members = [
   "crates/ant-retrieval",
   "crates/antctl",
   "crates/antd",
+  "crates/antop",
   "xtask",
 ]
 

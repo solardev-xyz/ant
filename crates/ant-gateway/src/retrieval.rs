@@ -178,7 +178,7 @@ pub async fn chunk(
     };
 
     // Register the request with the live gateway-activity registry so
-    // it shows up in the `antctl top` Retrieval tab. The guard's
+    // it shows up in the `antop` Retrieval tab. The guard's
     // `Drop` impl removes the entry when this handler returns, so
     // panics and early `return`s clean up automatically.
     let guard = handle
@@ -657,7 +657,7 @@ async fn push_chunks(
 }
 
 /// Trim a hex reference to its leading 8 chars (16 if the caller
-/// passed `0x` prefix) so the `antctl top` Retrieval tab column stays
+/// passed `0x` prefix) so the `antop` Retrieval tab column stays
 /// readable. Empty / invalid references just round-trip unchanged.
 fn short_reference(addr: &str) -> String {
     let stripped = addr
@@ -782,7 +782,7 @@ pub async fn bytes(
     // ack receiver; the daemon notices the closed channel and stops
     // joining further subtrees. Move the activity guard from the
     // cancelled `Started` into the new dispatch so the registry slot
-    // stays alive across the swap (otherwise `antctl top` would see
+    // stays alive across the swap (otherwise `antop` would see
     // the row blink out and back in for every range request).
     let carry_guard = started.take_activity_guard();
     started.cancel();

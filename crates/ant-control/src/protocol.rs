@@ -441,7 +441,7 @@ pub struct StatusSnapshot {
     /// Data-plane snapshot: chunk cache fill, in-flight retrievals,
     /// cumulative download counters, and the list of currently active
     /// gateway HTTP requests. Populated by the daemon on every status
-    /// update; surfaced as the `Retrieval` tab in `antctl top`. Old
+    /// update; surfaced as the `Retrieval` tab in `antop`. Old
     /// daemons leave this at the `#[serde(default)]` zero value.
     #[serde(default)]
     pub retrieval: RetrievalInfo,
@@ -483,12 +483,12 @@ pub struct PeerInfo {
     pub node_limit: u32,
     #[serde(default)]
     pub connected_peers: Vec<PeerConnectionInfo>,
-    /// Unified peer rows for UIs (e.g. `antctl top`); includes dialing / pipeline
+    /// Unified peer rows for UIs (e.g. `antop`); includes dialing / pipeline
     /// states not present in `connected_peers` alone. Empty on older daemons.
     #[serde(default)]
     pub peer_pipeline: Vec<PeerPipelineEntry>,
     pub last_handshake: Option<HandshakeReport>,
-    /// Monotonic time from process start to first BZZ peer (seconds, e.g. for `antctl top`).
+    /// Monotonic time from process start to first BZZ peer (seconds, e.g. for `antop`).
     #[serde(default)]
     pub time_to_first_peer_s: Option<f64>,
     /// Monotonic time from process start to reaching `node_limit` BZZ peers.
@@ -598,11 +598,11 @@ pub struct CacheInfo {
 /// are tracked in *bytes* — unlike the in-memory tier the disk
 /// cache's eviction key is total bytes, not slot count, so the row
 /// count is informational and the byte total is what drives the
-/// "fullness" gauge in `antctl top`.
+/// "fullness" gauge in `antop`.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct DiskCacheInfo {
     /// Whether the daemon has a persistent cache attached. When
-    /// `false`, every other field is zero and `antctl top` should
+    /// `false`, every other field is zero and `antop` should
     /// label the row as `disabled` rather than render
     /// `0/0 (0.0%)`.
     pub enabled: bool,
@@ -621,14 +621,14 @@ pub struct DiskCacheInfo {
     pub hits_total: u64,
 }
 
-/// Data-plane snapshot read by the `Retrieval` tab in `antctl top`.
+/// Data-plane snapshot read by the `Retrieval` tab in `antop`.
 ///
 /// All numeric fields are cumulative since process start except
 /// `cache.used`, `in_flight`, and the per-request entries in
 /// `gateway_requests`, which are instantaneous. Bandwidth is *not*
 /// reported as a derived rate here — the daemon publishes raw
 /// cumulative `bytes_fetched_total` and `chunks_fetched_total`, and
-/// the consumer (`antctl top`) computes whatever smoothing /
+/// the consumer (`antop`) computes whatever smoothing /
 /// peak-tracking it wants from successive snapshots. That keeps the
 /// daemon free of UI-tier policy and makes the rate trivially
 /// reproducible from the wire log.
@@ -647,7 +647,7 @@ pub struct RetrievalInfo {
     /// start. Includes both network deliveries and cache hits.
     pub chunks_fetched_total: u64,
     /// Cumulative wire bytes (`span (8) || payload`) delivered to
-    /// joiners. Used by `antctl top` to compute instantaneous
+    /// joiners. Used by `antop` to compute instantaneous
     /// bandwidth as `(b2 - b1) / dt`.
     pub bytes_fetched_total: u64,
     /// Cumulative cache hits (subset of `chunks_fetched_total`).
@@ -674,7 +674,7 @@ pub struct RetrievalInfo {
 /// `path` is a short human-readable label — usually `<short_ref>` for
 /// `/bytes` and `/chunks` and `<short_ref>/<path>` for `/bzz`. The
 /// daemon truncates the reference to its leading 8 hex chars to keep
-/// the table column width sane in `antctl top`; clients that need the
+/// the table column width sane in `antop`; clients that need the
 /// full reference can correlate via the gateway access log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayRequestInfo {
@@ -695,7 +695,7 @@ pub struct GatewayRequestInfo {
     pub bytes_done: u64,
 }
 
-/// Coarse classification of the gateway endpoint so `antctl top` can
+/// Coarse classification of the gateway endpoint so `antop` can
 /// label each row. Mapped from the axum handler that registered the
 /// active request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -713,7 +713,7 @@ pub enum GatewayRequestKind {
 }
 
 impl GatewayRequestKind {
-    /// Short label shown in the `antctl top` Retrieval tab. Up to 5
+    /// Short label shown in the `antop` Retrieval tab. Up to 5
     /// ASCII characters so the table's `Kind` column stays narrow
     /// while still being self-explanatory: each label is the bee /
     /// Ant endpoint name (`/bytes`, `/bzz`, `/chunks`, `/v0/manifest`)

@@ -38,7 +38,7 @@ pub struct ProgressSample {
     /// Chunk fetches the request currently has on the wire (acquired the
     /// retrieval semaphore but haven't yet returned a delivery). Cache
     /// hits never increment this counter because no semaphore
-    /// round-trip happens. Useful for `antctl top` to show how
+    /// round-trip happens. Useful for `antop` to show how
     /// busy each in-progress gateway request is.
     pub in_flight: u32,
 }

@@ -5,7 +5,7 @@
 //! stream back from the daemon, and removes the entry when the
 //! response body has finished draining. The daemon's status publisher
 //! (`ant-p2p`) reads a snapshot on every `StatusSnapshot` tick so
-//! `antctl top` can show what the gateway is currently working on.
+//! `antop` can show what the gateway is currently working on.
 //!
 //! The registry is intentionally defined here rather than in
 //! `ant-gateway` so `ant-p2p` can take an `Arc<GatewayActivity>` in
@@ -136,7 +136,7 @@ impl GatewayActivity {
 
 /// RAII guard returned by [`GatewayActivity::begin`]. Removes the
 /// entry from the registry on drop, so a panicking handler can't
-/// leak ghost rows in `antctl top`. Cloning the guard (via the
+/// leak ghost rows in `antop`. Cloning the guard (via the
 /// [`Self::handle`] accessor) is intentionally indirect: the *guard*
 /// is unique-ownership of the registry slot, but the *handle* is a
 /// cheap reference for the streaming-body loop to push updates from.
@@ -261,7 +261,7 @@ mod tests {
     }
 
     /// Multiple concurrent requests appear in stable `started_at` /
-    /// `id` order so `antctl top` rows don't jitter between ticks.
+    /// `id` order so `antop` rows don't jitter between ticks.
     #[test]
     fn snapshot_is_stably_ordered() {
         let reg = GatewayActivity::new();

@@ -107,7 +107,7 @@ pub struct RunConfig {
     /// Live registry of currently-active gateway HTTP requests,
     /// shared with `ant-gateway`. The swarm loop reads a snapshot
     /// from it on every status tick to populate
-    /// `StatusSnapshot::retrieval.gateway_requests` so `antctl top`
+    /// `StatusSnapshot::retrieval.gateway_requests` so `antop`
     /// can render the Retrieval tab. `None` when the gateway is
     /// disabled (e.g. `antd --no-http-api`).
     pub gateway_activity: Option<Arc<GatewayActivity>>,
@@ -293,7 +293,7 @@ fn is_globally_routable_multiaddr(addr: &Multiaddr) -> bool {
 /// `StatusSnapshot::external_addresses` field. Adding a new source means
 /// (a) adding a variant here, (b) wiring the variant through
 /// [`record_external_address`] at the relevant call site, and (c)
-/// optionally teaching `antctl top` to render it differently — but
+/// optionally teaching `antop` to render it differently — but
 /// unknown sources already round-trip fine since the on-the-wire type
 /// is `String`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -581,7 +581,7 @@ struct SwarmState {
     bzz_peers: HashSet<PeerId>,
     /// Total cold-start time (dial + identify + handshake, in ms) for each
     /// peer that has reached `Ready`. Surfaced as `ready_in_ms` on the
-    /// pipeline rows so `antctl top` can show the column and rank slow
+    /// pipeline rows so `antop` can show the column and rank slow
     /// peers. Reset on `ConnectionClosed` together with `bzz_peers`, so a
     /// reconnect always reports the new pipeline's timing rather than a
     /// stale one.
@@ -670,7 +670,7 @@ struct SwarmState {
     /// Optional live registry of in-flight gateway HTTP requests.
     /// `None` when `--no-http-api` was passed; `Some` when the
     /// gateway is wired up. Read by the status publisher for the
-    /// Retrieval tab in `antctl top`.
+    /// Retrieval tab in `antop`.
     gateway_activity: Option<Arc<GatewayActivity>>,
     /// One-shot guard for the "slow handshake = bee peerstore stall"
     /// `warn!` we emit on the first handshake whose timing matches the
@@ -963,7 +963,7 @@ fn build_peer_pipeline_entries(
 /// Time between full peer-pipeline rebuilds. Bootstrap fires hundreds of
 /// swarm events per second; without a floor here we'd rebuild + serialize a
 /// 200+ row pipeline (and grab the watch's write lock) on every event,
-/// starving `ant_control::serve` enough that `antctl top` reads time out.
+/// starving `ant_control::serve` enough that `antop` reads time out.
 const PIPELINE_SYNC_INTERVAL: Duration = Duration::from_millis(100);
 
 fn sync_peer_pipeline(status: Option<&watch::Sender<StatusSnapshot>>, state: &mut SwarmState) {
@@ -995,7 +995,7 @@ fn build_retrieval_info(state: &SwarmState) -> RetrievalInfo {
     // Disk cache snapshot. When the daemon was started with
     // `--no-disk-cache` (or no disk cache at all),
     // `state.disk_cache` is `None` and `enabled` stays false so
-    // `antctl top` can render a clean `disabled` label. The byte
+    // `antop` can render a clean `disabled` label. The byte
     // totals are read directly from the cache's `AtomicU64` mirror,
     // so we never block the status tick on a SQLite query.
     let disk = match state.disk_cache.as_ref() {
@@ -1036,7 +1036,7 @@ fn routing_snapshot(table: &RoutingTable) -> RoutingInfo {
 }
 
 /// Push a routing-only update to the status snapshot. Used right after
-/// `routing.admit` so `antctl top` reflects new peers without waiting for
+/// `routing.admit` so `antop` reflects new peers without waiting for
 /// the next pipeline-sync tick.
 fn sync_routing_snapshot(status: Option<&watch::Sender<StatusSnapshot>>, table: &RoutingTable) {
     let Some(tx) = status else { return };
@@ -1257,10 +1257,10 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     // Floor on how often the status snapshot is republished even when
     // the swarm is fully idle. `sync_peer_pipeline` already runs from
     // the loop top on every wakeup, gated by `PIPELINE_SYNC_INTERVAL`;
-    // this timer just guarantees `antctl top` keeps seeing a live
+    // this timer just guarantees `antop` keeps seeing a live
     // `RetrievalInfo` (cache fill, in-flight count, gateway-request
     // list) even when no swarm events fire. Cadence chosen to match
-    // `antctl top --interval`'s 1 s default while still letting
+    // `antop --interval`'s 1 s default while still letting
     // operators run with sub-second polling without seeing stale data.
     let mut status_pulse = tokio::time::interval(Duration::from_millis(250));
     status_pulse.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1631,7 +1631,7 @@ fn handle_control_command(
             let tracker = Arc::new(ProgressTracker::new(bypass_cache));
             // Always spawn the progress emitter for streaming requests:
             // the gateway uses the periodic `Progress` acks to update
-            // its `GatewayActivity` entry so `antctl top`'s Retrieval
+            // its `GatewayActivity` entry so `antop`'s Retrieval
             // tab reflects live per-request chunks/bytes/in-flight
             // counts. Unlike `GetBytes` (where the client opts in via
             // the `progress` flag), streaming has no "consumer doesn't
@@ -3441,7 +3441,7 @@ fn peer_endpoint(endpoint: &ConnectedPoint) -> (String, String) {
     }
 }
 
-/// Record one-shot session timings for UIs (e.g. `antctl top`).
+/// Record one-shot session timings for UIs (e.g. `antop`).
 fn record_peer_session_milestones(
     status: Option<&watch::Sender<StatusSnapshot>>,
     process_start: std::time::Instant,
@@ -3882,7 +3882,7 @@ mod tests {
         assert_eq!(snap_addrs, vec![a.to_string(), c.to_string()]);
     }
 
-    /// Pin the wire-stable source strings. Operators (and `antctl top`)
+    /// Pin the wire-stable source strings. Operators (and `antop`)
     /// match these literally; renaming a variant is a breaking change to
     /// the on-the-wire `StatusSnapshot::external_addresses[i].source`
     /// field.

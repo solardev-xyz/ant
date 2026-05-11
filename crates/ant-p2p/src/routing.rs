@@ -154,7 +154,7 @@ impl RoutingTable {
         }
     }
 
-    /// Number of peers per bin — used by `antctl top` to visualise the
+    /// Number of peers per bin — used by `antop` to visualise the
     /// routing table fan-out at a glance. Length is always `NUM_BINS`.
     #[must_use]
     pub fn bin_counts(&self) -> [u8; NUM_BINS] {
