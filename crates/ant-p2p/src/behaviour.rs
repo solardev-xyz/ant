@@ -3760,12 +3760,18 @@ async fn bootstrap_dial(
 /// Build a DNS resolver config from `/etc/resolv.conf` (system) but strip any
 /// local search domains. `/dnsaddr/*.ethswarm.org` must resolve globally; a
 /// captive-portal search suffix would turn it into a name that only exists on
-/// the local network. Falls back to Cloudflare (1.1.1.1) if system config is
-/// unreadable (common on Android / minimal containers).
+/// the local network. System nameservers are always followed by Cloudflare's
+/// anycast as a public fallback — see `dnsaddr::build_resolver` for the
+/// detailed rationale (in short: the iOS simulator's sandbox cannot reach
+/// the host's `/etc/resolv.conf` entries, so DNSADDR resolution fails on cold
+/// start without a backup). On hosts with `/etc/resolv.conf` unreadable
+/// (Android / minimal containers) we fall through to Cloudflare-only.
 fn resolver_config() -> dns::ResolverConfig {
     match hickory_resolver::system_conf::read_system_conf() {
         Ok((cfg, _)) => {
-            dns::ResolverConfig::from_parts(None, Vec::new(), cfg.name_servers().to_vec())
+            let mut servers = cfg.name_servers().to_vec();
+            servers.extend(dns::ResolverConfig::cloudflare().name_servers().iter().cloned());
+            dns::ResolverConfig::from_parts(None, Vec::new(), servers)
         }
         Err(_) => dns::ResolverConfig::cloudflare(),
     }

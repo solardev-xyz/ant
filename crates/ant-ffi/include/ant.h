@@ -20,12 +20,14 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/types.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 typedef struct AntHandle AntHandle;
+typedef struct AntStream AntStream;
 
 /*
  * POD mirror of the Rust `AntProgress` struct. Field order must match
@@ -97,6 +99,17 @@ unsigned char *ant_download(AntHandle *handle,
 int ant_peer_count(const AntHandle *handle);
 
 /*
+ * Snapshot the running node's `agent` string from the live status
+ * channel (currently `ant-ffi/<crate-version>`). Useful for displaying
+ * the version of the embedded library actually running, independent
+ * of the host bundle's version metadata.
+ *
+ * Caller takes ownership of the returned UTF-8 C string and must free
+ * it with `ant_free_string`. Returns NULL if `handle` is NULL.
+ */
+char *ant_agent_string(const AntHandle *handle);
+
+/*
  * Sample the current download progress. Fills *out and returns 0 on
  * success; returns -1 if `handle` or `out` is NULL. Safe to call at
  * any cadence (the implementation only takes a short mutex).
@@ -115,6 +128,92 @@ int ant_download_progress(const AntHandle *handle, AntProgress *out);
  * running. Returns 0 on success, -1 if `handle` is NULL.
  */
 int ant_cancel_download(const AntHandle *handle);
+
+/*
+ * List the entries of a mantaray manifest. `reference` is a
+ * `bzz://<64-hex>` (or bare hex) string. Returns a heap-allocated
+ * NUL-terminated JSON document of the form
+ *   {"entries":[{"path":"...","reference":"...","size":N,
+ *               "content_type":"..."},...]}
+ * (size and content_type are omitted when not known). Free with
+ * ant_free_string. On failure returns NULL with an allocated error in
+ * *out_err.
+ */
+char *ant_list_bzz(AntHandle *handle,
+                   const char *reference,
+                   char **out_err);
+
+/*
+ * Open a streaming session for a single file inside a bzz manifest.
+ * Sends a head-only request to learn `total_bytes` + Content-Type
+ * (written into *out_total_bytes / *out_content_type — pass NULL to
+ * skip). Returns an opaque AntStream* on success; null + *out_err on
+ * failure. The caller frees *out_content_type with ant_free_string
+ * (when it was non-NULL on entry and non-NULL on return).
+ *
+ * The stream borrows the AntHandle; closing the handle while a stream
+ * is open is undefined behaviour. Always call ant_stream_close before
+ * ant_shutdown.
+ */
+AntStream *ant_stream_open(AntHandle *handle,
+                           const char *reference,
+                           uint64_t *out_total_bytes,
+                           char **out_content_type,
+                           char **out_err);
+
+/*
+ * Read `len` bytes starting at `offset` into `dst`. Blocks until the
+ * range is delivered (or the per-read timeout fires). Returns the
+ * number of bytes written on success (<= len; truncated near EOF), or
+ * -1 on failure with an allocated error in *out_err.
+ *
+ * Safe to call from any thread, but callers should serialise reads on
+ * the same stream - concurrent reads issue independent range requests
+ * to the node and the pattern stops being efficient.
+ */
+ssize_t ant_stream_read(AntStream *stream,
+                        uint64_t offset,
+                        size_t len,
+                        unsigned char *dst,
+                        char **out_err);
+
+/*
+ * Pull a contiguous byte range and deliver each joiner-produced chunk
+ * to `on_chunk` as soon as it arrives. Unlike ant_stream_read, which
+ * blocks until the entire `len` window has buffered, this drives one
+ * StreamBzz request through to its terminal StreamDone and invokes
+ * the callback for every BytesChunk along the way - matching the
+ * shape of AVAssetResourceLoaderDelegate's dataRequest.
+ *
+ * The callback returns 0 to keep pulling, non-zero to ask the FFI to
+ * stop early (e.g. AVPlayer canceled the dataRequest). The FFI then
+ * drains the remaining acks for clean shutdown.
+ *
+ * Returns the total bytes delivered, or -1 on error (with *out_err
+ * set if non-null).
+ */
+typedef int (*AntStreamChunkCb)(void *ctx, const unsigned char *data, size_t len);
+
+int64_t ant_stream_pull(AntStream *stream,
+                        uint64_t offset,
+                        uint64_t len,
+                        AntStreamChunkCb on_chunk,
+                        void *ctx,
+                        char **out_err);
+
+/*
+ * Sample stream-level progress. `bytes_done` is the cumulative bytes
+ * AVPlayer has consumed so far for this file; `total_bytes` is what
+ * ant_stream_open reported. The chunk / peer / in-flight counters
+ * reflect the most recent range request's `Progress` ack. Returns 0 on
+ * success, -1 if either pointer is null.
+ */
+int ant_stream_progress(const AntStream *stream, AntProgress *out);
+
+/*
+ * Close a streaming session and free its handle. Null is a no-op.
+ */
+void ant_stream_close(AntStream *stream);
 
 /*
  * Free a buffer returned by ant_download. `len` must be the exact

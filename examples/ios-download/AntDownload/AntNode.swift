@@ -47,6 +47,12 @@ final class AntNode: ObservableObject {
 
     @Published private(set) var status: Status = .idle
     @Published private(set) var peerCount: Int = 0
+    /// Agent string reported by the embedded node's status snapshot,
+    /// e.g. `ant-ffi/0.4.0`. Sourced from `ant_agent_string`, set
+    /// once the FFI handle is up. Used in the Player header so the
+    /// version we display reflects the *running* binary rather than
+    /// the iOS bundle's `CFBundleShortVersionString`.
+    @Published private(set) var agentString: String = ""
     /// Live progress view of the in-flight `download(reference:)` call,
     /// updated ~4×/s from a poll loop. `nil` whenever no download is
     /// running (or the last one finished and its state was cleared).
@@ -82,10 +88,20 @@ final class AntNode: ObservableObject {
         case .ready(let h):
             handle = h
             status = .ready
+            agentString = Self.readAgentString(handle: h)
             startPollingPeers(handle: h)
         case .failed(let msg):
             status = .failed(msg)
         }
+    }
+
+    /// One-shot pull of the running node's `agent` field. The status
+    /// snapshot's agent string is fixed at `ant_init` time, so polling
+    /// would burn cycles for no signal.
+    private static func readAgentString(handle: OpaquePointer) -> String {
+        guard let raw = ant_agent_string(handle) else { return "" }
+        defer { ant_free_string(raw) }
+        return String(cString: raw)
     }
 
     func shutdown() async {
@@ -96,6 +112,7 @@ final class AntNode: ObservableObject {
         progressPollTask?.cancel()
         progressPollTask = nil
         peerCount = 0
+        agentString = ""
         downloadProgress = nil
         await Task.detached(priority: .userInitiated) {
             ant_shutdown(h)
@@ -136,6 +153,34 @@ final class AntNode: ObservableObject {
     func cancelDownload() {
         guard let h = handle else { return }
         ant_cancel_download(h)
+    }
+
+    /// Bulk download without touching the published `downloadProgress`
+    /// slot — used for ancillary fetches (album art, manifest probes)
+    /// where surfacing a HUD over the main playback UI would be
+    /// noisy. The single-flight progress poller is reserved for the
+    /// user-visible `download(reference:)` path.
+    func downloadQuiet(reference: String) async throws -> Data {
+        guard let h = handle else {
+            throw AntError.notReady
+        }
+        return try await Task.detached(priority: .utility) {
+            var len: Int = 0
+            var errPtr: UnsafeMutablePointer<CChar>? = nil
+            let body = reference.withCString { cref in
+                ant_download(h, cref, &len, &errPtr)
+            }
+            if let body = body {
+                let data = Data(bytes: body, count: len)
+                ant_free_buffer(body, len)
+                return data
+            }
+            let msg = errPtr.flatMap { String(cString: $0) } ?? "unknown download error"
+            if let errPtr = errPtr {
+                ant_free_string(errPtr)
+            }
+            throw AntError.download(msg)
+        }.value
     }
 
     func download(reference: String) async throws -> Data {
@@ -261,6 +306,52 @@ final class AntNode: ObservableObject {
             }
         }
     }
+
+    /// Synchronously list a `bzz://` manifest. Returns the decoded
+    /// `Manifest` on success; throws on FFI / decode failure. Runs on a
+    /// detached task so the caller's MainActor isn't blocked while the
+    /// node walks the mantaray tree.
+    func listManifest(reference: String) async throws -> Manifest {
+        guard let h = handle else { throw AntError.notReady }
+        return try await Task.detached(priority: .userInitiated) {
+            var errPtr: UnsafeMutablePointer<CChar>? = nil
+            let raw = reference.withCString { cref in
+                ant_list_bzz(h, cref, &errPtr)
+            }
+            if let raw = raw {
+                let json = String(cString: raw)
+                ant_free_string(raw)
+                guard let data = json.data(using: .utf8) else {
+                    throw AntError.download("manifest json was not utf-8")
+                }
+                return try JSONDecoder().decode(Manifest.self, from: data)
+            }
+            let msg = errPtr.flatMap { String(cString: $0) } ?? "unknown manifest error"
+            if let errPtr = errPtr { ant_free_string(errPtr) }
+            throw AntError.download(msg)
+        }.value
+    }
+
+    /// Open a streaming session for one file in a manifest. The session
+    /// frees its underlying `AntStream*` in `deinit`; do not let the
+    /// node be torn down while a session is alive (callers hold the
+    /// session on `PlayerEngine`, which is bound to the same lifetime
+    /// as `AntNode`).
+    func openStream(reference: String) async throws -> AntStreamSession {
+        guard let h = handle else { throw AntError.notReady }
+        let session: AntStreamSession? = await Task.detached(priority: .userInitiated) {
+            AntStreamSession(handle: h, bzzReference: reference)
+        }.value
+        guard let session = session else {
+            throw AntError.download("failed to open stream for \(reference)")
+        }
+        return session
+    }
+
+    /// Expose the raw handle so the resource loader can call FFI
+    /// directly without bouncing through MainActor for every byte.
+    /// Nil whenever the node is not `.ready`.
+    var rawHandle: OpaquePointer? { handle }
 
     private static func resolveDataDir() -> URL {
         let fm = FileManager.default

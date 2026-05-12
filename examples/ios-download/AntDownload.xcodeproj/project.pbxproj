@@ -8,17 +8,31 @@
 
 /* Begin PBXBuildFile section */
 		B00000000000000000000001 /* AntDownloadApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000002 /* AntDownloadApp.swift */; };
-		B00000000000000000000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000003 /* ContentView.swift */; };
 		B00000000000000000000003 /* AntNode.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000004 /* AntNode.swift */; };
 		B00000000000000000000004 /* libant_ffi.a in Frameworks */ = {isa = PBXBuildFile; fileRef = F00000000000000000000008 /* libant_ffi.a */; };
 		B00000000000000000000005 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000007 /* Assets.xcassets */; };
+		B00000000000000000000010 /* Manifest.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000010 /* Manifest.swift */; };
+		B00000000000000000000011 /* AntStreamSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000011 /* AntStreamSession.swift */; };
+		B00000000000000000000012 /* AntStreamLoader.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000012 /* AntStreamLoader.swift */; };
+		B00000000000000000000013 /* PlayerEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000013 /* PlayerEngine.swift */; };
+		B00000000000000000000014 /* LiquidGlass.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000014 /* LiquidGlass.swift */; };
+		B00000000000000000000015 /* PlayerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000015 /* PlayerView.swift */; };
+		B00000000000000000000016 /* NetworkView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000016 /* NetworkView.swift */; };
+		B00000000000000000000017 /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000017 /* RootView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		F00000000000000000000001 /* AntDownload.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AntDownload.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		F00000000000000000000002 /* AntDownloadApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AntDownloadApp.swift; sourceTree = "<group>"; };
-		F00000000000000000000003 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		F00000000000000000000004 /* AntNode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AntNode.swift; sourceTree = "<group>"; };
+		F00000000000000000000010 /* Manifest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Manifest.swift; sourceTree = "<group>"; };
+		F00000000000000000000011 /* AntStreamSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AntStreamSession.swift; sourceTree = "<group>"; };
+		F00000000000000000000012 /* AntStreamLoader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AntStreamLoader.swift; sourceTree = "<group>"; };
+		F00000000000000000000013 /* PlayerEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerEngine.swift; sourceTree = "<group>"; };
+		F00000000000000000000014 /* LiquidGlass.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiquidGlass.swift; sourceTree = "<group>"; };
+		F00000000000000000000015 /* PlayerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerView.swift; sourceTree = "<group>"; };
+		F00000000000000000000016 /* NetworkView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkView.swift; sourceTree = "<group>"; };
+		F00000000000000000000017 /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
 		F00000000000000000000005 /* AntDownload-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "AntDownload-Bridging-Header.h"; sourceTree = "<group>"; };
 		F00000000000000000000006 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		F00000000000000000000007 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -58,7 +72,14 @@
 			isa = PBXGroup;
 			children = (
 				F00000000000000000000002 /* AntDownloadApp.swift */,
-				F00000000000000000000003 /* ContentView.swift */,
+				F00000000000000000000017 /* RootView.swift */,
+				F00000000000000000000015 /* PlayerView.swift */,
+				F00000000000000000000016 /* NetworkView.swift */,
+				F00000000000000000000014 /* LiquidGlass.swift */,
+				F00000000000000000000013 /* PlayerEngine.swift */,
+				F00000000000000000000012 /* AntStreamLoader.swift */,
+				F00000000000000000000011 /* AntStreamSession.swift */,
+				F00000000000000000000010 /* Manifest.swift */,
 				F00000000000000000000004 /* AntNode.swift */,
 				F00000000000000000000005 /* AntDownload-Bridging-Header.h */,
 				F00000000000000000000006 /* Info.plist */,
@@ -168,7 +189,14 @@
 			buildActionMask = 2147483647;
 			files = (
 				B00000000000000000000001 /* AntDownloadApp.swift in Sources */,
-				B00000000000000000000002 /* ContentView.swift in Sources */,
+				B00000000000000000000017 /* RootView.swift in Sources */,
+				B00000000000000000000015 /* PlayerView.swift in Sources */,
+				B00000000000000000000016 /* NetworkView.swift in Sources */,
+				B00000000000000000000014 /* LiquidGlass.swift in Sources */,
+				B00000000000000000000013 /* PlayerEngine.swift in Sources */,
+				B00000000000000000000012 /* AntStreamLoader.swift in Sources */,
+				B00000000000000000000011 /* AntStreamSession.swift in Sources */,
+				B00000000000000000000010 /* Manifest.swift in Sources */,
 				B00000000000000000000003 /* AntNode.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -225,7 +253,7 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
@@ -278,7 +306,7 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				SDKROOT = iphoneos;

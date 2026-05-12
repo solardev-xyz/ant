@@ -21,9 +21,13 @@
 //! `ant_download` calls are allowed and share the node's cache /
 //! retrieval pipeline; the mpsc command channel serialises dispatch.
 
+mod manifest;
+mod stream;
+
 use ant_control::{
     ControlAck, ControlCommand, GetProgress, IdentityInfo, PeerInfo, RetrievalInfo, StatusSnapshot,
 };
+use stream::AntStream;
 use ant_crypto::{
     ethereum_address_from_public_key, overlay_from_ethereum_address, random_overlay_nonce,
     random_secp256k1_secret, OVERLAY_NONCE_LEN, SECP256K1_SECRET_LEN,
@@ -611,6 +615,35 @@ pub unsafe extern "C" fn ant_peer_count(handle: *const AntHandle) -> i32 {
     }
 }
 
+/// Snapshot the running node's `agent` string from the live status
+/// channel — currently `ant-ffi/<crate-version>` set at
+/// [`ant_init`] time. Lets the host display the version that is
+/// actually running, rather than e.g. `CFBundleShortVersionString`
+/// from the iOS bundle which can drift from the embedded library.
+///
+/// Returns a freshly-allocated UTF-8 C string the caller must release
+/// with [`ant_free_string`], or `NULL` if `handle` is null / the
+/// agent string contains an interior NUL (cannot happen in practice
+/// since we control the format).
+///
+/// # Safety
+///
+/// `handle` must come from [`ant_init`] and must not have been passed
+/// to [`ant_shutdown`].
+#[no_mangle]
+pub unsafe extern "C" fn ant_agent_string(handle: *const AntHandle) -> *mut c_char {
+    unsafe {
+        let Some(handle) = handle.as_ref() else {
+            return std::ptr::null_mut();
+        };
+        let agent = handle.status_rx.borrow().agent.clone();
+        match CString::new(agent) {
+            Ok(cs) => cs.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+}
+
 /// C-ABI mirror of [`DownloadProgressState`]. Kept as `#[repr(C)]` so
 /// the Swift side can treat it as a plain POD struct without a
 /// bridging header beyond `ant.h`. Field order is locked to the header
@@ -716,6 +749,339 @@ pub unsafe extern "C" fn ant_download_progress(
             cache_hits: snapshot.cache_hits,
         };
         0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Manifest listing — feeds the iOS player's "Up next" queue.
+// ---------------------------------------------------------------------------
+
+/// List the entries of a mantaray manifest. `reference` is a
+/// `bzz://<64-hex>` (or bare 64-hex) string. Returns a heap-allocated
+/// NUL-terminated JSON document of the form
+/// `{"entries":[{"path":"...","reference":"...","size":N,"content_type":"..."},...]}`,
+/// or null + error string on failure.
+///
+/// Free the returned string with [`ant_free_string`].
+///
+/// # Safety
+///
+/// * `handle` must come from [`ant_init`] and must not have been
+///   passed to [`ant_shutdown`].
+/// * `reference` must be a valid NUL-terminated UTF-8 string.
+/// * `out_err` must point at a writable `*mut c_char` slot, or be null
+///   to opt out of error reporting.
+#[no_mangle]
+pub unsafe extern "C" fn ant_list_bzz(
+    handle: *mut AntHandle,
+    reference: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        clear_out_err(out_err);
+        let result = catch_unwind(AssertUnwindSafe(|| -> Result<String, FfiError> {
+            let handle = handle.as_ref().ok_or(FfiError::NullPointer)?;
+            let reference = cstr_to_str(reference)?;
+            let parsed = parse_reference(reference)?;
+            // Manifest listing only makes sense for `bzz://` references.
+            // Reject `bytes://` here so callers don't get the gateway's
+            // generic "not a manifest" error halfway down the stack.
+            let root = match parsed {
+                ParsedRef::Bzz { root, .. } => root,
+                ParsedRef::Bytes(_) => {
+                    return Err(FfiError::Reference(
+                        "ant_list_bzz requires a bzz:// reference".into(),
+                    ))
+                }
+            };
+            manifest::list_to_json(&handle.runtime.handle().clone(), &handle.cmd_tx, root)
+                .map_err(|e| FfiError::Download(e.to_string()))
+        }));
+        match result {
+            Ok(Ok(json)) => {
+                let cstring = CString::new(json.replace('\0', "?"))
+                    .unwrap_or_else(|_| CString::new("manifest contained NUL byte").unwrap());
+                cstring.into_raw()
+            }
+            Ok(Err(e)) => {
+                write_out_err(out_err, &e.to_string());
+                std::ptr::null_mut()
+            }
+            Err(_) => {
+                write_out_err(out_err, "panic in ant_list_bzz");
+                std::ptr::null_mut()
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming session — backs the AVAssetResourceLoaderDelegate path.
+// ---------------------------------------------------------------------------
+
+/// Open a streaming session for `reference` (a `bzz://<hex>/path`
+/// string). Sends a `head_only` request to learn the file size and
+/// content type, then returns an opaque `AntStream*` the caller passes
+/// to [`ant_stream_read`] / [`ant_stream_progress`] / [`ant_stream_close`].
+///
+/// On success: writes the file size into `*out_total_bytes` (when
+/// non-null) and the manifest's `Content-Type` into `*out_content_type`
+/// (when non-null and the manifest carried one — caller frees the
+/// string with [`ant_free_string`]).
+///
+/// On failure: returns null and writes an allocated error into
+/// `*out_err`.
+///
+/// # Safety
+///
+/// * `handle` must come from [`ant_init`] and must outlive the returned
+///   stream (calling [`ant_shutdown`] before [`ant_stream_close`] is
+///   undefined behaviour).
+/// * `reference` must be a valid NUL-terminated UTF-8 string of the
+///   form `bzz://<64-hex>[/path]`.
+/// * `out_total_bytes`, `out_content_type`, `out_err` may each be null
+///   or point at a writable slot.
+#[no_mangle]
+pub unsafe extern "C" fn ant_stream_open(
+    handle: *mut AntHandle,
+    reference: *const c_char,
+    out_total_bytes: *mut u64,
+    out_content_type: *mut *mut c_char,
+    out_err: *mut *mut c_char,
+) -> *mut AntStream {
+    unsafe {
+        clear_out_err(out_err);
+        if !out_content_type.is_null() {
+            *out_content_type = std::ptr::null_mut();
+        }
+        if !out_total_bytes.is_null() {
+            *out_total_bytes = 0;
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| -> Result<AntStream, FfiError> {
+            let handle = handle.as_ref().ok_or(FfiError::NullPointer)?;
+            let reference = cstr_to_str(reference)?;
+            let parsed = parse_reference(reference)?;
+            let (root, path) = match parsed {
+                ParsedRef::Bzz { root, path } => (root, path),
+                ParsedRef::Bytes(_) => {
+                    return Err(FfiError::Reference(
+                        "ant_stream_open requires a bzz:// reference".into(),
+                    ))
+                }
+            };
+            AntStream::open(
+                handle.runtime.handle().clone(),
+                handle.cmd_tx.clone(),
+                root,
+                path,
+            )
+            .map_err(|e| FfiError::Download(e.to_string()))
+        }));
+        match result {
+            Ok(Ok(stream)) => {
+                if !out_total_bytes.is_null() {
+                    *out_total_bytes = stream.total_bytes();
+                }
+                if !out_content_type.is_null() {
+                    if let Some(ct) = stream.content_type() {
+                        let cstring = CString::new(ct.replace('\0', "?")).unwrap_or_else(|_| {
+                            CString::new("content_type contained NUL byte").unwrap()
+                        });
+                        *out_content_type = cstring.into_raw();
+                    }
+                }
+                Box::into_raw(Box::new(stream))
+            }
+            Ok(Err(e)) => {
+                write_out_err(out_err, &e.to_string());
+                std::ptr::null_mut()
+            }
+            Err(_) => {
+                write_out_err(out_err, "panic in ant_stream_open");
+                std::ptr::null_mut()
+            }
+        }
+    }
+}
+
+/// Pull `len` bytes starting at `offset` into `dst`. Blocks the calling
+/// thread until the bytes are ready (or the per-read timeout fires).
+/// Returns the number of bytes actually written into `dst` on success,
+/// or `-1` on error (with an allocated error string in `*out_err`).
+///
+/// Reads past `total_bytes` are truncated to the available tail; the
+/// return value reports the truncated length.
+///
+/// # Safety
+///
+/// * `stream` must come from [`ant_stream_open`] and must not have been
+///   passed to [`ant_stream_close`].
+/// * `dst` must point at a writable buffer of at least `len` bytes.
+/// * `out_err` may be null to opt out of error reporting.
+#[no_mangle]
+pub unsafe extern "C" fn ant_stream_read(
+    stream: *mut AntStream,
+    offset: u64,
+    len: usize,
+    dst: *mut u8,
+    out_err: *mut *mut c_char,
+) -> isize {
+    unsafe {
+        clear_out_err(out_err);
+        let result = catch_unwind(AssertUnwindSafe(|| -> Result<usize, FfiError> {
+            let stream = stream.as_ref().ok_or(FfiError::NullPointer)?;
+            if dst.is_null() && len > 0 {
+                return Err(FfiError::NullPointer);
+            }
+            let dst_slice = std::slice::from_raw_parts_mut(dst, len);
+            stream
+                .read(offset, len, dst_slice)
+                .map_err(|e| FfiError::Download(e.to_string()))
+        }));
+        match result {
+            Ok(Ok(n)) => isize::try_from(n).unwrap_or(isize::MAX),
+            Ok(Err(e)) => {
+                write_out_err(out_err, &e.to_string());
+                -1
+            }
+            Err(_) => {
+                write_out_err(out_err, "panic in ant_stream_read");
+                -1
+            }
+        }
+    }
+}
+
+/// Pull a contiguous byte range and deliver each joiner-produced
+/// chunk to `on_chunk` as it arrives. Unlike [`ant_stream_read`] —
+/// which holds the calling thread until the entire `len` bytes have
+/// been buffered — this drives a single `StreamBzz` request all the
+/// way to its terminal `StreamDone`, invoking the callback for every
+/// `BytesChunk` ack along the way. That matches the
+/// `AVAssetResourceLoaderDelegate` shape on the Swift side: a long-
+/// lived `dataRequest` that wants `respond(with:)` called as soon as
+/// each piece of body lands, not after the whole window has buffered.
+///
+/// `on_chunk(ctx, ptr, len) -> i32`: returning a non-zero value asks
+/// the FFI to stop pulling early (e.g. AVPlayer canceled the
+/// `dataRequest`). The remaining acks are drained for clean shutdown.
+/// The callback runs on a tokio runtime worker thread and must be
+/// non-blocking and Send-safe.
+///
+/// Returns the total number of bytes delivered, or `-1` on error
+/// (with `*out_err` set when the slot is non-null).
+///
+/// # Safety
+///
+/// * `stream` must come from [`ant_stream_open`] and must not have
+///   been passed to [`ant_stream_close`].
+/// * `on_chunk` must be a valid C ABI function pointer; `ctx` is
+///   passed through opaquely and may be null.
+/// * The callback receives a non-null `data` pointer and `len > 0`.
+#[no_mangle]
+pub unsafe extern "C" fn ant_stream_pull(
+    stream: *mut AntStream,
+    offset: u64,
+    len: u64,
+    on_chunk: Option<unsafe extern "C" fn(ctx: *mut std::ffi::c_void, data: *const u8, len: usize) -> i32>,
+    ctx: *mut std::ffi::c_void,
+    out_err: *mut *mut c_char,
+) -> i64 {
+    unsafe {
+        clear_out_err(out_err);
+        // SAFETY: the FFI shape uses a raw `*mut c_void` ctx that
+        // Swift will only pass back into us through `on_chunk`. Once we
+        // wrap it in a `usize` it crosses the `catch_unwind` boundary
+        // without UnwindSafe complaints, and we cast back inside the
+        // callback closure.
+        let ctx_addr = ctx as usize;
+        let result = catch_unwind(AssertUnwindSafe(|| -> Result<u64, FfiError> {
+            let stream = stream.as_ref().ok_or(FfiError::NullPointer)?;
+            let cb = on_chunk.ok_or_else(|| FfiError::Download("on_chunk is null".into()))?;
+            let mut closure = |chunk: &[u8]| -> bool {
+                if chunk.is_empty() {
+                    return false;
+                }
+                let rc = cb(ctx_addr as *mut std::ffi::c_void, chunk.as_ptr(), chunk.len());
+                rc != 0
+            };
+            stream
+                .pull(offset, len, &mut closure)
+                .map_err(|e| FfiError::Download(e.to_string()))
+        }));
+        match result {
+            Ok(Ok(n)) => i64::try_from(n).unwrap_or(i64::MAX),
+            Ok(Err(e)) => {
+                write_out_err(out_err, &e.to_string());
+                -1
+            }
+            Err(_) => {
+                write_out_err(out_err, "panic in ant_stream_pull");
+                -1
+            }
+        }
+    }
+}
+
+/// Sample the cumulative state of a stream (bytes downloaded so far,
+/// total file size, last `Progress` chunk/peer counters). Fills `*out`
+/// and returns 0 on success; returns `-1` if either pointer is null.
+///
+/// `bytes_done` is the running sum of bytes the stream has handed back
+/// across all `ant_stream_read` calls — i.e. the number of bytes
+/// AVPlayer has actually consumed for *this* file. The Network tab uses
+/// this for the "2.4 MB / 117.5 MB" progress card. The chunk / peer /
+/// in-flight numbers reflect the *most recent* range request the node
+/// emitted a `Progress` ack for, which is the most useful proxy for
+/// "what is the network doing right now" while a stream plays.
+///
+/// # Safety
+///
+/// * `stream` must come from [`ant_stream_open`] and must not have been
+///   passed to [`ant_stream_close`].
+/// * `out` must point at a writable [`AntProgress`] slot.
+#[no_mangle]
+pub unsafe extern "C" fn ant_stream_progress(
+    stream: *const AntStream,
+    out: *mut AntProgress,
+) -> i32 {
+    unsafe {
+        let Some(stream) = stream.as_ref() else {
+            return -1;
+        };
+        let Some(out) = out.as_mut() else {
+            return -1;
+        };
+        let (bytes_done, total_bytes, chunks_done, total_chunks, elapsed_ms, peers, in_flight, cache) =
+            stream::snapshot_progress(stream);
+        *out = AntProgress {
+            in_progress: 1,
+            bytes_done,
+            total_bytes,
+            chunks_done,
+            total_chunks,
+            elapsed_ms,
+            peers_used: peers,
+            in_flight,
+            cache_hits: cache,
+        };
+        0
+    }
+}
+
+/// Close a stream and free its handle. After this returns, `stream`
+/// must not be used again.
+///
+/// # Safety
+///
+/// `stream` must have come from [`ant_stream_open`]. Null is a no-op.
+#[no_mangle]
+pub unsafe extern "C" fn ant_stream_close(stream: *mut AntStream) {
+    unsafe {
+        if stream.is_null() {
+            return;
+        }
+        drop(Box::from_raw(stream));
     }
 }
 

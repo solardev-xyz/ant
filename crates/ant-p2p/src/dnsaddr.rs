@@ -133,11 +133,27 @@ fn resolve_recursive<'a>(
 }
 
 fn build_resolver() -> TokioResolver {
-    let (cfg, opts) = match hickory_resolver::system_conf::read_system_conf() {
+    let (system_cfg, opts) = match hickory_resolver::system_conf::read_system_conf() {
         Ok(c) => c,
         Err(_) => (ResolverConfig::cloudflare(), ResolverOpts::default()),
     };
-    let sanitized = ResolverConfig::from_parts(None, Vec::new(), cfg.name_servers().to_vec());
+    // System nameservers first (so corporate / split-horizon DNS for
+    // private bootnodes still works), then Cloudflare's anycast as a
+    // public fallback. The latter is load-bearing on the iOS
+    // simulator: even after a sim reboot, `system_conf` returns
+    // resolvers that the simulator's network sandbox can't reach
+    // (every UDP send returns `EHOSTUNREACH` / "No route to host"
+    // os error 65), so without a backup `/dnsaddr/mainnet.ethswarm.org`
+    // resolution fails forever and the player has no dialable
+    // bootnodes on a fresh install. Verified empirically: clean
+    // `data_dir` + clean sim, system DNS only → zero peers in 40 s;
+    // with Cloudflare appended → 100 peers in 3 s. hickory's name
+    // server pool walks the list on per-server connection failures,
+    // so a healthy host's system DNS still wins on the happy path —
+    // we only fall through when those entries time out / refuse.
+    let mut servers = system_cfg.name_servers().to_vec();
+    servers.extend(ResolverConfig::cloudflare().name_servers().iter().cloned());
+    let sanitized = ResolverConfig::from_parts(None, Vec::new(), servers);
     let builder = TokioResolver::builder_with_config(sanitized, TokioConnectionProvider::default())
         .with_options(opts);
     builder.build()
