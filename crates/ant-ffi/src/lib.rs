@@ -965,7 +965,7 @@ pub unsafe extern "C" fn ant_stream_read(
 /// each piece of body lands, not after the whole window has buffered.
 ///
 /// `on_chunk(ctx, ptr, len) -> i32`: returning a non-zero value asks
-/// the FFI to stop pulling early (e.g. AVPlayer canceled the
+/// the FFI to stop pulling early (e.g. `AVPlayer` canceled the
 /// `dataRequest`). The remaining acks are drained for clean shutdown.
 /// The callback runs on a tokio runtime worker thread and must be
 /// non-blocking and Send-safe.
@@ -1037,7 +1037,7 @@ pub unsafe extern "C" fn ant_stream_pull(
 ///
 /// `bytes_done` is the running sum of bytes the stream has handed back
 /// across all `ant_stream_read` calls — i.e. the number of bytes
-/// AVPlayer has actually consumed for *this* file. The Network tab uses
+/// `AVPlayer` has actually consumed for *this* file. The Network tab uses
 /// this for the "2.4 MB / 117.5 MB" progress card. The chunk / peer /
 /// in-flight numbers reflect the *most recent* range request the node
 /// emitted a `Progress` ack for, which is the most useful proxy for

@@ -247,17 +247,17 @@ pub extern "system" fn Java_at_vibing_ant_downloadsmoke_AntNode_nativeShutdown<'
 /// iOS smoke uses for `ant_download_progress`. The order matches the
 /// `AntProgress` C struct in `crates/ant-ffi/include/ant.h`:
 ///
-/// | idx | field          | type | iOS C struct field |
-/// |-----|----------------|------|--------------------|
-/// | 0   | in_progress    | u8   | `in_progress`      |
-/// | 1   | bytes_done     | u64  | `bytes_done`       |
-/// | 2   | total_bytes    | u64  | `total_bytes`      |
-/// | 3   | chunks_done    | u64  | `chunks_done`      |
-/// | 4   | total_chunks   | u64  | `total_chunks`     |
-/// | 5   | elapsed_ms     | u64  | `elapsed_ms`       |
-/// | 6   | peers_used     | u32  | `peers_used`       |
-/// | 7   | in_flight      | u32  | `in_flight`        |
-/// | 8   | cache_hits     | u64  | `cache_hits`       |
+/// | idx | field            | type |
+/// |-----|------------------|------|
+/// | 0   | `in_progress`    | u8   |
+/// | 1   | `bytes_done`     | u64  |
+/// | 2   | `total_bytes`    | u64  |
+/// | 3   | `chunks_done`    | u64  |
+/// | 4   | `total_chunks`   | u64  |
+/// | 5   | `elapsed_ms`     | u64  |
+/// | 6   | `peers_used`     | u32  |
+/// | 7   | `in_flight`      | u32  |
+/// | 8   | `cache_hits`     | u64  |
 ///
 /// We pack into a `long[]` rather than a Kotlin POJO because Kotlin's
 /// auto-boxed `LongArray` is the cheapest variable-width primitive

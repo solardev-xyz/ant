@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 /// Bound on how long we'll wait for a manifest listing. The mantaray
 /// walk fans out aggressively across the chunk cache so even a deep
 /// directory tree resolves in well under 30 s once peers are warm.
-const LIST_TIMEOUT: Duration = Duration::from_secs(60);
+const LIST_TIMEOUT: Duration = Duration::from_mins(1);
 const NO_PEERS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, thiserror::Error)]
@@ -66,12 +66,10 @@ pub(crate) fn list_to_json(
                     if message.contains("no peers available") {
                         let now = tokio::time::Instant::now();
                         if now >= deadline {
-                            return Err(ListError::Stream(format!(
-                                "list timed out: {message}",
-                            )));
+                            return Err(ListError::Stream(format!("list timed out: {message}")));
                         }
-                        let slice = NO_PEERS_RETRY_INTERVAL
-                            .min(deadline.saturating_duration_since(now));
+                        let slice =
+                            NO_PEERS_RETRY_INTERVAL.min(deadline.saturating_duration_since(now));
                         tokio::time::sleep(slice).await;
                         continue;
                     }
@@ -104,13 +102,9 @@ pub(crate) fn list_to_json(
                 path: &e.path,
                 reference: e.reference.as_deref(),
                 size: e.size,
-                content_type: e
-                    .metadata
-                    .get("Content-Type")
-                    .map(String::as_str),
+                content_type: e.metadata.get("Content-Type").map(String::as_str),
             })
             .collect(),
     };
-    serde_json::to_string(&wire)
-        .map_err(|e| ListError::Stream(format!("encode manifest: {e}")))
+    serde_json::to_string(&wire).map_err(|e| ListError::Stream(format!("encode manifest: {e}")))
 }

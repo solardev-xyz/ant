@@ -3008,7 +3008,6 @@ fn wait_for_peers(socket: &Path, min_peers: u32, timeout: Duration) {
     }
 }
 
-
 fn resolve_socket(opt: &Opt) -> PathBuf {
     if let Some(p) = &opt.socket {
         return expand_tilde(p);
@@ -3094,7 +3093,6 @@ fn print_status(s: &StatusSnapshot) {
     println!("Control:");
     println!("  Socket:      {}", s.control_socket);
 }
-
 
 fn current_unix() -> u64 {
     SystemTime::now()

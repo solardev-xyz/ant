@@ -1,0 +1,196 @@
+# Per-PR + per-merge-to-main CI for the ant workspace.
+#
+# Three parallel jobs, each modelling a piece of PLAN.md § 3
+# ("Per-PR (fast)" — clippy + rustfmt + cargo test on x86_64 Linux,
+#  cross-compile smoke-build on aarch64-linux-android and
+#  aarch64-apple-ios). When the proper Phase-4 mobile artefact lands
+# this workflow grows release-build + bundletool size-check jobs;
+# until then the smoke jobs only validate that the cross-compile
+# completes — they don't run the binary.
+#
+# The pre-commit-config.yaml at repo root is purely advisory; this
+# workflow is the actual enforcement point. If you flip a clippy lint
+# from warn to deny, this is the file you'll see go red.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Latest pushed commit on a PR cancels still-running CI for older
+# pushes on the same branch. Keeps the queue snappy when an author
+# fixes a typo and re-pushes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+  # `cargo xtask build-android-*` reads this; matches the
+  # `examples/android-download/app/build.gradle.kts` minSdk = 26.
+  ANDROID_NDK_API_LEVEL: "26"
+
+jobs:
+  # -------------------------------------------------------------------
+  # Lint + test on Linux. The fast path the PR template's "did you run
+  # checks?" question is asking about.
+  # -------------------------------------------------------------------
+  lint-and-test:
+    name: fmt + clippy + test (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        # `dtolnay/rust-toolchain` is the de-facto stable replacement
+        # for the deprecated `actions-rs/toolchain`. We pin to stable
+        # because rust-toolchain.toml says `channel = "stable"` —
+        # bumping that locally without bumping the runner here would
+        # produce a CI-vs-developer drift.
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + target
+        # Cuts cold CI from ~6 min to ~2 min on a clean lockfile.
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Bucket by job so the size-budget runner doesn't share a
+          # cache with the lint runner — different feature combos
+          # produce different intermediate artifacts.
+          shared-key: lint-and-test
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy (default features)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo clippy (ant-ffi with jni feature)
+        # The Android JNI surface is gated behind a default-off
+        # feature; without this step regressions in `src/jni.rs`
+        # would only surface when an Android cross-compile fires
+        # in the next job, doubling debug latency.
+        run: cargo clippy -p ant-ffi --features jni --all-targets -- -D warnings
+
+      - name: cargo test (lib only)
+        # Lib tests cover the unit-test surface (BMT, joiner,
+        # mantaray, parse_reference). Integration tests against
+        # a local bee container live behind a separate workflow
+        # we'll add when the bee Docker image stops drifting.
+        run: cargo test --workspace --lib
+
+  # -------------------------------------------------------------------
+  # Android cross-compile smoke. Confirms `crates/ant-ffi/src/jni.rs`
+  # links against the NDK and produces a `libant_ffi.so` that has the
+  # expected Java_… symbols.
+  # -------------------------------------------------------------------
+  android-smoke:
+    name: cross-compile aarch64-linux-android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # rustup adds the cross-target the Cargo.toml needs but
+          # rust-cache below also keys on it, so changing this list
+          # invalidates the cache.
+          targets: aarch64-linux-android
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: android-arm64
+
+      - name: Set up Android NDK
+        # `setup-android` is GitHub's blessed setup action for the
+        # Android SDK / NDK / cmdline-tools. Pinning the NDK version
+        # so reproducible cross-builds don't drift when Google ships
+        # a new minor; bump in lock-step with what local devs install.
+        uses: android-actions/setup-android@v3
+        with:
+          # Empty `packages:` short-circuits the SDK install we don't
+          # need — we only want the NDK directory, which the next
+          # step pulls in via sdkmanager directly.
+          packages: ""
+
+      - name: Install NDK r27 via sdkmanager
+        run: |
+          set -euxo pipefail
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "ndk;27.2.12479018"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Install cargo-ndk
+        # Ditto the NDK version pin: matches what `xtask` is tested
+        # against locally and keeps the toolchain-driven warnings
+        # under our control.
+        run: cargo install cargo-ndk --version 4.1.2 --locked
+
+      - name: cargo xtask build-android-arm64
+        run: cargo xtask build-android-arm64
+
+      - name: Verify exported JNI symbols
+        # Smoke check that the `Java_…_native…` symbols actually made
+        # it into the .so. A regression here would mean either the
+        # `jni` feature didn't get switched on (look at xtask) or
+        # R8/strip ate them (look at proguard-rules.pro). nm is part
+        # of the LLVM bin shipped with the NDK.
+        run: |
+          set -euxo pipefail
+          NM="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          SO="target/aarch64-linux-android/release/libant_ffi.so"
+          test -f "$SO"
+          "$NM" -D --defined-only "$SO" \
+            | grep -E '^[[:xdigit:]]+ T Java_at_vibing_ant_downloadsmoke_AntNode_native(Init|Download|PeerCount|AgentString|DownloadProgress|CancelDownload|Shutdown)$' \
+            | sort -u > /tmp/android-symbols.txt
+          actual=$(wc -l < /tmp/android-symbols.txt)
+          if [ "$actual" -ne 7 ]; then
+            echo "expected 7 Java_…_native… symbols, found $actual:" >&2
+            cat /tmp/android-symbols.txt >&2
+            exit 1
+          fi
+          ls -lh "$SO"
+
+  # -------------------------------------------------------------------
+  # iOS cross-compile smoke. The macOS runner's the bottleneck on the
+  # whole CI matrix (15 min queueing during business hours), so we
+  # keep it minimal: just confirm the simulator slice cross-compiles.
+  # The device slice + xcodebuild lives behind a release tag.
+  # -------------------------------------------------------------------
+  ios-smoke:
+    name: cross-compile aarch64-apple-ios-sim
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios-sim
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ios-sim
+
+      - name: cargo xtask build-ios-sim
+        run: cargo xtask build-ios-sim
+
+      - name: Verify libant_ffi.a exists and contains ant_init
+        run: |
+          set -euxo pipefail
+          AR="target/aarch64-apple-ios-sim/release/libant_ffi.a"
+          test -f "$AR"
+          # ant_init is the simplest smoke — if it's missing, every
+          # downstream symbol is too, and the iOS Xcode link step
+          # would fail with a "Undefined symbols for architecture
+          # arm64" wall further down the build.
+          nm "$AR" 2>/dev/null \
+            | grep -E '\bT _ant_init$' >/dev/null
+          ls -lh "$AR"
