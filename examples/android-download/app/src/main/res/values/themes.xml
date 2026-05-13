@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!--
+      Minimal Material3 theme. Compose drives every visual element
+      (RootScreen.kt sets the colour scheme via `MaterialTheme(…)`),
+      so this file's only job is to plug the activity into a sane
+      base theme that handles the system bars and status bar
+      contrast for the manifest before Compose's first frame draws.
+    -->
+    <style name="Theme.AntDownload" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor" tools:targetApi="l">@android:color/black</item>
+        <item name="android:windowBackground">@android:color/black</item>
+    </style>
+</resources>

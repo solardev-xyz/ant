@@ -27,3 +27,10 @@ examples/ios-download/build*/
 xcuserdata/
 *.xcworkspace/xcuserdata/
 DerivedData/
+
+# Gradle / Android smoke-test build artefacts
+examples/android-download/build/
+examples/android-download/.gradle/
+examples/android-download/local.properties
+examples/android-download/app/build/
+examples/android-download/app/src/main/jniLibs/

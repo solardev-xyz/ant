@@ -1,0 +1,46 @@
+# Gradle version catalog for the AntDownload Android example app.
+#
+# Pinned to versions current as of 2026-04 — bumping requires
+# bumping the matching Gradle wrapper distribution in
+# `gradle/wrapper/gradle-wrapper.properties` because AGP 9.x has
+# strict Gradle min-version requirements.
+
+[versions]
+# Build tools
+agp = "9.2.1"
+kotlin = "2.3.21"
+
+# AndroidX
+core-ktx = "1.18.0"
+lifecycle = "2.9.4"
+activity-compose = "1.11.0"
+compose-bom = "2026.04.01"
+
+# JDK
+java = "17"
+# minSdk is mirrored in `xtask::ANDROID_NDK_API_LEVEL` — bumping
+# requires updating both sides in lock-step so the .so we cross-
+# compile and the SDK we link against agree on libc availability.
+minSdk = "26"
+compileSdk = "36"
+targetSdk = "36"
+
+[libraries]
+androidx-core-ktx = { module = "androidx.core:core-ktx", version.ref = "core-ktx" }
+androidx-lifecycle-runtime-ktx = { module = "androidx.lifecycle:lifecycle-runtime-ktx", version.ref = "lifecycle" }
+androidx-lifecycle-viewmodel-compose = { module = "androidx.lifecycle:lifecycle-viewmodel-compose", version.ref = "lifecycle" }
+androidx-activity-compose = { module = "androidx.activity:activity-compose", version.ref = "activity-compose" }
+androidx-compose-bom = { module = "androidx.compose:compose-bom", version.ref = "compose-bom" }
+androidx-compose-ui = { module = "androidx.compose.ui:ui" }
+androidx-compose-ui-graphics = { module = "androidx.compose.ui:ui-graphics" }
+androidx-compose-ui-tooling-preview = { module = "androidx.compose.ui:ui-tooling-preview" }
+androidx-compose-material3 = { module = "androidx.compose.material3:material3" }
+androidx-compose-ui-tooling = { module = "androidx.compose.ui:ui-tooling" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+# AGP 9.0+ ships with built-in Kotlin support, so we don't apply
+# `org.jetbrains.kotlin.android` separately — the application plugin
+# handles `.kt` source compilation. The compose-compiler plugin is
+# still required separately.
+kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
