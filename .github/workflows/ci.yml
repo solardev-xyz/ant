@@ -109,22 +109,21 @@ jobs:
 
       - name: Set up Android NDK
         # `setup-android` is GitHub's blessed setup action for the
-        # Android SDK / NDK / cmdline-tools. Pinning the NDK version
-        # so reproducible cross-builds don't drift when Google ships
-        # a new minor; bump in lock-step with what local devs install.
+        # Android SDK / NDK / cmdline-tools and handles license
+        # acceptance + sdkmanager install in one step. Pinning the
+        # NDK version so reproducible cross-builds don't drift when
+        # Google ships a new minor — bump in lock-step with what
+        # local devs install.
         uses: android-actions/setup-android@v3
         with:
-          # Empty `packages:` short-circuits the SDK install we don't
-          # need — we only want the NDK directory, which the next
-          # step pulls in via sdkmanager directly.
-          packages: ""
+          packages: ndk;27.2.12479018
 
-      - name: Install NDK r27 via sdkmanager
-        run: |
-          set -euxo pipefail
-          yes | sdkmanager --licenses >/dev/null
-          sdkmanager "ndk;27.2.12479018"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+      - name: Export ANDROID_NDK_HOME
+        # `setup-android` sets ANDROID_HOME but not ANDROID_NDK_HOME;
+        # `cargo-ndk` reads the latter. Doing this in a separate
+        # step (rather than inline in the build) keeps the env
+        # available to subsequent steps without `&&` chains.
+        run: echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
       - name: Install cargo-ndk
         # Ditto the NDK version pin: matches what `xtask` is tested
@@ -190,7 +189,9 @@ jobs:
           # ant_init is the simplest smoke — if it's missing, every
           # downstream symbol is too, and the iOS Xcode link step
           # would fail with a "Undefined symbols for architecture
-          # arm64" wall further down the build.
-          nm "$AR" 2>/dev/null \
-            | grep -E '\bT _ant_init$' >/dev/null
+          # arm64" wall further down the build. macOS BSD grep
+          # doesn't support the GNU `\b` word boundary, so we
+          # match the literal space prefix in the `nm` output
+          # ("<addr> T _ant_init") instead.
+          nm "$AR" 2>/dev/null | grep -E ' T _ant_init$' >/dev/null
           ls -lh "$AR"
