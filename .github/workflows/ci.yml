@@ -172,6 +172,17 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios-sim
+          # `llvm-tools-preview` ships rustc's matching `llvm-nm` in
+          # `$(rustc --print sysroot)/lib/rustlib/<host>/bin/`. We
+          # need it because Xcode's bundled `nm` lags rustc's LLVM
+          # version (LLVM 17 vs rustc-1.95.0's LLVM 22) and chokes
+          # on newer bitcode attribute kinds with
+          #   "Unknown attribute kind (102) (Producer:
+          #    'LLVM22.1.2-rust-1.95.0-stable' Reader:
+          #    'LLVM APPLE_1_1500.3.9.4_0')"
+          # Using llvm-nm from the Rust toolchain sidesteps the
+          # version mismatch entirely.
+          components: llvm-tools-preview
 
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
@@ -187,21 +198,21 @@ jobs:
           AR="target/aarch64-apple-ios-sim/release/libant_ffi.a"
           test -f "$AR"
           ls -lh "$AR"
-          # `nm` on a static archive (.a) prints one object-file
-          # header per archive member, then the symbols. We accept
-          # any line whose symbol column ends in `_ant_init`; the
-          # text/data section letter (T/D/S) and the cross-arch
-          # whitespace differences between Apple `nm` and `llvm-nm`
-          # are noise we don't need to encode in the regex. If the
-          # symbol is genuinely missing the search returns nothing
-          # and the step fails; we print the head of nm's output
-          # at the same time so a future failure is easier to
-          # diagnose without re-running the runner.
-          if ! nm "$AR" 2>/dev/null | grep -E '_ant_init$' >/dev/null; then
+          # Use rustc's bundled llvm-nm — see the toolchain step's
+          # comment for why Xcode's `nm` is unusable on macos-14
+          # runners. Path resolution stays portable across Intel /
+          # Apple-Silicon hosts via `rustc -vV`.
+          HOST_TRIPLE="$(rustc -vV | awk '/^host:/ {print $2}')"
+          LLVM_NM="$(rustc --print sysroot)/lib/rustlib/$HOST_TRIPLE/bin/llvm-nm"
+          test -x "$LLVM_NM"
+          # ant_init is the simplest smoke — if it's missing every
+          # downstream symbol is too, and the Xcode link step would
+          # fail with "Undefined symbols for architecture arm64".
+          if ! "$LLVM_NM" "$AR" 2>/dev/null | grep -E '_ant_init$' >/dev/null; then
             echo "ant_init symbol not found in $AR"
-            echo "--- first 30 lines of nm output ---"
-            nm "$AR" 2>&1 | head -30 || true
+            echo "--- first 30 lines of llvm-nm output ---"
+            "$LLVM_NM" "$AR" 2>&1 | head -30 || true
             echo "--- lines containing 'ant' ---"
-            nm "$AR" 2>/dev/null | grep ant | head -10 || true
+            "$LLVM_NM" "$AR" 2>/dev/null | grep ant | head -10 || true
             exit 1
           fi
