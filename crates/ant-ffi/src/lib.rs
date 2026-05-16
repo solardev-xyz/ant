@@ -21,13 +21,14 @@
 //! `ant_download` calls are allowed and share the node's cache /
 //! retrieval pipeline; the mpsc command channel serialises dispatch.
 
+#[cfg(feature = "jni")]
+mod jni;
 mod manifest;
 mod stream;
 
 use ant_control::{
     ControlAck, ControlCommand, GetProgress, IdentityInfo, PeerInfo, RetrievalInfo, StatusSnapshot,
 };
-use stream::AntStream;
 use ant_crypto::{
     ethereum_address_from_public_key, overlay_from_ethereum_address, random_overlay_nonce,
     random_secp256k1_secret, OVERLAY_NONCE_LEN, SECP256K1_SECRET_LEN,
@@ -42,6 +43,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use stream::AntStream;
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, watch, Notify};
 
@@ -963,7 +965,7 @@ pub unsafe extern "C" fn ant_stream_read(
 /// each piece of body lands, not after the whole window has buffered.
 ///
 /// `on_chunk(ctx, ptr, len) -> i32`: returning a non-zero value asks
-/// the FFI to stop pulling early (e.g. AVPlayer canceled the
+/// the FFI to stop pulling early (e.g. `AVPlayer` canceled the
 /// `dataRequest`). The remaining acks are drained for clean shutdown.
 /// The callback runs on a tokio runtime worker thread and must be
 /// non-blocking and Send-safe.
@@ -983,7 +985,9 @@ pub unsafe extern "C" fn ant_stream_pull(
     stream: *mut AntStream,
     offset: u64,
     len: u64,
-    on_chunk: Option<unsafe extern "C" fn(ctx: *mut std::ffi::c_void, data: *const u8, len: usize) -> i32>,
+    on_chunk: Option<
+        unsafe extern "C" fn(ctx: *mut std::ffi::c_void, data: *const u8, len: usize) -> i32,
+    >,
     ctx: *mut std::ffi::c_void,
     out_err: *mut *mut c_char,
 ) -> i64 {
@@ -1002,7 +1006,11 @@ pub unsafe extern "C" fn ant_stream_pull(
                 if chunk.is_empty() {
                     return false;
                 }
-                let rc = cb(ctx_addr as *mut std::ffi::c_void, chunk.as_ptr(), chunk.len());
+                let rc = cb(
+                    ctx_addr as *mut std::ffi::c_void,
+                    chunk.as_ptr(),
+                    chunk.len(),
+                );
                 rc != 0
             };
             stream
@@ -1029,7 +1037,7 @@ pub unsafe extern "C" fn ant_stream_pull(
 ///
 /// `bytes_done` is the running sum of bytes the stream has handed back
 /// across all `ant_stream_read` calls — i.e. the number of bytes
-/// AVPlayer has actually consumed for *this* file. The Network tab uses
+/// `AVPlayer` has actually consumed for *this* file. The Network tab uses
 /// this for the "2.4 MB / 117.5 MB" progress card. The chunk / peer /
 /// in-flight numbers reflect the *most recent* range request the node
 /// emitted a `Progress` ack for, which is the most useful proxy for
@@ -1052,8 +1060,16 @@ pub unsafe extern "C" fn ant_stream_progress(
         let Some(out) = out.as_mut() else {
             return -1;
         };
-        let (bytes_done, total_bytes, chunks_done, total_chunks, elapsed_ms, peers, in_flight, cache) =
-            stream::snapshot_progress(stream);
+        let (
+            bytes_done,
+            total_bytes,
+            chunks_done,
+            total_chunks,
+            elapsed_ms,
+            peers,
+            in_flight,
+            cache,
+        ) = stream::snapshot_progress(stream);
         *out = AntProgress {
             in_progress: 1,
             bytes_done,
@@ -1241,9 +1257,16 @@ fn secp256k1_keypair_from_signing_secret(
 //
 // iOS surfaces process stderr through os_log, so a plain
 // tracing_subscriber::fmt() pointed at stderr shows up in the Xcode
-// console unmodified. The proper mobile artefact (PLAN.md § 11)
-// replaces this with a `set_log_sink` callback; the smoke test doesn't
-// need that yet.
+// console unmodified. Android does *not* — release-build stderr is
+// silently discarded — so on `target_os = "android"` we pipe through
+// __android_log_write instead, which routes to logcat under the tag
+// "ant-ffi". Both branches stay behind a `Once` so a Kotlin /
+// SwiftUI host that calls ant_init twice doesn't stack two
+// subscribers.
+//
+// The proper mobile artefact (PLAN.md § 11) replaces both with a
+// `set_log_sink` callback so the host owns sink lifecycle; the smoke
+// tests don't need that yet.
 // ---------------------------------------------------------------------------
 
 fn install_log_subscriber() {
@@ -1255,9 +1278,81 @@ fn install_log_subscriber() {
             .unwrap_or_else(|_| "info,ant_p2p=info,ant_retrieval=info".to_string());
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
-            .with_writer(std::io::stderr)
+            .with_writer(default_log_writer())
             .try_init();
     });
+}
+
+#[cfg(not(target_os = "android"))]
+fn default_log_writer() -> impl for<'a> tracing_subscriber::fmt::MakeWriter<'a> + 'static {
+    std::io::stderr
+}
+
+/// Logcat-backed writer. `tracing_subscriber::fmt` calls
+/// `make_writer()` once per event, then writes the formatted line in
+/// a single `write` call followed by a `flush`. Each `write` is one
+/// fully-formed line, so we hand it straight to `__android_log_write`
+/// after stripping the trailing newline (logcat appends its own).
+#[cfg(target_os = "android")]
+fn default_log_writer() -> android_log::MakeWriter {
+    android_log::MakeWriter
+}
+
+#[cfg(target_os = "android")]
+mod android_log {
+    use std::ffi::CString;
+    use std::io::{self, Write};
+    use std::os::raw::c_char;
+
+    /// `android_LogPriority::ANDROID_LOG_INFO`. Hard-coded rather than
+    /// pulled in via `android_log_sys` to keep the Android branch
+    /// dependency-free.
+    const ANDROID_LOG_INFO: i32 = 4;
+
+    /// Tag passed to logcat; `adb logcat ant-ffi:V *:S` filters on
+    /// just our output.
+    const LOG_TAG: &str = "ant-ffi";
+
+    // Linked from the NDK's `liblog.so`, which is part of the standard
+    // Android system libraries — every NDK toolchain ships it and
+    // every Android process can link against it without extra Gradle
+    // wiring.
+    #[link(name = "log")]
+    extern "C" {
+        fn __android_log_write(prio: i32, tag: *const c_char, text: *const c_char) -> i32;
+    }
+
+    pub struct LogcatWriter;
+
+    impl Write for LogcatWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            // tracing_subscriber::fmt always writes valid UTF-8, but
+            // be defensive against any future formatter that chunks
+            // mid-codepoint.
+            let s = std::str::from_utf8(buf).unwrap_or("(non-utf8 log line)");
+            let trimmed = s.trim_end_matches(|c| c == '\r' || c == '\n');
+            if !trimmed.is_empty() {
+                if let (Ok(tag), Ok(msg)) = (CString::new(LOG_TAG), CString::new(trimmed)) {
+                    unsafe { __android_log_write(ANDROID_LOG_INFO, tag.as_ptr(), msg.as_ptr()) };
+                }
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    pub struct MakeWriter;
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for MakeWriter {
+        type Writer = LogcatWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            LogcatWriter
+        }
+    }
 }
 
 #[cfg(test)]

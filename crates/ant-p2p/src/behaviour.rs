@@ -3770,7 +3770,12 @@ fn resolver_config() -> dns::ResolverConfig {
     match hickory_resolver::system_conf::read_system_conf() {
         Ok((cfg, _)) => {
             let mut servers = cfg.name_servers().to_vec();
-            servers.extend(dns::ResolverConfig::cloudflare().name_servers().iter().cloned());
+            servers.extend(
+                dns::ResolverConfig::cloudflare()
+                    .name_servers()
+                    .iter()
+                    .cloned(),
+            );
             dns::ResolverConfig::from_parts(None, Vec::new(), servers)
         }
         Err(_) => dns::ResolverConfig::cloudflare(),

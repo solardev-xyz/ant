@@ -1785,6 +1785,134 @@ In-repo from day one, not a separate repo: while the FFI is churning, every brea
 
 The proper M2 Phase 4 deliverable is still a UniFFI-based `.xcframework` that meets the size budget in §12, the FFI shape in §7, OSLog + lifecycle wiring per §8.4 / §11, and Keychain key storage per §5.10. The smoke test exists to prove the *transport* (Rust + libp2p inside iOS dialing mainnet) works end-to-end; it explicitly does not stand in for that artifact and is expected to be deleted when Phase 4 lands.
 
+### Android download smoke test (pre-FFI)
+
+Sibling to the iOS smoke above, runnable any time after `ant-ffi` exists. Goal: prove that our libp2p stack can dial mainnet bee peers and complete a chunk download from a Rust library running inside an Android app, **before** we commit to the full UniFFI surface in §7 or the polished `.aar` in Phase 4. De-risks the Android-specific edges (NDK toolchain quirks, `System.loadLibrary` + JNI symbol mangling, `NetworkOnMainThreadException`, `libc++_static` vs `libc++_shared`, logcat wiring, `cargo-ndk` integration) on a thin slice of code that's cheap to delete.
+
+Like the iOS smoke, it is **not** a substitute for the M2 Phase 4 deliverable and does not change any milestone gate. It exists to surface Android-specific surprises early, while the FFI is still soft, on the same checked-in `ant-ffi` crate the iOS app links against.
+
+#### Scope
+
+In:
+
+- `aarch64-linux-android` shared library (`libant_ffi.so`) for arm64 phones (the only ABI worth caring about for v1 — covers every device shipped post-2017). `armv7-linux-androideabi` and `x86_64-linux-android` (emulator) slices follow as cheap additions once the arm64 path works. No `.aar`, no Maven publish; the `.so` files land directly under `app/src/main/jniLibs/<abi>/` so Gradle picks them up via `android:extractNativeLibs`.
+- A hand-written **JNI** surface inside `crates/ant-ffi/src/jni.rs` (not a separate crate), gated by `#[cfg(target_os = "android")]` and a default-off `jni` Cargo feature. Mirrors the existing `extern "C"` API one-to-one as `Java_at_vibing_ant_downloadsmoke_AntNode_native…` exports — `nativeInit` / `nativeDownload` / `nativePeerCount` / `nativeAgentString` / `nativeDownloadProgress` / `nativeCancelDownload` / `nativeListBzz` / `nativeStreamOpen` / `nativeStreamRead` / `nativeStreamPull` / `nativeStreamProgress` / `nativeStreamClose` / `nativeShutdown`. No UniFFI, no `.udl`.
+- `ant-ffi` grows `cdylib` alongside `staticlib` in its `crate-type` so the same crate produces `libant_ffi.a` (iOS) and `libant_ffi.so` (Android) from one source tree.
+- Hardcoded mainnet bootnodes; the same `data_dir`-based `identity.json` / `peers.json` persistence as iOS, pointed at the app's `context.filesDir` by the Kotlin side; in-memory chunk cache only.
+- Two-tab Jetpack Compose app: *Player* (paste-and-download field for v1, ExoPlayer streaming once the streaming JNI lands) and *Network* (peer count, agent string, retrieval progress) — direct mirror of the SwiftUI `RootView` / `PlayerView` / `NetworkView` triple.
+
+Out (deferred to the proper M2/M3 mobile track, same as iOS):
+
+- UniFFI-generated Kotlin bindings.
+- `KeyProvider` callback / Android Keystore / StrongBox plumbing.
+- `WorkManager` foreground service / suspend-resume / Doze whitelisting.
+- SQLite disk cache, R8/ProGuard-tuned size budget, signed release APK / AAB.
+- Multi-ABI `.aar` packaging, Play Store metadata, CI gating.
+
+#### Responsibility split — same FFI surface as iOS
+
+The Rust side is platform-agnostic; only the bridge layer differs (JNI exports vs `extern "C"`). Anything any Android app would need lives in `ant-ffi`; anything specific to this demo lives in the app.
+
+| Concern | Owner |
+|---|---|
+| `extern "C"` API + `crates/ant-ffi/include/ant.h` (iOS) | ant |
+| JNI exports (`Java_at_vibing_ant_downloadsmoke_AntNode_native…`) | ant, in `crates/ant-ffi/src/jni.rs` |
+| Tokio runtime, libp2p host, retrieval, joiner, mantaray | ant — shared with iOS verbatim |
+| Mainnet bootnode + `network_id = 1` defaults | ant |
+| Auto-generated libp2p identity persisted under `<data_dir>/identity.json` | ant (replaced by `KeyProvider` callback later, see §5.10) |
+| `tracing` → `logcat` bridge via `android_logger`, `#[cfg(target_os = "android")]` | ant (replaced by `set_log_sink` callback per §11) |
+| `cargo xtask build-android-arm64` / `build-android-armv7` / `build-android-x86_64` / `build-android-all` cross-compile recipes | ant — wraps `cargo-ndk` |
+| `context.filesDir.absolutePath` chosen and passed to `nativeInit` | app |
+| `AndroidManifest.xml`, `INTERNET` permission | app |
+| Compose views, ExoPlayer wiring, package name `at.vibing.ant.downloadsmoke` (matches iOS bundle id) | app |
+
+Same rule of thumb: **removing the example app should not break the Rust test suite, and removing ant should not break the example app.** Anything a third-party Android app would have to reinvent themselves belongs in `ant-ffi`, not under `examples/`.
+
+#### Workspace placement
+
+```
+vibing/ant/
+├── crates/
+│   └── ant-ffi/                # rlib + staticlib (iOS) + cdylib (Android)
+│       ├── include/ant.h       # iOS bridging header
+│       └── src/jni.rs          # Android JNI exports, cfg-gated
+├── xtask/                      # build-ios-{sim,device}, build-android-{arm64,armv7,x86_64,all}
+└── examples/
+    ├── ios-download/           # SwiftUI smoke-test app, Xcode project
+    └── android-download/       # Compose smoke-test app, Gradle project
+```
+
+Same in-repo argument as iOS: while the FFI is churning, every breaking change is one PR that touches `crates/ant-ffi/src/jni.rs` and `examples/android-download/app/src/main/java/at/vibing/ant/downloadsmoke/AntNode.kt` together — no version-skew matrix.
+
+#### Bridge style — why hand-written JNI, not UniFFI
+
+Same answer as iOS, mirrored: UniFFI is Phase 4 work; the smoke-test apps are explicitly throwaway. Hand-rolling JNI:
+
+- Keeps the surface obvious — every `external fun` in Kotlin lines up 1:1 with a Rust `Java_…` export, no codegen step in the loop.
+- Avoids the UniFFI/Kotlin/NDK toolchain stack while we're still pinning down which bootnodes Android trusts on cellular.
+- Stays deletable: when Phase 4 lands the `.aar`, we delete `examples/android-download/` and `crates/ant-ffi/src/jni.rs` together.
+
+JNI lives inside `ant-ffi` (not a sibling `ant-jni` crate) so the Rust state machine (`AntHandle`, `init_inner`, `download_inner`, `AntStream`) is reused verbatim by both extern-C and JNI wrappers, with no `pub` API surface widened just to bridge crates.
+
+#### Player engine — ExoPlayer mirrors AVPlayer
+
+The `ant_stream_open` / `ant_stream_read` / `ant_stream_pull` / `ant_stream_close` shape we shipped for `AVAssetResourceLoaderDelegate` was deliberately picked to also fit Media3 / ExoPlayer's `DataSource` interface:
+
+| ExoPlayer method | iOS equivalent | FFI call |
+|---|---|---|
+| `DataSource.open(DataSpec)` | `loadingRequestHandled.dataRequest.open()` | `nativeStreamOpen(reference)` |
+| `DataSource.read(buffer, offset, length)` | `respond(with:)` inside `dataRequest` | `nativeStreamRead(stream, offset, len, dst)` |
+| `DataSource.close()` | `cancel(loadingRequest)` | `nativeStreamClose(stream)` |
+
+v1 of the Android player goes through `nativeStreamRead` (blocking) since ExoPlayer's `DataSource` is already a blocking interface. The lower-overhead `nativeStreamPull` (callback-per-chunk) is held back until we measure whether the JNI byte-array copy is actually a bottleneck on a $200 phone.
+
+#### Build pipeline
+
+`xtask/src/main.rs` grows three Android subcommands and an `all` aggregator:
+
+```
+cargo xtask build-android-arm64    # aarch64-linux-android
+cargo xtask build-android-armv7    # armv7-linux-androideabi
+cargo xtask build-android-x86_64   # x86_64-linux-android (emulator)
+cargo xtask build-android-all      # all three, in series
+```
+
+Each invokes `cargo ndk -t <abi> -p 26 -- build -p ant-ffi --release --features jni`. We depend on `cargo-ndk` being on `$PATH`; `ensure_rust_target` gets a sibling `ensure_cargo_ndk` that prints `cargo install cargo-ndk` on miss. On success, the `.so` is copied into `examples/android-download/app/src/main/jniLibs/<abi>/libant_ffi.so` so a plain `./gradlew assembleRelease` from the example directory finds it without further wiring. (Same shape as the iOS xtask: it builds and reports the path; the host build system consumes that path.)
+
+minSdk is **26** (Android 8.0). NDK is **r26+** for current libp2p / `getrandom` / `clock_gettime` expectations. `compileSdk = 35`.
+
+#### Suggested ordering, smallest-merge-first
+
+Same logic as the iOS smoke — each step is the smallest checkpoint that proves the next layer of plumbing:
+
+1. Rust `cdylib` + minimal JNI (`nativeInit` + `nativeDownload` + `nativeShutdown` + `nativePeerCount` + `nativeAgentString`) + xtask `build-android-arm64`. Validation: `cargo xtask build-android-arm64` produces `libant_ffi.so` and `nm -D` shows the `Java_…_nativeInit` symbol.
+2. Compose app skeleton with the equivalent of `AntDownloadApp.swift` + `RootView.swift` + a single screen showing peer count + a paste-and-download field. Validation: install on an arm64 emulator (or device), paste a known mainnet hex, see bytes.
+3. xtask `build-android-armv7` + `build-android-x86_64`, ABI splits, README scaffold (mirroring `examples/ios-download/README.md`).
+4. Progress JNI + `DownloadProgress` flow + Network tab.
+5. `nativeListBzz` + `Manifest.kt` + manifest browser screen.
+6. Streaming JNI + ExoPlayer `DataSource` + audio playback.
+
+#### Likely Android-specific traps
+
+Lessons from iOS that translate, and a few that don't:
+
+- **`libc++_shared.so` vs `libc++_static.a`.** `cargo-ndk` defaults to static-linking the C++ runtime, which is what we want — otherwise the APK has to ship `libc++_shared.so` alongside `libant_ffi.so` and Gradle won't do that automatically.
+- **`panic = "abort"` on Android tends to kill processes with no useful stack.** Wrap every JNI entry point in `catch_unwind` (we do this on iOS already) and rethrow as a Kotlin `RuntimeException` carrying the panic message.
+- **Network on the main thread is illegal on Android** (`NetworkOnMainThreadException`). Every native call that does I/O has to be on `Dispatchers.IO`. Mirroring the iOS `Task.detached(priority: .userInitiated)` pattern handles this naturally.
+- **`System.loadLibrary` is per-process, not per-Activity.** Loading happens in a static initializer on the `AntNode` class. Calling `nativeInit` more than once leaks runtimes — gate it the same way `AntNode.swift` does (`guard case .idle = status else { return }`).
+- **No ATS analogue.** Android trusts arbitrary TCP by default, so there's no `NSAllowsArbitraryLoads` switch to flip. Cleartext HTTP isn't relevant either since we only do raw TCP+Noise.
+- **Background time.** Android is similar to iOS (~30 s before Doze) but stricter on battery-saver. v1 ignores this — the same way the iOS smoke does — and documents it. The proper fix is a foreground service (§ 10).
+
+#### Exit
+
+- Android emulator on a Mac connects to live mainnet bee peers, completes the BZZ handshake, fetches a known small CAC root chunk via `RoutingFetcher::fetch` + `joiner::join`, and renders the byte length + hex prefix in the Compose view.
+- Stretch: same flow on a real Android device over Wi-Fi (USB debugging only — no provisioning-profile dance like iOS, just `adb install`).
+- Stretch: streaming an audio file from a `bzz://` manifest through ExoPlayer's `DataSource`.
+
+#### What this does not solve
+
+The proper M2 Phase 4 deliverable is still a UniFFI-based `.aar` that meets the size budget in §12, the FFI shape in §7, logcat + lifecycle wiring per §8.4 / §11, and Keystore / StrongBox key storage per §5.10. This smoke test exists to prove the *transport* (Rust + libp2p inside Android dialing mainnet) works end-to-end; it explicitly does not stand in for that artifact and is expected to be deleted when Phase 4 lands.
+
 ### iOS `bzz://` browser — architecture note
 
 Non-committed design note captured while building the § 9 smoke test. Records how a native iOS browser can serve `bzz://` links straight from libant **without** a localhost HTTP gateway, so we don't re-derive this from scratch when Phase 4 closes. Not a milestone, not on the critical path — here so the option stays visible.
@@ -1898,6 +2026,8 @@ Worth revisiting at the start of Phase 4 to decide whether to widen the § 7 Uni
 
 ## 12. Size Budget
 
+### Per-component target (stripped, library only)
+
 | Component | Target (stripped) |
 |---|---|
 | libp2p (TCP/Noise/Yamux/Kad) | ≤ 2.5 MB |
@@ -1910,6 +2040,81 @@ Worth revisiting at the start of Phase 4 to decide whether to widen the § 7 Uni
 | **Total per platform** | **≤ 8.8 MB** |
 
 Tracked as a CI check that fails the build if `.xcframework` or `.aar` grows past the threshold for a release build.
+
+### Measured: Android `aarch64-linux-android` slice (smoke-test app, 2026-04)
+
+These are real numbers from the smoke-test app in `examples/android-download/`,
+not projections — captured with `cargo xtask build-android-arm64`,
+`./gradlew :app:bundleRelease`, and Google's `bundletool 1.18.1`. The
+PLAN.md ≤ 10 MB Tier-1 budget for the Android library slice (§ 3 deployment
+targets table) is an order of magnitude bigger than the per-component
+sums above on purpose — the per-component table is what we *aim* for once
+the proper M2 Phase 4 mobile artefact lands; the 10 MB ceiling is what we
+*allow* the throwaway smoke test to ship at while we're still hardening
+the FFI.
+
+| Artefact | Pre-R8 | Post-R8 | Δ |
+|---|---|---|---|
+| `libant_ffi.so` (uncompressed, stripped) | 6.7 MB | 6.7 MB (R8 doesn't touch native libs) | 0 |
+| `app-release.aab` on disk | 11.0 MB | 6.06 MB | **−45 %** |
+| Per-device download for arm64 (compressed, what Play Store reports) | 10.83 MB | 4.14 MB | **−62 %** |
+| Per-device install footprint (uncompressed APK splits) | ~15 MB | ~7.9 MB | **−47 %** |
+
+The post-R8 download size of 4.14 MB is the gzip-compressed wire bytes
+Play Store streams to a device. After install the on-disk footprint
+expands to ~7.9 MB because the `.so` ships uncompressed inside the APK
+(so the dynamic linker can mmap it at process start). Of the 4.14 MB
+download:
+
+- `libant_ffi.so` (compressed during wire delivery, stored uncompressed
+  inside the APK): ~3.1 MB. This is **the entire embedded ant** —
+  Tokio, libp2p, Noise, the BMT joiner, the mantaray walker, the JNI
+  surface, and the `tracing` → logcat bridge.
+- Compose + Kotlin stdlib + AndroidX lifecycle / activity-compose +
+  app dex + resources, post-R8: ~1.0 MB. Pre-R8 this was ~7.7 MB,
+  ~85 % of which was dead code that Compose / Kotlin coroutines /
+  AndroidX never reach from our actual entry points.
+
+Section breakdown of the 6.7 MB stripped `libant_ffi.so` (from
+`llvm-readelf -S`):
+
+| Section | Size | What's in it |
+|---|---|---|
+| `.text` | 4.88 MB | executable code (Tokio + libp2p + retrieval + JNI) |
+| `.rodata` | 0.70 MB | constants, string tables, vtables |
+| `.eh_frame` | 0.46 MB | panic-unwind tables (kept for `catch_unwind` in `crates/ant-ffi/src/jni.rs`) |
+| `.rela.dyn` | 0.33 MB | dynamic relocations |
+| everything else | ~0.33 MB | `.data`, `.got`, `.dynsym`, ELF headers, PLT stubs |
+
+#### Headroom vs Tier-1 budget
+
+The deployment targets table (§ 3) caps the Android arm64 library slice
+at 10 MB stripped. We're at 6.7 MB, so **3.3 MB of headroom**. That's
+enough to absorb the Phase 4 additions (UniFFI runtime ≈ 0.3 MB, the
+`KeyProvider` callback machinery ≈ 0.1 MB, SQLite disk cache code path
+≈ 0.4 MB, Reed-Solomon recovery ≈ 0.2 MB) and still leave ~2 MB for
+post-launch growth.
+
+The per-component target table further down (≤ 8.8 MB total) is the
+*aspirational* breakdown the proper Phase 4 `.aar` should hit; it's
+intentionally tighter than the 10 MB Tier-1 ceiling so a single
+component blowing its budget is detectable before the deliverable
+overruns.
+
+#### Easy wins still available
+
+| Change | Library save | App save | Cost |
+|---|---|---|---|
+| `lto = "fat"` instead of `thin` | ~5–10 % (≈ 0.3–0.7 MB) | same | Doubles the link step (4–5 min cold) |
+| `opt-level = "z"` instead of default `3` | ~10–20 % (≈ 0.7–1.3 MB) | same | Slower retrieval: 10–25 % throughput hit on the joiner inner loop |
+| Strip `.eh_frame` post-build | 0.46 MB | 0.46 MB | Breaks `catch_unwind` JNI safety net; FFI panics would `SIGABRT` instead of throwing `RuntimeException` |
+| Trim `tracing-subscriber`, swap to `log` + `android_logger` | 0.3–0.5 MB | 0.3–0.5 MB | Loses `RUST_LOG` env-var filter syntax inside the FFI |
+| Replace `serde_json` with `simd-json` or hand-rolled parser for manifests | ~0.15 MB | ~0.15 MB | More maintenance on the manifest path |
+| Audit transitive libp2p features (drop UPnP, mDNS) | 0.2–0.4 MB | 0.2–0.4 MB | Pre-Phase-4 the smoke test doesn't need either |
+
+None of these are blocking — we're already well under budget. They
+become relevant if the Tier-1 ceiling tightens (e.g. India / SEA market
+data costs argue for a ≤ 5 MB Play Store download).
 
 ---
 

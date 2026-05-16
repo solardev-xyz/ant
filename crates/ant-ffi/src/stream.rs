@@ -33,10 +33,10 @@ use tokio::sync::mpsc;
 /// Per-`ant_stream_read` deadline. The body of one range request is
 /// usually a handful of chunks (≤ 1 MiB), which lands in 1–3 s on a
 /// warm peer set, but the first read on a cold cache also pays the
-/// manifest walk. 60 s is well above the worst case we've observed
+/// manifest walk. 1 minute is well above the worst case we've observed
 /// from the existing smoke test and well below `AVPlayer`'s ~3 minute
 /// buffering timeout, so the player retries before iOS gives up.
-const READ_TIMEOUT: Duration = Duration::from_secs(60);
+const READ_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Shared with `lib.rs::download_inner` — same retry envelope, same
 /// "wait for BZZ handshakes to complete on cold start" behaviour. We
@@ -62,8 +62,8 @@ pub struct AntStream {
     /// against this anyway.
     total_bytes: u64,
     /// MIME type the manifest reported, or `None` if the manifest had
-    /// no `Content-Type` metadata. Surfaced to Swift so AVPlayer can
-    /// pick a reader without sniffing the body.
+    /// no `Content-Type` metadata. Surfaced to Swift so `AVPlayer`
+    /// can pick a reader without sniffing the body.
     content_type: Option<String>,
     /// Filename derived from manifest metadata (or the path tail). Not
     /// surfaced through the FFI yet but kept here so future tracks-list
@@ -75,13 +75,18 @@ pub struct AntStream {
     started_at: Instant,
 }
 
+/// Latest snapshot of the in-flight `StreamBzz`'s `Progress` ack.
+/// All fields are "the most recent value the node reported"; the
+/// implicit `last_` prefix used to be spelled out on every field
+/// but tripped clippy's `struct_field_names` lint and didn't add
+/// any signal beyond what the struct's name already conveys.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct StreamProgress {
-    last_chunks_done: u64,
-    last_total_chunks: u64,
-    last_peers_used: u32,
-    last_in_flight: u32,
-    last_cache_hits: u64,
+    chunks_done: u64,
+    total_chunks: u64,
+    peers_used: u32,
+    in_flight: u32,
+    cache_hits: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -140,10 +145,9 @@ impl AntStream {
     }
 
     pub(crate) fn last_progress(&self) -> StreamProgress {
-        self.progress.lock().map_or_else(
-            |poisoned| *poisoned.into_inner(),
-            |guard| *guard,
-        )
+        self.progress
+            .lock()
+            .map_or_else(|poisoned| *poisoned.into_inner(), |guard| *guard)
     }
 
     /// Fetch `len` bytes starting at `offset`, blocking the calling
@@ -155,7 +159,12 @@ impl AntStream {
     /// only when `offset + len > total_bytes`, in which case the
     /// trailing slice is empty and we return whatever bytes the joiner
     /// produced before reaching EOF).
-    pub(crate) fn read(&self, offset: u64, len: usize, dst: &mut [u8]) -> Result<usize, StreamError> {
+    pub(crate) fn read(
+        &self,
+        offset: u64,
+        len: usize,
+        dst: &mut [u8],
+    ) -> Result<usize, StreamError> {
         if len == 0 || offset >= self.total_bytes {
             return Ok(0);
         }
@@ -163,8 +172,7 @@ impl AntStream {
             .ok()
             .and_then(|len| len.checked_add(offset))
             .map(|end| end.min(self.total_bytes) - offset)
-            .map(|n| usize::try_from(n).unwrap_or(len))
-            .unwrap_or(len);
+            .map_or(len, |n| usize::try_from(n).unwrap_or(len));
         let dst = &mut dst[..bound_len];
         let end_inclusive = offset.saturating_add(bound_len as u64).saturating_sub(1);
         let cmd_tx = self.cmd_tx.clone();
@@ -198,14 +206,14 @@ impl AntStream {
     /// once, and `BytesChunk` acks flow straight to the consumer
     /// without staging in a Swift-side buffer first.
     ///
-    /// This is the path AVPlayer's `AVAssetResourceLoaderDelegate`
+    /// This is the path `AVPlayer`'s `AVAssetResourceLoaderDelegate`
     /// uses: each `dataRequest` opens one pull, and the consumer
     /// calls `dataRequest.respond(with:)` inside the callback. With
-    /// the prior `read`-fills-buffer model, AVPlayer's ~10 s
+    /// the prior `read`-fills-buffer model, `AVPlayer`'s ~10 s
     /// per-`dataRequest` patience window expired before the first
-    /// 256 KiB landed (each slice paid the full StreamBzz setup tax,
-    /// so a 55 MiB toEnd request never delivered enough body for
-    /// playback before AVPlayer canceled it).
+    /// 256 KiB landed (each slice paid the full `StreamBzz` setup
+    /// tax, so a 55 MiB toEnd request never delivered enough body
+    /// for playback before `AVPlayer` canceled it).
     ///
     /// `on_chunk(ctx, ptr, len) -> i32`: returning a non-zero value
     /// requests early termination (e.g. the consumer was cancelled);
@@ -214,12 +222,7 @@ impl AntStream {
     /// non-blocking and Send-safe.
     ///
     /// Returns the total number of bytes delivered to the callback.
-    pub(crate) fn pull<F>(
-        &self,
-        offset: u64,
-        len: u64,
-        mut on_chunk: F,
-    ) -> Result<u64, StreamError>
+    pub(crate) fn pull<F>(&self, offset: u64, len: u64, mut on_chunk: F) -> Result<u64, StreamError>
     where
         F: FnMut(&[u8]) -> bool,
     {
@@ -368,11 +371,11 @@ async fn range_request(
                 }
                 Ok(Some(ControlAck::Progress(p))) => {
                     if let Ok(mut slot) = progress_slot.lock() {
-                        slot.last_chunks_done = p.chunks_done;
-                        slot.last_total_chunks = p.total_chunks_estimate;
-                        slot.last_peers_used = p.peers_used;
-                        slot.last_in_flight = p.in_flight;
-                        slot.last_cache_hits = p.cache_hits;
+                        slot.chunks_done = p.chunks_done;
+                        slot.total_chunks = p.total_chunks_estimate;
+                        slot.peers_used = p.peers_used;
+                        slot.in_flight = p.in_flight;
+                        slot.cache_hits = p.cache_hits;
                     }
                 }
                 Ok(Some(ControlAck::Error { message })) => {
@@ -412,7 +415,7 @@ async fn range_request(
 /// arrive instead of filling a destination buffer. Returns the total
 /// number of bytes pushed to the callback (≤ `cap` and ≤ remaining
 /// body bytes). The callback's return value of `true` means "stop
-/// pulling now" — used by the Swift loader to honour AVPlayer's
+/// pulling now" — used by the Swift loader to honour `AVPlayer`'s
 /// cancellation before the joiner runs out of input.
 #[allow(clippy::too_many_arguments)]
 async fn range_pull(
@@ -475,11 +478,11 @@ async fn range_pull(
                 }
                 Ok(Some(ControlAck::Progress(p))) => {
                     if let Ok(mut slot) = progress_slot.lock() {
-                        slot.last_chunks_done = p.chunks_done;
-                        slot.last_total_chunks = p.total_chunks_estimate;
-                        slot.last_peers_used = p.peers_used;
-                        slot.last_in_flight = p.in_flight;
-                        slot.last_cache_hits = p.cache_hits;
+                        slot.chunks_done = p.chunks_done;
+                        slot.total_chunks = p.total_chunks_estimate;
+                        slot.peers_used = p.peers_used;
+                        slot.in_flight = p.in_flight;
+                        slot.cache_hits = p.cache_hits;
                     }
                 }
                 Ok(Some(ControlAck::Error { message })) => {
@@ -517,9 +520,7 @@ async fn range_pull(
 }
 
 async fn drain_until_done(rx: &mut mpsc::Receiver<ControlAck>) {
-    while let Ok(Some(ack)) =
-        tokio::time::timeout(Duration::from_millis(250), rx.recv()).await
-    {
+    while let Ok(Some(ack)) = tokio::time::timeout(Duration::from_millis(250), rx.recv()).await {
         if matches!(ack, ControlAck::StreamDone | ControlAck::Error { .. }) {
             return;
         }
@@ -543,20 +544,21 @@ async fn sleep_until_or_deadline(dur: Duration, deadline: tokio::time::Instant) 
     true
 }
 
-/// Mirrors the `last_*` fields on `StreamProgress` so callers can read a
-/// snapshot through the FFI without holding the mutex.
-pub(crate) fn snapshot_progress(
-    stream: &AntStream,
-) -> (u64, u64, u64, u64, u64, u32, u32, u64) {
+/// Mirrors the `StreamProgress` fields so callers can read a snapshot
+/// through the FFI without holding the mutex. Order matches the
+/// `AntProgress` C struct in `crates/ant-ffi/include/ant.h`:
+/// `(bytes_done, total_bytes, chunks_done, total_chunks, elapsed_ms,
+///   peers_used, in_flight, cache_hits)`.
+pub(crate) fn snapshot_progress(stream: &AntStream) -> (u64, u64, u64, u64, u64, u32, u32, u64) {
     let p = stream.last_progress();
     (
         stream.bytes_downloaded(),
         stream.total_bytes(),
-        p.last_chunks_done,
-        p.last_total_chunks,
+        p.chunks_done,
+        p.total_chunks,
         stream.elapsed_ms(),
-        p.last_peers_used,
-        p.last_in_flight,
-        p.last_cache_hits,
+        p.peers_used,
+        p.in_flight,
+        p.cache_hits,
     )
 }
