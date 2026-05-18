@@ -2249,7 +2249,7 @@ async fn post_soc_maps_not_ready_to_503() {
     let router = router_with_dispatcher(|cmd| async move {
         if let ControlCommand::PushSoc { ack, .. } = cmd {
             let _ = ack.send(ControlAck::NotReady {
-                message: "uploads not configured: pass --postage-batch and --wallet-key".into(),
+                message: "uploads not configured: pass --postage-batch and --postage-owner-key".into(),
             });
         }
     });

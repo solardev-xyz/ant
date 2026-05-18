@@ -1429,7 +1429,7 @@ fn handle_control_command(
         ControlCommand::PushChunk { wire, ack } => {
             let Some(upload) = upload.clone() else {
                 let _ = ack.send(ControlAck::Error {
-                    message: "uploads not configured: pass --postage-batch and --wallet-key (or set the env vars) at startup".into(),
+                    message: "uploads not configured: pass --postage-batch and --postage-owner-key (or set the env vars) at startup".into(),
                 });
                 return;
             };
@@ -1502,7 +1502,7 @@ fn handle_control_command(
         ControlCommand::PushSoc { address, wire, ack } => {
             let Some(upload) = upload.clone() else {
                 let _ = ack.send(ControlAck::NotReady {
-                    message: "uploads not configured: pass --postage-batch and --wallet-key (or set the env vars) at startup".into(),
+                    message: "uploads not configured: pass --postage-batch and --postage-owner-key (or set the env vars) at startup".into(),
                 });
                 return;
             };

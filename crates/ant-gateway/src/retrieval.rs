@@ -468,6 +468,7 @@ pub async fn upload_chunk(
 pub async fn upload_soc(
     State(handle): State<GatewayHandle>,
     Path((owner_hex, id_hex)): Path<(String, String)>,
+    Query(query): Query<UploadSocQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -480,16 +481,26 @@ pub async fn upload_soc(
         Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("bad id: {e}")),
     };
 
-    let Some(sig_header) = headers.get(&SWARM_SOC_SIGNATURE) else {
+    // Bee accepts the SOC signature in either the `swarm-soc-signature`
+    // header (older bee / bee-js ≤ 9) or the `?sig=…` query parameter
+    // (modern bee / bee-js ≥ 10). Mirror that to keep both client
+    // generations working unchanged.
+    let sig_str: &str = if let Some(h) = headers.get(&SWARM_SOC_SIGNATURE) {
+        match h.to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "swarm-soc-signature must be ascii hex",
+                );
+            }
+        }
+    } else if let Some(s) = query.sig.as_deref() {
+        s
+    } else {
         return json_error(
             StatusCode::BAD_REQUEST,
-            "missing swarm-soc-signature header",
-        );
-    };
-    let Ok(sig_str) = sig_header.to_str() else {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "swarm-soc-signature must be ascii hex",
+            "missing soc signature: provide swarm-soc-signature header or ?sig=… query param",
         );
     };
     let sig = match parse_hex_fixed::<65>(sig_str) {
@@ -497,7 +508,7 @@ pub async fn upload_soc(
         Err(e) => {
             return json_error(
                 StatusCode::BAD_REQUEST,
-                format!("bad swarm-soc-signature: {e}"),
+                format!("bad soc signature: {e}"),
             );
         }
     };
@@ -1321,6 +1332,15 @@ impl UploadBzzQuery {
             .map(str::trim)
             .filter(|s| !s.is_empty())
     }
+}
+
+/// `?sig=<65-byte hex>` for `POST /soc/{owner}/{id}`. Bee-js ≥ 10
+/// (matching modern bee) sends the SOC signature here instead of in
+/// the `swarm-soc-signature` header. `upload_soc` accepts either form.
+#[derive(Debug, Default, Deserialize)]
+pub struct UploadSocQuery {
+    #[serde(default)]
+    sig: Option<String>,
 }
 
 /// Result of dispatching a streaming retrieval against the node loop:
