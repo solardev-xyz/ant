@@ -67,6 +67,7 @@ final class AntNode: ObservableObject {
         status = .starting
 
         let dataDir = Self.resolveDataDir()
+        Self.seedPeerstoreIfNeeded(in: dataDir)
         let path = dataDir.path
 
         let result: InitOutcome = await Task.detached(priority: .userInitiated) {
@@ -364,6 +365,35 @@ final class AntNode: ObservableObject {
         let dir = base.appendingPathComponent("ant", isDirectory: true)
         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
+    }
+
+    /// Cold-start bootstrap for the embedded node. Mainnet bootnodes
+    /// (bee 2.8) reject our outbound BZZ handshake, so a fresh install
+    /// with no `peers.json` never leaves `peer_set_size = 0`. Desktop
+    /// `antd` avoids this because it reloads a warm peerstore from disk;
+    /// seed the same snapshot on first launch so the pipeline can dial
+    /// hive hints immediately.
+    private static func seedPeerstoreIfNeeded(in dataDir: URL) {
+        let dest = dataDir.appendingPathComponent("peers.json")
+        if FileManager.default.fileExists(atPath: dest.path),
+           let data = try? Data(contentsOf: dest),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let peers = obj["peers"] as? [Any],
+           !peers.isEmpty {
+            return
+        }
+        guard let bundled = Bundle.main.url(forResource: "peers.seed", withExtension: "json") else {
+            NSLog("[ant] peers.seed.json missing from app bundle")
+            return
+        }
+        do {
+            if FileManager.default.fileExists(atPath: dest.path) {
+                try FileManager.default.removeItem(at: dest)
+            }
+            try FileManager.default.copyItem(at: bundled, to: dest)
+        } catch {
+            NSLog("[ant] failed to seed peers.json: %@", "\(error)")
+        }
     }
 }
 

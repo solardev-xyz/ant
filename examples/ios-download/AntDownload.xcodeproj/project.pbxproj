@@ -11,6 +11,7 @@
 		B00000000000000000000003 /* AntNode.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000004 /* AntNode.swift */; };
 		B00000000000000000000004 /* libant_ffi.a in Frameworks */ = {isa = PBXBuildFile; fileRef = F00000000000000000000008 /* libant_ffi.a */; };
 		B00000000000000000000005 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000007 /* Assets.xcassets */; };
+		B00000000000000000000018 /* peers.seed.json in Resources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000018 /* peers.seed.json */; };
 		B00000000000000000000010 /* Manifest.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000010 /* Manifest.swift */; };
 		B00000000000000000000011 /* AntStreamSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000011 /* AntStreamSession.swift */; };
 		B00000000000000000000012 /* AntStreamLoader.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000012 /* AntStreamLoader.swift */; };
@@ -36,6 +37,7 @@
 		F00000000000000000000005 /* AntDownload-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "AntDownload-Bridging-Header.h"; sourceTree = "<group>"; };
 		F00000000000000000000006 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		F00000000000000000000007 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		F00000000000000000000018 /* peers.seed.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = peers.seed.json; sourceTree = "<group>"; };
 		F00000000000000000000008 /* libant_ffi.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libant_ffi.a; path = "../../target/aarch64-apple-ios-sim/release/libant_ffi.a"; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
@@ -84,6 +86,7 @@
 				F00000000000000000000005 /* AntDownload-Bridging-Header.h */,
 				F00000000000000000000006 /* Info.plist */,
 				F00000000000000000000007 /* Assets.xcassets */,
+				F00000000000000000000018 /* peers.seed.json */,
 			);
 			path = AntDownload;
 			sourceTree = "<group>";
@@ -156,6 +159,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				B00000000000000000000005 /* Assets.xcassets in Resources */,
+				B00000000000000000000018 /* peers.seed.json in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

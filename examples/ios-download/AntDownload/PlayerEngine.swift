@@ -16,6 +16,11 @@ final class PlayerEngine: ObservableObject {
     @Published private(set) var currentIndex: Int = 0
     @Published private(set) var isPlaying: Bool = false
     @Published private(set) var currentTime: TimeInterval = 0
+    /// Target position while a seek is in flight and AVPlayer is still
+    /// fetching bytes for the new offset. The scrubber reads
+    /// [`displayTime`] so the thumb does not snap back to the pre-seek
+    /// clock reported by the periodic time observer.
+    @Published private(set) var pendingSeekTime: TimeInterval? = nil
     @Published private(set) var duration: TimeInterval = 0
     @Published private(set) var playbackStatus: PlaybackStatus = .waitingForPeers
     @Published private(set) var activeSession: AntStreamSession? = nil
@@ -46,6 +51,10 @@ final class PlayerEngine: ObservableObject {
     private var endObserver: NSObjectProtocol?
     private var progressTask: Task<Void, Never>?
     private var bytesSamples: [(at: Date, bytes: UInt64)] = []
+    private var resumePlaybackAfterSeek = false
+    private var seekGeneration: UInt64 = 0
+    private var bufferObservation: NSKeyValueObservation?
+    private var seekResumeTask: Task<Void, Never>?
 
     /// Player-engine state machine. Hard-coded playlist means we never
     /// need a "manifest loading" / "manifest failed" state — the queue
@@ -62,6 +71,11 @@ final class PlayerEngine: ObservableObject {
     var currentTrack: Track? {
         guard !queue.isEmpty, queue.indices.contains(currentIndex) else { return nil }
         return queue[currentIndex]
+    }
+
+    /// Scrubber / elapsed label: live clock unless a seek is pending.
+    var displayTime: TimeInterval {
+        pendingSeekTime ?? currentTime
     }
 
     init(
@@ -133,6 +147,7 @@ final class PlayerEngine: ObservableObject {
 
     func togglePlay() {
         if isPlaying {
+            resumePlaybackAfterSeek = false
             player.pause()
         } else {
             player.play()
@@ -140,7 +155,10 @@ final class PlayerEngine: ObservableObject {
     }
 
     func play() { player.play() }
-    func pause() { player.pause() }
+    func pause() {
+        resumePlaybackAfterSeek = false
+        player.pause()
+    }
 
     func next() {
         guard !queue.isEmpty else { return }
@@ -168,13 +186,93 @@ final class PlayerEngine: ObservableObject {
         guard duration > 0 else { return }
         let clamped = max(0, min(seconds, duration))
         let target = CMTime(seconds: clamped, preferredTimescale: 600)
-        player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
+
+        cancelSeekWait()
+        seekGeneration &+= 1
+        let generation = seekGeneration
+        resumePlaybackAfterSeek = isPlaying
+        player.pause()
+        pendingSeekTime = clamped
+        currentTime = clamped
+        updateNowPlaying()
+
+        player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
+            Task { @MainActor in
+                guard let self, self.seekGeneration == generation else { return }
+                guard finished else {
+                    self.pendingSeekTime = nil
+                    self.resumePlaybackAfterSeek = false
+                    return
+                }
+                self.waitForBufferThenFinishSeek(generation: generation)
+            }
+        }
     }
 
     // MARK: – internals
 
+    private func cancelSeekWait() {
+        seekResumeTask?.cancel()
+        seekResumeTask = nil
+        bufferObservation?.invalidate()
+        bufferObservation = nil
+    }
+
+    private func waitForBufferThenFinishSeek(generation: UInt64) {
+        guard seekGeneration == generation else { return }
+        guard let item = player.currentItem else {
+            finishSeekPlayback(generation: generation)
+            return
+        }
+        if item.isPlaybackLikelyToKeepUp {
+            finishSeekPlayback(generation: generation)
+            return
+        }
+        bufferObservation = item.observe(\.isPlaybackLikelyToKeepUp, options: [.new]) { [weak self] item, _ in
+            guard item.isPlaybackLikelyToKeepUp else { return }
+            Task { @MainActor in self?.finishSeekPlayback(generation: generation) }
+        }
+        seekResumeTask?.cancel()
+        seekResumeTask = Task { [weak self] in
+            let pollInterval: UInt64 = 250_000_000
+            let maxPolls = 120
+            for _ in 0..<maxPolls {
+                try? await Task.sleep(nanoseconds: pollInterval)
+                guard !Task.isCancelled else { return }
+                let ready = await MainActor.run { () -> Bool in
+                    guard let self else { return true }
+                    if self.seekGeneration != generation { return true }
+                    if self.pendingSeekTime == nil { return true }
+                    return self.player.currentItem?.isPlaybackLikelyToKeepUp == true
+                }
+                if ready {
+                    await MainActor.run { self?.finishSeekPlayback(generation: generation) }
+                    return
+                }
+            }
+            await MainActor.run { self?.finishSeekPlayback(generation: generation) }
+        }
+    }
+
+    private func finishSeekPlayback(generation: UInt64) {
+        guard seekGeneration == generation, pendingSeekTime != nil else { return }
+        cancelSeekWait()
+        if let target = pendingSeekTime {
+            currentTime = target
+        }
+        pendingSeekTime = nil
+        updateNowPlaying()
+        if resumePlaybackAfterSeek {
+            player.play()
+        }
+        resumePlaybackAfterSeek = false
+    }
+
     private func prepareCurrent(autoPlay: Bool) async {
         guard let track = currentTrack else { return }
+        cancelSeekWait()
+        pendingSeekTime = nil
+        resumePlaybackAfterSeek = false
         player.pause()
         // The periodic time observer and the `rate` KVO live on the
         // AVPlayer instance, not on individual items, so they survive
@@ -249,7 +347,9 @@ final class PlayerEngine: ObservableObject {
             // without a Task hop that would lose a tick of UI updates.
             MainActor.assumeIsolated {
                 guard let self else { return }
-                self.currentTime = time.seconds.isFinite ? time.seconds : 0
+                if self.pendingSeekTime == nil {
+                    self.currentTime = time.seconds.isFinite ? time.seconds : 0
+                }
                 if let item = self.player.currentItem,
                    item.duration.seconds.isFinite,
                    item.duration.seconds > 0,
@@ -311,7 +411,7 @@ final class PlayerEngine: ObservableObject {
         info[MPMediaItemPropertyTitle] = track.title
         info[MPMediaItemPropertyAlbumTitle] = "Swarm"
         info[MPMediaItemPropertyPlaybackDuration] = duration
-        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = currentTime
+        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = displayTime
         info[MPNowPlayingInfoPropertyPlaybackRate] = player.rate
         if let image = coverArt {
             let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }

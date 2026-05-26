@@ -136,7 +136,7 @@ struct PlayerView: View {
         // 0.25 s time-observer ticks from yanking the thumb back
         // while the user is dragging.
         let hasDuration = engine.duration > 0
-        let displayedTime = scrubValue ?? engine.currentTime
+        let displayedTime = scrubValue ?? engine.displayTime
         let upper = hasDuration ? engine.duration : 1
         return VStack(spacing: 6) {
             Slider(
@@ -150,13 +150,10 @@ struct PlayerView: View {
                         if let target = scrubValue {
                             engine.seek(to: target)
                         }
-                        // Hold the user's value for one extra tick so
-                        // there's no flash of the pre-seek time before
-                        // AVPlayer's observer reports the new clock —
-                        // typically <120 ms on a healthy stream.
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                            scrubValue = nil
-                        }
+                        // `PlayerEngine.pendingSeekTime` holds the thumb
+                        // at the release position until the stream has
+                        // buffered at the new offset.
+                        scrubValue = nil
                     }
                 }
             )
