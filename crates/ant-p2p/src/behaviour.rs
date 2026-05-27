@@ -1008,6 +1008,9 @@ fn build_retrieval_info(state: &SwarmState) -> RetrievalInfo {
             used_bytes: c.used_bytes(),
             capacity_bytes: c.capacity_bytes(),
             hits_total: counters.disk_hits,
+            chunks: c.used_rows(),
+            path: c.path().display().to_string(),
+            read_workers: c.read_workers() as u32,
         },
         None => DiskCacheInfo::default(),
     };

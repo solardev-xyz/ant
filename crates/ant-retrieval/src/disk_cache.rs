@@ -145,6 +145,17 @@ struct Inner {
     writer_thread: Mutex<Option<JoinHandle<()>>>,
     max_bytes: u64,
     total_bytes: Arc<AtomicU64>,
+    /// Live row count mirrored from `COUNT(*) FROM chunks`. Maintained
+    /// by the writer thread alongside `total_bytes` so `antop` can show
+    /// the chunk count without round-tripping a SQL query on every
+    /// status tick. Reads `0` between `open()` returning and the
+    /// initial `SELECT COUNT(*)` finishing (cosmetic; same trade-off as
+    /// `total_bytes`).
+    total_rows: Arc<AtomicU64>,
+    /// Read-worker pool size, captured once at open time so the status
+    /// snapshot can surface it without re-querying
+    /// `available_parallelism`.
+    read_workers: usize,
 }
 
 impl Drop for Inner {
@@ -176,7 +187,9 @@ impl DiskChunkCache {
         }
 
         let total_bytes = Arc::new(AtomicU64::new(0));
+        let total_rows = Arc::new(AtomicU64::new(0));
         let tb = total_bytes.clone();
+        let tr = total_rows.clone();
         let slack_bytes = ((max_bytes as f64) * EVICTION_SLACK_RATIO) as u64;
 
         let (ready_tx, ready_rx) = sync_channel::<()>(0);
@@ -188,7 +201,7 @@ impl DiskChunkCache {
             .name("ant-disk-cache-writer".into())
             .spawn(move || {
                 if let Err(e) =
-                    writer_main(path_thread, write_rx, ready_tx, tb, max_bytes, slack_bytes)
+                    writer_main(path_thread, write_rx, ready_tx, tb, tr, max_bytes, slack_bytes)
                 {
                     warn!(
                         target: "ant_retrieval::disk_cache",
@@ -235,8 +248,27 @@ impl DiskChunkCache {
                 writer_thread: Mutex::new(Some(join)),
                 max_bytes,
                 total_bytes,
+                total_rows,
+                read_workers: n_read,
             }),
         })
+    }
+
+    /// Live row count (mirrored from `COUNT(*)` and maintained in
+    /// transactions on every write / eviction). Reads `0` until the
+    /// initial backfill scan completes (~30 s on a cold 7 GB cache);
+    /// see the rationale in `writer_main`.
+    #[must_use]
+    pub fn used_rows(&self) -> u64 {
+        self.inner.total_rows.load(Ordering::Relaxed)
+    }
+
+    /// Number of dedicated read worker threads servicing `get`
+    /// requests. Set at `open()` time and held constant for the
+    /// lifetime of the cache.
+    #[must_use]
+    pub fn read_workers(&self) -> usize {
+        self.inner.read_workers
     }
 
     #[must_use]
@@ -405,17 +437,18 @@ fn process_put_batch_transaction(
     conn: &mut Connection,
     items: &[([u8; 32], Vec<u8>)],
     total_bytes: &Arc<AtomicU64>,
+    total_rows: &Arc<AtomicU64>,
     max_bytes: u64,
     slack_bytes: u64,
 ) -> Result<(), DiskCacheError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     for (addr, data) in items {
-        put_upsert_tx(&tx, *addr, data.as_slice(), total_bytes)?;
+        put_upsert_tx(&tx, *addr, data.as_slice(), total_bytes, total_rows)?;
     }
     tx.commit()?;
     let current = total_bytes.load(Ordering::Relaxed);
     if current > max_bytes {
-        evict_to_slack(conn, total_bytes, slack_bytes)?;
+        evict_to_slack(conn, total_bytes, total_rows, slack_bytes)?;
     }
     Ok(())
 }
@@ -433,6 +466,7 @@ fn consume_put_touch_batch(
     conn: &mut Connection,
     batch: Vec<WriteMsg>,
     total_bytes: &Arc<AtomicU64>,
+    total_rows: &Arc<AtomicU64>,
     max_bytes: u64,
     slack_bytes: u64,
 ) -> Result<bool, DiskCacheError> {
@@ -456,7 +490,7 @@ fn consume_put_touch_batch(
     let batch_res: Result<(), DiskCacheError> = (|| {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for (addr, data, _) in &put_ops {
-            put_upsert_tx(&tx, *addr, data, total_bytes)?;
+            put_upsert_tx(&tx, *addr, data, total_bytes, total_rows)?;
         }
         for (addr, last) in &touches {
             if let Err(e) = tx.execute(
@@ -477,7 +511,7 @@ fn consume_put_touch_batch(
         Ok(()) => {
             let current = total_bytes.load(Ordering::Relaxed);
             if current > max_bytes {
-                if let Err(e) = evict_to_slack(conn, total_bytes, slack_bytes) {
+                if let Err(e) = evict_to_slack(conn, total_bytes, total_rows, slack_bytes) {
                     for (_, _, ack) in put_ops {
                         let _ = ack.send(Err(e.clone()));
                     }
@@ -503,32 +537,45 @@ fn writer_main(
     rx: CbReceiver<WriteMsg>,
     ready_tx: SyncSender<()>,
     total_bytes: Arc<AtomicU64>,
+    total_rows: Arc<AtomicU64>,
     max_bytes: u64,
     slack_bytes: u64,
 ) -> Result<(), DiskCacheError> {
     let mut conn = open_write_connection(&path)?;
 
     // Signal `open()` ready as soon as the schema is in place. The
-    // initial `SUM(size)` below scans every row in the chunks table
-    // (sequential disk read on a cold page cache: ~28 s on a 7 GB DB),
-    // and `antd` must be free to start its libp2p listener + bootstrap
-    // dial before we finish that — `time_to_first_peer_s` is otherwise
-    // dominated by this scan on every cold start. Until the SUM
-    // finishes, `total_bytes` stays at zero; that just means the
-    // eviction trigger won't fire (no harm, we re-check inside every
-    // write batch via `process_put_batch_transaction`), and
-    // `used_bytes()` under-reports for the first few seconds. Both are
+    // initial backfill scan below (SUM(size) + COUNT(*)) touches every
+    // row in the chunks table (sequential disk read on a cold page
+    // cache: ~28 s on a 7 GB DB), and `antd` must be free to start its
+    // libp2p listener + bootstrap dial before we finish that —
+    // `time_to_first_peer_s` is otherwise dominated by this scan on
+    // every cold start. Until backfill finishes, `total_bytes` and
+    // `total_rows` stay at zero; that just means the eviction trigger
+    // won't fire (no harm, we re-check inside every write batch via
+    // `process_put_batch_transaction`), and `used_bytes()` /
+    // `used_rows()` under-report for the first few seconds. Both are
     // acceptable; a frozen daemon is not.
     ready_tx
         .send(())
         .map_err(|_| DiskCacheError::WriterStopped)?;
 
-    let initial_total: u64 = conn
-        .query_row("SELECT COALESCE(SUM(size), 0) FROM chunks", [], |row| {
-            row.get::<_, i64>(0).map(|n| n as u64)
-        })
-        .unwrap_or(0);
+    // Single combined backfill query: SQLite serves SUM + COUNT from
+    // the same sequential scan, so we pay the cold-cache scan cost
+    // once.
+    let (initial_total, initial_rows): (u64, u64) = conn
+        .query_row(
+            "SELECT COALESCE(SUM(size), 0), COUNT(*) FROM chunks",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, i64>(1)? as u64,
+                ))
+            },
+        )
+        .unwrap_or((0, 0));
     total_bytes.store(initial_total, Ordering::Relaxed);
+    total_rows.store(initial_rows, Ordering::Relaxed);
 
     'outer: loop {
         match rx.recv() {
@@ -538,6 +585,7 @@ fn writer_main(
                     &mut conn,
                     &items,
                     &total_bytes,
+                    &total_rows,
                     max_bytes,
                     slack_bytes,
                 );
@@ -556,6 +604,7 @@ fn writer_main(
                                 &mut conn,
                                 batch,
                                 &total_bytes,
+                                &total_rows,
                                 max_bytes,
                                 slack_bytes,
                             ) {
@@ -569,6 +618,7 @@ fn writer_main(
                                 &mut conn,
                                 &items,
                                 &total_bytes,
+                                &total_rows,
                                 max_bytes,
                                 slack_bytes,
                             );
@@ -588,6 +638,7 @@ fn writer_main(
                     &mut conn,
                     batch,
                     &total_bytes,
+                    &total_rows,
                     max_bytes,
                     slack_bytes,
                 )?;
@@ -606,6 +657,7 @@ fn put_upsert_tx(
     addr: [u8; 32],
     data: &[u8],
     total_bytes: &AtomicU64,
+    total_rows: &AtomicU64,
 ) -> Result<(), DiskCacheError> {
     let size = data.len() as u64;
     let now = unix_now();
@@ -629,6 +681,9 @@ fn put_upsert_tx(
 
     let delta = size as i64 - existing.unwrap_or(0) as i64;
     update_total(total_bytes, delta);
+    if existing.is_none() {
+        total_rows.fetch_add(1, Ordering::Relaxed);
+    }
     Ok(())
 }
 
@@ -649,6 +704,7 @@ fn update_total(total: &AtomicU64, delta: i64) -> u64 {
 fn evict_to_slack(
     conn: &mut Connection,
     total_bytes: &AtomicU64,
+    total_rows: &AtomicU64,
     slack_bytes: u64,
 ) -> Result<(), DiskCacheError> {
     let current = total_bytes.load(Ordering::Relaxed);
@@ -692,11 +748,20 @@ fn evict_to_slack(
     tx.commit().map_err(DiskCacheError::from)?;
 
     update_total(total_bytes, -(freed as i64));
+    // Decrement row count by the eviction batch size. Saturating
+    // because total_rows is observably zero between open() returning
+    // and the initial COUNT(*) backfill finishing — a write+eviction
+    // racing the backfill must not underflow.
+    let evicted = victim_addrs.len() as u64;
+    let _ = total_rows.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        Some(v.saturating_sub(evicted))
+    });
     debug!(
         target: "ant_retrieval::disk_cache",
-        evicted_rows = victim_addrs.len(),
+        evicted_rows = evicted,
         freed_bytes = freed,
         new_total = total_bytes.load(Ordering::Relaxed),
+        new_rows = total_rows.load(Ordering::Relaxed),
         slack = slack_bytes,
         "disk cache eviction sweep complete",
     );
@@ -805,6 +870,10 @@ mod tests {
         assert!(cache.get(chunks[0].0).await.unwrap().is_some());
         assert!(cache.get(chunks[1].0).await.unwrap().is_none());
         assert!(cache.get(chunks[2].0).await.unwrap().is_some());
+        // The fast-path row counter must stay in lock-step with the
+        // SQL COUNT(*). One eviction victim → counter goes 3 → 2.
+        assert_eq!(cache.used_rows(), 2);
+        assert_eq!(cache.row_count().await.unwrap(), 2);
     }
 
     /// Bee-style trust: a hand-corrupted row is still returned on read
@@ -845,6 +914,8 @@ mod tests {
         cache.put(addr, wire.clone()).await.unwrap();
         cache.put(addr, wire.clone()).await.unwrap();
         assert_eq!(cache.row_count().await.unwrap(), 1);
+        // Fast-path row counter must agree with the SQL truth.
+        assert_eq!(cache.used_rows(), 1);
         assert_eq!(cache.used_bytes(), wire.len() as u64);
     }
 

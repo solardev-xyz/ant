@@ -599,10 +599,10 @@ pub struct CacheInfo {
 /// cache's eviction key is total bytes, not slot count, so the row
 /// count is informational and the byte total is what drives the
 /// "fullness" gauge in `antop`.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DiskCacheInfo {
     /// Whether the daemon has a persistent cache attached. When
-    /// `false`, every other field is zero and `antop` should
+    /// `false`, every other field is zero / empty and `antop` should
     /// label the row as `disabled` rather than render
     /// `0/0 (0.0%)`.
     pub enabled: bool,
@@ -619,6 +619,26 @@ pub struct DiskCacheInfo {
     /// subsequent fetches from the warm in-memory entry count toward
     /// `mem_hits_total`.
     pub hits_total: u64,
+    /// Live row count mirrored from `COUNT(*) FROM chunks`. Combined
+    /// with `used_bytes` this exposes the on-disk mean chunk size
+    /// (useful for sanity-checking against the 4 KiB BMT chunk size).
+    /// Reports `0` for the ~30 s after a cold start while the backfill
+    /// `COUNT(*)` is still running — see `DiskChunkCache::open` for
+    /// why we don't block startup on that scan.
+    #[serde(default)]
+    pub chunks: u64,
+    /// Absolute on-disk path of the `chunks.sqlite` file. Empty when
+    /// `enabled = false`. Surfaced so `antop` operators don't have to
+    /// guess between the default `~/.antd/chunks.sqlite` and whatever
+    /// `--disk-cache-path` the daemon was started with.
+    #[serde(default)]
+    pub path: String,
+    /// Number of dedicated read-worker threads servicing `get`
+    /// requests. Reported so an operator can correlate sustained
+    /// retrieval queue depth against the worker pool size without
+    /// digging into the binary.
+    #[serde(default)]
+    pub read_workers: u32,
 }
 
 /// Data-plane snapshot read by the `Retrieval` tab in `antop`.

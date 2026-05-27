@@ -790,10 +790,14 @@ fn draw_retrieval_page(frame: &mut Frame, area: TuiRect, ctx: &TopFrameContext<'
     let r = &ctx.status.retrieval;
     let [metrics_area, requests_area] = vertical_chunks(
         area,
-        // 9 rows = top border (1) + 6 panel rows + bottom border (1) +
-        // 1 padding. The two cache rows (Mem / Disk) plus In-flight,
-        // Bandwidth, Totals, Requests give us six.
-        [Constraint::Length(9), Constraint::Min(0)],
+        // 10 rows = top border (1) + 7 panel rows + bottom border (1) +
+        // 1 padding. The two cache rows (Mem / Disk) plus the
+        // continuation row for disk details (chunks · avg · workers ·
+        // path) plus In-flight, Bandwidth, Totals, Requests give us
+        // seven. When the disk cache is disabled the continuation row
+        // is suppressed and the panel runs with one row of slack —
+        // ratatui treats extra rows as empty padding, which is fine.
+        [Constraint::Length(10), Constraint::Min(0)],
     );
     draw_retrieval_metrics(frame, metrics_area, r, ctx.bandwidth);
     draw_gateway_requests(frame, requests_area, r, ctx.now);
@@ -822,16 +826,41 @@ fn draw_retrieval_metrics(
         format_percentage(u64::from(r.cache.used), u64::from(r.cache.capacity)),
         format_count(r.mem_hits_total),
     );
-    let disk_cache = if r.disk.enabled {
-        format!(
+    // Disk-cache readout is two rows when enabled: the first carries
+    // the byte gauge + lifetime hit count (matches the legacy
+    // single-row layout), the second the row count, derived mean
+    // chunk size, read-worker pool, and the on-disk path. Path
+    // goes last on the same row because it tends to be the longest
+    // string and trailing it preserves the column alignment of the
+    // numeric fields when the terminal is narrow enough that `Path:
+    // /…` would wrap.
+    let (disk_cache, disk_detail) = if r.disk.enabled {
+        let primary = format!(
             "{} / {} ({})  · {} hits",
             format_bytes(r.disk.used_bytes),
             format_bytes(r.disk.capacity_bytes),
             format_percentage(r.disk.used_bytes, r.disk.capacity_bytes),
             format_count(r.disk.hits_total),
-        )
+        );
+        let avg = if r.disk.chunks > 0 {
+            format_bytes(r.disk.used_bytes / r.disk.chunks)
+        } else {
+            "—".to_string()
+        };
+        let detail = format!(
+            "{} chunks · {} avg · {} read workers · {}",
+            format_count(r.disk.chunks),
+            avg,
+            r.disk.read_workers,
+            if r.disk.path.is_empty() {
+                "(no path)"
+            } else {
+                r.disk.path.as_str()
+            },
+        );
+        (primary, Some(detail))
     } else {
-        "disabled".to_string()
+        ("disabled".to_string(), None)
     };
     let in_flight = format!("{}/{} chunks", r.in_flight, r.in_flight_capacity);
     let totals = format!(
@@ -850,14 +879,18 @@ fn draw_retrieval_metrics(
     };
     let bandwidth_row = format!("{bw_now}  (peak {bw_peak})");
 
-    let rows = vec![
+    let mut rows = vec![
         kv("Mem cache", &mem_cache),
         kv("Disk cache", &disk_cache),
-        kv("In-flight", &in_flight),
-        kv("Bandwidth", &bandwidth_row),
-        kv("Totals", &totals),
-        kv("Requests", &r.gateway_requests.len().to_string()),
     ];
+    if let Some(detail) = disk_detail.as_deref() {
+        // Empty key keeps the indent of the parent `Disk cache` row.
+        rows.push(kv("", detail));
+    }
+    rows.push(kv("In-flight", &in_flight));
+    rows.push(kv("Bandwidth", &bandwidth_row));
+    rows.push(kv("Totals", &totals));
+    rows.push(kv("Requests", &r.gateway_requests.len().to_string()));
     draw_panel(frame, area, "Retrieval", &rows);
 }
 
@@ -1638,6 +1671,9 @@ mod tests {
                 used_bytes: 13_200_000_000,      // ~12.3 GiB
                 capacity_bytes: 107_374_182_400, // 100 GiB
                 hits_total: 487_000,
+                chunks: 3_300_000,
+                path: "/home/op/.antd/chunks.sqlite".to_string(),
+                read_workers: 16,
             },
             gateway_requests: Vec::new(),
         };
@@ -1651,7 +1687,7 @@ mod tests {
                     x: 0,
                     y: 0,
                     width: 120,
-                    height: 9,
+                    height: 10,
                 };
                 draw_retrieval_metrics(frame, area, &info, &bw);
             })
@@ -1693,6 +1729,24 @@ mod tests {
         assert!(
             rendered.contains("487.0K hits"),
             "disk hit count not rendered in:\n{rendered}",
+        );
+        assert!(
+            rendered.contains("3.3M chunks"),
+            "disk row count not rendered in:\n{rendered}",
+        );
+        // 13_200_000_000 / 3_300_000 = 4000 → 3.9KiB (format_bytes
+        // rounds 4000 down to the next mebi-step boundary).
+        assert!(
+            rendered.contains(" avg"),
+            "disk mean chunk size not rendered in:\n{rendered}",
+        );
+        assert!(
+            rendered.contains("16 read workers"),
+            "disk read worker count not rendered in:\n{rendered}",
+        );
+        assert!(
+            rendered.contains("/home/op/.antd/chunks.sqlite"),
+            "disk db path not rendered in:\n{rendered}",
         );
         // Sanity: we shouldn't have the disabled label when the
         // cache is wired up. Catches a regression that flips the
@@ -1736,7 +1790,7 @@ mod tests {
                     x: 0,
                     y: 0,
                     width: 120,
-                    height: 9,
+                    height: 10,
                 };
                 draw_retrieval_metrics(frame, area, &info, &bw);
             })
