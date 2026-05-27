@@ -508,16 +508,27 @@ fn writer_main(
 ) -> Result<(), DiskCacheError> {
     let mut conn = open_write_connection(&path)?;
 
+    // Signal `open()` ready as soon as the schema is in place. The
+    // initial `SUM(size)` below scans every row in the chunks table
+    // (sequential disk read on a cold page cache: ~28 s on a 7 GB DB),
+    // and `antd` must be free to start its libp2p listener + bootstrap
+    // dial before we finish that — `time_to_first_peer_s` is otherwise
+    // dominated by this scan on every cold start. Until the SUM
+    // finishes, `total_bytes` stays at zero; that just means the
+    // eviction trigger won't fire (no harm, we re-check inside every
+    // write batch via `process_put_batch_transaction`), and
+    // `used_bytes()` under-reports for the first few seconds. Both are
+    // acceptable; a frozen daemon is not.
+    ready_tx
+        .send(())
+        .map_err(|_| DiskCacheError::WriterStopped)?;
+
     let initial_total: u64 = conn
         .query_row("SELECT COALESCE(SUM(size), 0) FROM chunks", [], |row| {
             row.get::<_, i64>(0).map(|n| n as u64)
         })
         .unwrap_or(0);
     total_bytes.store(initial_total, Ordering::Relaxed);
-
-    ready_tx
-        .send(())
-        .map_err(|_| DiskCacheError::WriterStopped)?;
 
     'outer: loop {
         match rx.recv() {
