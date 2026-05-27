@@ -15,7 +15,12 @@
 //! [`ant_chain::chequebook`]. This module owns the **wire layer**:
 //! how cheques traverse the libp2p stream between peers.
 //!
-//! # The protocol (bee 2.7.x)
+//! # The protocol (bee 2.7.x and 2.8.0)
+//!
+//! Bee 2.8.0 reshapes the BZZ handshake (new signed preimage; nonce /
+//! timestamp / chequebook moved into `BzzAddress`) but does not touch
+//! the swap stream itself. Cheque issue / receive remains the same
+//! wire format and is unaffected by the cutover.
 //!
 //! `/swarm/swap/1.0.0/swap` is a single-direction stream:
 //!

@@ -115,7 +115,10 @@ pub trait ChunkFetcher: Send + Sync {
     async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>>;
 }
 
-/// Bee `pkg/retrieval` protocol id; pinned to bee 2.7.x.
+/// Bee `pkg/retrieval` protocol id. Unchanged between bee 2.7.x and
+/// 2.8.0 — the 2.8 release reshapes the handshake (see
+/// `ant-p2p::handshake`) but leaves the retrieval wire format alone,
+/// so we keep talking `1.4.0/retrieval` across the cutover.
 pub const PROTOCOL_RETRIEVAL: &str = "/swarm/retrieval/1.4.0/retrieval";
 
 /// 32-byte Swarm chunk address (content-addressed root or single-owner).

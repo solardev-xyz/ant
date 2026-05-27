@@ -17,7 +17,12 @@
 //! redial fresh peers, which is the peer-set thrash we observed during the
 //! 0.3.0 streaming regression.
 //!
-//! # The protocol (bee 2.7.x)
+//! # The protocol (bee 2.7.x and 2.8.0)
+//!
+//! Pseudosettle is unchanged between bee 2.6 → 2.7.x → 2.8.0. The 2.8
+//! release reshapes the BZZ handshake (handshake `15.0.0`, new signed
+//! preimage) but leaves the per-peer `PaymentSent` / `PaymentReceived`
+//! flow we depend on here alone.
 //!
 //! `pseudosettle` is bee's free **time-based debt refresh** mechanism. The
 //! exchange is symmetric (either peer can dial), single round-trip, no

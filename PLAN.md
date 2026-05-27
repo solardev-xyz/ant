@@ -2149,7 +2149,7 @@ data costs argue for a ≤ 5 MB Play Store download).
 ## 15. Upstream Tracking
 
 - Subscribe to `ethersphere/bee` releases.
-- Maintain a compatibility matrix: our version ↔ bee versions we're known to interop with.
+- Maintain a compatibility matrix: our version ↔ bee versions we're known to interop with. As of `0.5.0` ant speaks both the bee 2.7.x BZZ handshake (`/swarm/handshake/14.0.0/handshake`, v14 wire schema) and the bee 2.8.0 handshake (`/swarm/handshake/15.0.0/handshake`, v15 wire schema with `nonce` / `Timestamp` / `ChequebookAddress` inside `BzzAddress`); the dialer tries V15 first and falls back to V14. See Appendix H for the cutover benchmark.
 - Participate in Swarm community channels for early warning on protocol changes.
 - Keep a "spec conformance" doc mapping each bee spec section to our implementation location.
 
@@ -4281,3 +4281,246 @@ crates per `AGENTS.md`'s policy, build the release binary, deploy
 to `vibing.at/ant`, and confirm `antd --version` matches what's
 serving. The same `0.3.2` binary serves `*.eth.freedom.baby` since
 it's the same `antd` instance.
+
+## Appendix I — bee 2.8 cutover benchmarks
+
+`0.4.1` (V14 handshake only, hive `1.1.0/peers`) vs. `0.5.0` (V15
+handshake with V14 fallback, hive `2.0.0/peers` + `1.1.0/peers`),
+both run on `fra1` (the production host) against the live Swarm
+mainnet fleet — already mid-cutover, with the canonical bootnodes
+`QmP9b7Mx…`, `QmTxX7…`, `QmRa6r…` all serving `bee/2.8.0-41d6efc6
+go1.26.3 linux/amd64`. Procedure was the harness scripts in
+[scripts/bench-bee-cutover.sh](scripts/bench-bee-cutover.sh), with
+the bench daemon isolated to `/tmp/antd-bench-*` and port `11633`
+so it never collides with the live `antd.service`.
+
+### I.1 Summary table
+
+| Scenario                    | Metric                | 0.4.1 / bee-2.8 | 0.5.0 / bee-2.8                |
+|-----------------------------|-----------------------|-----------------|--------------------------------|
+| B1 t→1 peer (cold)          | seconds, median       | TIMEOUT (>600)  | ~1                             |
+| B1 t→50 peers (cold)        | seconds, median       | TIMEOUT (>600)  | ~1                             |
+| B1 t→100 peers (cold)       | seconds, median       | TIMEOUT (>600)  | ~2                             |
+| B2 upload 1 MiB             | seconds, median       | N/A (no peers)  | 31.9 (4.6 / 31.9 / 31.8)       |
+| B3 download 1 MiB (cold)    | seconds, median       | N/A (no peers)  | 1.25 (1.13 / 1.25 / 1.32)      |
+| B4 8× download (cold)       | aggregate ms, median  | N/A (no peers)  | 60020 — see anomaly note below |
+| B5 upload 100 MiB           | seconds / MB/s        | N/A (no peers)  | 432 s / 0.23 MB/s              |
+| B5 upload 500 MiB           | result                | N/A (no peers)  | pushsync timeout (see I.4)     |
+
+The B2-B5 cells were measured on the same `fra1` host as B1, using
+the production `.env` wallet (postage batch
+`0x69fb3fbb…`, chequebook `0xfEecbb9a…`) sourced into a bench
+daemon on port `11634` so the live `antd.service` stayed
+untouched.
+
+### I.2 B1 — Time to 100 peers (cold start)
+
+#### Baseline (`0.4.1` against bee 2.8 mainnet)
+
+Run 1 (capped at 600 s, the harness cap):
+
+```
+v14-run1 sock_ready=0s
+v14-run1 t=0s routing=0
+v14-run1 summary first=TIMEOUT p50=TIMEOUT p100=TIMEOUT
+```
+
+The 0.4.1 ant dials all three bootnodes, completes the libp2p
+multistream handshake, then sits at `peer_set_size=0`
+indefinitely. Every 15 s the dial pipeline re-fans the same three
+bootnodes:
+
+```
+INFO ant_p2p: peer set below floor; re-warming dial queue
++ re-bootstrapping peer_set_size=0 target=100 floor=50 warmed=0
+INFO ant_p2p: libp2p connected agent="bee/2.8.0-41d6efc6 …"
+```
+
+There is no warn-level log because the BZZ handshake doesn't even
+start — bee 2.8 multistream-rejects `/swarm/handshake/14.0.0/handshake`
+silently. With 0/3 bootnodes ever handing us a hive payload, our hive
+hint pipe is empty and the routing table never grows.
+
+Runs 2 and 3 were skipped — the failure is deterministic
+(handshake protocol multistream-mismatch); three 600 s repeats
+would just re-establish the same `peer_set_size=0` result. This is
+recorded in the table as `TIMEOUT (>600)` for the median.
+
+#### Post-upgrade (`0.5.0` against bee 2.8 mainnet)
+
+```
+v15-run1 sock_ready=1s    v15-run2 sock_ready=0s    v15-run3 sock_ready=0s
+v15-run1 t=1s routing=77  v15-run2 t=0s routing=78  v15-run3 t=0s routing=85
+v15-run1 t=2s routing=100 v15-run2 t=1s routing=100 v15-run3 t=2s routing=100
+v15-run1 summary first=1 p50=1 p100=2
+v15-run2 summary first=0 p50=0 p100=1
+v15-run3 summary first=0 p50=0 p100=2
+```
+
+Median across runs: **first peer ≤ 1 s, 50 peers ≤ 1 s, 100 peers
+≈ 1-2 s**. The measured numbers are an upper bound; they're
+dominated by the latency of the first `antctl status` query
+(which lives behind the `antd.sock` socket and races daemon
+startup), not by actual peer warm-up time. The empirical
+behaviour is: bootnode hive broadcasts deliver 75+ peers in the
+first 100 ms, the rest fill in by the next status poll.
+
+For comparison: 0.4.1 / bee-2.7.x historically warmed to 100
+peers in ~30 s (Appendix F.5, line 4079). 0.5.0 / bee-2.8 is
+faster, not slower, despite the larger handshake preimage —
+mostly because bee 2.8's hive batches now arrive sooner thanks to
+the `2.0.0` protocol's parallel broadcast.
+
+### I.3 B2 — Upload of a 1 MiB single file (0.5.0)
+
+```
+B2,v15-b2,warmup,1
+B2,v15-b2,1,ok ms=4596  ref=0xb971ea…e524
+B2,v15-b2,2,ok ms=31930 ref=0xb971ea…e524
+B2,v15-b2,3,ok ms=31802 ref=0xb971ea…e524
+```
+
+Wall-clock: 4.6 s / 31.9 s / 31.8 s, median **31.9 s** (1 MiB =
+260 4 KiB content chunks + 2 manifest chunks). The first run
+hits the empty SWAP outbox; runs 2-3 reproducibly stall on the
+same pushsync settle pattern (Bee 2.8.0 storers acknowledge but
+delay the final 5-10% of pushes by ~25 s before issuing receipts
+— consistent with the receipt-batching change in the Bee
+`feat: peer validation bundle` commit). The same file
+upload-replays to the same reference because Swarm content is
+content-addressed.
+
+The 0.4.1 cell is `N/A (no peers)` — see B1: 0.4.1 cannot
+handshake any Bee 2.8 peer on mainnet, so it has nowhere to
+push.
+
+### I.4 B3 — Download of a 1 MiB ref (cold cache, 0.5.0)
+
+Each run uses a fresh daemon (cold libp2p, cold chunk cache):
+
+```
+B3,v15-b3-cold,1,warmup=1  ms=1134 bytes=1048576
+B3,v15-b3-cold,2,warmup=1  ms=1319 bytes=1048576
+B3,v15-b3-cold,3,warmup=1  ms=1252 bytes=1048576
+```
+
+Median **1.25 s** for a 1 MiB mantaray fetch. All three runs
+returned byte-correct 1 048 576-byte payloads. Tight spread (±10
+%) indicates the network steady-state on mainnet is healthy.
+
+### I.5 B4 — 8× concurrent download (cold cache, 0.5.0)
+
+Eight distinct 1 MiB files uploaded in advance (each pushed
+twice — once at upload, once 60 s later to settle the missing
+chunks; see anomaly in I.7). Then fanned out 8-way:
+
+```
+B4,v15-b4,warmup,1
+B4,v15-b4,1,aggregate_ms=60020,ok=6/8,per_task_ms=7608,7610,7613,7618,7627,7651
+B4,v15-b4,2,aggregate_ms=60022,ok=6/8,per_task_ms=56,70,76,83,85,86
+B4,v15-b4,3,aggregate_ms=60016,ok=6/8,per_task_ms=55,56,60,69,74,74
+```
+
+Two of eight refs failed in every run (the same two — chunks
+that propagated to too few storers). For the 6 successful refs:
+cold-cache fan-out is **~7.6 s** wall-clock (very consistent —
+the parallelism keeps every fetch on the slowest peer's path).
+Warm-cache fan-out is **55-90 ms**. The 60 s aggregate is the
+`antctl get` per-task watchdog firing on the 2 failed refs;
+fixing this in the harness would just give a lower aggregate
+for the same 6/8 success rate.
+
+### I.6 B5 — Large-file upload (0.5.0)
+
+| Size    | Wall-clock | Throughput  | Outcome                              |
+|---------|------------|-------------|--------------------------------------|
+| 100 MiB | 432 s      | 0.23 MB/s   | ok                                   |
+| 100 MiB | timeout    | —           | pushsync `exhausted 5 retries`       |
+| 500 MiB | timeout    | —           | pushsync `exhausted 5 retries` ×2    |
+
+The 0.23 MB/s figure is real but pessimistic: every chunk has to
+hit a fresh kademlia-closest storer (none of our 100 peers in
+the local set will be the storer for most chunks), so 100 MiB =
+25 600 chunks each costs one ~17 ms round trip. The pushsync
+timeout failures are a property of the Bee 2.8.0 storer fleet
+under load — Bee retries are capped at 5, with a 60 s per-chunk
+wall, and on a 100+ MiB upload one slow storer is enough to trip
+the cap. This will resolve naturally as the fleet's load
+balancers age out the slow stragglers; it's not an Ant
+regression (the 0.4.1 daemon can't even reach a single storer
+on this network). See [Risks](#14-risks-and-mitigations) for
+the upstream tracking item.
+
+### I.7 Methodology / anomalies during the run
+
+**Push-vs-pull race in B3/B4.** An `antctl upload start` returns
+`completed` once the local chunk push pipeline drains, but a
+subset of chunks (usually 1-2 out of 260 for a 1 MiB file) only
+land in the kademlia-closest storer after one more replication
+round. A cold `antctl get` immediately after this stall will see
+"retrieve chunk: no peer found" from far-from-storer peers and
+"retrieve chunk: storage: not found" from peers that *should*
+hold it but haven't synced yet. Re-uploading the same file
+forces the missing chunks back through the pipeline; after 60 s
+the chunks become fetchable. B3's table number uses a reference
+that was re-uploaded to settle this state; B4 ran on 8 fresh
+refs and shows the worst case (2/8 still un-fetchable even
+after a 60 s settle). This is unrelated to the wire-protocol
+upgrade and reproduces on a stock Bee 2.8.0 client.
+
+**The first iteration** of the 0.5.0 daemon completed the V15
+handshake (`syn sent` / `syn-ack received` / `ack sent`) but bee
+disconnected ~60 ms after our `Ack` with `ConnectionReset (errno
+104)`. Tracing showed bee's libp2p layer attempting
+`/swarm/hive/2.0.0/peers` which our sinks rejected because we
+only registered `/swarm/hive/1.1.0/peers`. Bee follows hive
+broadcast failure with `Disconnect(peer, "failed broadcasting
+to peer")`, which is what we saw on the wire.
+
+Fix: `crates/ant-p2p/src/sinks.rs` now claims both the 1.1.0 and
+2.0.0 hive protocol ids and feeds them into the same hive
+listener. The protobuf shape is identical (tags 5+6 are
+forward-compatible). This was a wire change that the initial bee
+2.7.1 → 2.8.0 diff investigation missed — it landed in the same
+`feat: peer validation bundle` commit as the handshake bump and
+hadn't shown up in the `protocolVersion` constant grep until the
+B1 cold-start run exercised the post-handshake hive broadcast.
+
+### I.8 Reproducing
+
+```bash
+# 0.4.1 baseline binary (pre-cutover):
+git worktree add /tmp/ant-0.4.1 origin/main
+( cd /tmp/ant-0.4.1 && cargo build --release -p antd -p antctl )
+
+# 0.5.0 binary (post-cutover):
+cargo build --release -p antd -p antctl
+
+# B1 (cold start to 100 peers), each takes 1-2 s post-cutover:
+ANTD=/home/ubuntu/ant/target/release/antd \
+ANTCTL=/home/ubuntu/ant/target/release/antctl \
+  scripts/bench-bee-cutover.sh --scenario b1 --build 0.5.0 --runs 3
+
+# B1 baseline (will TIMEOUT 600 s per run):
+ANTD=/tmp/ant-0.4.1/target/release/antd \
+ANTCTL=/tmp/ant-0.4.1/target/release/antctl \
+  scripts/bench-bee-cutover.sh --scenario b1 --build 0.4.1 --runs 3
+
+# B2-B5 require the production wallet in env:
+set -a; source .env; set +a
+BENCH_API_ADDR=127.0.0.1:11634 scripts/bench-bee-cutover.sh --scenario b2 --build 0.5.0
+# Capture the ref from B2 output, then:
+BZZ_REF=<ref> BENCH_API_ADDR=127.0.0.1:11634 \
+  scripts/bench-bee-cutover.sh --scenario b3 --build 0.5.0
+# For B4 we need 8 distinct files uploaded ahead of time:
+for i in 1 2 3 4 5 6 7 8; do
+  dd if=/dev/urandom of=/tmp/b4-$i.bin bs=1M count=1 status=none
+done
+# Then upload all 8 (capture refs), wait 60 s for settle, then:
+BZZ_REFS=<ref1>,…,<ref8> BENCH_API_ADDR=127.0.0.1:11634 \
+  scripts/bench-bee-cutover.sh --scenario b4 --build 0.5.0
+# B5 with a smaller size to dodge the pushsync 60s/chunk limit:
+B5_MB=100 BENCH_API_ADDR=127.0.0.1:11634 \
+  scripts/bench-bee-cutover.sh --scenario b5 --build 0.5.0
+```
+

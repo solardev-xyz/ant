@@ -46,6 +46,24 @@ struct PeerEntry {
     overlay: String,
     last_seen_unix: u64,
     fail_count: u32,
+    /// Bee 2.8+: peer-declared unix timestamp on the signed
+    /// `BzzAddress` we accepted during the last successful handshake.
+    /// Zero when unknown (V14 peer or first-seen entry from a
+    /// hint-only path). `#[serde(default)]` so older snapshots
+    /// (written by `0.4.x`) decode cleanly into the same struct.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    bzz_timestamp: u64,
+    /// Bee 2.8+: peer-declared chequebook contract address, `0x`-prefixed
+    /// 20-byte hex. Empty string when the peer advertised no chequebook
+    /// or we learned about them under V14. Kept as a string for forward
+    /// compatibility with operator-edited snapshots.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    chequebook: String,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -66,6 +84,13 @@ struct EntryState {
     overlay: [u8; 32],
     last_seen_unix: u64,
     fail_count: u32,
+    /// Bee 2.8+ signed timestamp from the last successful handshake.
+    /// Zero when not yet seen on a V15 handshake.
+    bzz_timestamp: u64,
+    /// Bee 2.8+ chequebook address from the last successful handshake.
+    /// `None` for V14 peers and for V15 peers with an empty
+    /// chequebook field.
+    chequebook: Option<[u8; 20]>,
 }
 
 impl PeerStore {
@@ -137,6 +162,16 @@ impl PeerStore {
                     overlay = [0u8; 32];
                 }
             }
+            let chequebook = if p.chequebook.is_empty() {
+                None
+            } else {
+                let mut buf = [0u8; 20];
+                let hex_str = p.chequebook.strip_prefix("0x").unwrap_or(&p.chequebook);
+                match hex::decode_to_slice(hex_str, &mut buf) {
+                    Ok(()) => Some(buf),
+                    Err(_) => None,
+                }
+            };
             entries.insert(
                 peer_id,
                 EntryState {
@@ -144,6 +179,8 @@ impl PeerStore {
                     overlay,
                     last_seen_unix: p.last_seen_unix,
                     fail_count: p.fail_count,
+                    bzz_timestamp: p.bzz_timestamp,
+                    chequebook,
                 },
             );
         }
@@ -186,7 +223,18 @@ impl PeerStore {
     }
 
     /// Stamp `peer_id` as healthy after a successful BZZ handshake.
-    pub fn record_success(&mut self, peer_id: PeerId, addrs: Vec<Multiaddr>, overlay: [u8; 32]) {
+    /// `bzz_timestamp` and `chequebook` come from the V15 handshake
+    /// fields; pass `0` and `None` for V14 peers (the snapshot keeps
+    /// them at their existing values so a V15 handshake earlier in
+    /// the session isn't downgraded by a subsequent V14 reconnect).
+    pub fn record_success(
+        &mut self,
+        peer_id: PeerId,
+        addrs: Vec<Multiaddr>,
+        overlay: [u8; 32],
+        bzz_timestamp: u64,
+        chequebook: Option<[u8; 20]>,
+    ) {
         if self.path.is_none() {
             return;
         }
@@ -195,6 +243,8 @@ impl PeerStore {
             overlay,
             last_seen_unix: 0,
             fail_count: 0,
+            bzz_timestamp: 0,
+            chequebook: None,
         });
         if !addrs.is_empty() {
             entry.addrs = addrs;
@@ -202,6 +252,15 @@ impl PeerStore {
         entry.overlay = overlay;
         entry.last_seen_unix = unix_now();
         entry.fail_count = 0;
+        // Don't downgrade V15 info to V14. If the new handshake brought
+        // fresh fields, take them; if it was V14 (`0` / `None`), keep
+        // whatever we previously knew.
+        if bzz_timestamp != 0 {
+            entry.bzz_timestamp = bzz_timestamp;
+        }
+        if chequebook.is_some() {
+            entry.chequebook = chequebook;
+        }
         self.dirty = true;
     }
 
@@ -304,6 +363,11 @@ impl PeerStore {
                     overlay: format!("0x{}", hex::encode(e.overlay)),
                     last_seen_unix: e.last_seen_unix,
                     fail_count: e.fail_count,
+                    bzz_timestamp: e.bzz_timestamp,
+                    chequebook: e
+                        .chequebook
+                        .map(|c| format!("0x{}", hex::encode(c)))
+                        .unwrap_or_default(),
                 })
                 .collect(),
         };
@@ -358,7 +422,7 @@ mod tests {
 
         let mut store = PeerStore::load(path.clone());
         let peer = fake_peer(7);
-        store.record_success(peer, vec![fake_addr(1634)], [0xab; 32]);
+        store.record_success(peer, vec![fake_addr(1634)], [0xab; 32], 0, None);
         store.flush();
         assert!(path.exists());
         // Tempfile must be cleaned up by the rename.
@@ -380,7 +444,7 @@ mod tests {
         let path = dir.path().join("peers.json");
         let mut store = PeerStore::load(path);
         let peer = fake_peer(9);
-        store.record_success(peer, vec![fake_addr(1634)], [0; 32]);
+        store.record_success(peer, vec![fake_addr(1634)], [0; 32], 0, None);
         for _ in 0..(MAX_FAIL_COUNT - 1) {
             store.record_failure(&peer);
             assert!(store.contains(&peer));
@@ -395,11 +459,11 @@ mod tests {
         let path = dir.path().join("peers.json");
         let mut store = PeerStore::load(path);
         let peer = fake_peer(11);
-        store.record_success(peer, vec![fake_addr(1634)], [0; 32]);
+        store.record_success(peer, vec![fake_addr(1634)], [0; 32], 0, None);
         for _ in 0..(MAX_FAIL_COUNT - 1) {
             store.record_failure(&peer);
         }
-        store.record_success(peer, vec![fake_addr(1634)], [0; 32]);
+        store.record_success(peer, vec![fake_addr(1634)], [0; 32], 0, None);
         for _ in 0..(MAX_FAIL_COUNT - 1) {
             store.record_failure(&peer);
         }
@@ -413,10 +477,10 @@ mod tests {
         let mut store = PeerStore::load(path);
         let older = fake_peer(1);
         let newer = fake_peer(2);
-        store.record_success(older, vec![fake_addr(1)], [0; 32]);
+        store.record_success(older, vec![fake_addr(1)], [0; 32], 0, None);
         // Force divergent timestamps without sleeping the whole test.
         store.entries.get_mut(&older).unwrap().last_seen_unix = 1_000;
-        store.record_success(newer, vec![fake_addr(2)], [0; 32]);
+        store.record_success(newer, vec![fake_addr(2)], [0; 32], 0, None);
         store.entries.get_mut(&newer).unwrap().last_seen_unix = 2_000;
         let hints = store.warm_hints();
         assert_eq!(hints[0].peer_id, newer);
@@ -430,7 +494,7 @@ mod tests {
         std::fs::write(&path, b"not json").unwrap();
         let mut store = PeerStore::load(path.clone());
         assert_eq!(store.len(), 0);
-        store.record_success(fake_peer(3), vec![fake_addr(1)], [0; 32]);
+        store.record_success(fake_peer(3), vec![fake_addr(1)], [0; 32], 0, None);
         store.flush();
         // The corrupted file should have been replaced with a valid snapshot.
         let raw = std::fs::read(&path).unwrap();
@@ -443,8 +507,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("peers.json");
         let mut store = PeerStore::load(path.clone());
-        store.record_success(fake_peer(5), vec![fake_addr(1)], [0xcd; 32]);
-        store.record_success(fake_peer(6), vec![fake_addr(2)], [0xef; 32]);
+        store.record_success(fake_peer(5), vec![fake_addr(1)], [0xcd; 32], 0, None);
+        store.record_success(fake_peer(6), vec![fake_addr(2)], [0xef; 32], 0, None);
         store.flush();
         assert!(path.exists());
 
@@ -455,7 +519,7 @@ mod tests {
 
         // A follow-up `record_success` after `clear()` re-establishes the
         // file on the next flush — the store isn't permanently disabled.
-        store.record_success(fake_peer(7), vec![fake_addr(3)], [0xab; 32]);
+        store.record_success(fake_peer(7), vec![fake_addr(3)], [0xab; 32], 0, None);
         store.flush();
         assert!(path.exists());
         assert_eq!(PeerStore::load(path).len(), 1);
@@ -468,9 +532,63 @@ mod tests {
     }
 
     #[test]
+    fn loads_legacy_snapshot_without_v15_fields() {
+        // Simulate a snapshot written by ant 0.4.x — no bzz_timestamp,
+        // no chequebook. `serde(default)` must let it parse cleanly.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("peers.json");
+        let legacy = format!(
+            "{{\"version\":{SNAPSHOT_VERSION},\"peers\":[{{\
+\"peer_id\":\"{}\",\"addrs\":[\"/ip4/192.0.2.1/tcp/1\"],\
+\"overlay\":\"0xab0000000000000000000000000000000000000000000000000000000000ab00\",\
+\"last_seen_unix\":1234,\"fail_count\":0}}]}}",
+            fake_peer(42)
+        );
+        std::fs::write(&path, legacy).unwrap();
+        let store = PeerStore::load(path);
+        assert_eq!(store.len(), 1);
+        // Defaults: timestamp 0, chequebook None.
+        let e = store.entries.values().next().unwrap();
+        assert_eq!(e.bzz_timestamp, 0);
+        assert!(e.chequebook.is_none());
+    }
+
+    #[test]
+    fn round_trip_persists_v15_fields() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("peers.json");
+        let mut store = PeerStore::load(path.clone());
+        let peer = fake_peer(50);
+        let cb = [0xcd; 20];
+        store.record_success(peer, vec![fake_addr(1)], [0xab; 32], 1_715_000_000, Some(cb));
+        store.flush();
+
+        let reloaded = PeerStore::load(path);
+        let e = reloaded.entries.get(&peer).unwrap();
+        assert_eq!(e.bzz_timestamp, 1_715_000_000);
+        assert_eq!(e.chequebook, Some(cb));
+    }
+
+    #[test]
+    fn v14_handshake_after_v15_keeps_chequebook() {
+        // Once we've learned a peer's chequebook over a V15 handshake,
+        // a subsequent V14 reconnect (passing `None`) must not erase it.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("peers.json");
+        let mut store = PeerStore::load(path);
+        let peer = fake_peer(51);
+        let cb = [0xef; 20];
+        store.record_success(peer, vec![fake_addr(1)], [0; 32], 1_715_000_000, Some(cb));
+        store.record_success(peer, vec![fake_addr(1)], [0; 32], 0, None);
+        let e = store.entries.get(&peer).unwrap();
+        assert_eq!(e.bzz_timestamp, 1_715_000_000);
+        assert_eq!(e.chequebook, Some(cb));
+    }
+
+    #[test]
     fn disabled_store_is_silent() {
         let mut store = PeerStore::disabled();
-        store.record_success(fake_peer(0), vec![fake_addr(1)], [0; 32]);
+        store.record_success(fake_peer(0), vec![fake_addr(1)], [0; 32], 0, None);
         store.record_failure(&fake_peer(0));
         store.flush();
         assert_eq!(store.len(), 0);

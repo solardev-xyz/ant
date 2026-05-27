@@ -77,6 +77,7 @@
 //!   `RUST_LOG`                   - tracing filter; default "`ant_p2p=info`"
 
 use ant_p2p::swap::{emit_cheque, issue_cheque};
+use ant_crypto::HandshakeWireVersion;
 use ant_p2p::{handshake_outbound_with_role, PROTOCOL_HANDSHAKE};
 use futures::StreamExt;
 use libp2p::core::ConnectedPoint;
@@ -307,6 +308,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::slice::from_ref(&peer_addr),
         Vec::new(),
         advertise_full_node,
+        HandshakeWireVersion::V15,
     )
     .await?;
 

@@ -61,15 +61,77 @@ pub fn overlay_from_ethereum_address(
     keccak256(&buf)
 }
 
-/// Payload signed in the BZZ handshake: `bee-handshake- ‖ underlay ‖ overlay ‖ network_id_be`.
+/// Length of the EVM address embedded in the BZZ handshake (the peer's
+/// chequebook contract). An empty chequebook is represented on the wire
+/// as zero bytes (the field is optional), but it gets zero-padded to 20
+/// bytes inside the signed preimage so that the recoverable signature
+/// is over a fixed-length tail.
+pub const HANDSHAKE_CHEQUEBOOK_LEN: usize = 20;
+
+/// Wire version of the BZZ handshake protocol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandshakeWireVersion {
+    /// bee 2.7.x — preimage: `bee-handshake- ‖ underlay ‖ overlay ‖ network_id_be`.
+    /// Nonce sits next to the signature in the `Ack` rather than inside
+    /// `BzzAddress`.
+    V14,
+    /// bee 2.8.0 — preimage extended with `‖ nonce ‖ timestamp_be ‖ chequebook(20B)`.
+    /// Nonce, timestamp, and chequebook are now fields of `BzzAddress`.
+    V15,
+}
+
+/// Payload signed in the BZZ handshake. The preimage depends on the wire
+/// version we're talking to — V14 is the bee 2.7.x layout, V15 is bee
+/// 2.8.0 with the extra `nonce ‖ timestamp_be ‖ chequebook(20B)` tail
+/// (see [pkg/bzz/address.go](../bee/pkg/bzz/address.go)
+/// `generateSignData`). Both layouts get wrapped with the EIP-191
+/// prefix downstream by [`sign_handshake_data`] / [`recover_public_key`].
+///
+/// `chequebook` must be either zero-length (peer advertises no
+/// chequebook) or exactly [`HANDSHAKE_CHEQUEBOOK_LEN`] bytes — empty
+/// chequebooks are zero-padded into the preimage for V15.
 #[must_use]
-pub fn handshake_sign_data(underlay: &[u8], overlay: &[u8; 32], network_id: u64) -> Vec<u8> {
-    let mut v = Vec::with_capacity(15 + underlay.len() + 32 + 8);
-    v.extend_from_slice(b"bee-handshake-");
-    v.extend_from_slice(underlay);
-    v.extend_from_slice(overlay);
-    v.extend_from_slice(&network_id.to_be_bytes());
-    v
+#[allow(clippy::too_many_arguments)]
+pub fn handshake_sign_data(
+    version: HandshakeWireVersion,
+    underlay: &[u8],
+    overlay: &[u8; 32],
+    network_id: u64,
+    nonce: &[u8; OVERLAY_NONCE_LEN],
+    timestamp: i64,
+    chequebook: &[u8],
+) -> Vec<u8> {
+    match version {
+        HandshakeWireVersion::V14 => {
+            let mut v = Vec::with_capacity(14 + underlay.len() + 32 + 8);
+            v.extend_from_slice(b"bee-handshake-");
+            v.extend_from_slice(underlay);
+            v.extend_from_slice(overlay);
+            v.extend_from_slice(&network_id.to_be_bytes());
+            v
+        }
+        HandshakeWireVersion::V15 => {
+            let cb_padded: [u8; HANDSHAKE_CHEQUEBOOK_LEN] = if chequebook.is_empty() {
+                [0u8; HANDSHAKE_CHEQUEBOOK_LEN]
+            } else {
+                debug_assert_eq!(chequebook.len(), HANDSHAKE_CHEQUEBOOK_LEN);
+                let mut a = [0u8; HANDSHAKE_CHEQUEBOOK_LEN];
+                a.copy_from_slice(chequebook);
+                a
+            };
+            let mut v = Vec::with_capacity(
+                14 + underlay.len() + 32 + 8 + OVERLAY_NONCE_LEN + 8 + HANDSHAKE_CHEQUEBOOK_LEN,
+            );
+            v.extend_from_slice(b"bee-handshake-");
+            v.extend_from_slice(underlay);
+            v.extend_from_slice(overlay);
+            v.extend_from_slice(&network_id.to_be_bytes());
+            v.extend_from_slice(nonce);
+            v.extend_from_slice(&timestamp.to_be_bytes());
+            v.extend_from_slice(&cb_padded);
+            v
+        }
+    }
 }
 
 fn ethereum_prefixed_sign_data(sign_data: &[u8]) -> Vec<u8> {
@@ -154,25 +216,34 @@ pub fn recover_public_key_from_prehash(
     Ok(VerifyingKey::recover_from_prehash(digest, &sig, recid)?)
 }
 
-/// Verify a BZZ handshake signature and optionally that overlay matches `nonce` + `network_id`.
+/// Verify a BZZ handshake signature and that overlay matches `nonce` +
+/// `network_id`. Bee 2.8 always validates the overlay; we follow suit
+/// for both wire versions to keep the code path uniform.
+///
+/// For [`HandshakeWireVersion::V14`] `timestamp` and `chequebook` are
+/// ignored. For [`HandshakeWireVersion::V15`] `chequebook` must be
+/// either empty or exactly [`HANDSHAKE_CHEQUEBOOK_LEN`] bytes — empty
+/// chequebooks are zero-padded into the preimage.
+#[allow(clippy::too_many_arguments)]
 pub fn verify_bzz_address_signature(
+    version: HandshakeWireVersion,
     underlay: &[u8],
     overlay: &[u8; 32],
     signature: &[u8; 65],
     nonce: &[u8; OVERLAY_NONCE_LEN],
     network_id: u64,
-    validate_overlay: bool,
+    timestamp: i64,
+    chequebook: &[u8],
 ) -> Result<[u8; 20], CryptoError> {
-    let sign_data = handshake_sign_data(underlay, overlay, network_id);
+    let sign_data =
+        handshake_sign_data(version, underlay, overlay, network_id, nonce, timestamp, chequebook);
     let vk = recover_public_key(signature, &sign_data)?;
-    if validate_overlay {
-        let eth = ethereum_address_from_public_key(&vk);
-        let expected = overlay_from_ethereum_address(&eth, network_id, nonce);
-        if expected != *overlay {
-            return Err(CryptoError::OverlayMismatch);
-        }
+    let eth = ethereum_address_from_public_key(&vk);
+    let expected = overlay_from_ethereum_address(&eth, network_id, nonce);
+    if expected != *overlay {
+        return Err(CryptoError::OverlayMismatch);
     }
-    Ok(ethereum_address_from_public_key(&vk))
+    Ok(eth)
 }
 
 /// Random 32-byte overlay nonce.
@@ -196,7 +267,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sign_verify_roundtrip() {
+    fn sign_verify_roundtrip_v15() {
         let secret = random_secp256k1_secret();
         let sk = SigningKey::from_bytes(&secret.into()).unwrap();
         let vk = VerifyingKey::from(&sk);
@@ -205,12 +276,115 @@ mod tests {
         let nonce = random_overlay_nonce();
         let overlay = overlay_from_ethereum_address(&eth, network_id, &nonce);
         let underlay = b"/ip4/127.0.0.1/tcp/1634/p2p/12D3KooW";
-        let sign_data = handshake_sign_data(underlay, &overlay, network_id);
+        let timestamp = 1_715_000_000_i64;
+        let chequebook: [u8; 20] = [0u8; 20];
+        let sign_data = handshake_sign_data(
+            HandshakeWireVersion::V15,
+            underlay,
+            &overlay,
+            network_id,
+            &nonce,
+            timestamp,
+            &chequebook,
+        );
         let sig = sign_handshake_data(&secret, &sign_data).unwrap();
-        let recovered_eth =
-            verify_bzz_address_signature(underlay, &overlay, &sig, &nonce, network_id, true)
-                .unwrap();
+        let recovered_eth = verify_bzz_address_signature(
+            HandshakeWireVersion::V15,
+            underlay,
+            &overlay,
+            &sig,
+            &nonce,
+            network_id,
+            timestamp,
+            &chequebook,
+        )
+        .unwrap();
         assert_eq!(recovered_eth, eth);
+    }
+
+    /// V14 backward-compat: a 2.7 peer signs the shorter preimage,
+    /// recovers fine, and the overlay validates against the same nonce
+    /// that bee 2.7 ships next to the signature in the `Ack`.
+    #[test]
+    fn sign_verify_roundtrip_v14() {
+        let secret = random_secp256k1_secret();
+        let sk = SigningKey::from_bytes(&secret.into()).unwrap();
+        let vk = VerifyingKey::from(&sk);
+        let eth = ethereum_address_from_public_key(&vk);
+        let network_id = 1u64;
+        let nonce = random_overlay_nonce();
+        let overlay = overlay_from_ethereum_address(&eth, network_id, &nonce);
+        let underlay = b"/ip4/127.0.0.1/tcp/1634/p2p/12D3KooW";
+        let sign_data = handshake_sign_data(
+            HandshakeWireVersion::V14,
+            underlay,
+            &overlay,
+            network_id,
+            &nonce,
+            0,
+            &[],
+        );
+        let sig = sign_handshake_data(&secret, &sign_data).unwrap();
+        let recovered_eth = verify_bzz_address_signature(
+            HandshakeWireVersion::V14,
+            underlay,
+            &overlay,
+            &sig,
+            &nonce,
+            network_id,
+            0,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(recovered_eth, eth);
+    }
+
+    /// Golden vector: the V15 preimage layout must end with `nonce ‖
+    /// timestamp_be ‖ chequebook(20B)` and the V14 preimage must NOT
+    /// include those tail bytes. Catches accidental field reorders.
+    #[test]
+    fn v15_preimage_layout() {
+        let underlay = b"u";
+        let overlay = [0u8; 32];
+        let network_id = 1u64;
+        let nonce = [0xcd_u8; OVERLAY_NONCE_LEN];
+        let timestamp = 1_715_000_000_i64;
+        let chequebook: [u8; HANDSHAKE_CHEQUEBOOK_LEN] = [0xab; HANDSHAKE_CHEQUEBOOK_LEN];
+
+        let v14 = handshake_sign_data(
+            HandshakeWireVersion::V14,
+            underlay,
+            &overlay,
+            network_id,
+            &nonce,
+            timestamp,
+            &chequebook,
+        );
+        let v15 = handshake_sign_data(
+            HandshakeWireVersion::V15,
+            underlay,
+            &overlay,
+            network_id,
+            &nonce,
+            timestamp,
+            &chequebook,
+        );
+        assert_eq!(v14.len() + OVERLAY_NONCE_LEN + 8 + HANDSHAKE_CHEQUEBOOK_LEN, v15.len());
+        assert!(v15.starts_with(&v14), "V15 preimage must be V14 extended in-place");
+        assert!(v15.ends_with(&chequebook));
+
+        // Empty chequebook on V15 zero-pads to 20 bytes inside the preimage.
+        let v15_empty = handshake_sign_data(
+            HandshakeWireVersion::V15,
+            underlay,
+            &overlay,
+            network_id,
+            &nonce,
+            timestamp,
+            &[],
+        );
+        assert_eq!(v15_empty.len(), v15.len());
+        assert!(v15_empty.ends_with(&[0u8; HANDSHAKE_CHEQUEBOOK_LEN]));
     }
 
     /// Cross-check overlay formula with fixed vectors (endianness + layout).
@@ -224,7 +398,15 @@ mod tests {
         let o = overlay_from_ethereum_address(&eth, network_id, &nonce);
         let h = hex::encode(o);
         assert_eq!(h.len(), 64);
-        let sign_data = handshake_sign_data(b"bee-handshake-", &o, network_id);
+        let sign_data = handshake_sign_data(
+            HandshakeWireVersion::V14,
+            b"bee-handshake-",
+            &o,
+            network_id,
+            &nonce,
+            0,
+            &[],
+        );
         assert!(sign_data.ends_with(&1u64.to_be_bytes()));
     }
 }

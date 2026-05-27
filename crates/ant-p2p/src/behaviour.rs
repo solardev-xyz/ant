@@ -2,7 +2,11 @@
 
 use crate::dial::{bootstrap_dial_opts, endpoint_host, first_multiaddr_per_peer};
 use crate::dnsaddr;
-use crate::handshake::{handshake_outbound, HandshakeError, HandshakeInfo, PROTOCOL_HANDSHAKE};
+use crate::handshake::{
+    handshake_outbound, HandshakeError, HandshakeInfo, PROTOCOL_HANDSHAKE_V14,
+    PROTOCOL_HANDSHAKE_V15,
+};
+use ant_crypto::HandshakeWireVersion;
 use crate::peerstore::PeerStore;
 use crate::routing::{Overlay, RoutingTable};
 use crate::sinks;
@@ -3328,7 +3332,12 @@ fn handle_drive_outcome(
             // reachable multiaddr, so we let those become hints via hive
             // gossip on the next start instead.
             let addrs = dialed_addr.map(|a| vec![a]).unwrap_or_default();
-            peerstore.record_success(peer, addrs, info.remote_overlay);
+            // Pass the V15 fields through to the peerstore so peers.json
+            // carries the signed timestamp + chequebook forward across
+            // restarts. `record_success` won't downgrade V15 → V14 on a
+            // subsequent V14 reconnect (see peerstore unit tests).
+            let bzz_ts: u64 = u64::try_from(info.remote_timestamp).unwrap_or(0);
+            peerstore.record_success(peer, addrs, info.remote_overlay, bzz_ts, info.remote_chequebook);
         }
         DriveOutcome::OpenFailed(e) => {
             debug!(target: "ant_p2p", %peer, "open handshake stream: {e}");
@@ -3385,39 +3394,68 @@ fn spawn_handshake_driver(
         };
         let _ = tokio::time::timeout(wait_budget, identify_signal).await;
 
-        let proto = StreamProtocol::new(PROTOCOL_HANDSHAKE);
-        let stream = match control.open_stream(peer_id, proto).await {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = result_tx
-                    .send((peer_id, DriveOutcome::OpenFailed(e.to_string())))
-                    .await;
-                return;
-            }
-        };
-
+        // Bee 2.8.0 ships handshake `15.0.0`; 2.7.x ships `14.0.0`.
+        // The mainnet is rolling through the cutover, so try V15 first
+        // and fall back to V14 when the remote refuses the protocol
+        // id (libp2p-stream surfaces that as an `OpenStreamError`).
+        // Once a peer answers under one version we stick with that
+        // version's wire schema for the rest of the handshake — the
+        // sender / receiver in `handshake.rs` is parameterised on the
+        // chosen version.
         let dial_addrs = vec![dial_addr];
-        match handshake_outbound(
-            stream,
-            params.local_peer_id,
-            peer_id,
-            &params.signing_secret,
-            &params.overlay_nonce,
-            params.network_id,
-            &dial_addrs,
-            listen_addrs,
-        )
-        .await
-        {
-            Ok(info) => {
-                let _ = result_tx.send((peer_id, DriveOutcome::Ok(info))).await;
-            }
-            Err(e) => {
-                let _ = result_tx
-                    .send((peer_id, DriveOutcome::HandshakeFailed(e)))
-                    .await;
+        let attempts: [(HandshakeWireVersion, &'static str); 2] = [
+            (HandshakeWireVersion::V15, PROTOCOL_HANDSHAKE_V15),
+            (HandshakeWireVersion::V14, PROTOCOL_HANDSHAKE_V14),
+        ];
+        let mut last_open_err: Option<String> = None;
+        for (version, proto_id) in attempts {
+            let proto = StreamProtocol::new(proto_id);
+            let stream = match control.open_stream(peer_id, proto).await {
+                Ok(s) => s,
+                Err(e) => {
+                    last_open_err = Some(e.to_string());
+                    continue;
+                }
+            };
+
+            match handshake_outbound(
+                stream,
+                params.local_peer_id,
+                peer_id,
+                &params.signing_secret,
+                &params.overlay_nonce,
+                params.network_id,
+                &dial_addrs,
+                listen_addrs.clone(),
+                version,
+            )
+            .await
+            {
+                Ok(info) => {
+                    let _ = result_tx.send((peer_id, DriveOutcome::Ok(info))).await;
+                    return;
+                }
+                Err(e) => {
+                    // A handshake-level failure (network id, signature,
+                    // timestamp gate, …) is a peer rejection, not a
+                    // version mismatch — surface it and don't retry the
+                    // other wire version.
+                    let _ = result_tx
+                        .send((peer_id, DriveOutcome::HandshakeFailed(e)))
+                        .await;
+                    return;
+                }
             }
         }
+
+        let _ = result_tx
+            .send((
+                peer_id,
+                DriveOutcome::OpenFailed(
+                    last_open_err.unwrap_or_else(|| "no handshake version accepted".into()),
+                ),
+            ))
+            .await;
     });
 }
 

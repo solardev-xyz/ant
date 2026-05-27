@@ -367,12 +367,15 @@ final class AntNode: ObservableObject {
         return dir
     }
 
-    /// Cold-start bootstrap for the embedded node. Mainnet bootnodes
-    /// (bee 2.8) reject our outbound BZZ handshake, so a fresh install
-    /// with no `peers.json` never leaves `peer_set_size = 0`. Desktop
-    /// `antd` avoids this because it reloads a warm peerstore from disk;
-    /// seed the same snapshot on first launch so the pipeline can dial
-    /// hive hints immediately.
+    /// Cold-start bootstrap for the embedded node. Historically
+    /// (ant 0.4.x) mainnet bootnodes that had moved to bee 2.8
+    /// rejected our outbound BZZ handshake — we only spoke the
+    /// `14.0.0` protocol id while bee 2.8 only listens on `15.0.0`
+    /// — so a fresh install with no `peers.json` never left
+    /// `peer_set_size = 0`. Ant 0.5.0+ speaks both wire versions
+    /// (defaults to V15, falls back to V14), but we keep seeding
+    /// `peers.json` here so the pipeline can dial hive hints in
+    /// parallel with the first round of cold-start handshakes.
     private static func seedPeerstoreIfNeeded(in dataDir: URL) {
         let dest = dataDir.appendingPathComponent("peers.json")
         if FileManager.default.fileExists(atPath: dest.path),

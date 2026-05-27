@@ -5,11 +5,12 @@
 //! down if we're not prepared:
 //!
 //! 1. **`ConnectIn`** callbacks on each registered p2p protocol (libp2p-go
-//!    `p2p.ProtocolSpec`). Only `pricing` and `pseudosettle` expose one in
-//!    bee 2.7.1, and of those only [`pricing`] opens a stream back to us —
-//!    `/swarm/pricing/1.0.0/pricing` — and returns an error if the stream
-//!    can't be negotiated. Bee's stream handler catches that as
-//!    `Disconnect(overlay, "failed to process inbound connection notifier")`.
+//!    `p2p.ProtocolSpec`). Only `pricing` and `pseudosettle` expose one
+//!    in bee 2.7.x and 2.8.0, and of those only [`pricing`] opens a
+//!    stream back to us — `/swarm/pricing/1.0.0/pricing` — and returns
+//!    an error if the stream can't be negotiated. Bee's stream handler
+//!    catches that as `Disconnect(overlay, "failed to process inbound
+//!    connection notifier")`.
 //!
 //! 2. **Kademlia's `Announce`** then calls
 //!    `discovery.BroadcastPeers(ctx, peer, addrs...)` on every new peer,
@@ -58,8 +59,18 @@ use tracing::{debug, trace, warn};
 
 /// bee `pkg/pricing`, sends a single `AnnouncePaymentThreshold` (<= ~256 bits).
 pub const PROTOCOL_PRICING: &str = "/swarm/pricing/1.0.0/pricing";
-/// bee `pkg/hive`, sends a `Peers{ repeated BzzAddress }` with up to 30 entries.
-pub const PROTOCOL_HIVE_PEERS: &str = "/swarm/hive/1.1.0/peers";
+/// bee 2.8.0 `pkg/hive`, sends a `Peers{ repeated BzzAddress }` with up to
+/// 30 entries. The protocol id bumped from `1.1.0` (bee 2.7.x) to `2.0.0`
+/// in the same `peer validation bundle` commit that reshaped the handshake
+/// — bee disconnects peers it can't broadcast hive gossip to (`"failed
+/// broadcasting to peer"`), so we must claim both ids to stay connected
+/// across the cutover.
+pub const PROTOCOL_HIVE_PEERS_V2: &str = "/swarm/hive/2.0.0/peers";
+pub const PROTOCOL_HIVE_PEERS_V1: &str = "/swarm/hive/1.1.0/peers";
+/// Default protocol id used by external callers. Points at the new bee
+/// 2.8 id now that ant 0.5.0 is on the V15 handshake.
+#[allow(dead_code)]
+pub const PROTOCOL_HIVE_PEERS: &str = PROTOCOL_HIVE_PEERS_V2;
 
 /// Tight bound for the pricing payload — it's a single big.Int.
 const PRICING_MAX: usize = 1024;
@@ -94,11 +105,21 @@ struct PeersPb {
     peers: Vec<BzzAddressPb>,
 }
 
-/// hive.proto `message BzzAddress { bytes Underlay=1; Signature=2; Overlay=3; Nonce=4; }`.
-/// Underlay is `bzz.SerializeUnderlays(addrs)` — either raw multiaddr bytes
-/// (single address, backward-compat) or the 0x99-prefixed length-delimited list.
-/// Signature and Nonce are required on the wire (both empty is a decode error
-/// for bee) but we ignore them: we don't verify overlays for hints.
+/// hive.proto `message BzzAddress`. Bee 2.7 ships tags 1-4
+/// (`Underlay`, `Signature`, `Overlay`, `Nonce`); bee 2.8 added tag 5
+/// (`Timestamp`) and tag 6 (`ChequebookAddress`) alongside the
+/// peer-validation-bundle handshake change. Prost ignores unknown
+/// fields on decode, so the new tags would parse correctly even
+/// without listing them here — but we surface them for parity with
+/// the bee schema and so future changes (e.g. dialing prioritised by
+/// fresh-timestamp gossip) can read them without a second wire
+/// migration.
+///
+/// Underlay is `bzz.SerializeUnderlays(addrs)` — either raw multiaddr
+/// bytes (single address, backward-compat) or the 0x99-prefixed
+/// length-delimited list. Signature and Nonce are required on the
+/// wire (both empty is a decode error for bee) but we ignore them:
+/// we don't verify overlays for hints.
 #[derive(Clone, PartialEq, prost::Message)]
 struct BzzAddressPb {
     #[prost(bytes = "vec", tag = "1")]
@@ -109,13 +130,26 @@ struct BzzAddressPb {
     overlay: Vec<u8>,
     #[prost(bytes = "vec", tag = "4")]
     nonce: Vec<u8>,
+    /// Bee 2.8+. Unix seconds of the signed `BzzAddress` record. We
+    /// currently ignore the value but accept it for forward-compat.
+    #[prost(int64, tag = "5")]
+    #[allow(dead_code)]
+    timestamp: i64,
+    /// Bee 2.8+. Peer's chequebook contract address (20 bytes) or
+    /// empty when the peer has no chequebook. We accept it for
+    /// forward-compat without acting on it: hive hints feed the
+    /// dialer, which still re-verifies via the BZZ handshake itself.
+    #[prost(bytes = "vec", tag = "6")]
+    #[allow(dead_code)]
+    chequebook_address: Vec<u8>,
 }
 
 /// Handles on the `IncomingStreams` we need to keep alive while the node runs.
 #[must_use = "register() must be paired with a spawn() call to drive the sinks"]
 pub struct Registrations {
     pricing: IncomingStreams,
-    hive: IncomingStreams,
+    hive_v1: IncomingStreams,
+    hive_v2: IncomingStreams,
     pseudosettle: IncomingStreams,
     swap: IncomingStreams,
     hint_tx: mpsc::Sender<PeerHint>,
@@ -129,9 +163,17 @@ pub fn register(control: &mut Control, hint_tx: mpsc::Sender<PeerHint>) -> Regis
     let pricing = control
         .accept(StreamProtocol::new(PROTOCOL_PRICING))
         .expect("pricing protocol registered exactly once");
-    let hive = control
-        .accept(StreamProtocol::new(PROTOCOL_HIVE_PEERS))
-        .expect("hive peers protocol registered exactly once");
+    // Bee 2.8 bumped hive to 2.0.0; 2.7.x peers still dial 1.1.0. Claim
+    // both ids so we keep talking to whichever side of the cutover the
+    // remote is on — both speak the same protobuf shape (with tags 5 +
+    // 6 added in 2.8, which prost already tolerates as unknown fields
+    // on the 1.1.0 path).
+    let hive_v2 = control
+        .accept(StreamProtocol::new(PROTOCOL_HIVE_PEERS_V2))
+        .expect("hive 2.0.0 protocol registered exactly once");
+    let hive_v1 = control
+        .accept(StreamProtocol::new(PROTOCOL_HIVE_PEERS_V1))
+        .expect("hive 1.1.0 protocol registered exactly once");
     let pseudosettle = control
         .accept(StreamProtocol::new(
             crate::pseudosettle::PROTOCOL_PSEUDOSETTLE,
@@ -142,7 +184,8 @@ pub fn register(control: &mut Control, hint_tx: mpsc::Sender<PeerHint>) -> Regis
         .expect("swap protocol registered exactly once");
     Registrations {
         pricing,
-        hive,
+        hive_v1,
+        hive_v2,
         pseudosettle,
         swap,
         hint_tx,
@@ -159,7 +202,8 @@ pub fn register(control: &mut Control, hint_tx: mpsc::Sender<PeerHint>) -> Regis
 /// disconnect on the libp2p layer.
 pub fn spawn(reg: Registrations, swap: Option<SwapWiring>) {
     tokio::spawn(run_pricing(reg.pricing));
-    tokio::spawn(run_hive(reg.hive, reg.hint_tx));
+    tokio::spawn(run_hive(reg.hive_v1, reg.hint_tx.clone()));
+    tokio::spawn(run_hive(reg.hive_v2, reg.hint_tx));
     tokio::spawn(crate::pseudosettle::run_inbound(reg.pseudosettle));
     match swap {
         Some(s) => {
@@ -402,6 +446,7 @@ mod tests {
                 signature: vec![0u8; 65],
                 overlay: vec![0xab; 32],
                 nonce: vec![0xcd; 32],
+                ..Default::default()
             }],
         };
         let mut buf = Vec::new();
@@ -430,6 +475,7 @@ mod tests {
                 signature: vec![],
                 overlay: vec![0u8; 32],
                 nonce: vec![],
+                ..Default::default()
             }],
         };
         let mut buf = Vec::new();
@@ -438,6 +484,36 @@ mod tests {
         let hints = decode_hive_peers(&buf);
         assert_eq!(hints.len(), 1);
         assert_eq!(hints[0].addrs, vec![a4, a6]);
+    }
+
+    #[test]
+    fn decodes_bee_2_8_payload_with_new_tags() {
+        // A bee-2.8 hive Peers payload carries Timestamp (tag 5) and
+        // ChequebookAddress (tag 6) inside each BzzAddress. We don't
+        // act on either yet but the decoder must still produce the
+        // correct hint (dropping the new fields cleanly).
+        let addr: Multiaddr =
+            "/ip4/4.3.2.1/tcp/1634/p2p/QmP9b7MxjyEfrJrch5jUThmuFaGzvUPpWEJewCpx5Ln6i8"
+                .parse()
+                .unwrap();
+        let underlay = serialize_underlays(std::slice::from_ref(&addr));
+        let msg = PeersPb {
+            peers: vec![BzzAddressPb {
+                underlay,
+                signature: vec![0u8; 65],
+                overlay: vec![0xab; 32],
+                nonce: vec![0xcd; 32],
+                timestamp: 1_715_000_000,
+                chequebook_address: vec![0xef; 20],
+            }],
+        };
+        let mut buf = Vec::new();
+        msg.encode(&mut buf).unwrap();
+
+        let hints = decode_hive_peers(&buf);
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].addrs, vec![addr]);
+        assert_eq!(hints[0].overlay, [0xab; 32]);
     }
 
     #[test]
@@ -450,6 +526,7 @@ mod tests {
                 signature: vec![],
                 overlay: vec![0u8; 32],
                 nonce: vec![],
+                ..Default::default()
             }],
         };
         let mut buf = Vec::new();
