@@ -25,8 +25,11 @@ the still-open items.
 ### Mainnet peering & read path (M1, M2)
 
 - **Mainnet peering.** libp2p (TCP, DNS, Noise, Yamux, identify, ping,
-  streams), outbound BZZ Swarm handshake on `/swarm/handshake/14.0.0`, Hive
-  v2 peer exchange, forwarding-Kademlia routing bins. Bootstraps from
+  streams), outbound BZZ Swarm handshake on `/swarm/handshake/15.0.0`
+  with a `14.0.0` fallback for bee 2.7.x peers (see PLAN.md Appendix I
+  for the bee-2.8 cutover work), hive peer exchange on both
+  `/swarm/hive/2.0.0/peers` and `/swarm/hive/1.1.0/peers`,
+  forwarding-Kademlia routing bins. Bootstraps from
   `/dnsaddr/mainnet.ethswarm.org` by default; warm-restart peer snapshot
   lands you back at the previous set in seconds. Handshake now also
   recovers each peer's Ethereum EOA from the BZZ address signature so
@@ -144,6 +147,36 @@ the still-open items.
   [`PLAN.md` §9.0 "Drop-in light-node gap"](PLAN.md), and the
   per-endpoint matrix is in
   [`crates/ant-gateway/README.md`](crates/ant-gateway/README.md).
+
+## Known issues
+
+- **Large-file uploads stall at ~250 MiB+ on bee 2.8 mainnet.** The
+  pushsync layer caps each chunk at 5 retries / 60 s wall. On the
+  current bee 2.8 storer fleet at least one storer is slow enough
+  per ~25 K chunks to exhaust that cap, so a 500 MiB
+  `antctl upload start` reliably ends with
+  `push chunk failed: exhausted 5 retries: push timed out after 60s`.
+  We've reproduced the same failure mode on a stock bee 2.8.0
+  client, so this is not an ant regression — it's the network
+  catching up after the 2.7 → 2.8 cutover. Workarounds: chunk uploads
+  client-side into ≤200 MiB ranges and stitch them with mantaray
+  manifests, or wait for the storer fleet to age out. Tracking in
+  [`PLAN.md` Appendix I.6](PLAN.md).
+- **Push-vs-pull race on freshly-uploaded refs.** `antctl upload`
+  returns `completed` once the local push pipeline drains, but the
+  last 1-2 chunks per MiB often only land in their kademlia-closest
+  storer one replication round later. A cold `antctl get` inside
+  that ~60 s window can return `retrieve chunk: no peer found` /
+  `storage: not found`. Workaround: re-upload the same file (it's
+  content-addressed, so the reference doesn't change) or wait 60 s
+  before publishing the reference. Bee 2.8 upstream, not an ant bug;
+  details in [`PLAN.md` Appendix I.7](PLAN.md).
+- **`ant-gateway` SOC retrieval has two stale test-asserts** for
+  error-message wording (`post_soc_rejects_malformed_signature_hex`,
+  `post_soc_rejects_missing_signature_header`). Pre-existing on
+  `origin/main`, unrelated to the bee-2.8 cutover, surfacing in
+  `cargo test --workspace`. Production HTTP behaviour is correct;
+  only the test strings drifted.
 
 ## Workspace
 
