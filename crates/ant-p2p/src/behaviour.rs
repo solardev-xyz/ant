@@ -1,6 +1,6 @@
 //! Tokio libp2p swarm: dial bootnodes, open `/swarm/handshake/14.0.0/handshake` via `libp2p_stream`, Identify + Ping.
 
-use crate::dial::{bootstrap_dial_opts, endpoint_host, first_multiaddr_per_peer};
+use crate::dial::endpoint_host;
 use crate::dnsaddr;
 use crate::handshake::{
     handshake_outbound, HandshakeError, HandshakeInfo, PROTOCOL_HANDSHAKE_V14,
@@ -1246,6 +1246,13 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
         network_id: cfg.network_id,
     };
     let (result_tx, mut result_rx) = mpsc::channel::<(PeerId, DriveOutcome)>(64);
+    // Channel that resolved bootnode multiaddrs flow through. A spawned
+    // task does the DNS work and sends each leaf as it's resolved; the
+    // main `select!` below dials them from the swarm-event-loop task
+    // (which is where `swarm.dial()` must be called from). Sized to
+    // comfortably fit one full resolution round (8 regions × ~3 leaves
+    // each) without blocking the resolver.
+    let (bootnode_dial_tx, mut bootnode_dial_rx) = mpsc::channel::<Multiaddr>(64);
 
     let mut backoff = MIN_BACKOFF;
     let mut last_bootstrap_at = Instant::now();
@@ -1255,7 +1262,7 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     let mut last_top_up_at = Instant::now()
         .checked_sub(PEER_TOP_UP_INTERVAL)
         .unwrap_or_else(Instant::now);
-    bootstrap_dial(&mut swarm, &cfg.bootnodes, &mut state).await;
+    spawn_bootstrap_dial(&cfg.bootnodes, bootnode_dial_tx.clone());
 
     let mut flush_timer = tokio::time::interval(PEERSTORE_FLUSH_INTERVAL);
     flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1281,22 +1288,20 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     loop {
         fill_pipeline_from_hints(&mut swarm, &mut state);
         maybe_top_up_peers(
-            &mut swarm,
             &cfg.bootnodes,
             &mut state,
             &peerstore,
             &mut last_top_up_at,
             local_peer_id,
-        )
-        .await;
+            &bootnode_dial_tx,
+        );
         maybe_rebootstrap(
-            &mut swarm,
             &cfg.bootnodes,
-            &mut state,
+            &state,
             &mut backoff,
             &mut last_bootstrap_at,
-        )
-        .await;
+            &bootnode_dial_tx,
+        );
         if last_pipeline_sync.elapsed() >= PIPELINE_SYNC_INTERVAL {
             sync_peer_pipeline(cfg.status.as_ref(), &mut state);
             last_pipeline_sync = Instant::now();
@@ -1324,6 +1329,9 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
             }
             Some(hint) = hint_rx.recv() => {
                 state.enqueue_hint(hint, local_peer_id);
+            }
+            Some(addr) = bootnode_dial_rx.recv() => {
+                handle_bootnode_dial(&mut swarm, &mut state, addr);
             }
             Some((peer, outcome)) = result_rx.recv() => {
                 handle_drive_outcome(
@@ -2994,13 +3002,13 @@ fn fill_pipeline_from_hints(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmSt
 /// Observable failure mode before this guard: the peer set slid from 100 →
 /// ~15 mid-upload, never recovered without a daemon restart, and the upload
 /// died with `pushsync: no peers`.
-async fn maybe_top_up_peers(
-    swarm: &mut Swarm<AntBehaviour>,
+fn maybe_top_up_peers(
     bootnodes: &[Multiaddr],
     state: &mut SwarmState,
     peerstore: &PeerStore,
     last_top_up_at: &mut Instant,
     local_peer_id: PeerId,
+    bootnode_dial_tx: &mpsc::Sender<Multiaddr>,
 ) {
     let floor = state.target_peers / 2;
     let before = state.peer_set_size();
@@ -3030,19 +3038,19 @@ async fn maybe_top_up_peers(
         "peer set below floor; re-warming dial queue + re-bootstrapping",
     );
     if !bootnodes.is_empty() {
-        bootstrap_dial(swarm, bootnodes, state).await;
+        spawn_bootstrap_dial(bootnodes, bootnode_dial_tx.clone());
     }
 }
 
 /// Fire a fresh bootstrap dial when we've fully drained: no BZZ-handshaked
 /// peers, nothing mid-pipeline, nothing queued. Uses exponential backoff so a
 /// cold DNS + dead bootnode region doesn't turn into a tight retry loop.
-async fn maybe_rebootstrap(
-    swarm: &mut Swarm<AntBehaviour>,
+fn maybe_rebootstrap(
     bootnodes: &[Multiaddr],
-    state: &mut SwarmState,
+    state: &SwarmState,
     backoff: &mut Duration,
     last_at: &mut Instant,
+    bootnode_dial_tx: &mpsc::Sender<Multiaddr>,
 ) {
     if bootnodes.is_empty()
         || !state.bzz_peers.is_empty()
@@ -3056,7 +3064,7 @@ async fn maybe_rebootstrap(
         return;
     }
     *last_at = Instant::now();
-    bootstrap_dial(swarm, bootnodes, state).await;
+    spawn_bootstrap_dial(bootnodes, bootnode_dial_tx.clone());
     *backoff = bump_backoff(*backoff);
 }
 
@@ -3734,67 +3742,86 @@ fn log_handshake_ok(
 /// Swarm's `mainnet.ethswarm.org` TXT tree fans out into several regional
 /// bootnodes; dialing them concurrently makes bootstrap tolerant of any
 /// single region being unreachable.
-async fn bootstrap_dial(
-    swarm: &mut Swarm<AntBehaviour>,
+///
+/// DNS resolution for `/dnsaddr/` entries can take seconds on slow / partly-
+/// failing system DNS (we've seen the macOS resolver burn ~5 s walking the
+/// regional TXT chain on first run), and awaiting it from the main loop
+/// freezes everything else: the listener `NewListenAddr` events sit
+/// undelivered in the swarm queue, identify can't fire, warm-peerstore
+/// hints don't get dialed. So we resolve in a spawned task and feed each
+/// resolved bootnode multiaddr through `dial_tx`. The main `select!` reads
+/// the receiver and calls `swarm.dial()` from the event-loop task, which
+/// is what `swarm.dial()` requires anyway.
+fn spawn_bootstrap_dial(
     bootnodes: &[Multiaddr],
-    state: &mut SwarmState,
+    dial_tx: mpsc::Sender<Multiaddr>,
 ) {
     if bootnodes.is_empty() {
         return;
     }
-    let resolved = dnsaddr::resolve_all(bootnodes.iter().cloned()).await;
-    let first_for_peer = first_multiaddr_per_peer(&resolved);
-    let opts_list = bootstrap_dial_opts(resolved);
-    if opts_list.is_empty() {
-        warn!(
+    let bootnodes = bootnodes.to_vec();
+    tokio::spawn(async move {
+        let start = Instant::now();
+        let resolved = dnsaddr::resolve_all(bootnodes.iter().cloned()).await;
+        let total = resolved.len();
+        if total == 0 {
+            warn!(
+                target: "ant_p2p",
+                "no dialable bootnode addresses after /dnsaddr/ resolution"
+            );
+            return;
+        }
+        info!(
             target: "ant_p2p",
-            "no dialable bootnode addresses after /dnsaddr/ resolution"
+            count = total,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "bootnode /dnsaddr/ resolution complete",
         );
+        for addr in resolved {
+            if dial_tx.send(addr).await.is_err() {
+                // Receiver closed — daemon is shutting down.
+                return;
+            }
+        }
+    });
+}
+
+/// Drain one bootnode multiaddr from the channel and dial it from the
+/// swarm-event-loop task. Mirrors the bookkeeping `bootstrap_dial` used
+/// to do inline: skips peers we're already connected to (or already
+/// dialing), records `dial_started` for the cold-start metric, and
+/// pins a `dial_hint_addr` so the handshake driver knows which underlay
+/// to advertise in `BzzAddress.underlays`.
+fn handle_bootnode_dial(
+    swarm: &mut Swarm<AntBehaviour>,
+    state: &mut SwarmState,
+    addr: Multiaddr,
+) {
+    let Some(peer) = crate::dial::extract_peer_id(&addr) else {
+        return;
+    };
+    if swarm.is_connected(&peer) || state.dialing.contains(&peer) {
         return;
     }
-    // Skip peers we're already connected to (common on retry: bee ejects our
-    // BZZ peer but keeps the other regional connections open, which would
-    // otherwise produce noisy `PeerCondition::Disconnected` dial-cancelled
-    // warnings).
-    let filtered: Vec<_> = opts_list
-        .into_iter()
-        .filter(|opts| match opts.get_peer_id() {
-            Some(p) => !swarm.is_connected(&p) && !state.dialing.contains(&p),
-            None => true,
-        })
-        .collect();
-    let total = filtered.len();
-    let mut actually_dialed = 0usize;
-    for opts in filtered {
-        let peer = opts.get_peer_id();
-        match swarm.dial(opts) {
-            Ok(()) => {
-                actually_dialed += 1;
-                if let Some(p) = peer {
-                    state.dialing.insert(p);
-                    state.dial_started.insert(p, Instant::now());
-                    state.failed.retain(|f| f.peer != p);
-                    if let Some(a) = first_for_peer.get(&p) {
-                        state.dial_hint_addr.insert(p, a.clone());
-                    }
-                    info!(target: "ant_p2p", peer=%p, "dialing bootnode");
-                }
-            }
-            // Benign: the peer reconnected (or its dial is still pending)
-            // between our `is_connected` check and libp2p's own bookkeeping.
-            // Happens on hot retry loops when bee drops-then-reaccepts us.
-            Err(DialError::DialPeerConditionFalse(_)) => {
-                tracing::debug!(
-                    target: "ant_p2p",
-                    peer = ?peer,
-                    "dial skipped: already connected or dial in progress",
-                );
-            }
-            Err(e) => warn!(target: "ant_p2p", "dial error: {e}"),
+    let opts = DialOpts::peer_id(peer)
+        .addresses(vec![addr.clone()])
+        .build();
+    match swarm.dial(opts) {
+        Ok(()) => {
+            state.dialing.insert(peer);
+            state.dial_started.insert(peer, Instant::now());
+            state.failed.retain(|f| f.peer != peer);
+            state.dial_hint_addr.insert(peer, addr);
+            info!(target: "ant_p2p", peer=%peer, "dialing bootnode");
         }
-    }
-    if actually_dialed > 0 {
-        info!(target: "ant_p2p", "bootstrap dial fanout={actually_dialed}/{total}");
+        Err(DialError::DialPeerConditionFalse(_)) => {
+            tracing::debug!(
+                target: "ant_p2p",
+                %peer,
+                "dial skipped: already connected or dial in progress",
+            );
+        }
+        Err(e) => warn!(target: "ant_p2p", "dial error: {e}"),
     }
 }
 
