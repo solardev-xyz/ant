@@ -1,6 +1,6 @@
 [package]
 name = "antctl"
-version = "0.5.5"
+version = "0.5.6"
 edition.workspace = true
 
 [[bin]]

@@ -34,6 +34,7 @@ use ant_crypto::{
     random_secp256k1_secret, OVERLAY_NONCE_LEN, SECP256K1_SECRET_LEN,
 };
 use ant_node::{run_node, NodeConfig};
+use ant_retrieval::DiskChunkCache;
 use k256::ecdsa::SigningKey;
 use libp2p::identity::{self, Keypair};
 use serde::{Deserialize, Serialize};
@@ -41,7 +42,7 @@ use std::ffi::{c_char, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use stream::AntStream;
 use tokio::runtime::Runtime;
@@ -63,6 +64,19 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(10);
 /// the whole warmup window is friendlier than forcing the Swift
 /// side to poll.
 const NO_PEERS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+/// On-disk `SQLite` chunk cache cap for the embedded node. The whole
+/// point of running a Swarm node on-device is to amortise fetches
+/// across app launches; without a persistent cache every cold start
+/// re-walks the manifest tree from the network and re-pays the
+/// per-chunk latency, which is what makes iOS feel "always slow" to
+/// users who actually re-open the same content. 512 MiB is the size we
+/// can comfortably commit to on a phone (sandboxed app caches survive
+/// app restarts but get reaped by the OS under memory pressure;
+/// half a gigabyte is well under that threshold on every device
+/// shipped in the last five years), and covers thousands of small
+/// media files or a couple of long-form videos.
+const DISK_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Per-request joiner size ceiling. `ant_retrieval::DEFAULT_MAX_FILE_BYTES`
 /// is 32 MiB, which is the right cap for interactive `antctl get` but
@@ -275,11 +289,42 @@ fn init_inner(data_dir: &Path) -> Result<AntHandle, FfiError> {
     let peerstore_path = Some(data_dir.join("peers.json"));
     let process_start = Instant::now();
 
+    // Persistent chunk cache. On-device retrieval is dominated by
+    // per-chunk close-peer latency, so amortising fetches across app
+    // launches is the single biggest win we can hand the host: a
+    // re-opened photo album / video is served from local SQLite
+    // instead of re-walking the manifest tree against a small (NAT'd,
+    // ~100 peer) BZZ peer set. A failed open is non-fatal — the node
+    // still serves uploads and live retrievals, it just doesn't
+    // amortise them.
+    let disk_cache_path = data_dir.join("chunks.sqlite");
+    let disk_cache = match DiskChunkCache::open(&disk_cache_path, DISK_CACHE_MAX_BYTES) {
+        Ok(c) => {
+            tracing::info!(
+                target: "ant-ffi",
+                path = %disk_cache_path.display(),
+                max_bytes = DISK_CACHE_MAX_BYTES,
+                used_bytes = c.used_bytes(),
+                "opened persistent chunk cache",
+            );
+            Some(Arc::new(c))
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "ant-ffi",
+                path = %disk_cache_path.display(),
+                "failed to open persistent chunk cache: {e}; falling back to in-memory only",
+            );
+            None
+        }
+    };
+
     let cfg = NodeConfig::mainnet_default(signing_secret, overlay_nonce, bootnodes, libp2p_keypair)
         .with_status(status_tx)
         .with_process_start(process_start)
         .with_peerstore_path(peerstore_path)
-        .with_commands(cmd_rx);
+        .with_commands(cmd_rx)
+        .with_disk_cache(disk_cache);
 
     runtime.spawn(async move {
         if let Err(e) = run_node(cfg).await {
