@@ -323,12 +323,34 @@ pub async fn resolve_sequence_feed_full(
     }
 }
 
+/// True for fetch failures we should treat as "this update index isn't
+/// present" rather than as a hard error worth bubbling up.
+///
+/// Bee surfaces two distinct messages that both mean "this chunk isn't
+/// reachable", and both are the natural termination of a feed walk:
+///
+/// - `storage: not found` — bee was asked and answered with the
+///   explicit `storage.ErrNotFound` (`bee/pkg/storage/storage.go`).
+/// - `no peer found` — bee's topology layer couldn't find any peer
+///   in the neighbourhood responsible for the address
+///   (`bee/pkg/topology/lightnode/container.go`).
+///
+/// `RoutingFetcher` surfaces both verbatim through `RetrievalError::Remote`,
+/// and aggregates them in its multi-peer fallback message as
+/// `all peers failed for chunk … (last: remote: retrieve chunk: <tail>)`.
+/// Either tail must classify as a miss; otherwise every feed walk runs
+/// to retry-exhaustion at its natural end-gap.
+///
+/// Peer-availability shortages ("no BZZ peers available", `all peers
+/// failed` with a non-miss tail like a timeout) are *not* misses:
+/// pretending they were would silently truncate the feed walk and let
+/// us declare a healthy feed empty on a flaky peer set. Let those
+/// propagate as [`FeedError::Fetch`] so the outer manifest-walk retry
+/// loop can refresh the peer snapshot and try again — see
+/// `ant-p2p::is_manifest_transient`.
 fn is_chunk_not_found(e: &(dyn StdError + 'static)) -> bool {
     let msg = e.to_string().to_ascii_lowercase();
-    msg.contains("not found")
-        || msg.contains("no peers")
-        || msg.contains("all peers failed")
-        || msg.contains("forbidden")
+    msg.contains("not found") || msg.contains("no peer found")
 }
 
 /// Parse + verify a SOC chunk delivered for a sequence feed update,
@@ -777,26 +799,54 @@ mod tests {
 
     /// `is_chunk_not_found` must classify the messages that
     /// `RoutingFetcher` and `RetrievalError::Remote` actually emit.
+    ///
+    /// The strings pinned here are the *literal* shapes
+    /// `crates/ant-retrieval/src/fetcher.rs` produces. An earlier
+    /// version of this test invented synthetic strings ("no peers
+    /// available") that didn't appear anywhere in production and hid
+    /// the fact that the matcher silently failed to recognise
+    /// "no BZZ peers available" — the actual fetcher message. Tests
+    /// here now use exactly what the live code emits so a future
+    /// rename to that message is caught immediately.
     #[test]
     fn classify_chunk_not_found_messages() {
-        // Anything that goes through `RoutingFetcher::fetch` ends with
-        // either "all peers failed for chunk <hex>" or "chunk not
-        // found"; Bee's retrieval handler answers explicit misses with
-        // the literal string "not found".
-        let cases = [
+        // Bee's two distinct "this chunk isn't reachable" signals —
+        // bare and as the tail of `RoutingFetcher`'s "all peers failed"
+        // aggregation. Both must read as misses so the feed walk
+        // terminates at the first gap past the last real update.
+        // Live freemap.eth tile retrievals showed both shapes coming
+        // back from bee/2.7 + bee/2.8 peers depending on whether the
+        // neighbourhood was empty (`no peer found`) or merely missing
+        // the chunk (`storage: not found`).
+        let miss_cases = [
             "remote: not found",
-            "fetch chunk abcd: all peers failed for chunk abcd",
-            "no peers available",
-            "Forbidden",
+            "remote: retrieve chunk: storage: not found",
+            "remote: retrieve chunk: no peer found",
+            "all peers failed for chunk abcd after 3 attempts \
+                 (last: remote: retrieve chunk: storage: not found)",
+            "all peers failed for chunk abcd after 34 attempts \
+                 (last: remote: retrieve chunk: no peer found)",
         ];
-        for msg in cases {
+        for msg in miss_cases {
             let e = std::io::Error::other(msg);
             let dyn_e: &(dyn StdError + 'static) = &e;
             assert!(is_chunk_not_found(dyn_e), "should be miss: {msg}");
         }
-        // Real I/O errors should not be silenced.
-        let real = std::io::Error::other("connection reset by peer");
-        let dyn_real: &(dyn StdError + 'static) = &real;
-        assert!(!is_chunk_not_found(dyn_real));
+
+        // Peer-availability failures and other transient peer errors
+        // must NOT be silenced — they propagate as `FeedError::Fetch`
+        // and the manifest layer treats them as transient so the outer
+        // retry loop refreshes the peer set and tries again.
+        let propagate_cases = [
+            "no BZZ peers available",
+            "all peers failed for chunk abcd after 5 attempts (last: timeout)",
+            "Forbidden",
+            "connection reset by peer",
+        ];
+        for msg in propagate_cases {
+            let e = std::io::Error::other(msg);
+            let dyn_e: &(dyn StdError + 'static) = &e;
+            assert!(!is_chunk_not_found(dyn_e), "should propagate: {msg}");
+        }
     }
 }

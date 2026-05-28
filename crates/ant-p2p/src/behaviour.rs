@@ -2553,11 +2553,21 @@ const fn is_join_transient(e: &ant_retrieval::JoinError) -> bool {
 /// during the trie walk? The wire/encoding variants (bad version hash,
 /// invalid metadata, descend-past-leaf, …) and the lookup-miss are all
 /// terminal.
+///
+/// `Feed(FeedError::Fetch(_))` is treated as transient for the same
+/// reason `Fetch(JoinError::FetchChunk { .. })` is: the underlying
+/// failure is a chunk lookup that the [`run_get_bytes`] / [`run_get_bzz`]
+/// retry loop can re-drive against a fresh peer snapshot. Without this,
+/// a momentary empty peer pool during the feed walk (e.g. `RoutingFetcher`
+/// returning "no BZZ peers available") would escape the loop and surface
+/// as a hard 404 to the user — even though the same shortage on a
+/// non-feed manifest node retries cleanly.
 const fn is_manifest_transient(e: &ant_retrieval::ManifestError) -> bool {
-    matches!(
-        e,
-        ant_retrieval::ManifestError::Fetch(inner) if is_join_transient(inner)
-    )
+    match e {
+        ant_retrieval::ManifestError::Fetch(inner) => is_join_transient(inner),
+        ant_retrieval::ManifestError::Feed(ant_retrieval::FeedError::Fetch(_)) => true,
+        _ => false,
+    }
 }
 
 /// Spawned task body for `Request::GetBytes`. Fetches the root chunk via
@@ -3993,6 +4003,45 @@ mod tests {
             !state.bee_peerstore_stall_warning_emitted,
             "fast handshake must not arm the flag",
         );
+    }
+
+    /// Pin the contract that `is_manifest_transient` treats a feed
+    /// dereference whose underlying chunk fetch failed as transient.
+    /// This is the read-path equivalent of marking a normal manifest
+    /// node fetch failure transient: without it, "no BZZ peers
+    /// available" raised inside `resolve_sequence_feed` escapes the
+    /// `run_get_bzz` retry loop and surfaces to the gateway as a 404
+    /// — even though the very next attempt could have a fresh peer
+    /// snapshot that resolves the feed cleanly.
+    #[test]
+    fn is_manifest_transient_classifies_feed_fetch_as_transient() {
+        let inner: Box<dyn std::error::Error + Send + Sync> =
+            "no BZZ peers available".into();
+        let e = ant_retrieval::ManifestError::Feed(ant_retrieval::FeedError::Fetch(inner));
+        assert!(
+            is_manifest_transient(&e),
+            "feed dereference chunk-fetch failures must retry",
+        );
+
+        // Terminal feed errors (no updates published, owner mismatch,
+        // malformed metadata, …) must NOT retry — they would re-fail
+        // the same way every time and just stretch out the user's
+        // wait before the inevitable error.
+        let terminal = [
+            ant_retrieval::ManifestError::Feed(ant_retrieval::FeedError::NoUpdates {
+                probed: 4096,
+            }),
+            ant_retrieval::ManifestError::Feed(ant_retrieval::FeedError::OwnerMismatch),
+            ant_retrieval::ManifestError::Feed(ant_retrieval::FeedError::InvalidMetadata(
+                "bad hex".into(),
+            )),
+        ];
+        for e in &terminal {
+            assert!(
+                !is_manifest_transient(e),
+                "terminal feed error must not retry: {e}",
+            );
+        }
     }
 
     /// Pin the contract that `sync_external_addresses_status` projects
