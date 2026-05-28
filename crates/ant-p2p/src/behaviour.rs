@@ -711,6 +711,17 @@ struct SwarmState {
     /// legacy "push without settlement" behaviour for ultra-light
     /// reads + tests.
     pushsync_swap: Option<Arc<crate::PushsyncSwap>>,
+    /// Process-wide push-side peer skip cache. Cloned into every
+    /// `RoutingFetcher` built for `PushChunk` / `PushSoc` so a peer
+    /// that just bounced a pushsync on chunk N is excluded from
+    /// chunk N+1's candidate list for the cache's TTL (5 s). The
+    /// per-chunk skip list inside `push_stamped_chunk` is still in
+    /// effect and gives same-chunk retries their own scope; the
+    /// cache adds the missing cross-chunk dimension so a single
+    /// flapping bee 2.7.1 storer can't get re-picked dozens of
+    /// times across a multi-chunk upload. See
+    /// [`ant_retrieval::PushSkipCache`] for the design rationale.
+    push_skip: ant_retrieval::PushSkipCache,
 }
 
 impl SwarmState {
@@ -760,6 +771,7 @@ impl SwarmState {
             external_addresses_order: Vec::new(),
             peer_eth,
             pushsync_swap: None,
+            push_skip: ant_retrieval::PushSkipCache::new(),
         }
     }
 
@@ -1497,8 +1509,10 @@ fn handle_control_command(
             }
             let control = control.clone();
             let pushsync_swap = state.pushsync_swap.clone();
+            let push_skip = state.push_skip.clone();
             tokio::spawn(async move {
-                let mut fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx);
+                let mut fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx)
+                    .with_push_skip(push_skip);
                 if let Some(svc) = pushsync_swap {
                     let s: Arc<dyn ant_retrieval::PushsyncSettlement> = svc;
                     fetcher = fetcher.with_pushsync_settlement(s);
@@ -1569,8 +1583,10 @@ fn handle_control_command(
             }
             let control = control.clone();
             let pushsync_swap = state.pushsync_swap.clone();
+            let push_skip = state.push_skip.clone();
             tokio::spawn(async move {
-                let mut fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx);
+                let mut fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx)
+                    .with_push_skip(push_skip);
                 if let Some(svc) = pushsync_swap {
                     let s: Arc<dyn ant_retrieval::PushsyncSettlement> = svc;
                     fetcher = fetcher.with_pushsync_settlement(s);

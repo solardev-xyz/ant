@@ -42,6 +42,7 @@
 //! sustained reader would need to honor SWAP debits (M3 territory); we
 //! deliberately don't here.
 
+pub mod push_skip_cache;
 pub mod pushsync;
 pub mod pushsync_settlement;
 
@@ -80,6 +81,7 @@ pub use mantaray::{
     MANTARAY_CONTENT_TYPE_KEY, MANTARAY_ERROR_DOC_KEY, MANTARAY_INDEX_DOC_KEY,
 };
 pub use progress::{estimate_total_chunks, ProgressSample, ProgressTracker};
+pub use push_skip_cache::{PushSkipCache, DEFAULT_SKIP_TTL};
 pub use pushsync_settlement::{peer_chunk_price, PushsyncSettlement};
 pub use splitter::{split_bytes, SplitChunk, SplitResult, StreamingSplitter, BRANCHES};
 

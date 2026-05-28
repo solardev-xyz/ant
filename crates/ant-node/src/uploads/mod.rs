@@ -98,16 +98,60 @@ const MAX_PUSH_CONCURRENCY: usize = 32;
 /// chunks/s on a fast LAN) this is one fsync per 50 ms.
 const CHECKPOINT_INTERVAL_CHUNKS: u64 = 256;
 
-/// Cap on outstanding `PushChunk` ack timeout. Mirrors what the
-/// gateway uses for `upload_bzz`.
-const PUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
+/// Cap on outstanding `PushChunk` ack timeout. Raised from 60 s to
+/// 120 s once the bee 2.7→2.8 cutover surfaced reproducible
+/// receipt-batching tails of ~25-35 s per chunk on slow storers:
+/// the inner `push_stamped_chunk` runs one 45 s pushsync envelope
+/// per candidate peer (see `ant_retrieval::pushsync::PUSHSYNC_TIMEOUT`)
+/// and on the cutover network it routinely needs two consecutive
+/// candidates before a storer issues the final receipt. 60 s here
+/// cut the first attempt short on the slow path; 120 s gives the
+/// inner peer-walk room to settle one re-route inside the outer
+/// retry budget, instead of bouncing into `PER_CHUNK_RETRY_BUDGET`
+/// re-dispatches that all queue against the same hot storer set.
+const PUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(2);
 
 /// Per-chunk retry budget before the job moves to `Failed`. Pushsync
 /// against a freshly-handshaked peer set occasionally fires a
 /// transient "no peers available" or "stamp signature rejected"
 /// error; a small fixed retry hides those from the operator without
 /// wallpapering over a real protocol failure.
-const PER_CHUNK_RETRY_BUDGET: u32 = 5;
+///
+/// Bumped from 5 to 8 in lockstep with the inter-attempt back-off
+/// extension below: under the bee 2.7→2.8 cutover load the slow-
+/// storer tail is bursty (clusters around the chunks that hash into
+/// the same neighbourhood), and a 5-retry budget with the previous
+/// 100 ms × 2^n back-off saturated in about 3.1 s — short enough
+/// that all 5 retries hit the same momentarily-overloaded storer
+/// set. 8 retries with the new back-off (see [`backoff_for_retry`])
+/// stretches that to ~38 s, which is the empirical settle-time of
+/// the cutover receipt-batching tail in our B5 traces.
+const PER_CHUNK_RETRY_BUDGET: u32 = 8;
+
+/// Back-off between consecutive same-chunk retries.
+///
+/// Old curve was `100 ms × 2^attempt` capped at 4 s. Combined with
+/// the old 5-retry budget that gave ~3.1 s total back-off — short
+/// enough that retries 2-5 routinely landed inside the bee 2.8.0
+/// receipt-batching window for a slow storer, so they all queued
+/// against the same wedged path.
+///
+/// The new curve is `250 ms × 2^attempt` capped at 4 s, steps as
+/// 0.25 / 0.5 / 1 / 2 / 4 / 4 / 4 / 4 s for the 8-attempt budget
+/// (≈ 19.75 s total back-off). The bulk of the extension comes
+/// from the larger budget (8 retries instead of 5) combined with
+/// the cross-chunk [`ant_retrieval::PushSkipCache`] — the cache
+/// rotates the inner peer pick to a different storer between
+/// retries, so we don't burn additional back-off just because the
+/// network has one slow storer; we surf past it on the next
+/// attempt's pick. Keeping the per-attempt back-off cap at 4 s
+/// (rather than the multi-second values an earlier iteration of
+/// this fix tried) avoids stretching the happy-path P95 by tens
+/// of seconds on busy uploads.
+fn backoff_for_retry(attempt: u32) -> std::time::Duration {
+    let ms = 250u64.saturating_mul(1u64 << attempt).min(4_000);
+    std::time::Duration::from_millis(ms)
+}
 
 /// Future returned by [`UploadManager::dispatch_push`]: a chunk-emit
 /// index (so the ack log can advance the in-order cursor) plus the
@@ -877,12 +921,7 @@ impl UploadManager {
                             Some(format!("push timed out after {}s", PUSH_TIMEOUT.as_secs()));
                     }
                 }
-                // Bounded back-off between retries: 100 ms × 2^n,
-                // capped at 4 s. Most transient pushsync failures
-                // (no peers ready, stamp signature collision)
-                // recover within the first second.
-                let backoff_ms = (100u64 << attempt).min(4000);
-                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                tokio::time::sleep(backoff_for_retry(attempt)).await;
             }
             (
                 index,
@@ -1397,6 +1436,24 @@ mod tests {
             total_chunks - (total_chunks / 2),
             "resume should push exactly the chunks past the cursor",
         );
+    }
+
+    /// Back-off curve sanity. Locks in the documented step
+    /// sequence so future tuning can't silently regress to the
+    /// pre-cutover 100 ms × 2^n curve that was retrying inside the
+    /// receipt-batching window. See `backoff_for_retry` for the
+    /// rationale.
+    #[test]
+    fn backoff_curve_matches_documented_steps() {
+        let steps: Vec<u64> = (0..PER_CHUNK_RETRY_BUDGET)
+            .map(|a| backoff_for_retry(a).as_millis() as u64)
+            .collect();
+        assert_eq!(steps, vec![250, 500, 1000, 2000, 4000, 4000, 4000, 4000]);
+        let total: u64 = steps.iter().sum();
+        // Total budget across all retries: ~20 s. Comfortably
+        // inside the 120 s outer PUSH_TIMEOUT wall, leaves room
+        // for the 45 s single-attempt pushsync envelope.
+        assert!((15_000..=25_000).contains(&total), "total={total}");
     }
 
     /// `cancel` flips status and stops the driver. Already-pushed

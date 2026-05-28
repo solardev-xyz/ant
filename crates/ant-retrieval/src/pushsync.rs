@@ -7,14 +7,33 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, trace};
 
-use crate::{
-    read_delimited, write_delimited, PbHeaders, RetrievalError, HEADERS_MAX, RETRIEVE_TIMEOUT,
-};
+use crate::{read_delimited, write_delimited, PbHeaders, RetrievalError, HEADERS_MAX};
 
 /// Bee `pkg/pushsync/pushsync.go` pinned protocol id.
 pub const PROTOCOL_PUSH: &str = "/swarm/pushsync/1.3.1/pushsync";
 
 const RECEIPT_MAX: usize = 4 * 1024;
+
+/// Single-attempt pushsync envelope. Was 30 s (mirroring our
+/// retrieval timeout); raised to 45 s when the bee 2.7→2.8 cutover
+/// surfaced a reproducible class of receipt-batching tail-stalls
+/// where a Bee 2.8.0 storer acknowledges the chunk but holds the
+/// final receipt for ~25-35 s before issuing it. The 30 s wall was
+/// firing on those before the receipt landed, marking the peer as
+/// failed and re-routing — only for the *same* slow path to repeat
+/// on the next-closest storer.
+///
+/// The outer upload-driver wall in `ant_node::uploads` is 60 s per
+/// chunk-emit; 45 s here leaves the outer 15 s to either accept a
+/// late receipt mid-retry or move on cleanly. We never want this to
+/// exceed the outer wall — if it did, the outer retry would never
+/// fire because the inner would still be parked on a single peer's
+/// timer.
+///
+/// Reverting to 30 s is safe (just slower under cutover load); raising
+/// further than ~50 s causes the outer 60 s wall to fire mid-receipt
+/// and we never see the late ack.
+const PUSHSYNC_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[derive(Debug, Error)]
 pub enum PushSyncError {
@@ -71,11 +90,11 @@ pub async fn push_chunk_to_peer(
     stamp_binary: &[u8; ant_postage::STAMP_SIZE],
 ) -> Result<(), PushSyncError> {
     tokio::time::timeout(
-        RETRIEVE_TIMEOUT,
+        PUSHSYNC_TIMEOUT,
         push_chunk_inner(control, peer, chunk_addr, wire_span_payload, stamp_binary),
     )
     .await
-    .map_err(|_| PushSyncError::Timeout(RETRIEVE_TIMEOUT))?
+    .map_err(|_| PushSyncError::Timeout(PUSHSYNC_TIMEOUT))?
 }
 
 async fn push_chunk_inner(

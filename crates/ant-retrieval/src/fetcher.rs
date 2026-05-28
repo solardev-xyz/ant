@@ -22,6 +22,7 @@ use crate::accounting::{Accounting, DebitGuard};
 use crate::counters::RetrievalCounters;
 use crate::disk_cache::DiskChunkCache;
 use crate::progress::ProgressTracker;
+use crate::push_skip_cache::{PushSkipCache, DEFAULT_SKIP_TTL};
 use crate::pushsync_settlement::{peer_chunk_price, PushsyncSettlement};
 use crate::{retrieve_chunk, ChunkFetcher, InMemoryChunkCache, RetrievalError, RetrievedChunk};
 use async_trait::async_trait;
@@ -182,6 +183,17 @@ pub struct RoutingFetcher {
     /// ultra-light read-only build (where the daemon never opens a
     /// pushsync stream anyway).
     pushsync_settlement: Option<Arc<dyn PushsyncSettlement>>,
+    /// Optional shared push-side peer skip cache. When set,
+    /// `push_stamped_chunk` filters its ranked candidate list
+    /// against this cache before picking the closest peer for the
+    /// chunk. The cache is process-wide, so a peer that just
+    /// bounced a pushsync on chunk N is automatically excluded from
+    /// chunk N+1's candidate list for the duration of the TTL
+    /// (default 5 s). Same `Arc` is cloned into every fetcher
+    /// built for `PushChunk` / `PushSoc` so the cool-down survives
+    /// across the per-chunk fetcher lifetime. `None` keeps the
+    /// legacy per-chunk-only skip behaviour for unit tests.
+    push_skip: Option<PushSkipCache>,
 }
 
 impl RoutingFetcher {
@@ -216,7 +228,19 @@ impl RoutingFetcher {
             accounting: None,
             counters: None,
             pushsync_settlement: None,
+            push_skip: None,
         }
+    }
+
+    /// Attach the daemon-wide push-side peer skip cache. Same
+    /// `PushSkipCache` should be cloned into every fetcher built for
+    /// `PushChunk` / `PushSoc` so a peer that just bounced a
+    /// pushsync on chunk N is excluded from chunk N+1's candidate
+    /// list. See [`PushSkipCache`] for the rationale.
+    #[must_use]
+    pub fn with_push_skip(mut self, cache: PushSkipCache) -> Self {
+        self.push_skip = Some(cache);
+        self
     }
 
     /// Attach a pushsync-side settlement hook. After every accepted
@@ -424,6 +448,14 @@ impl RoutingFetcher {
         let mut last_err: Option<crate::pushsync::PushSyncError> = None;
         for _ in 0..Self::MAX_PUSH_ERRORS {
             let live = self.peers_rx.borrow().clone();
+            // Rank closest-first, then apply the shared per-process
+            // push skip cache as a *soft* filter: if it would leave
+            // the candidate list empty (every closest peer is
+            // currently cooling down), fall through to the
+            // unfiltered list so we still attempt the push. Without
+            // this fall-through the cache could indefinitely block
+            // small networks where every BZZ peer flapped at least
+            // once during the upload.
             let mut ranked: Vec<(PeerId, Overlay)> = live
                 .into_iter()
                 .filter(|(p, _)| !skipped.contains(p))
@@ -438,6 +470,16 @@ impl RoutingFetcher {
                 }
                 Ordering::Equal
             });
+            if let Some(skip) = self.push_skip.as_ref() {
+                let filtered: Vec<(PeerId, Overlay)> = ranked
+                    .iter()
+                    .copied()
+                    .filter(|(p, _)| !skip.is_skipped(*p))
+                    .collect();
+                if !filtered.is_empty() {
+                    ranked = filtered;
+                }
+            }
             let Some((peer, peer_overlay)) = ranked.first().copied() else {
                 return Err(crate::pushsync::PushSyncError::Remote("no peers".into()));
             };
@@ -465,6 +507,14 @@ impl RoutingFetcher {
                         if let Some(s) = self.pushsync_settlement.as_ref() {
                             s.note_pushsync(peer, chunk_price).await;
                         }
+                        // Clear any pre-existing cool-down: a
+                        // peer that successfully accepts a chunk is
+                        // healthy *right now*, so the next chunk's
+                        // ranking should put it back at the top
+                        // instead of waiting out the TTL.
+                        if let Some(s) = self.push_skip.as_ref() {
+                            s.clear(peer);
+                        }
                         return Ok(());
                     }
                     Err(e) => e,
@@ -488,6 +538,9 @@ impl RoutingFetcher {
                         if let Some(s) = self.pushsync_settlement.as_ref() {
                             s.note_pushsync(peer, chunk_price).await;
                         }
+                        if let Some(s) = self.push_skip.as_ref() {
+                            s.clear(peer);
+                        }
                         return Ok(());
                     }
                     Err(e) => err = e,
@@ -500,6 +553,15 @@ impl RoutingFetcher {
                 err=%err,
                 "pushsync attempt failed; skipping peer for this chunk",
             );
+            // Cross-chunk cool-down: keep this peer out of the
+            // candidate set for the next few seconds so the
+            // *next* chunk doesn't immediately re-pick the same
+            // broken peer. Soft (the filter falls through when
+            // every candidate is skipped) so a small network
+            // can't starve itself out.
+            if let Some(s) = self.push_skip.as_ref() {
+                s.note_failure(peer, DEFAULT_SKIP_TTL);
+            }
             skipped.push(peer);
             last_err = Some(err);
         }

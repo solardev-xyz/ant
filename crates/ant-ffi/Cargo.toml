@@ -1,6 +1,6 @@
 [package]
 name = "ant-ffi"
-version = "0.5.3"
+version = "0.5.4"
 edition.workspace = true
 
 # staticlib for the iOS simulator + device slices (linked into the Xcode
