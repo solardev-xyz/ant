@@ -3,13 +3,18 @@ import SwiftUI
 struct PlayerView: View {
     @EnvironmentObject var node: AntNode
     @EnvironmentObject var engine: PlayerEngine
-    /// Local scrubbing intent. While the user has the thumb down,
-    /// `engine.currentTime` keeps ticking in the background but the
-    /// slider must show *their* finger position — otherwise the
-    /// periodic time observer's writes on the main actor would yank
-    /// the thumb back. Mirrors UIKit's "tracking" state. `nil` means
-    /// "not scrubbing — show the live time".
-    @State private var scrubValue: Double? = nil
+    /// True only while the user physically has the thumb down. This is the
+    /// single source of truth for "show the finger position instead of the
+    /// engine playhead". It must NOT be inferred from `scrubValue` being
+    /// non-nil: the Slider's setter can fire during a track-change range
+    /// reconciliation and leave a stale value behind, which previously
+    /// shadowed the new track's 0 (scrub to 30s → skip → thumb stuck mid
+    /// song). Gating on an explicit drag flag keeps `scrubValue` inert
+    /// unless a drag is actually in progress.
+    @State private var isScrubbing = false
+    /// The finger position during a drag. Only consulted while
+    /// `isScrubbing`; otherwise the scrubber follows `engine.displayTime`.
+    @State private var scrubValue: Double = 0
 
     var body: some View {
         ZStack {
@@ -27,6 +32,7 @@ struct PlayerView: View {
                 .padding(.horizontal, 16)
                 .padding(.top, 12)
                 .padding(.bottom, 120)
+                .animation(.easeInOut(duration: 0.25), value: engine.isBuffering)
             }
             .scrollIndicators(.hidden)
         }
@@ -136,7 +142,8 @@ struct PlayerView: View {
         // 0.25 s time-observer ticks from yanking the thumb back
         // while the user is dragging.
         let hasDuration = engine.duration > 0
-        let displayedTime = scrubValue ?? engine.displayTime
+        let displayedTime = scrubberTime(
+            isScrubbing: isScrubbing, scrubValue: scrubValue, enginePlayhead: engine.displayTime)
         let upper = hasDuration ? engine.duration : 1
         return VStack(spacing: 6) {
             Slider(
@@ -146,14 +153,21 @@ struct PlayerView: View {
                 ),
                 in: 0...upper,
                 onEditingChanged: { editing in
-                    if !editing {
-                        if let target = scrubValue {
-                            engine.seek(to: target)
-                        }
-                        // `PlayerEngine.pendingSeekTime` holds the thumb
-                        // at the release position until the stream has
-                        // buffered at the new offset.
-                        scrubValue = nil
+                    if editing {
+                        // Seed the finger position from the live playhead
+                        // so the thumb doesn't jump on grab.
+                        scrubValue = engine.displayTime
+                        isScrubbing = true
+                        engine.viewDebugLog(
+                            "scrub-begin", isScrubbing: true, scrubValue: scrubValue, shown: scrubValue)
+                    } else {
+                        isScrubbing = false
+                        engine.viewDebugLog(
+                            "scrub-end", isScrubbing: false, scrubValue: scrubValue, shown: scrubValue)
+                        engine.seek(to: scrubValue)
+                        // `PlayerEngine.position.pendingSeekTime` holds the
+                        // thumb at the release position until the stream
+                        // has buffered at the new offset.
                     }
                 }
             )
@@ -162,7 +176,23 @@ struct PlayerView: View {
 
             HStack {
                 Text(formatDuration(displayedTime))
-                Spacer()
+                Spacer(minLength: 8)
+                if engine.isBuffering {
+                    HStack(spacing: 6) {
+                        ProgressView()
+                            .tint(.white)
+                            .controlSize(.mini)
+                        ProgressView(value: bufferFraction)
+                            .progressViewStyle(.linear)
+                            .tint(.white)
+                            .frame(width: 44)
+                            .animation(.easeOut(duration: 0.25), value: bufferFraction)
+                        Text(bufferingDetail)
+                            .foregroundStyle(.white.opacity(0.85))
+                    }
+                    .transition(.opacity)
+                    Spacer(minLength: 8)
+                }
                 Text(formatDuration(engine.duration))
             }
             .font(.system(.caption, design: .rounded))
@@ -170,6 +200,55 @@ struct PlayerView: View {
             .foregroundStyle(.white.opacity(0.7))
         }
         .padding(.horizontal, 8)
+        // A track switch is authoritative: drop any scrub tracking so the
+        // thumb follows the new track's playhead (0) instead of a stale
+        // drag value left in @State by the Slider's reconciliation.
+        .onChange(of: engine.currentIndex) { _, _ in
+            isScrubbing = false
+            scrubValue = 0
+            engine.viewDebugLog(
+                "track-change", isScrubbing: false, scrubValue: 0, shown: engine.displayTime)
+        }
+        // Regression sentinel: while not dragging, the thumb must track the
+        // engine playhead. If `displayedTime` ever drifts from it, log a
+        // MISMATCH line so a reintroduced stale-scrub leak is diagnosable
+        // from the log alone — no screenshot needed.
+        .onChange(of: engine.displayTime) { _, _ in
+            if !isScrubbing && abs(displayedTime - engine.displayTime) > 0.5 {
+                engine.viewDebugLog(
+                    "drift", isScrubbing: isScrubbing, scrubValue: scrubValue, shown: displayedTime)
+            }
+        }
+    }
+
+    /// Fill for the little bar next to the spinner, as a 0…1 fraction.
+    /// Prefers the live stream *download* progress (`streamProgress.fraction`),
+    /// which advances monotonically the instant bytes arrive — including
+    /// during the `openStream` / first-fill gap when AVPlayer's
+    /// `loadedTimeRanges` (and hence `bufferedAhead`) are still empty.
+    /// Falls back to the decoded-runway estimate when no stream stats are
+    /// available yet, so the bar always reflects forward progress rather
+    /// than sitting at zero.
+    private var bufferFraction: Double {
+        if let fraction = engine.streamProgress?.fraction, fraction > 0 {
+            return min(max(fraction, 0), 1)
+        }
+        return min(max(engine.bufferedAhead / Self.bufferTargetSeconds, 0), 1)
+    }
+    private static let bufferTargetSeconds: Double = 10
+
+    /// Compact buffering detail shown between the time labels: how much
+    /// runway is already decoded plus the live fetch rate, so a stall
+    /// reads as "filling up" rather than "frozen".
+    private var bufferingDetail: String {
+        var parts: [String] = []
+        if engine.bufferedAhead >= 0.5 {
+            parts.append(String(format: "%.0fs ready", engine.bufferedAhead))
+        }
+        if engine.throughputBytesPerSec >= 1 {
+            parts.append(formatBytesPerSec(engine.throughputBytesPerSec))
+        }
+        return parts.isEmpty ? "fetching…" : parts.joined(separator: " · ")
     }
 
     private var transport: some View {
