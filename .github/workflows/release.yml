@@ -45,7 +45,11 @@ jobs:
             linker: aarch64-linux-gnu-gcc
             apt: gcc-aarch64-linux-gnu
           - asset: darwin-amd64
-            runner: macos-13
+            # Cross-compile the Intel slice on an Apple-Silicon runner:
+            # macos-14 schedules promptly where macos-13 (Intel) can sit
+            # unscheduled for 15+ min, and the Xcode toolchain links
+            # x86_64-apple-darwin natively.
+            runner: macos-14
             target: x86_64-apple-darwin
             archive: tar
           - asset: darwin-arm64
