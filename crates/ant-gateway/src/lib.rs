@@ -38,12 +38,18 @@ mod retrieval;
 #[cfg(feature = "http-api")]
 mod router;
 #[cfg(feature = "http-api")]
+mod stamps;
+#[cfg(feature = "http-api")]
 mod status;
 #[cfg(feature = "http-api")]
 mod stubs;
+#[cfg(feature = "http-api")]
+mod tags;
 
 #[cfg(feature = "http-api")]
 pub use handle::{GatewayHandle, GatewayIdentity};
+#[cfg(feature = "http-api")]
+pub use tags::TagRegistry;
 
 #[cfg(feature = "http-api")]
 use std::net::SocketAddr;

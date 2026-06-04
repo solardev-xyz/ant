@@ -34,18 +34,6 @@ pub async fn wallet() -> Response {
 }
 
 #[derive(Debug, Serialize)]
-struct StampsBody {
-    stamps: Vec<()>,
-}
-
-/// `GET /stamps`. Tier A: no batches. Bee always returns the outer
-/// `stamps` key even when empty, so consumers can iterate without a
-/// null check.
-pub async fn stamps() -> Response {
-    Json(StampsBody { stamps: Vec::new() }).into_response()
-}
-
-#[derive(Debug, Serialize)]
 struct ChequebookAddressBody {
     #[serde(rename = "chequebookAddress")]
     chequebook_address: &'static str,

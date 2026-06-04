@@ -8,7 +8,7 @@ use ant_crypto::{
     ethereum_address_from_public_key, overlay_from_ethereum_address, random_overlay_nonce,
     random_secp256k1_secret, SECP256K1_SECRET_LEN,
 };
-use ant_gateway::{Gateway, GatewayHandle, GatewayIdentity};
+use ant_gateway::{Gateway, GatewayHandle, GatewayIdentity, TagRegistry};
 use ant_node::{run_node, NodeConfig};
 use ant_p2p::UploadRuntime;
 use anyhow::{anyhow, bail, Context, Result};
@@ -439,6 +439,13 @@ async fn main() -> Result<()> {
     .await
     .map_err(|e| anyhow!("upload runtime: {e}"))?;
 
+    // The node is "light" (publish-capable) once a postage batch is
+    // configured: that's what lets it stamp + pushsync uploads. Freedom
+    // gates its whole publish UI on `GET /node.beeMode == "light"`
+    // (PLAN.md J.4.1), so surface it here. Captured before `upload` is
+    // moved into the node future below.
+    let light_mode = upload.is_some();
+
     // `antctl upload` job manager. Built unconditionally — listing
     // and inspecting jobs work even when no postage batch is
     // configured. Actually starting a new job will fail (with the
@@ -595,6 +602,8 @@ async fn main() -> Result<()> {
             status: status_rx.clone(),
             commands: cmd_tx.clone(),
             activity: gateway_activity.clone(),
+            light_mode,
+            tags: Arc::new(TagRegistry::new()),
         })
     };
 

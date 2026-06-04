@@ -73,6 +73,14 @@ const SWARM_INDEX_DOCUMENT: HeaderName = HeaderName::from_static("swarm-index-do
 /// signature over `keccak256(id || inner_cac_addr)` (EIP-191 wrapped),
 /// hex-encoded with or without an `0x` prefix.
 const SWARM_SOC_SIGNATURE: HeaderName = HeaderName::from_static("swarm-soc-signature");
+/// Bee request header on uploads: a pre-created tag uid to attach this
+/// upload to (bee-js sends it when the caller created a tag via
+/// `POST /tags` first). Absent on most uploads — bee then auto-creates
+/// a tag server-side.
+const SWARM_TAG: HeaderName = HeaderName::from_static("swarm-tag");
+/// Bee response header on uploads: the tag uid bee-js polls via
+/// `GET /tags/{uid}` for progress (PLAN.md J.2.4 / J.4.5).
+const SWARM_TAG_UID: HeaderName = HeaderName::from_static("swarm-tag-uid");
 
 /// Concurrency cap on outbound `PushChunk` commands during a `POST /bzz`
 /// upload. Matched to the daemon-side
@@ -675,6 +683,156 @@ pub async fn upload_bzz(
         StatusCode::CREATED,
         &serde_json::json!({ "reference": reference_hex }),
     );
+    set_immutable_cache_headers(&mut resp);
+    finalize_upload_tag(&handle, &headers, total_chunks as u64, assembled.root, &mut resp);
+    resp
+}
+
+/// Resolve (or create) the upload tag for a just-finished synchronous
+/// upload and stamp the `Swarm-Tag-Uid` response header so bee-js can
+/// poll `GET /tags/{uid}`. If the client pre-created a tag and sent it
+/// in `Swarm-Tag`, that one is marked complete and echoed; otherwise a
+/// fresh already-synced tag is minted (bee's server-side auto-tag
+/// behaviour). The whole upload is already pushsynced by the time we
+/// get here, so the tag is reported fully synced immediately.
+fn finalize_upload_tag(
+    handle: &GatewayHandle,
+    headers: &HeaderMap,
+    total_chunks: u64,
+    root: [u8; 32],
+    resp: &mut Response,
+) {
+    let uid = match headers
+        .get(&SWARM_TAG)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u32>().ok())
+    {
+        Some(existing) => {
+            handle.tags.complete(existing, total_chunks, root);
+            existing
+        }
+        None => handle.tags.create_completed(total_chunks, root),
+    };
+    if let Ok(v) = HeaderValue::from_str(&uid.to_string()) {
+        resp.headers_mut().insert(SWARM_TAG_UID, v);
+    }
+}
+
+/// `POST /bytes` — raw byte upload. Splits the body into a content-
+/// addressed chunk tree (no manifest) and pushsyncs every chunk,
+/// returning `{"reference":"<data-root hash>"}` with status 201. This
+/// is what bee-js uses for feed payloads larger than one chunk and for
+/// direct `bee.uploadData` calls (PLAN.md J.2.5 / C1). The returned
+/// reference is a `/bytes/<ref>` reference — it has no mantaray
+/// manifest, unlike `POST /bzz`.
+pub async fn upload_bytes(
+    State(handle): State<GatewayHandle>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if body.len() as u64 > GATEWAY_MAX_UPLOAD_BYTES {
+        return json_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "request body {} bytes exceeds upload cap {} bytes",
+                body.len(),
+                GATEWAY_MAX_UPLOAD_BYTES
+            ),
+        );
+    }
+
+    let timeout = request_timeout(&headers, DEFAULT_REQUEST_TIMEOUT);
+    let guard = handle
+        .activity
+        .begin(GatewayRequestKind::Bytes, "upload-bytes".to_string());
+
+    let split = split_bytes(&body);
+    let total_chunks = split.chunks.len();
+    debug!(
+        target: "ant_gateway",
+        body_len = body.len(),
+        chunks = total_chunks,
+        data_root = %hex::encode(split.root),
+        "bytes upload assembled"
+    );
+    guard.update(0, total_chunks as u64, total_chunks as u32, 0);
+
+    if let Err(err_resp) = push_chunks(&handle, &split.chunks, timeout, &guard).await {
+        return err_resp;
+    }
+
+    let reference_hex = hex::encode(split.root);
+    let mut resp = json_response(
+        StatusCode::CREATED,
+        &serde_json::json!({ "reference": reference_hex }),
+    );
+    set_immutable_cache_headers(&mut resp);
+    finalize_upload_tag(&handle, &headers, total_chunks as u64, split.root, &mut resp);
+    resp
+}
+
+/// `POST /feeds/{owner}/{topic}` — create a feed manifest (bee-js
+/// `createFeedManifest`). Builds the mantaray feed manifest binding
+/// `(owner, topic)` for a `Sequence` feed, pushsyncs its single chunk,
+/// and returns `{"reference":"<manifest root>"}` (PLAN.md J.2.5 / C2).
+/// The reference resolves transparently to the feed's current update
+/// via any bee gateway. `?type=` defaults to `sequence`; `epoch` feeds
+/// are not supported (501), matching the read path.
+pub async fn create_feed(
+    State(handle): State<GatewayHandle>,
+    Path((owner_hex, topic_hex)): Path<(String, String)>,
+    Query(query): Query<FeedQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let owner = match parse_hex_fixed::<20>(&owner_hex) {
+        Ok(o) => o,
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("bad owner: {e}")),
+    };
+    let topic = match parse_hex_fixed::<32>(&topic_hex) {
+        Ok(t) => t,
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("bad topic: {e}")),
+    };
+
+    if let Some(kind) = query.r#type.as_deref() {
+        match kind.to_ascii_lowercase().as_str() {
+            "sequence" => {}
+            "epoch" => {
+                return json_error(StatusCode::NOT_IMPLEMENTED, "epoch feeds are not supported");
+            }
+            other => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown feed type: {other}"),
+                );
+            }
+        }
+    }
+
+    let timeout = request_timeout(&headers, CHUNK_REQUEST_TIMEOUT);
+    let guard = handle.activity.begin(
+        GatewayRequestKind::Feed,
+        short_reference(&hex::encode(topic)),
+    );
+
+    let manifest = match ant_retrieval::build_feed_manifest(&owner, &topic) {
+        Ok(m) => m,
+        Err(e) => return map_manifest_error(e),
+    };
+    let total_chunks = manifest.chunks.len();
+    guard.update(0, total_chunks as u64, total_chunks as u32, 0);
+
+    if let Err(err_resp) = push_chunks(&handle, &manifest.chunks, timeout, &guard).await {
+        return err_resp;
+    }
+
+    let reference_hex = hex::encode(manifest.root);
+    let mut resp = json_response(
+        StatusCode::CREATED,
+        &serde_json::json!({ "reference": reference_hex }),
+    );
+    // Feed manifests are content-addressed and immutable (the manifest
+    // binds owner+topic forever; only the feed *updates* it points at
+    // change), so the manifest reference itself caches like any CAC.
     set_immutable_cache_headers(&mut resp);
     resp
 }

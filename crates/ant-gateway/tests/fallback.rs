@@ -30,9 +30,12 @@ async fn unknown_path_returns_structured_501() {
     assert_eq!(json["message"], "not implemented in ant");
 }
 
-/// Tier-B endpoints that bee defines as POST/DELETE/PATCH (writes,
-/// stamps mutation, peer control) are out of scope; verify they all
-/// drop into the fallback regardless of method.
+/// Tier-B endpoints that bee defines as POST/DELETE/PATCH but Ant does
+/// not implement (transaction management, peer control) are out of
+/// scope; verify an unrouted write path drops into the fallback. (We
+/// deliberately avoid `/bytes` here — that's now a real upload
+/// endpoint; with no node dispatcher attached it would block on the
+/// upload timeout rather than 501.)
 #[tokio::test]
 async fn tier_b_writes_fall_through_to_501() {
     let router = status_only_router(snapshot_with_one_peer());
@@ -40,7 +43,7 @@ async fn tier_b_writes_fall_through_to_501() {
         router,
         Request::builder()
             .method(Method::POST)
-            .uri("/bytes")
+            .uri("/transactions")
             .body(Body::empty())
             .unwrap(),
     )

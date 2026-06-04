@@ -212,6 +212,53 @@ pub fn build_collection_manifest(
     })
 }
 
+/// Build a **feed manifest**: a mantaray manifest whose single `/` fork
+/// carries the `swarm-feed-{owner,topic,type}` metadata bee's feed
+/// dereferencer reads (see [`crate::feed::feed_from_metadata`] and
+/// [`crate::mantaray::resolve_feed_root`]). This is what bee's
+/// `POST /feeds/{owner}/{topic}` (`createFeedManifest` in bee-js)
+/// returns: a stable reference that transparently resolves to whichever
+/// feed update is current.
+///
+/// Only the `Sequence` feed type is emitted (the only type bee writes
+/// through `/feeds`). The `/` fork's child is a zero-address value leaf,
+/// mirroring bee's `feedManifestEntry`. Returns the manifest root plus
+/// the (single) chunk to push.
+pub fn build_feed_manifest(
+    owner: &[u8; 20],
+    topic: &[u8; 32],
+) -> Result<ManifestWriteResult, ManifestWriteError> {
+    let mut meta = BTreeMap::new();
+    meta.insert(crate::feed::FEED_OWNER_KEY.to_string(), hex::encode(owner));
+    meta.insert(crate::feed::FEED_TOPIC_KEY.to_string(), hex::encode(topic));
+    meta.insert(
+        crate::feed::FEED_TYPE_KEY.to_string(),
+        "Sequence".to_string(),
+    );
+
+    let mut root = TrieNode::default();
+    let leaf = TrieNode {
+        value: Some(EmptyValue),
+        ..Default::default()
+    };
+    root.forks.insert(
+        b'/',
+        TrieFork {
+            prefix: b"/".to_vec(),
+            child: Box::new(leaf),
+            metadata_override: Some(meta),
+            path_separator: true,
+        },
+    );
+
+    let mut chunks: Vec<SplitChunk> = Vec::new();
+    let root_addr = serialize_node(&root, &mut chunks)?;
+    Ok(ManifestWriteResult {
+        root: root_addr,
+        chunks,
+    })
+}
+
 // --- trie data model + insertion ---
 
 /// Marker for the "/" placeholder leaf used to anchor the
@@ -892,6 +939,39 @@ mod tests {
         };
         let err = build_collection_manifest(&[f.clone(), f], None).unwrap_err();
         assert!(matches!(err, ManifestWriteError::EmptyPath));
+    }
+
+    /// A feed manifest built by [`build_feed_manifest`] must be
+    /// recognised as a feed by the reader: `resolve_feed_root` detects
+    /// the `/` fork's `swarm-feed-*` metadata and *attempts* to
+    /// dereference (failing only because no update chunks are staged).
+    /// A non-feed manifest would instead return the root unchanged. We
+    /// assert the "detected" branch by requiring an error rather than
+    /// `Ok(root)`.
+    #[tokio::test]
+    async fn feed_manifest_is_detected_by_reader() {
+        use crate::mantaray::resolve_feed_root;
+
+        let owner = [0x11u8; 20];
+        let topic = [0x22u8; 32];
+        let manifest = build_feed_manifest(&owner, &topic).expect("build feed manifest");
+        // The trie is the root node plus its `/`-fork value leaf, so it
+        // serializes to two chunks; the root is emitted last (bottom-up).
+        assert_eq!(manifest.chunks.len(), 2, "feed manifest is root + leaf");
+        assert_eq!(manifest.chunks.last().unwrap().address, manifest.root);
+
+        let mut fetcher = MapFetcher::new();
+        for c in &manifest.chunks {
+            fetcher.ingest(c);
+        }
+
+        // Detected as a feed → tries to resolve → no updates staged →
+        // Err. A plain content manifest would return Ok(root) instead.
+        let resolved = resolve_feed_root(&fetcher, manifest.root).await;
+        assert!(
+            resolved.is_err(),
+            "feed manifest should be detected and attempt dereference, got {resolved:?}",
+        );
     }
 
     /// JSON encoder produces strict, deterministic output for the keys

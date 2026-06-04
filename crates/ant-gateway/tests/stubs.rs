@@ -27,22 +27,10 @@ async fn wallet_returns_zero_balances_on_gnosis() {
     assert_eq!(json["chainID"], 100);
 }
 
-#[tokio::test]
-async fn stamps_returns_empty_list() {
-    let router = status_only_router(snapshot_with_one_peer());
-    let resp = send(
-        router,
-        Request::builder()
-            .method(Method::GET)
-            .uri("/stamps")
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let json: Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(json["stamps"].as_array().unwrap().len(), 0);
-}
+// `GET /stamps` is no longer a stub — it now reports the daemon's
+// configured postage batch over the control channel. Its empty-list
+// (uploads-disabled) and populated-batch behaviour are covered by the
+// `freedom_dropin` integration tests, which attach a node dispatcher.
 
 #[tokio::test]
 async fn chequebook_address_zeroed() {

@@ -71,14 +71,20 @@ struct NodeBody {
     swap_enabled: bool,
 }
 
-/// `GET /node`. Hardcoded to `ultra-light` for Tier A — once SWAP / a
-/// chequebook are wired up (Tier B) this flips to `light`.
-pub async fn node(State(_handle): State<GatewayHandle>) -> Response {
+/// `GET /node`. Reports `light` once `antd` has uploads + SWAP
+/// settlement configured (`handle.light_mode`), `ultra-light`
+/// otherwise. Freedom's `checkSwarmPreFlight` refuses to publish
+/// against an `ultra-light` node, so this flag is the gate that lets
+/// the whole publish/feed/SOC-write surface work (PLAN.md J.4.1).
+/// `chequebookEnabled` / `swapEnabled` track `beeMode` because, in
+/// `antd`, light mode *is* the SWAP-settlement mode.
+pub async fn node(State(handle): State<GatewayHandle>) -> Response {
+    let light = handle.light_mode;
     Json(NodeBody {
-        bee_mode: "ultra-light",
+        bee_mode: if light { "light" } else { "ultra-light" },
         gateway_mode: false,
-        chequebook_enabled: false,
-        swap_enabled: false,
+        chequebook_enabled: light,
+        swap_enabled: light,
     })
     .into_response()
 }
@@ -227,11 +233,21 @@ pub async fn topology(State(handle): State<GatewayHandle>) -> Response {
     .into_response()
 }
 
+/// RFC3339 timestamp for the current wall-clock second. Shared with
+/// the tag registry (`startedAt`) so both surfaces emit the identical
+/// bee-parseable form.
+pub(crate) fn format_rfc3339_now() -> String {
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    format_rfc3339(now_unix)
+}
+
 /// Best-effort RFC3339 (`1970-01-01T00:00:00Z` form) without pulling in
 /// `chrono`. Bee's `timestamp` field uses `time.Time.MarshalJSON` which
 /// emits RFC3339; `bee-js` parses it via `new Date(...)` which accepts
 /// both `Z` and `+00:00` suffixes, so the canonical form is enough.
-fn format_rfc3339(unix: u64) -> String {
+pub(crate) fn format_rfc3339(unix: u64) -> String {
     // Days since 1970-01-01 → calendar date via Howard Hinnant's
     // civil_from_days (public domain). Cheaper than pulling in `time`
     // for one field.

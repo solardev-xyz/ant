@@ -19,7 +19,7 @@ use tracing::Instrument;
 use crate::fallback::not_implemented;
 use crate::handle::GatewayHandle;
 use crate::retrieval::GATEWAY_MAX_UPLOAD_BYTES;
-use crate::{retrieval, status, stubs};
+use crate::{retrieval, stamps, status, stubs, tags};
 
 const SERVER_HEADER: &str = concat!("ant-gateway/", env!("CARGO_PKG_VERSION"));
 
@@ -37,23 +37,36 @@ pub fn build(handle: GatewayHandle) -> Router {
         .route("/peers", get(status::peers))
         .route("/topology", get(status::topology))
         .route("/wallet", get(stubs::wallet))
-        .route("/stamps", get(stubs::stamps))
+        // Real postage listing backed by the daemon's configured batch
+        // (PLAN.md J.5.B); on-chain buy/topup/dilute remain on the 501
+        // fallback pending live-mainnet validation.
+        .route("/stamps", get(stamps::stamps))
+        .route("/stamps/{id}", get(stamps::stamp))
         .route("/chequebook/address", get(stubs::chequebook_address))
         .route("/chequebook/balance", get(stubs::chequebook_balance))
+        // Upload-progress tags (PLAN.md J.2.4 / C3). `POST /tags`
+        // creates a tag; `GET /tags/{uid}` polls it. Uploads also
+        // auto-create a tag and echo its uid in `Swarm-Tag-Uid`.
+        .route("/tags", post(tags::create_tag))
+        .route("/tags/{uid}", get(tags::get_tag))
         .route("/chunks", post(retrieval::upload_chunk))
         .route("/soc/{owner}/{id}", post(retrieval::upload_soc))
+        // Raw byte upload (PLAN.md J.2.5 / C1): bee-js feed payloads and
+        // direct data uploads. Returns a `/bytes/<ref>` reference.
+        .route("/bytes", post(retrieval::upload_bytes))
         .route("/chunks/{addr}", get_or_head(retrieval::chunk))
         // Single-owner-chunk read: the address is derived as
         // `keccak256(id || owner)`, so callers that already know the
         // `(owner, id)` pair can avoid computing it client-side.
         .route("/soc/{owner}/{id}", get_or_head(retrieval::download_soc))
-        // Sequence-feed lookup. Returns the latest update's
-        // `ts(8 BE) || ref(32)` body by default (matching bee), or a
-        // structured JSON / XML body when the client opts in via the
-        // `Accept` request header.
+        // Sequence-feed lookup (GET/HEAD) + feed-manifest creation
+        // (POST, PLAN.md J.2.5 / C2) share the one path. GET returns the
+        // latest update's `ts(8 BE) || ref(32)` body by default
+        // (matching bee), or structured JSON / XML when the client opts
+        // in via `Accept`; POST builds and pushes the feed manifest.
         .route(
             "/feeds/{owner}/{topic}",
-            get_or_head(retrieval::download_feed),
+            get_or_head(retrieval::download_feed).post(retrieval::create_feed),
         )
         .route("/bzz", post(retrieval::upload_bzz))
         .route("/bytes/{addr}", get_or_head(retrieval::bytes))

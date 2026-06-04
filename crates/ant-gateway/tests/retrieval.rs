@@ -2082,9 +2082,9 @@ async fn post_soc_rejects_bad_id_hex() {
     );
 }
 
-/// A request without the `swarm-soc-signature` header is a 400.
-/// The signature is mandatory: there's no fall-back recovery path in
-/// bee.
+/// A request with neither the `swarm-soc-signature` header nor the
+/// `?sig=` query param is a 400. The signature is mandatory: there's no
+/// fall-back recovery path in bee.
 #[tokio::test]
 async fn post_soc_rejects_missing_signature_header() {
     let owner = [0u8; 20];
@@ -2103,7 +2103,7 @@ async fn post_soc_rejects_missing_signature_header() {
     let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
     assert_eq!(
         json["message"].as_str().unwrap(),
-        "missing swarm-soc-signature header",
+        "missing soc signature: provide swarm-soc-signature header or ?sig=… query param",
     );
 }
 
@@ -2158,8 +2158,8 @@ async fn post_soc_rejects_malformed_signature_hex() {
         json["message"]
             .as_str()
             .unwrap()
-            .starts_with("bad swarm-soc-signature:"),
-        "expected `bad swarm-soc-signature:` prefix, got {}",
+            .starts_with("bad soc signature:"),
+        "expected `bad soc signature:` prefix, got {}",
         json["message"],
     );
 }

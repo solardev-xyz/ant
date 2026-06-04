@@ -17,6 +17,8 @@ use ant_control::{ControlCommand, GatewayActivity, StatusSnapshot};
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 
+use crate::tags::TagRegistry;
+
 /// Static identity surface used by `/addresses`. All fields are owned
 /// strings so cloning the handle is cheap and the gateway can drop the
 /// original without affecting in-flight requests.
@@ -64,4 +66,19 @@ pub struct GatewayHandle {
     /// publisher, which snapshots it for `StatusSnapshot::retrieval`
     /// so `antop` can render the Retrieval tab.
     pub activity: Arc<GatewayActivity>,
+    /// Whether the node is running in **light** mode (uploads + SWAP
+    /// settlement configured) versus **ultra-light** (read-only). Set
+    /// by `antd` at startup from the postage/chequebook config. Drives
+    /// `GET /node.beeMode`, which Freedom's `checkSwarmPreFlight` gates
+    /// every publish/feed/SOC write on — an `ultra-light` answer makes
+    /// Freedom refuse to publish at all (PLAN.md J.4.1).
+    pub light_mode: bool,
+    /// In-process upload-tag registry backing `POST /tags` and
+    /// `GET /tags/{uid}`. bee auto-creates a tag on every `POST /bzz`
+    /// / `POST /bytes` and returns its uid in the `Swarm-Tag-Uid`
+    /// response header; bee-js then polls `GET /tags/{uid}` for upload
+    /// progress (PLAN.md J.2.4 / C3). Because the gateway's uploads are
+    /// synchronous (every chunk is pushsynced before the response),
+    /// the tag is marked fully synced as soon as it's created.
+    pub tags: Arc<TagRegistry>,
 }

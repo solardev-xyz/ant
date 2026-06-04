@@ -4524,3 +4524,393 @@ B5_MB=100 BENCH_API_ADDR=127.0.0.1:11634 \
   scripts/bench-bee-cutover.sh --scenario b5 --build 0.5.0
 ```
 
+---
+
+## Appendix J — Freedom drop-in: bee API surface required by the next release
+
+This appendix is the concrete, audited list of everything `antd` must do to
+be a **drop-in replacement for the bundled `bee` node in Freedom Browser**
+(`solardev-xyz/freedom-browser`). It was produced by reading the Freedom
+source at tag `0.7.5-dev` (commit `3a140bd`) — every place it touches the
+Bee node, both the `@ethersphere/bee-js` client calls in the main process
+and the raw `fetch()` calls in the renderer and protocol handlers.
+
+The goal: a user points Freedom's integrated-node config at `antd` instead
+of `bee`, flips the Nodes-panel toggle, and **publish, feeds, stamps, and
+browsing all work unmodified**. Where `antd` already satisfies a
+requirement (per Appendix C/D) it is marked ✅; gaps are ❌ / ⚠️ with a work
+item.
+
+### J.1 How Freedom talks to the node
+
+Freedom drives the node through **three** distinct channels, all pointed at
+`http://127.0.0.1:1633`:
+
+1. **`bee-js` v`^12.2.1`** in the Electron main process
+   (`src/main/swarm/*.js`). A single `Bee` client
+   (`swarm-service.js::getBee()`) backs publish, feeds, chunks, and stamps.
+   This is the bulk of the *write* surface and it pins us to bee-js v12's
+   exact request/response shapes.
+2. **Raw `fetch()`** in the renderer (`bee-ui.js`, `bee-api.js::fetchBeeJson`,
+   `node-status.js`, `publish-setup.js`, `stamp-manager.js`,
+   `chequebook-deposit.js`) for status/health/wallet polling.
+3. **The `bzz://` protocol handler** (`src/main/swarm/bzz-protocol.js`) and
+   **content probe** (`swarm-probe.js`), which proxy every in-page
+   `bzz://<ref|ens>/<path>` request straight to `GET/HEAD /bzz/...` with
+   `Swarm-Chunk-Retrieval-Timeout`, `Swarm-Redundancy-Strategy`, and
+   `Swarm-Redundancy-Fallback-Mode` headers and a retry loop.
+
+Additionally Freedom manages the node **process**: it writes a bee YAML
+config, runs `bee init --config` then `bee start --config`, can **inject an
+identity** by writing `keys/swarm.key` before start
+(`bee-manager.js`, `useInjectedIdentity`), reuses an already-running daemon
+detected on `:1633` via `GET /health`, and shells `SIGTERM` with a 5 s
+force-kill fallback. All of this is in scope for a true drop-in (§J.5.D).
+
+### J.2 Complete inventory of bee operations Freedom performs
+
+Grouped by endpoint. "Call site" is the Freedom file; "bee-js" means the
+call is issued by the bee-js client (so the HTTP shape is whatever bee-js
+v12 emits, not Freedom's own code).
+
+#### J.2.1 Status / health / identity (renderer `fetch` + main pre-flight)
+
+| Op | Endpoint | Fields Freedom reads | Call site |
+|---|---|---|---|
+| Health / version | `GET /health` | `version` (split on `-`), `status` | `bee-ui.js`, `bee-manager.js` (`probeBeeApi`, reuse detection) |
+| Readiness gate | `GET /readiness` | HTTP `200` vs not | `node-status.js`, `swarm-provider-ipc.js` pre-flight |
+| Node mode | `GET /node` | **`beeMode` — must be `"light"`** | `node-status.js`, `publish-setup.js`, pre-flight (`checkSwarmPreFlight`, `checkBeeReachable`) |
+| Addresses | `GET /addresses` | `ethereum` | `publish-setup.js`, `node-status.js` |
+| Connected peers | `GET /peers` | `peers[].length` | `bee-ui.js` (Nodes panel, polled 500 ms) |
+| Visible peers | `GET /topology` | `bins[*].population` (summed) | `bee-ui.js` (polled 1 s) |
+| Chain sync | `GET /status` | `lastSyncedBlock` | `publish-setup.js`, `node-status.js` (sync-progress UI) |
+
+#### J.2.2 Postage stamps (bee-js `stamp-service.js`)
+
+| Op | bee-js call | HTTP (bee v12) | Fields read |
+|---|---|---|---|
+| List batches | `bee.getPostageBatches()` | `GET /stamps` | `batchID`, `usable`, `immutableFlag`, `size`, `remainingSize`, `usage`, `duration` (with `.toBytes()/.toSeconds()/.toEndDate()`) |
+| Cost estimate | `bee.getStorageCost(Size, Duration)` | `GET /chainstate` (`currentPrice`) | computed client-side |
+| Buy | `bee.buyStorage(Size, Duration, {waitForUsable:false})` | `POST /stamps/{amount}/{depth}` | returns `batchID` |
+| Top-up (duration) | `bee.extendStorageDuration(id, Duration)` | `PATCH /stamps/topup/{id}/{amount}` | |
+| Dilute (size) | `bee.extendStorageSize(id, Size)` | `PATCH /stamps/dilute/{id}/{depth}` | |
+| Extension cost | `bee.getDurationExtensionCost` / `getSizeExtensionCost` | `GET /chainstate` + `GET /stamps/{id}` | computed client-side |
+
+Stamp cost math in bee-js v12 **requires `GET /chainstate.currentPrice`**;
+without it `getStorageCost` / `buyStorage` throw before any purchase. This
+endpoint is currently marked **501** in §C.4.2 and that must change for
+Freedom.
+
+#### J.2.3 Wallet & chequebook (bee-js + renderer `fetch`)
+
+| Op | Call | HTTP | Fields read |
+|---|---|---|---|
+| BZZ/native balance | `bee.getWalletBalance()` / `fetch /wallet` | `GET /wallet` | `bzzBalance` (and `.toPLURBigInt()`), `nativeTokenBalance` |
+| Chequebook addr | `fetch /chequebook/address` | `GET /chequebook/address` | `chequebookAddress` (zero ⇒ "not deployed") |
+| Chequebook bal | `bee.getChequebookBalance()` / `fetch` | `GET /chequebook/balance` | `totalBalance`, `availableBalance` (`.toSignificantDigits()`, `.toPLURBigInt()`) |
+| Deposit | `bee.depositTokens(plur)` | `POST /chequebook/deposit?amount=` | returns tx id |
+
+Freedom **auto-deposits 0.1 xBZZ into the chequebook** after a stamp
+purchase (`autoDepositChequebookIfEmpty`) and pre-checks balances before
+buying — so deposit + real wallet/chequebook reads are on the publish happy
+path, not optional.
+
+#### J.2.4 Uploads — data, files, collections (bee-js `publish-service.js`)
+
+| Op | bee-js call | HTTP | Headers / query |
+|---|---|---|---|
+| Publish data | `bee.uploadFile(batch, data, name, {pin, deferred:false, contentType})` | `POST /bzz?name=` | `Swarm-Postage-Batch-Id`, `Swarm-Pin`, `Swarm-Deferred-Upload`, `Content-Type` |
+| Publish file | `bee.uploadFile(batch, stream, name, {pin, deferred:true, size})` | `POST /bzz` | as above + `Content-Length` |
+| Publish dir / in-memory files | `bee.uploadFilesFromDirectory(batch, dir, {pin, deferred, indexDocument})` | `POST /bzz` (tar) | `Swarm-Collection:true`, `Swarm-Index-Document` |
+| Upload progress | `bee.retrieveTag(uid)` | `GET /tags/{uid}` | reads `split, seen, stored, sent, synced, uid` |
+
+`uploadFile`/`uploadFilesFromDirectory` in bee-js create a **tag**
+(`POST /tags`) and surface its `uid`; `getUploadStatus` polls
+`GET /tags/{uid}`. Progress is computed from `sent/split`. So `/tags`
+(POST + GET) is required for the upload-status UX even though content
+addressing itself doesn't need it.
+
+#### J.2.5 Feeds (bee-js `feed-service.js`)
+
+| Op | bee-js call | HTTP |
+|---|---|---|
+| Create feed manifest | `bee.createFeedManifest(batch, topic, owner)` | `POST /feeds/{owner}/{topic}?type=sequence` |
+| Read latest / by index | `makeFeedReader(topic, owner).downloadPayload()` | `GET /feeds/{owner}/{topic}` |
+| Write reference | `makeFeedWriter(topic, key).uploadReference(batch, ref, {index})` | `POST /soc/...` (+ chunk) |
+| Write payload | `makeFeedWriter(topic, key).uploadPayload(batch, data, {index})` | `POST /bytes` (payload > 4 KiB) + `POST /soc/...` |
+| Resolve next index | `reader.downloadPayload()` (404/500 ⇒ index 0) | `GET /feeds` / `GET /chunks` |
+
+bee-js v12 feeds are **SOC-backed**: a feed write is a content-addressed
+`POST /bytes` (for payloads > 4096 B) followed by a single-owner-chunk
+`POST /soc/{owner}/{id}?sig=`. Reads use `bee.downloadChunk` +
+`unmarshalSingleOwnerChunk` + (for large payloads) `bee.downloadData`
+(`GET /bytes/{ref}`). The exact identifier derivation
+(`keccak256(topic || feedIndex)`) and the manifest format must match bee or
+Freedom's published feeds become unresolvable by other bee gateways.
+
+#### J.2.6 Low-level chunks / SOC (bee-js `chunk-service.js`)
+
+| Op | bee-js call | HTTP |
+|---|---|---|
+| Upload CAC | `bee.uploadChunk(batch, chunk, {pin, deferred:false})` | `POST /chunks` |
+| Download CAC | `bee.downloadChunk(ref)` | `GET /chunks/{ref}` |
+| Upload SOC | hand-rolled `fetch` `POST /soc/{owner}/{id}?sig=` | `POST /soc/...` (`Swarm-Postage-Batch-Id`, `Swarm-Pin`, `Swarm-Deferred-Upload`) |
+| Download SOC | `bee.downloadChunk(ref)` + `unmarshalSingleOwnerChunk` | `GET /chunks/{ref}` |
+| Read bytes | `bee.downloadData(ref)` | `GET /bytes/{ref}` |
+
+#### J.2.7 Content serving (`bzz-protocol.js`, `swarm-probe.js`, `ens-prefetch.js`)
+
+| Op | HTTP | Notes |
+|---|---|---|
+| Probe availability | `HEAD /bzz/{hash}` | gates navigation; 404/500 ⇒ keep polling, conn-refused ⇒ "node down" |
+| Serve page + subresources | `GET /bzz/{hash}/{path}` | streamed, `Range` honored, retried on 500/502/503/504; sends the three `Swarm-*` redundancy/timeout headers |
+| ENS-named content | `GET /bzz/{ens-decoded-ref}/{path}` | Freedom resolves ENS itself, then hits `/bzz` with the hex ref |
+
+### J.3 Gap analysis vs current `ant-gateway`
+
+Current router (`crates/ant-gateway/src/router.rs`) and stubs
+(`stubs.rs`) as of this writing:
+
+| Endpoint | Method(s) | Needed by Freedom | ant today | Gap |
+|---|---|---|---|---|
+| `/health` | GET | ✅ | ✅ implemented | — |
+| `/readiness` | GET | ✅ | ✅ | — |
+| `/node` | GET | ✅ (`beeMode:"light"`) | ⚠️ hardcoded `ultra-light` | **must report `light` in swap mode** |
+| `/addresses` | GET | ✅ | ✅ | — |
+| `/peers` | GET | ✅ | ✅ | — |
+| `/topology` | GET | ✅ | ✅ | — |
+| `/status` | GET | ✅ (`lastSyncedBlock`) | ❌ (falls to 501) | **add** |
+| `/chainstate` | GET | ✅ (`currentPrice`, for cost calc) | ❌ 501 by design | **add (reclassify from 501)** |
+| `/bzz/{addr}[/{path}]` | GET, HEAD | ✅ | ✅ | — |
+| `/bytes/{addr}` | GET, HEAD | ✅ | ✅ | — |
+| `/bytes` | POST | ✅ (feed payloads, bee-js data upload) | ❌ | **add** |
+| `/chunks/{addr}` | GET, HEAD | ✅ | ✅ | — |
+| `/chunks` | POST | ✅ | ✅ | — |
+| `/soc/{owner}/{id}` | GET/HEAD, POST | ✅ | ✅ | verify `?sig=` + body shape vs bee-js |
+| `/feeds/{owner}/{topic}` | GET | ✅ | ✅ | verify identifier/index semantics |
+| `/feeds/{owner}/{topic}` | POST | ✅ (createFeedManifest) | ❌ (GET only) | **add** |
+| `/tags` | POST | ✅ (upload creates tag) | ❌ | **add** |
+| `/tags/{uid}` | GET | ✅ (upload progress) | ❌ | **add** |
+| `/bzz` | POST | ✅ (file + collection) | ✅ exists | **verify stamps wired + `Swarm-Collection`/`Swarm-Index-Document` + tar** |
+| `/stamps` | GET | ✅ (real batches) | ⚠️ stub `{stamps:[]}` | **real listing** |
+| `/stamps/{id}` | GET | ✅ (extension cost) | ❌ | **add** |
+| `/stamps/{amount}/{depth}` | POST | ✅ (buy) | ❌ | **add** |
+| `/stamps/topup/{id}/{amount}` | PATCH | ✅ | ❌ | **add** |
+| `/stamps/dilute/{id}/{depth}` | PATCH | ✅ | ❌ | **add** |
+| `/wallet` | GET | ✅ (real `bzzBalance`) | ⚠️ stub zero | **real balances** |
+| `/chequebook/address` | GET | ✅ (real addr) | ⚠️ stub zero | **real address** |
+| `/chequebook/balance` | GET | ✅ (real) | ⚠️ stub zero | **real balances** |
+| `/chequebook/deposit` | POST | ✅ (`?amount=`) | ❌ | **add** |
+
+**Read/browse path is essentially done** (Tier A + the SOC/chunk/feed
+read endpoints already landed). The drop-in gap is the **publish path**:
+real stamps, real wallet/chequebook, feed *create*, `POST /bytes`, tags,
+`/chainstate`, `/status`, and — the gating one — **reporting
+`beeMode:"light"`** so Freedom's `checkSwarmPreFlight` lets publishing
+proceed at all.
+
+### J.4 Behavioural requirements (not just routes)
+
+These are the easy-to-miss bits that break Freedom even when the routes
+exist:
+
+1. **`beeMode` gate.** `checkSwarmPreFlight` (swarm-provider-ipc.js)
+   *rejects* `ultra-light` for any publish/feed/SOC write. `antd` started
+   with `swap-enable: true` must return `beeMode:"light"` from `/node`, and
+   `isLightOrFull` logic also accepts `"full"`.
+2. **bee-js typed responses.** Stamp/cost/balance objects are consumed via
+   bee-js helpers (`.toBytes()`, `.toSeconds()`, `.toEndDate()`,
+   `.toPLURBigInt()`, `.toSignificantDigits()`). That means the **raw JSON
+   field names and units must match bee exactly** (e.g. `/stamps` items use
+   `batchID`, `amount`, `depth`, `bucketDepth`, `utilization`, `usable`,
+   `immutableFlag`, `batchTTL`, `exists`; `/wallet` uses string-integer
+   `bzzBalance` in PLUR). bee-js parses these; wrong casing or a number
+   where bee sends a string crashes the client.
+3. **Error shape on not-found.** Feed/chunk reads rely on
+   `BeeResponseError.status` being **404 or 500** to mean "empty / not
+   found" (feed-service `isNotFoundError`, chunk-service
+   `isChunkNotFoundError` which also matches a 500 body of
+   `"read chunk failed"`). `antd` must return those statuses (not, say,
+   400) for missing chunks/feeds or feed index-resolution loops forever.
+4. **SOC upload contract.** `POST /soc/{owner}/{id}?sig=<hex>` with body
+   `span(8 LE) || payload`, headers `Swarm-Postage-Batch-Id`, `Swarm-Pin`,
+   `Swarm-Deferred-Upload:false`, and a JSON `{reference}` response whose
+   reference equals the locally-computed SOC address (Freedom asserts
+   equality and fails the write otherwise).
+5. **Upload reference echo.** `POST /bzz` / `POST /chunks` must return
+   `{reference}` (hex, no `0x`) and a `Swarm-Tag-Uid` so bee-js can poll
+   progress.
+6. **Deferred + pin semantics.** Freedom publishes data with
+   `deferred:false` (synchronous pushsync, used as the "it's on the
+   network" signal) and files/dirs with `deferred:true`. Both set
+   `pin:true`. `antd` must accept both and have `deferred:false` actually
+   block until the chunks are pushed (this is the existing pushsync work in
+   M3 / Appendix F).
+7. **Redundancy/timeout headers are advisory.** `bzz-protocol.js` always
+   sends `Swarm-Chunk-Retrieval-Timeout:30s`,
+   `Swarm-Redundancy-Strategy:3`, `Swarm-Redundancy-Fallback-Mode:true`.
+   Accept-and-honor the timeout; accept-and-ignore the redundancy pair is
+   fine (already the Tier-A stance).
+8. **CORS.** Freedom's config sets `cors-allowed-origins: "null"`. Page
+   `fetch`/SOC uploads originate from the dweb page origin; `antd` must
+   apply the same CORS handling bee does for that value (Appendix C.4
+   already commits to driving CORS off `cors-allowed-origins`).
+
+### J.5 Work items
+
+Ordered so each step is independently verifiable against a real Freedom
+build. A–C are the gateway; D is process/identity parity.
+
+**A. Make the read/publish *gate* pass (smallest unblock).**
+- A1. `/node` returns `beeMode:"light"` when the node is running with SWAP
+  enabled; `"ultra-light"` otherwise. Wire to the actual SWAP/chequebook
+  state, not a constant.
+- A2. `GET /status` returning at least `{lastSyncedBlock, ...}` from
+  `ant-chain`'s synced block. (Freedom only reads `lastSyncedBlock`; emit
+  the rest of bee's `/status` body for safety per §C.6 golden corpus.)
+- A3. `GET /chainstate` with real `currentPrice` (and `block`,
+  `totalAmount`) from `ant-chain`. Reclassify from 501 in §C.4.2 — bee-js
+  cost math depends on it.
+
+**B. Real postage (the core of publishing).**
+- B1. `GET /stamps` + `GET /stamps/{id}` backed by `ant-postage`, with the
+  full bee batch JSON (`batchID`, `amount`, `depth`, `bucketDepth`,
+  `utilization`, `usable`, `immutableFlag`, `batchTTL`, `exists`, `label`).
+- B2. `POST /stamps/{amount}/{depth}` (buy) → on-chain batch creation via
+  `ant-chain` + `ant-postage`; honor `immutable` and `label` query/headers;
+  return `{batchID}`. `waitForUsable=false` path: return as soon as the tx
+  is mined; Freedom polls `/stamps` for `usable`.
+- B3. `PATCH /stamps/topup/{id}/{amount}` and
+  `PATCH /stamps/dilute/{id}/{depth}`.
+- B4. Stamp signing on upload: `Swarm-Postage-Batch-Id` on `POST /bzz`,
+  `POST /chunks`, `POST /bytes`, `POST /soc` must produce valid per-chunk
+  stamps the network accepts.
+
+**C. Missing write/route surface.**
+- C1. `POST /bytes` (raw byte upload, returns `{reference}`), used by
+  bee-js for feed payloads > 4 KiB and direct data uploads.
+- C2. `POST /feeds/{owner}/{topic}` (create feed manifest); align the
+  manifest + `?type=sequence` semantics with bee so other gateways resolve
+  it.
+- C3. `/tags`: `POST /tags` (create) and `GET /tags/{uid}` with
+  `split, seen, stored, sent, synced, uid, address, startedAt`. Uploads
+  attach to / create a tag and set `Swarm-Tag-Uid` on the response.
+- C4. `POST /bzz` collection mode: `Swarm-Collection:true` + tar body →
+  mantaray, honoring `Swarm-Index-Document`. Verify single-file `POST /bzz`
+  already returns a browsable manifest (Freedom publishes *data* via
+  `uploadFile`, which expects a manifest, not a raw `/bytes` ref).
+
+**D. Wallet / chequebook / SWAP.**
+- D1. `GET /wallet` real `bzzBalance` (PLUR string) + `nativeTokenBalance`
+  + `chainID:100` from `ant-chain`.
+- D2. `GET /chequebook/address` (real, or zero when not deployed) and
+  `GET /chequebook/balance` real `totalBalance`/`availableBalance`.
+- D3. `POST /chequebook/deposit?amount=` → deposit xBZZ into the
+  chequebook; return `{transactionHash}`. (Freedom auto-deposits 0.1 xBZZ
+  post-purchase and on demand.)
+- D4. Chequebook **deploy** path: bee deploys the chequebook lazily on
+  first need; Freedom keys its whole "publish ready" UX off
+  `chequebookAddress !== 0x0`. Ensure first deposit / first light-mode
+  start deploys it (this is the M3 SWAP milestone).
+
+**E. Process / identity / config parity (so the toggle works at all).**
+- E1. Bee YAML config support (`§C.2`, `D.3.1`): `api-addr`, `data-dir`,
+  `password`, `mainnet`, `full-node:false`, `swap-enable`,
+  `blockchain-rpc-endpoint`, `cors-allowed-origins`, `resolver-options`,
+  `skip-postage-snapshot`, `storage-incentives-enable`. Freedom writes
+  exactly these.
+- E2. `antd init --config` / `antd start --config` subcommands; idempotent
+  init.
+- E3. **Injected identity:** detect a pre-written
+  `keys/swarm.key` (Web3 v3 keystore, `§C.3`/`D.3.2`) and start without
+  re-init. Freedom's identity system writes this file before launch.
+- E4. Daemon manners Freedom relies on: `/health` answers < 50 ms after
+  bind (reuse detection), graceful `SIGTERM` exit < 5 s, and tolerating a
+  second instance probing `:1633` (it will reuse rather than spawn).
+
+### J.6 Mapping to existing milestones
+
+Almost all of J.5 is already planned — this appendix just confirms Freedom
+needs the **whole of Tier B** (Appendix C) plus three endpoints currently
+filed as 501/absent:
+
+- **A1–A2, D1–D4, B1–B4** = §9 Milestone 3 (light node: uploads + stamps +
+  SWAP) and the "Drop-in light-node gap" follow-on (§9 line ~1663).
+- **A3 (`/chainstate`)** = **reclassification** required: §C.4.2 lists it
+  under permanent 501 "full-node only", but bee-js's stamp-cost math reads
+  `currentPrice` from it. Expose the read-only `currentPrice`/`block` view
+  (not the full-node reserve machinery).
+- **C1–C4** = Tier B endpoint matrix (`POST /bytes`, `POST /feeds`,
+  `/tags`, collection upload) — already in §C.4.2, just not yet routed.
+- **E1–E4** = Appendix D.3.1 / D.3.2 + §C.2/§C.3, promoted from "optional
+  follow-on" to **required** for the Freedom drop-in.
+
+### J.7 Acceptance — "Freedom runs on antd"
+
+The drop-in is done when, against an `antd` started from Freedom's own
+config (`swap-enable:true`, injected `keys/swarm.key`):
+
+1. **Toggle + status.** Freedom's Nodes panel shows the `antd` version,
+   connected/visible peer counts, and `beeMode:light`; the publish UI
+   leaves the "checking node status" state and reaches "ready".
+2. **Buy stamps.** The Storage screen estimates a cost (needs
+   `/chainstate`), buys a batch (`POST /stamps/...`), polls it to `usable`,
+   and can extend duration/size.
+3. **Publish.** `freedom://publish` uploads text, a file, and a directory
+   (`POST /bzz`), each returns a `bzz://<ref>` that renders back in a tab
+   (`GET /bzz`), and the progress bar advances via `/tags`.
+4. **Feeds + SOC.** A connected dweb page can `swarm_createFeed`,
+   `swarm_writeFeedEntry`, `swarm_readFeedEntry`, and
+   `swarm_write/readSingleOwnerChunk` through `window.swarm` without error.
+5. **Wallet.** Bee-wallet xBZZ/native balances and chequebook
+   address/balance render real values; post-purchase auto-deposit succeeds.
+6. **No silent 501s** on any endpoint in §J.3 marked ✅/add. A Freedom
+   session produces zero `NODE_UNAVAILABLE` / `not implemented` errors in
+   normal publish/browse flows.
+
+### J.8 Implementation status (gateway HTTP surface)
+
+Landed in the gateway (all behind the existing in-process node-loop
+control channel; no new chain wiring, fully covered by
+`crates/ant-gateway/tests/freedom_dropin.rs`):
+
+- **A1 `/node` beeMode** — returns `light` (+ `chequebookEnabled` /
+  `swapEnabled`) when the daemon is started upload-capable (a postage
+  batch is configured), `ultra-light` otherwise. Driven by
+  `GatewayHandle::light_mode`, set by `antd` from the upload runtime.
+- **C1 `POST /bytes`** — raw byte upload: split → pushsync → `{reference}`
+  (bare `/bytes` ref, no manifest), with `Swarm-Tag-Uid`.
+- **C2 `POST /feeds/{owner}/{topic}`** — builds + pushes a `Sequence`
+  feed manifest (`ant_retrieval::build_feed_manifest`), returns the
+  manifest root; `?type=epoch` → 501, matching the read path. Shares the
+  route with the existing `GET/HEAD` feed lookup.
+- **C3 `/tags`** — `POST /tags` (create) + `GET /tags/{uid}` returning
+  bee-shaped `{split,seen,stored,sent,synced,uid,address,startedAt}`.
+  Because gateway uploads are synchronous (every chunk is pushsynced
+  before the response), a tag is reported fully synced as soon as the
+  upload completes; uploads auto-create (or adopt a client-supplied) tag
+  and echo it in `Swarm-Tag-Uid`. In-memory registry (`tags.rs`).
+- **C4 `POST /bzz`** — single-file + collection paths now finalize an
+  upload tag (`Swarm-Tag-Uid`) like bee; the manifest shape was already
+  browsable.
+- **B1 `GET /stamps` + `GET /stamps/{id}`** — backed by the daemon's
+  `PostageStatusView` over `ControlCommand::PostageStatus` (`stamps.rs`).
+  A configured batch is surfaced as a `usable` bee-shaped stamp so
+  Freedom's publish pre-flight passes; an empty list is returned when
+  uploads are disabled. `amount`/`batchTTL`/`blockNumber` use safe
+  placeholders pending a chain read. The request is bounded by a 10 s
+  timeout so a wedged node loop yields `504`, not a hung task.
+
+Deferred (require live-mainnet validation; not safely testable offline,
+and they pair with the on-chain *write* path which is itself deferred):
+
+- **A2 `GET /status` (`lastSyncedBlock`)** and **A3 `GET /chainstate`
+  (`currentPrice`)** — need new `ant-chain` reads (`eth_blockNumber`,
+  postage price-oracle `eth_call`) plumbed through `ant-control` /
+  `ant-node` to the gateway. Left on the 501 fallback rather than
+  shipping fabricated chain data that bee-js cost math would trust.
+- **B2–B4 on-chain stamp mutation** (`POST /stamps/{amount}/{depth}`,
+  `PATCH topup|dilute`, per-chunk stamp signing on arbitrary
+  `Swarm-Postage-Batch-Id`) and **D1–D4 wallet/chequebook/deposit/deploy**
+  — Milestone 3 SWAP work; remain on the 501 fallback.
+
