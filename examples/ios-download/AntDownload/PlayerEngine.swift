@@ -61,6 +61,8 @@ final class PlayerEngine: ObservableObject {
     private var bufferEmptyObservation: NSKeyValueObservation?
     private var endObserver: NSObjectProtocol?
     private var stallObserver: NSObjectProtocol?
+    private var interruptionObserver: NSObjectProtocol?
+    private var routeChangeObserver: NSObjectProtocol?
     private var progressTask: Task<Void, Never>?
     private var bytesSamples: [(at: Date, bytes: UInt64)] = []
     private var bufferObservation: NSKeyValueObservation?
@@ -77,6 +79,24 @@ final class PlayerEngine: ObservableObject {
     /// Polls the buffer back to health after a mid-track stall and calls
     /// `play()` again (the player won't, with auto-wait disabled).
     private var stallResumeTask: Task<Void, Never>?
+    /// Set when an audio-session interruption (call, Siri, another app)
+    /// pauses us *while we intended to play*, so we know to resume once the
+    /// interruption ends and the system grants `.shouldResume`.
+    private var resumeAfterInterruption = false
+    /// True for the duration of a single stall episode (buffer-dry →
+    /// resumed). Gates the rebuffer-hysteresis growth so a stall that fires
+    /// several KVO/notification callbacks only widens the cushion once.
+    private var isStalled = false
+    /// Wall-clock of the last successful post-stall resume. If the next
+    /// stall lands inside [`quickStallWindow`] we treat the runway as too
+    /// small and grow it (hysteresis); if it lands well after, the network
+    /// was healthy for a while so we reset the cushion back to the base.
+    private var lastResumeAt: Date?
+    /// Current decoded cushion required before resuming after a stall.
+    /// Starts at [`baseResumeRunwaySeconds`] and grows on repeated quick
+    /// stalls up to [`maxResumeRunwaySeconds`] to stop stutter cycling on a
+    /// flaky network.
+    private var resumeRunwaySeconds: TimeInterval = PlayerEngine.baseResumeRunwaySeconds
 
     /// Player-engine state machine. Hard-coded playlist means we never
     /// need a "manifest loading" / "manifest failed" state — the queue
@@ -122,6 +142,7 @@ final class PlayerEngine: ObservableObject {
         Self.resetDebugLog()
         debugLog("init")
         configureAudioSession()
+        observeAudioSession()
         configureRemoteCommands()
         observePlayer()
         startProgressPoll()
@@ -136,6 +157,12 @@ final class PlayerEngine: ObservableObject {
         }
         if let stallObserver = stallObserver {
             NotificationCenter.default.removeObserver(stallObserver)
+        }
+        if let interruptionObserver = interruptionObserver {
+            NotificationCenter.default.removeObserver(interruptionObserver)
+        }
+        if let routeChangeObserver = routeChangeObserver {
+            NotificationCenter.default.removeObserver(routeChangeObserver)
         }
         progressTask?.cancel()
         stallResumeTask?.cancel()
@@ -370,6 +397,14 @@ final class PlayerEngine: ObservableObject {
         isPlaying = autoPlay
         bufferedAhead = 0
         bytesSamples.removeAll(keepingCapacity: true)
+        // Fresh track: forget the previous track's stall history so its
+        // rebuffer cushion doesn't carry over.
+        isStalled = false
+        lastResumeAt = nil
+        resumeRunwaySeconds = Self.baseResumeRunwaySeconds
+        // Clear any prior terminal failure so skipping/selecting a new track
+        // recovers from a `.failed` state (`openStream` re-sets it on error).
+        if case .failed = playbackStatus { playbackStatus = .ready }
 
         do {
             let session = try await node.openStream(reference: track.bzzReference)
@@ -381,6 +416,12 @@ final class PlayerEngine: ObservableObject {
             self.loader = loader
             self.asset = asset
             let item = AVPlayerItem(asset: asset)
+            // Ask AVPlayer to keep more decoded runway ahead than its
+            // default. With `automaticallyWaitsToMinimizeStalling` off we
+            // drive resume off a concrete cushion, so biasing the player
+            // toward filling a deeper forward buffer means fewer dry-buffer
+            // stalls on the bursty ant transport.
+            item.preferredForwardBufferDuration = Self.preferredForwardBufferSeconds
             self.playerItem = item
             attachItemObservers(item: item)
             player.replaceCurrentItem(with: item)
@@ -403,9 +444,20 @@ final class PlayerEngine: ObservableObject {
         statusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
             guard let self else { return }
             Task { @MainActor in
-                if item.status == .readyToPlay {
+                switch item.status {
+                case .readyToPlay:
                     self.duration = item.duration.seconds.isFinite ? item.duration.seconds : 0
                     self.updateNowPlaying()
+                case .failed:
+                    // The loader errored *after* playback began (peer drop,
+                    // range read failure). `openStream`'s own catch only
+                    // covers the cold start, so surface it here too —
+                    // otherwise we sit on a frozen buffering spinner forever.
+                    self.failPlayback("playback: \(item.error?.localizedDescription ?? "item failed")")
+                case .unknown:
+                    break
+                @unknown default:
+                    break
                 }
             }
         }
@@ -420,8 +472,7 @@ final class PlayerEngine: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 if item.isPlaybackBufferEmpty, self.intendsToPlay, self.position.pendingSeekTime == nil {
-                    self.isBuffering = true
-                    self.resumeAfterStallWhenReady()
+                    self.beginStall()
                 }
                 self.recomputeBufferedAhead()
             }
@@ -440,8 +491,7 @@ final class PlayerEngine: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.intendsToPlay, self.position.pendingSeekTime == nil else { return }
-                self.isBuffering = true
-                self.resumeAfterStallWhenReady()
+                self.beginStall()
             }
         }
     }
@@ -503,8 +553,7 @@ final class PlayerEngine: ObservableObject {
             // pause: keep the buffering UI up and schedule a resume.
             if intendsToPlay {
                 isPlaying = true
-                isBuffering = true
-                resumeAfterStallWhenReady()
+                beginStall()
             } else {
                 isPlaying = false
                 isBuffering = false
@@ -515,6 +564,9 @@ final class PlayerEngine: ObservableObject {
         case .playing:
             isPlaying = true
             isBuffering = false
+            // Healthy playback resumed: the stall episode is over, so the
+            // next dry buffer is allowed to widen the cushion again.
+            isStalled = false
         @unknown default:
             break
         }
@@ -522,15 +574,46 @@ final class PlayerEngine: ObservableObject {
         updateNowPlaying()
     }
 
+    /// Single entry point for "the buffer ran dry while we wanted to play".
+    /// Folds the eager buffering UI, the rebuffer-hysteresis bookkeeping,
+    /// and the resume poll together so the three callbacks that can detect
+    /// a stall (`isPlaybackBufferEmpty`, `AVPlayerItemPlaybackStalled`, and
+    /// a `.paused` `timeControlStatus` while we intend to play) all share
+    /// one consistent path.
+    private func beginStall() {
+        guard intendsToPlay, position.pendingSeekTime == nil else { return }
+        isBuffering = true
+        // Only adjust the cushion on the *first* callback of a stall
+        // episode; the flag is cleared once playback returns to `.playing`.
+        if !isStalled {
+            isStalled = true
+            if let last = lastResumeAt, Date().timeIntervalSince(last) < Self.quickStallWindow {
+                // We resumed and re-stalled almost immediately — the runway
+                // was too short. Widen it so the next resume has more slack.
+                resumeRunwaySeconds = min(
+                    resumeRunwaySeconds + Self.baseResumeRunwaySeconds, Self.maxResumeRunwaySeconds)
+                debugLog("rebuffer-grow runway=\(fmt(resumeRunwaySeconds))")
+            } else if lastResumeAt != nil {
+                // The network held up for a healthy stretch before this
+                // stall; decay the cushion back to the base.
+                resumeRunwaySeconds = Self.baseResumeRunwaySeconds
+                debugLog("rebuffer-reset runway=\(fmt(resumeRunwaySeconds))")
+            }
+        }
+        resumeAfterStallWhenReady()
+    }
+
     /// After a mid-track stall (or the first fill of a freshly-loaded
     /// track) the player won't resume on its own — auto-wait is off. Poll
     /// the item back to health and `play()` again, bailing if the user
-    /// pauses, a seek takes over, or the track is swapped out.
+    /// pauses, a seek takes over, or the track is swapped out. If the buffer
+    /// never recovers within the ceiling we give up to a `.failed` state
+    /// rather than spinning forever.
     private func resumeAfterStallWhenReady() {
         guard intendsToPlay, position.pendingSeekTime == nil else { return }
         stallResumeTask?.cancel()
         if bufferReadyToResume() {
-            player.play()
+            performResume()
             return
         }
         stallResumeTask = Task { [weak self] in
@@ -547,12 +630,39 @@ final class PlayerEngine: ObservableObject {
                     await MainActor.run {
                         guard let self, self.intendsToPlay, self.position.pendingSeekTime == nil else { return }
                         self.debugLog("stall-resume")
-                        self.player.play()
+                        self.performResume()
                     }
                 }
                 return
             }
+            // Ceiling hit without ever recovering: surface a terminal state
+            // so the UI can stop showing a perpetual buffering spinner.
+            await MainActor.run {
+                guard let self, self.intendsToPlay, self.position.pendingSeekTime == nil else { return }
+                self.failPlayback("buffering timed out")
+            }
         }
+    }
+
+    /// Resume after a stall and stamp `lastResumeAt`, which the hysteresis
+    /// logic in [`beginStall`] reads to tell a quick re-stall (grow the
+    /// cushion) from a stall after a healthy stretch (reset it).
+    private func performResume() {
+        lastResumeAt = Date()
+        player.play()
+    }
+
+    /// Tear playback down into a recoverable failed state: stop the resume
+    /// poll, clear the buffering UI and play intent, and publish the
+    /// message the `UP NEXT` card and status title render.
+    private func failPlayback(_ message: String) {
+        debugLog("fail: \(message)")
+        stallResumeTask?.cancel()
+        intendsToPlay = false
+        isStalled = false
+        isPlaying = false
+        isBuffering = false
+        playbackStatus = .failed(message)
     }
 
     /// Seconds of contiguous buffered media ahead of the playhead, read
@@ -587,14 +697,26 @@ final class PlayerEngine: ObservableObject {
     /// reached the end of the track.
     private func bufferReadyToResume() -> Bool {
         let ahead = currentBufferedAhead()
-        if ahead >= Self.resumeRunwaySeconds { return true }
+        if ahead >= resumeRunwaySeconds { return true }
         if duration > 0 {
             let remaining = duration - position.displayTime
             if remaining > 0, ahead >= remaining - 0.5 { return true }
         }
         return false
     }
-    private static let resumeRunwaySeconds: TimeInterval = 3
+    /// Baseline decoded cushion required to resume after a stall.
+    private static let baseResumeRunwaySeconds: TimeInterval = 3
+    /// Hard cap on the grown cushion so a chronically bad network doesn't
+    /// turn into a multi-minute pre-buffer.
+    private static let maxResumeRunwaySeconds: TimeInterval = 15
+    /// A re-stall within this window of the last resume counts as "the
+    /// runway was too short" and widens the cushion; a stall after it
+    /// resets the cushion back to the base.
+    private static let quickStallWindow: TimeInterval = 12
+    /// Forward buffer target handed to each `AVPlayerItem`. Deeper than the
+    /// system default (0 = "let AVPlayer decide") to smooth over the
+    /// transport's bursty delivery.
+    private static let preferredForwardBufferSeconds: TimeInterval = 30
 
     private func configureAudioSession() {
         do {
@@ -604,6 +726,79 @@ final class PlayerEngine: ObservableObject {
         } catch {
             NSLog("audio session: %@", "\(error)")
         }
+    }
+
+    /// Wire up the two audio-session notifications a well-behaved iOS
+    /// player must honour:
+    ///
+    /// - **Interruptions** (`.began`/`.ended`): a phone call, Siri, or
+    ///   another app taking the session stops our audio. On `.began` we
+    ///   remember whether we intended to play and pause; on `.ended` we
+    ///   reactivate the session and resume only if the system grants
+    ///   `.shouldResume` *and* we were playing before. Without this an
+    ///   interruption is indistinguishable from a silent dead-stop.
+    /// - **Route changes** (`.oldDeviceUnavailable`): unplugging headphones
+    ///   or dropping a Bluetooth device must pause rather than abruptly
+    ///   blast audio out the built-in speaker — the platform convention.
+    private func observeAudioSession() {
+        let center = NotificationCenter.default
+        let session = AVAudioSession.sharedInstance()
+        interruptionObserver = center.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: session,
+            queue: .main
+        ) { [weak self] note in
+            Task { @MainActor in self?.handleInterruption(note) }
+        }
+        routeChangeObserver = center.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: session,
+            queue: .main
+        ) { [weak self] note in
+            Task { @MainActor in self?.handleRouteChange(note) }
+        }
+    }
+
+    private func handleInterruption(_ note: Notification) {
+        guard
+            let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+            let type = AVAudioSession.InterruptionType(rawValue: raw)
+        else { return }
+        switch type {
+        case .began:
+            // The system has already silenced us; record intent and mirror
+            // the pause into our own state so the UI shows the play button.
+            resumeAfterInterruption = intendsToPlay
+            debugLog("interrupt-began resume=\(resumeAfterInterruption ? 1 : 0)")
+            if intendsToPlay { pause() }
+        case .ended:
+            guard resumeAfterInterruption else { return }
+            resumeAfterInterruption = false
+            let options: AVAudioSession.InterruptionOptions
+            if let raw = note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt {
+                options = AVAudioSession.InterruptionOptions(rawValue: raw)
+            } else {
+                options = []
+            }
+            debugLog("interrupt-ended shouldResume=\(options.contains(.shouldResume) ? 1 : 0)")
+            guard options.contains(.shouldResume) else { return }
+            try? AVAudioSession.sharedInstance().setActive(true)
+            play()
+        @unknown default:
+            break
+        }
+    }
+
+    private func handleRouteChange(_ note: Notification) {
+        guard
+            let raw = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
+            let reason = AVAudioSession.RouteChangeReason(rawValue: raw)
+        else { return }
+        // Only the "old device went away" case maps to a pause; new-device
+        // and category-change reasons should leave playback untouched.
+        guard reason == .oldDeviceUnavailable else { return }
+        debugLog("route-change oldDeviceUnavailable")
+        if isPlaying { pause() }
     }
 
     private func configureRemoteCommands() {
