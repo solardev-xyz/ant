@@ -657,7 +657,9 @@ async fn main() -> Result<()> {
             .or_else(|| std::env::var("CHEQUEBOOK_ADDRESS").ok())
             .and_then(|s| {
                 let mut a = [0u8; 20];
-                hex::decode_to_slice(strip_0x(s.trim()), &mut a).ok().map(|()| a)
+                hex::decode_to_slice(strip_0x(s.trim()), &mut a)
+                    .ok()
+                    .map(|()| a)
             });
         // The node's own signing key funds postage buys / chequebook
         // deposits and is the batch owner — same key that derives `eth`.
@@ -688,7 +690,9 @@ async fn main() -> Result<()> {
             activity: gateway_activity.clone(),
             light_mode,
             tags: Arc::new(TagRegistry::new()),
-            cors: Arc::new(ant_gateway::CorsConfig::new(opt.cors_allowed_origins.iter())),
+            cors: Arc::new(ant_gateway::CorsConfig::new(
+                opt.cors_allowed_origins.iter(),
+            )),
             chain: chain_ctx,
         })
     };
@@ -708,14 +712,26 @@ async fn main() -> Result<()> {
         }
     };
 
-    if opt.no_control_socket {
+    // The `antctl`/`antop` control socket is a Unix domain socket; it
+    // only exists on Unix targets. On Windows antd runs the node loop +
+    // HTTP gateway and operators drive it through the bee-shaped HTTP
+    // API instead. `--no-control-socket` forces that same path on Unix.
+    #[cfg(unix)]
+    let serve_control = !opt.no_control_socket;
+    #[cfg(not(unix))]
+    let serve_control = false;
+
+    if !serve_control {
         drop(cmd_tx);
-        tokio::select! {
+        return tokio::select! {
             res = node_fut => res.map_err(|e| anyhow::anyhow!("{e}")),
             res = gateway_fut => res,
             () = shutdown_signal() => Ok(()),
-        }
-    } else {
+        };
+    }
+
+    #[cfg(unix)]
+    {
         let control_path = control_socket.clone();
         let control_fut =
             ant_control::serve(control_path, AGENT.to_string(), status_rx, Some(cmd_tx));
@@ -735,6 +751,8 @@ async fn main() -> Result<()> {
             () = shutdown_signal() => Ok(()),
         }
     }
+    #[cfg(not(unix))]
+    unreachable!("serve_control is always false on non-unix targets")
 }
 
 /// Resolve when the process receives `SIGTERM` or `SIGINT` (Ctrl-C).
