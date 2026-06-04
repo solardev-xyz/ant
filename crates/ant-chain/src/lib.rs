@@ -202,6 +202,66 @@ impl ChainClient {
         let out = self.eth_call(token, &data).await?;
         abi_word_last_u128_be(&out)
     }
+
+    /// Latest block number (`eth_blockNumber`). Drives bee's
+    /// `/status.lastSyncedBlock` and `/chainstate.block`/`chainTip` —
+    /// `antd` is a light node with no block pipeline of its own, so the
+    /// chain tip *is* our synced block.
+    pub async fn eth_block_number(&self) -> Result<u64, RpcError> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1u64,
+            "method": "eth_blockNumber",
+            "params": [],
+        });
+        let v: RpcResp<'_> = self
+            .http
+            .post(&self.url)
+            .json(&body)
+            .send()
+            .await?
+            .json()
+            .await?;
+        if let Some(e) = v.error {
+            return Err(RpcError::Rpc(
+                e.message.unwrap_or_else(|| "unknown RPC error".to_string()),
+            ));
+        }
+        let s = v
+            .result
+            .ok_or_else(|| RpcError::Rpc("missing result".into()))?;
+        let s = s.strip_prefix("0x").unwrap_or(&s);
+        let s = if s.is_empty() { "0" } else { s };
+        u64::from_str_radix(s, 16).map_err(|e| RpcError::Decode(format!("eth_blockNumber: {e}")))
+    }
+
+    /// `PostageStamp.lastPrice()` — current price per chunk per block
+    /// (PLUR), the value bee-js's stamp-cost math reads from
+    /// `/chainstate.currentPrice`.
+    pub async fn postage_last_price(&self, postage_contract: &str) -> Result<u128, RpcError> {
+        let data = format!("0x{}", hex::encode(fn_selector(b"lastPrice()")));
+        let out = self.eth_call(postage_contract, &data).await?;
+        abi_word_last_u128_be(&out)
+    }
+
+    /// `PostageStamp.currentTotalOutPayment()` — cumulative per-chunk
+    /// outpayment, bee's `/chainstate.totalAmount`. Combined with a
+    /// batch's `normalisedBalance` this is what TTL math is derived from.
+    pub async fn postage_total_amount(&self, postage_contract: &str) -> Result<u128, RpcError> {
+        let data = format!("0x{}", hex::encode(fn_selector(b"currentTotalOutPayment()")));
+        let out = self.eth_call(postage_contract, &data).await?;
+        abi_word_last_u128_be(&out)
+    }
+}
+
+/// 4-byte ABI function selector = first 4 bytes of `keccak256(sig)`.
+#[cfg(feature = "chain-rpc")]
+fn fn_selector(sig: &[u8]) -> [u8; 4] {
+    use sha3::{Digest, Keccak256};
+    let h = Keccak256::digest(sig);
+    let mut s = [0u8; 4];
+    s.copy_from_slice(&h[..4]);
+    s
 }
 
 /// Views required for a postage `StampIssuer` (bee `batchDepth` / `batchBucketDepth` / `immutableFlag`).

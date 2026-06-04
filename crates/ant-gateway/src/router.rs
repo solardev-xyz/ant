@@ -11,7 +11,7 @@ use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::{get, on, post, MethodFilter, MethodRouter};
+use axum::routing::{get, on, patch, post, MethodFilter, MethodRouter};
 use axum::Router;
 
 use tracing::Instrument;
@@ -19,7 +19,7 @@ use tracing::Instrument;
 use crate::fallback::not_implemented;
 use crate::handle::GatewayHandle;
 use crate::retrieval::GATEWAY_MAX_UPLOAD_BYTES;
-use crate::{retrieval, stamps, status, stubs, tags};
+use crate::{chain, retrieval, stamps, status, tags};
 
 const SERVER_HEADER: &str = concat!("ant-gateway/", env!("CARGO_PKG_VERSION"));
 
@@ -36,14 +36,29 @@ pub fn build(handle: GatewayHandle) -> Router {
         .route("/addresses", get(status::addresses))
         .route("/peers", get(status::peers))
         .route("/topology", get(status::topology))
-        .route("/wallet", get(stubs::wallet))
+        // Chain-backed wallet / chequebook / status / chainstate
+        // (PLAN.md J.5 A2/A3/D1/D2). Real Gnosis balances + block /
+        // postage price when an RPC endpoint is configured; bee's
+        // zero-stub (wallet/chequebook) or 501 (status/chainstate)
+        // otherwise.
+        .route("/wallet", get(chain::wallet))
+        .route("/status", get(chain::status))
+        .route("/chainstate", get(chain::chainstate))
         // Real postage listing backed by the daemon's configured batch
         // (PLAN.md J.5.B); on-chain buy/topup/dilute remain on the 501
         // fallback pending live-mainnet validation.
         .route("/stamps", get(stamps::stamps))
         .route("/stamps/{id}", get(stamps::stamp))
-        .route("/chequebook/address", get(stubs::chequebook_address))
-        .route("/chequebook/balance", get(stubs::chequebook_balance))
+        // On-chain postage mutation (PLAN.md J.5 B2/B3): buy / topup /
+        // dilute. `501` when no funded wallet key is configured.
+        .route("/stamps/{amount}/{depth}", post(chain::buy_stamp))
+        .route("/stamps/topup/{id}/{amount}", patch(chain::topup_stamp))
+        .route("/stamps/dilute/{id}/{depth}", patch(chain::dilute_stamp))
+        .route("/chequebook/address", get(chain::chequebook_address))
+        .route("/chequebook/balance", get(chain::chequebook_balance))
+        // Chequebook funding (PLAN.md J.5 D3): transfer xBZZ into the
+        // chequebook. `501` without a funded wallet key.
+        .route("/chequebook/deposit", post(chain::chequebook_deposit))
         // Upload-progress tags (PLAN.md J.2.4 / C3). `POST /tags`
         // creates a tag; `GET /tags/{uid}` polls it. Uploads also
         // auto-create a tag and echo its uid in `Swarm-Tag-Uid`.
@@ -89,6 +104,14 @@ pub fn build(handle: GatewayHandle) -> Router {
         .fallback(not_implemented)
         .layer(DefaultBodyLimit::max(GATEWAY_MAX_UPLOAD_BYTES as usize))
         .layer(middleware::from_fn(request_span))
+        // CORS is applied outermost so a preflight `OPTIONS` is answered
+        // before the body-limit / span layers and never reaches a route
+        // (PLAN.md J.4.8). `from_fn_with_state` hands it the same handle
+        // the routes use, so the policy reads `handle.cors`.
+        .layer(middleware::from_fn_with_state(
+            handle.clone(),
+            crate::cors::cors_middleware,
+        ))
         .with_state(handle)
 }
 

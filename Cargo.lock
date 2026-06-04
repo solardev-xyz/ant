@@ -104,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "ant-chain"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "ant-crypto",
  "getrandom 0.3.4",
@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "ant-control"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "hex",
  "serde",
@@ -135,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "ant-crypto"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "getrandom 0.3.4",
  "hex",
@@ -146,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "ant-ffi"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "ant-control",
  "ant-crypto",
@@ -168,7 +168,7 @@ dependencies = [
 
 [[package]]
 name = "ant-gateway"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "ant-control",
  "ant-crypto",
@@ -194,7 +194,7 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "ant-control",
  "ant-crypto",
@@ -214,7 +214,7 @@ dependencies = [
 
 [[package]]
 name = "ant-p2p"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "ant-chain",
  "ant-control",
@@ -244,7 +244,7 @@ dependencies = [
 
 [[package]]
 name = "ant-postage"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "ant-crypto",
  "hex",
@@ -255,7 +255,7 @@ dependencies = [
 
 [[package]]
 name = "ant-retrieval"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "ant-crypto",
  "ant-postage",
@@ -279,7 +279,7 @@ dependencies = [
 
 [[package]]
 name = "antctl"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "ant-chain",
  "ant-control",
@@ -299,8 +299,9 @@ dependencies = [
 
 [[package]]
 name = "antd"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
+ "aes",
  "ant-chain",
  "ant-control",
  "ant-crypto",
@@ -310,15 +311,23 @@ dependencies = [
  "ant-postage",
  "ant-retrieval",
  "anyhow",
+ "async-trait",
  "clap",
+ "ctr",
  "dirs",
  "fs4",
  "hex",
+ "hmac",
  "k256",
  "libp2p",
+ "pbkdf2",
+ "primitive-types",
  "rlimit",
+ "scrypt",
  "serde",
  "serde_json",
+ "serde_yaml",
+ "sha2 0.10.9",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -326,7 +335,7 @@ dependencies = [
 
 [[package]]
 name = "antop"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "ant-control",
  "anyhow",
@@ -3118,6 +3127,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
+name = "pbkdf2"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
+dependencies = [
+ "digest 0.10.7",
+ "hmac",
+]
+
+[[package]]
 name = "pem"
 version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3982,6 +4001,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "salsa20"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97a22f5af31f73a954c10289c93e8a50cc23d971e80ee446f1f6f7137a088213"
+dependencies = [
+ "cipher",
+]
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3995,6 +4023,17 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "scrypt"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0516a385866c09368f0b5bcd1caff3366aace790fcd46e2bb032697bb172fd1f"
+dependencies = [
+ "pbkdf2",
+ "salsa20",
+ "sha2 0.10.9",
+]
 
 [[package]]
 name = "sec1"
@@ -4080,6 +4119,19 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "serde_yaml"
+version = "0.9.34+deprecated"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
 ]
 
 [[package]]
@@ -4813,6 +4865,12 @@ dependencies = [
  "crypto-common 0.1.7",
  "subtle",
 ]
+
+[[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "unsigned-varint"

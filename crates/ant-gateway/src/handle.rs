@@ -17,6 +17,8 @@ use ant_control::{ControlCommand, GatewayActivity, StatusSnapshot};
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 
+use crate::chain::ChainContext;
+use crate::cors::CorsConfig;
 use crate::tags::TagRegistry;
 
 /// Static identity surface used by `/addresses`. All fields are owned
@@ -81,4 +83,16 @@ pub struct GatewayHandle {
     /// synchronous (every chunk is pushsynced before the response),
     /// the tag is marked fully synced as soon as it's created.
     pub tags: Arc<TagRegistry>,
+    /// CORS policy applied to every response. Driven by bee's
+    /// `cors-allowed-origins` config (PLAN.md J.4.8): Freedom sets it to
+    /// `"null"` because its dweb pages `fetch`/upload from an opaque
+    /// (`null`) origin. With the default (deny) config no CORS headers
+    /// are emitted, matching a bee node started without the option.
+    pub cors: Arc<CorsConfig>,
+    /// Optional live Gnosis chain reader + addresses backing
+    /// `/wallet`, `/chequebook/*`, `/status`, `/chainstate` (PLAN.md J.5
+    /// A2/A3/D1/D2). `None` on a node started without an RPC endpoint:
+    /// balances then report the bee zero-stub and the chain-state
+    /// endpoints fall to `501`, matching bee with no configured backend.
+    pub chain: Option<Arc<ChainContext>>,
 }

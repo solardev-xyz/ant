@@ -28,7 +28,7 @@ use ant_control::{
     RetrievalInfo, RoutingInfo, StatusSnapshot, StreamRange, PROTOCOL_VERSION,
 };
 use ant_gateway::testkit::build_router;
-use ant_gateway::{GatewayHandle, GatewayIdentity, TagRegistry};
+use ant_gateway::{ChainContext, CorsConfig, GatewayHandle, GatewayIdentity, TagRegistry};
 use ant_retrieval::{
     join_to_sender_range, join_with_options, list_manifest, lookup_path, ByteRange, ChunkFetcher,
     JoinOptions, DEFAULT_MAX_FILE_BYTES,
@@ -195,6 +195,57 @@ pub fn status_only_router(snapshot: StatusSnapshot) -> Router {
         activity: GatewayActivity::new(),
         light_mode: false,
         tags: Arc::new(TagRegistry::new()),
+        cors: Arc::new(CorsConfig::default()),
+        chain: None,
+    };
+    build_router(handle)
+}
+
+/// Like [`status_only_router`] but with a caller-supplied chain context,
+/// so the chain-backed endpoints (`/wallet`, `/chequebook/*`,
+/// `/status`, `/chainstate`) can be driven end-to-end with a fake
+/// reader. `light_mode` is on so `/status.beeMode` reports `light`.
+pub fn status_router_with_chain(
+    snapshot: StatusSnapshot,
+    chain: std::sync::Arc<ChainContext>,
+) -> Router {
+    let (status_tx, status_rx) = watch::channel(snapshot);
+    Box::leak(Box::new(status_tx));
+    let (cmd_tx, cmd_rx) = mpsc::channel::<ControlCommand>(8);
+    Box::leak(Box::new(cmd_rx));
+    let handle = GatewayHandle {
+        agent: Arc::new("antd/test".to_string()),
+        api_version: Arc::new("7.2.0".to_string()),
+        identity: Arc::new(test_identity()),
+        status: status_rx,
+        commands: cmd_tx,
+        activity: GatewayActivity::new(),
+        light_mode: true,
+        tags: Arc::new(TagRegistry::new()),
+        cors: Arc::new(CorsConfig::default()),
+        chain: Some(chain),
+    };
+    build_router(handle)
+}
+
+/// Like [`status_only_router`] but with a caller-supplied CORS policy,
+/// so the CORS integration tests can drive the middleware end-to-end.
+pub fn status_router_with_cors(snapshot: StatusSnapshot, cors: CorsConfig) -> Router {
+    let (status_tx, status_rx) = watch::channel(snapshot);
+    Box::leak(Box::new(status_tx));
+    let (cmd_tx, cmd_rx) = mpsc::channel::<ControlCommand>(8);
+    Box::leak(Box::new(cmd_rx));
+    let handle = GatewayHandle {
+        agent: Arc::new("antd/test".to_string()),
+        api_version: Arc::new("7.2.0".to_string()),
+        identity: Arc::new(test_identity()),
+        status: status_rx,
+        commands: cmd_tx,
+        activity: GatewayActivity::new(),
+        light_mode: false,
+        tags: Arc::new(TagRegistry::new()),
+        cors: Arc::new(cors),
+        chain: None,
     };
     build_router(handle)
 }
@@ -228,6 +279,8 @@ pub fn handle_with_fixture_node() -> Router {
         activity: GatewayActivity::new(),
         light_mode: true,
         tags: Arc::new(TagRegistry::new()),
+        cors: Arc::new(CorsConfig::default()),
+        chain: None,
     };
     build_router(handle)
 }
@@ -521,6 +574,8 @@ where
         activity: GatewayActivity::new(),
         light_mode: true,
         tags: Arc::new(TagRegistry::new()),
+        cors: Arc::new(CorsConfig::default()),
+        chain: None,
     };
     build_router(handle)
 }

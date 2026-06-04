@@ -1,6 +1,9 @@
 # Rust build artifacts
 /target/
 
+# Locally packaged release artifacts (the canonical ones come from CI)
+/dist/
+
 # Local environment and secrets
 .env
 .env.*

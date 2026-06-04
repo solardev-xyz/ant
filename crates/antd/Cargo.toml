@@ -1,6 +1,6 @@
 [package]
 name = "antd"
-version = "0.5.6"
+version = "0.5.7"
 edition.workspace = true
 
 [[bin]]
@@ -17,18 +17,38 @@ ant-p2p = { path = "../ant-p2p" }
 ant-postage = { path = "../ant-postage" }
 ant-retrieval = { path = "../ant-retrieval" }
 anyhow.workspace = true
+async-trait.workspace = true
 clap.workspace = true
 dirs = "6.0.0"
 fs4 = "1.0.2"
 hex.workspace = true
 k256.workspace = true
 libp2p.workspace = true
-rlimit = "0.11.0"
+# u256 amount math for the on-chain postage-buy / chequebook-deposit
+# write endpoints (same version ant-chain pins).
+primitive-types = { version = "0.14.0", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
+# Bee-compatible YAML config (`antd --config`, PLAN.md J.5.E1/E2).
+serde_yaml = "0.9.34"
+# Web3 v3 keystore decryption for Freedom's injected `keys/swarm.key`
+# (PLAN.md J.5.E3). RustCrypto building blocks; `aes`/`ctr`/`hmac`/`sha2`
+# are already in the workspace tree, scrypt/pbkdf2 are the two KDFs the
+# v3 spec allows.
+aes = "0.8.4"
+ctr = "0.9.2"
+hmac = "0.12.1"
+pbkdf2 = { version = "0.12.2", default-features = false }
+scrypt = { version = "0.11.0", default-features = false }
+sha2 = "0.10.9"
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+# `RLIMIT_NOFILE` bump is Unix-only; Windows has no equivalent and the
+# `rlimit` crate's `Resource`/`getrlimit` API isn't available there.
+[target.'cfg(unix)'.dependencies]
+rlimit = "0.11.0"
 
 [lints]
 workspace = true

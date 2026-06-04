@@ -28,6 +28,10 @@
 #![cfg_attr(not(feature = "http-api"), allow(dead_code))]
 
 #[cfg(feature = "http-api")]
+mod chain;
+#[cfg(feature = "http-api")]
+mod cors;
+#[cfg(feature = "http-api")]
 mod error;
 #[cfg(feature = "http-api")]
 mod fallback;
@@ -42,10 +46,12 @@ mod stamps;
 #[cfg(feature = "http-api")]
 mod status;
 #[cfg(feature = "http-api")]
-mod stubs;
-#[cfg(feature = "http-api")]
 mod tags;
 
+#[cfg(feature = "http-api")]
+pub use chain::{ChainContext, ChainReader, ChainWriter};
+#[cfg(feature = "http-api")]
+pub use cors::CorsConfig;
 #[cfg(feature = "http-api")]
 pub use handle::{GatewayHandle, GatewayIdentity};
 #[cfg(feature = "http-api")]

@@ -1,0 +1,140 @@
+# Release workflow: build the `antd` daemon for every platform Freedom
+# bundles (the bee drop-in) and publish them as a GitHub Release.
+#
+# Targets mirror Freedom's `scripts/fetch-bee.js` matrix so a forked
+# `fetch-ant.js` can pick assets by the same os/arch keywords:
+#   darwin-arm64, darwin-amd64, linux-amd64, linux-arm64, windows-amd64
+# (Windows arm64 runs the amd64 build under emulation, same as bee.)
+#
+# Trigger: push a tag like `v0.5.7`, or run manually via the Actions tab
+# (workflow_dispatch) for a dry run that builds without publishing.
+#
+# Each job builds only `antd` (the node binary Freedom spawns), archives
+# it (tar.gz on unix, zip on windows), and uploads it to the release.
+# A final job aggregates SHA256SUMS so downloads can be verified.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.asset }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: linux-amd64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar
+          - asset: linux-arm64
+            runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            archive: tar
+            linker: aarch64-linux-gnu-gcc
+            apt: gcc-aarch64-linux-gnu
+          - asset: darwin-amd64
+            runner: macos-13
+            target: x86_64-apple-darwin
+            archive: tar
+          - asset: darwin-arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            archive: tar
+          - asset: windows-amd64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.asset }}
+
+      - name: Install cross linker (linux-arm64)
+        if: matrix.apt != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt }}
+
+      - name: Build antd (release)
+        shell: bash
+        env:
+          # Tell cargo which linker to use for the cross target. The env
+          # var name is the target triple upper-cased with `-`→`_`.
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
+        run: cargo build --release -p antd --target ${{ matrix.target }}
+
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          [ "$ver" = "$GITHUB_REF_NAME" ] && ver="dev"   # workflow_dispatch
+          out="antd-v${ver}-${{ matrix.asset }}"
+          bindir="target/${{ matrix.target }}/release"
+          mkdir -p dist
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            cp "${bindir}/antd.exe" "antd.exe"
+            7z a "dist/${out}.zip" "antd.exe" >/dev/null
+            echo "file=dist/${out}.zip" >> "$GITHUB_OUTPUT"
+          else
+            cp "${bindir}/antd" "antd"
+            chmod 755 antd
+            tar -czf "dist/${out}.tar.gz" antd
+            echo "file=dist/${out}.tar.gz" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ steps.pkg.outputs.file }}
+          retention-days: 7
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    # Only publish for real tags; workflow_dispatch is a build-only dry run.
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect + checksum
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} dist/ \;
+          cd dist
+          sha256sum * > SHA256SUMS
+          echo "=== release contents ===" && ls -la && cat SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true

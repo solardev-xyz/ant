@@ -1,5 +1,9 @@
 //! `antd` — Swarm light node daemon (M1.0: mainnet dial + BZZ handshake).
 
+mod chainreader;
+mod config;
+mod keystore;
+
 use ant_control::{
     ControlCommand, GatewayActivity, IdentityInfo, PeerInfo, RetrievalInfo, StatusSnapshot,
     PROTOCOL_VERSION,
@@ -12,7 +16,8 @@ use ant_gateway::{Gateway, GatewayHandle, GatewayIdentity, TagRegistry};
 use ant_node::{run_node, NodeConfig};
 use ant_p2p::UploadRuntime;
 use anyhow::{anyhow, bail, Context, Result};
-use clap::Parser;
+use clap::parser::ValueSource;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use fs4::{FileExt, TryLockError};
 use k256::ecdsa::SigningKey;
 use libp2p::identity::{self, Keypair};
@@ -36,6 +41,27 @@ const BEE_API_VERSION: &str = "7.2.0";
 #[derive(Parser, Debug)]
 #[command(name = "antd", version, about = "Ant Swarm light node (M1.0)")]
 struct Opt {
+    /// Path to a bee-compatible YAML config file (PLAN.md J.5.E1/E2).
+    /// Lets Freedom launch `antd` with the same config it writes for
+    /// bee. Explicit CLI flags override values from this file, which
+    /// override the built-in defaults. Recognised keys: `api-addr`,
+    /// `data-dir`, `password` / `password-file`, `mainnet` /
+    /// `network-id`, `blockchain-rpc-endpoint`, `cors-allowed-origins`,
+    /// `verbosity`; other bee keys are accepted and ignored.
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// Password used to decrypt a bee `keys/swarm.key` v3 keystore
+    /// (PLAN.md J.5.E3). Usually supplied via the config file's
+    /// `password` / `password-file`; this flag is the CLI override.
+    #[arg(long)]
+    password: Option<String>,
+
+    /// File whose (trimmed) contents are the keystore password. CLI
+    /// equivalent of bee's `password-file`.
+    #[arg(long)]
+    password_file: Option<PathBuf>,
+
     /// Data directory (identity + nonce persisted here).
     #[arg(long, default_value = "~/.antd")]
     data_dir: PathBuf,
@@ -75,6 +101,15 @@ struct Opt {
     /// socket.
     #[arg(long, default_value_t = false)]
     no_http_api: bool,
+
+    /// CORS allowed origins for the HTTP API (bee's
+    /// `cors-allowed-origins`). Comma-separated; `*` allows any origin
+    /// and the literal `null` allows opaque-origin pages. Freedom sets
+    /// this to `null` so its `bzz://` dweb pages can call `window.swarm`
+    /// (PLAN.md J.4.8). Empty (default) disables CORS, matching a bee
+    /// node started without the option.
+    #[arg(long, value_delimiter = ',')]
+    cors_allowed_origins: Vec<String>,
 
     /// Externally reachable multiaddrs to advertise via libp2p-identify.
     /// Bee bootnodes stall our handshake by 10 s when their peerstore lacks a
@@ -239,7 +274,15 @@ struct IdentityFile {
 #[tokio::main]
 async fn main() -> Result<()> {
     let process_start = Instant::now();
-    let opt = Opt::parse();
+    // Parse via `ArgMatches` (not the `Opt::parse()` shortcut) so the
+    // config-file merge can tell which settings came from the command
+    // line — those win over the config file (PLAN.md J.5.E2).
+    let matches = Opt::command().get_matches();
+    let mut opt = match Opt::from_arg_matches(&matches) {
+        Ok(o) => o,
+        Err(e) => e.exit(),
+    };
+    let resolved_password = apply_config_file(&mut opt, &matches)?;
     let data_dir = expand_tilde(&opt.data_dir);
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("create data dir {}", data_dir.display()))?;
@@ -258,10 +301,21 @@ async fn main() -> Result<()> {
     raise_nofile_soft_limit();
 
     let id_path = data_dir.join("identity.json");
-    let key_path = opt.key_file.unwrap_or_else(|| data_dir.join("signing.key"));
+    let key_path = opt
+        .key_file
+        .clone()
+        .unwrap_or_else(|| data_dir.join("signing.key"));
 
-    let (signing_secret, overlay_nonce, libp2p_keypair) =
-        load_or_create_identity(&id_path, &key_path)?;
+    // A bee-managed Web3 v3 keystore at `<data-dir>/keys/swarm.key`
+    // (Freedom's injected identity) takes precedence over our own
+    // `identity.json` (PLAN.md J.5.E3); only fall back to generate /
+    // load our native identity when no keystore is present.
+    let swarm_key_path = data_dir.join("keys").join("swarm.key");
+    let (signing_secret, overlay_nonce, libp2p_keypair) = if swarm_key_path.exists() {
+        load_identity_from_keystore(&swarm_key_path, resolved_password.as_deref())?
+    } else {
+        load_or_create_identity(&id_path, &key_path)?
+    };
 
     let vk = *(SigningKey::from_bytes((&signing_secret).into())
         .context("invalid signing key")?
@@ -587,6 +641,36 @@ async fn main() -> Result<()> {
             .with_upload_manager(Some(upload_manager)),
     );
 
+    // Chain context for the gateway's wallet / chequebook / status /
+    // chainstate endpoints (PLAN.md J.5 A2/A3/D1/D2). Built only when a
+    // Gnosis RPC endpoint is configured; the node's own Ethereum address
+    // is the wallet bee-js reports balances for.
+    let chain_ctx = {
+        let rpc = opt
+            .gnosis_rpc_url
+            .clone()
+            .or_else(|| std::env::var("GNOSIS_RPC_URL").ok())
+            .filter(|s| !s.trim().is_empty());
+        let chequebook_addr = opt
+            .chequebook
+            .clone()
+            .or_else(|| std::env::var("CHEQUEBOOK_ADDRESS").ok())
+            .and_then(|s| {
+                let mut a = [0u8; 20];
+                hex::decode_to_slice(strip_0x(s.trim()), &mut a).ok().map(|()| a)
+            });
+        // The node's own signing key funds postage buys / chequebook
+        // deposits and is the batch owner — same key that derives `eth`.
+        chainreader::build(
+            rpc,
+            opt.postage_contract.clone(),
+            eth,
+            chequebook_addr,
+            ant_chain::tx::GNOSIS_CHAIN_ID,
+            Some(signing_secret),
+        )
+    };
+
     let gateway_handle = if opt.no_http_api {
         None
     } else {
@@ -604,6 +688,8 @@ async fn main() -> Result<()> {
             activity: gateway_activity.clone(),
             light_mode,
             tags: Arc::new(TagRegistry::new()),
+            cors: Arc::new(ant_gateway::CorsConfig::new(opt.cors_allowed_origins.iter())),
+            chain: chain_ctx,
         })
     };
 
@@ -627,6 +713,7 @@ async fn main() -> Result<()> {
         tokio::select! {
             res = node_fut => res.map_err(|e| anyhow::anyhow!("{e}")),
             res = gateway_fut => res,
+            () = shutdown_signal() => Ok(()),
         }
     } else {
         let control_path = control_socket.clone();
@@ -645,7 +732,52 @@ async fn main() -> Result<()> {
                 Err(e) => Err(anyhow::anyhow!("control socket: {e}")),
             },
             res = gateway_fut => res,
+            () = shutdown_signal() => Ok(()),
         }
+    }
+}
+
+/// Resolve when the process receives `SIGTERM` or `SIGINT` (Ctrl-C).
+///
+/// systemd / Freedom stop the daemon with `SIGTERM` and expect a prompt
+/// (< 5 s) exit (PLAN.md J.5.E4). Returning from `main` drops every
+/// runtime handle and exits cleanly; the durable state
+/// (`StampIssuer`, upload jobs, peerstore, SWAP ledger) is already
+/// checkpointed incrementally, so a clean return needs no extra flush
+/// step. We win over the OS default disposition only to log the cause
+/// and to give the `select!` an arm that completes — that's what lets
+/// the racing futures (node loop, gateway, control socket) be dropped
+/// in order rather than the process being torn down mid-syscall.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(target: "antd", "cannot install SIGTERM handler: {e}");
+                std::future::pending::<()>().await;
+                return;
+            }
+        };
+        let mut int = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(target: "antd", "cannot install SIGINT handler: {e}");
+                std::future::pending::<()>().await;
+                return;
+            }
+        };
+        let sig = tokio::select! {
+            _ = term.recv() => "SIGTERM",
+            _ = int.recv() => "SIGINT",
+        };
+        tracing::info!(target: "antd", "received {sig}; shutting down");
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!(target: "antd", "received Ctrl-C; shutting down");
     }
 }
 
@@ -728,6 +860,13 @@ fn acquire_instance_lock(lock_path: &Path) -> Result<File> {
 /// fan-out doesn't trip the default 1024-fd ulimit on macOS / Linux. We
 /// silently keep whatever the OS already gave us if the bump fails — running
 /// with too few fds is a degraded but legitimate state, not a startup error.
+///
+/// No-op on non-Unix (Windows has no `RLIMIT_NOFILE`); the descriptor
+/// ceiling there is governed differently and isn't a startup concern.
+#[cfg(not(unix))]
+fn raise_nofile_soft_limit() {}
+
+#[cfg(unix)]
 fn raise_nofile_soft_limit() {
     use rlimit::{getrlimit, setrlimit, Resource};
     let Ok((soft, hard)) = getrlimit(Resource::NOFILE) else {
@@ -759,6 +898,118 @@ fn expand_tilde(p: &Path) -> PathBuf {
         }
     }
     p.to_path_buf()
+}
+
+/// Load `--config` (if given), merging its values into `opt` for every
+/// setting the operator did **not** pass on the command line. Returns
+/// the resolved keystore password (from `--password` / `--password-file`
+/// or the config's `password` / `password-file`), if any.
+///
+/// CLI > config file > default — the same precedence bee uses, so a
+/// Freedom-written config behaves predictably while an operator can
+/// still override one knob on the command line.
+fn apply_config_file(opt: &mut Opt, matches: &clap::ArgMatches) -> Result<Option<String>> {
+    let from_cli = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
+
+    // CLI password flags take precedence; fall back to the config file
+    // below once it's loaded.
+    let cli_password = opt.password.clone();
+    let cli_password_file = opt.password_file.clone();
+
+    let cfg = match opt.config.as_ref() {
+        Some(path) => Some(config::BeeConfig::load(&expand_tilde(path))?),
+        None => None,
+    };
+
+    if let Some(cfg) = &cfg {
+        if !from_cli("data_dir") {
+            if let Some(d) = &cfg.data_dir {
+                opt.data_dir = PathBuf::from(d);
+            }
+        }
+        if !from_cli("api_addr") {
+            if let Some(addr) = cfg.api_socket_addr()? {
+                opt.api_addr = addr;
+            }
+        }
+        if !from_cli("network_id") {
+            if let Some(n) = cfg.network_id() {
+                opt.network_id = n;
+            }
+        }
+        if !from_cli("gnosis_rpc_url") {
+            if let Some(rpc) = &cfg.blockchain_rpc_endpoint {
+                opt.gnosis_rpc_url = Some(rpc.clone());
+            }
+        }
+        if !from_cli("cors_allowed_origins") {
+            let origins = cfg.cors_origins_vec();
+            if !origins.is_empty() {
+                opt.cors_allowed_origins = origins;
+            }
+        }
+        if !from_cli("log_level") {
+            if let Some(level) = cfg.log_level() {
+                opt.log_level = level;
+            }
+        }
+        let ignored = cfg.extra.len();
+        if ignored > 0 {
+            let keys: Vec<&str> = cfg.extra.keys().map(String::as_str).collect();
+            tracing::debug!(
+                target: "antd",
+                "ignoring {ignored} unmodelled bee config key(s): {}",
+                keys.join(", "),
+            );
+        }
+    }
+
+    // Resolve the password: CLI flag wins, then CLI password-file, then
+    // the config file's `password` / `password-file`.
+    if let Some(p) = cli_password {
+        return Ok(Some(p));
+    }
+    if let Some(file) = cli_password_file {
+        let raw = std::fs::read_to_string(&file)
+            .with_context(|| format!("read --password-file {}", file.display()))?;
+        return Ok(Some(raw.trim_end_matches(['\n', '\r']).to_string()));
+    }
+    if let Some(cfg) = &cfg {
+        return cfg.resolve_password();
+    }
+    Ok(None)
+}
+
+/// Load the node identity from a bee Web3 v3 keystore at
+/// `<data-dir>/keys/swarm.key` (PLAN.md J.5.E3). The decrypted 32-byte
+/// secp256k1 secret becomes our signing key; the libp2p keypair is
+/// derived from it and the overlay nonce is zero (bee's default for a
+/// node whose nonce isn't separately configured). Using the
+/// Freedom-managed keystore as the source of truth means the daemon's
+/// Ethereum identity matches the one Freedom provisioned.
+fn load_identity_from_keystore(
+    swarm_key_path: &std::path::Path,
+    password: Option<&str>,
+) -> Result<([u8; SECP256K1_SECRET_LEN], [u8; 32], Keypair)> {
+    let password = password.ok_or_else(|| {
+        anyhow!(
+            "found a bee keystore at {} but no password is configured; \
+             set `password` / `password-file` in the --config file or pass --password",
+            swarm_key_path.display(),
+        )
+    })?;
+    let json = std::fs::read_to_string(swarm_key_path)
+        .with_context(|| format!("read keystore {}", swarm_key_path.display()))?;
+    let signing_secret = keystore::decrypt_v3(&json, password)
+        .with_context(|| format!("decrypt keystore {}", swarm_key_path.display()))?;
+    let overlay_nonce = [0u8; 32];
+    let kp = secp256k1_keypair_from_signing_secret(&signing_secret)?;
+    tracing::info!(
+        target: "antd",
+        keystore = %swarm_key_path.display(),
+        "loaded node identity from bee v3 keystore",
+    );
+    Ok((signing_secret, overlay_nonce, kp))
 }
 
 fn load_or_create_identity(
