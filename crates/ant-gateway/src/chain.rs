@@ -21,9 +21,17 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
+use tokio::sync::oneshot;
+
+use ant_control::{ControlAck, ControlCommand};
 
 use crate::error::json_error;
 use crate::handle::GatewayHandle;
+
+/// Collision-bucket depth baked into every `createBatch` transaction
+/// (bee's constant). The runtime issuer registered for a freshly-bought
+/// batch must use the same value or its stamps won't validate.
+const POSTAGE_BUCKET_DEPTH: u8 = 16;
 
 /// Bound on every chain RPC a request makes, so a slow / wedged RPC
 /// endpoint surfaces as `504` rather than hanging the HTTP handler.
@@ -371,6 +379,53 @@ fn parse_batch_id(s: &str) -> Result<[u8; 32], Response> {
     Ok(id)
 }
 
+/// Register (or refresh) a freshly bought / diluted batch with the
+/// running node so it can immediately stamp uploads against it — the
+/// crux of bee/Freedom's "buy then publish" flow. Returns a bee-shaped
+/// error response if the node loop can't be reached or rejects the
+/// batch; the caller surfaces it instead of a misleading `201`.
+#[allow(clippy::result_large_err)]
+async fn register_batch(
+    handle: &GatewayHandle,
+    batch_id: [u8; 32],
+    depth: u8,
+    immutable: bool,
+) -> Result<(), Response> {
+    let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
+    let cmd = ControlCommand::RegisterBatch {
+        batch_id,
+        depth,
+        bucket_depth: POSTAGE_BUCKET_DEPTH,
+        immutable,
+        ack: ack_tx,
+    };
+    if handle.commands.send(cmd).await.is_err() {
+        return Err(json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node loop is no longer accepting commands",
+        ));
+    }
+    match tokio::time::timeout(CHAIN_RPC_TIMEOUT, ack_rx).await {
+        Ok(Ok(ControlAck::Ok { .. })) => Ok(()),
+        Ok(Ok(ControlAck::Error { message })) => Err(json_error(
+            StatusCode::BAD_GATEWAY,
+            format!("batch registration failed: {message}"),
+        )),
+        Ok(Ok(other)) => Err(json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unexpected node ack for batch registration: {other:?}"),
+        )),
+        Ok(Err(_)) => Err(json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node loop dropped the batch registration request",
+        )),
+        Err(_) => Err(json_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "batch registration timed out",
+        )),
+    }
+}
+
 #[derive(Serialize)]
 struct BatchIdBody {
     #[serde(rename = "batchID")]
@@ -407,6 +462,14 @@ pub async fn buy_stamp(
         Ok(id) => id,
         Err(r) => return r,
     };
+    // Register the issuer with the running node *before* returning 201,
+    // so Freedom's immediate `POST /bzz … Swarm-Postage-Batch-Id: <id>`
+    // finds a usable batch without a restart. We construct the issuer
+    // from the known buy params (depth, bucket_depth=16, immutable) and
+    // never chain-read the batch back — Gnosis indexing lags the receipt.
+    if let Err(r) = register_batch(&handle, batch_id, depth, immutable).await {
+        return r;
+    }
     (
         StatusCode::CREATED,
         Json(BatchIdBody {
@@ -455,6 +518,13 @@ pub async fn dilute_stamp(
         Err(r) => return r,
     };
     if let Err(r) = guarded_tx(w.dilute_batch(batch_id, depth)).await {
+        return r;
+    }
+    // Bump the live issuer's depth so subsequent uploads use the larger
+    // capacity. `immutable` is irrelevant for an existing issuer (the
+    // register handler only updates depth when the batch is already
+    // live), so pass `false`.
+    if let Err(r) = register_batch(&handle, batch_id, depth, false).await {
         return r;
     }
     Json(BatchIdBody { batch_id: id }).into_response()

@@ -51,6 +51,10 @@ async fn post_bytes_returns_reference_and_completed_tag() {
         Request::builder()
             .method(Method::POST)
             .uri("/bytes")
+            .header(
+                "swarm-postage-batch-id",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
             .body(Body::from(body))
             .unwrap(),
     )
@@ -144,6 +148,10 @@ async fn post_feeds_creates_manifest() {
         Request::builder()
             .method(Method::POST)
             .uri(format!("/feeds/{owner}/{topic}"))
+            .header(
+                "swarm-postage-batch-id",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
             .body(Body::empty())
             .unwrap(),
     )
@@ -185,7 +193,7 @@ const TEST_BATCH_BARE: &str =
 
 fn enabled_postage_router() -> axum::Router {
     router_with_dispatcher(|cmd| async move {
-        if let ControlCommand::PostageStatus { ack } = cmd {
+        if let ControlCommand::PostageList { ack } = cmd {
             let view = PostageStatusView {
                 enabled: true,
                 batch_id: TEST_BATCH_0X.to_string(),
@@ -195,7 +203,7 @@ fn enabled_postage_router() -> axum::Router {
                 bucket_fill_max: 7,
                 ..PostageStatusView::default()
             };
-            let _ = ack.send(ControlAck::PostageStatus(view));
+            let _ = ack.send(ControlAck::PostageList(vec![view]));
         }
     })
 }
@@ -262,8 +270,8 @@ async fn stamp_by_id_matches_then_404() {
 #[tokio::test]
 async fn stamps_empty_when_uploads_disabled() {
     let router = router_with_dispatcher(|cmd| async move {
-        if let ControlCommand::PostageStatus { ack } = cmd {
-            let _ = ack.send(ControlAck::PostageStatus(PostageStatusView::default()));
+        if let ControlCommand::PostageList { ack } = cmd {
+            let _ = ack.send(ControlAck::PostageList(Vec::new()));
         }
     });
     let resp = send(

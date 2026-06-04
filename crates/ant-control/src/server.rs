@@ -467,6 +467,12 @@ fn ack_to_response(ack: ControlAck) -> Response {
         ControlAck::UploadList(views) => Response::UploadList { jobs: views },
         ControlAck::UploadProgress(view) => Response::UploadProgress(view),
         ControlAck::PostageStatus(view) => Response::PostageStatus(view),
+        // The Unix-socket protocol returns a single batch via
+        // `PostageStatus`; the multi-batch list is an HTTP-gateway-only
+        // surface (`GET /stamps`).
+        ControlAck::PostageList(_) => Response::Error {
+            message: "postage batch listing is only supported by ant-gateway".to_string(),
+        },
         // The Unix-socket protocol used by `antctl` doesn't expose feed
         // reads today; the control surface is just for renderers and
         // ops tooling, and feed lookup lives on the gateway HTTP API.

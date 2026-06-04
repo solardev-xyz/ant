@@ -211,8 +211,20 @@ pub fn status_router_with_chain(
 ) -> Router {
     let (status_tx, status_rx) = watch::channel(snapshot);
     Box::leak(Box::new(status_tx));
-    let (cmd_tx, cmd_rx) = mpsc::channel::<ControlCommand>(8);
-    Box::leak(Box::new(cmd_rx));
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<ControlCommand>(8);
+    // The buy / dilute handlers register the resulting batch with the
+    // node loop before replying; answer those so the write endpoints
+    // don't time out. Everything else is ignored (the chain tests don't
+    // exercise the node loop).
+    tokio::spawn(async move {
+        while let Some(cmd) = cmd_rx.recv().await {
+            if let ControlCommand::RegisterBatch { ack, .. } = cmd {
+                let _ = ack.send(ControlAck::Ok {
+                    message: "registered (chain test fixture)".into(),
+                });
+            }
+        }
+    });
     let handle = GatewayHandle {
         agent: Arc::new("antd/test".to_string()),
         api_version: Arc::new("7.2.0".to_string()),
@@ -447,7 +459,9 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
                 message: "ok".to_string(),
             });
         }
-        ControlCommand::PushSoc { address, wire, ack } => {
+        ControlCommand::PushSoc {
+            address, wire, ack, ..
+        } => {
             // Mirror the real handler: trust the gateway's `soc_valid`
             // pre-check and reply with the supplied address. Test
             // fixtures exercise the gateway's validation path; the
@@ -463,7 +477,7 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
             };
             let _ = ack.send(reply);
         }
-        ControlCommand::PushChunk { wire, ack } => {
+        ControlCommand::PushChunk { wire, ack, .. } => {
             // Mirror what `ant-p2p`'s `PushChunk` handler does: BMT-hash
             // the wire bytes and reply with the resulting reference.
             // Validation lives in the gateway itself; test fixtures
@@ -516,6 +530,20 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
             let _ = ack.send(ControlAck::PostageStatus(
                 ant_control::PostageStatusView::default(),
             ));
+        }
+        // The fixture models a node with no registered batches; the
+        // multi-batch list is therefore empty (matching `GET /stamps`
+        // on a freshly-started node).
+        ControlCommand::PostageList { ack } => {
+            let _ = ack.send(ControlAck::PostageList(Vec::new()));
+        }
+        // Runtime batch registration touches the daemon's issuer
+        // registry, which the gateway fixture doesn't model; ack OK so
+        // the buy/dilute handlers' register step doesn't error.
+        ControlCommand::RegisterBatch { ack, .. } => {
+            let _ = ack.send(ControlAck::Ok {
+                message: "registered (test fixture)".into(),
+            });
         }
         // Local chunk-cache writes are an antctl-only escape hatch
         // (`antctl pin`) that doesn't go through the gateway HTTP

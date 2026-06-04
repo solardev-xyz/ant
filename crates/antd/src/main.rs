@@ -488,16 +488,19 @@ async fn main() -> Result<()> {
         opt.postage_contract.clone(),
         opt.postage_batch.clone(),
         opt.postage_owner_key.clone(),
+        signing_secret,
+        eth,
         data_dir.clone(),
     )
     .await
     .map_err(|e| anyhow!("upload runtime: {e}"))?;
 
-    // The node is "light" (publish-capable) once a postage batch is
-    // configured: that's what lets it stamp + pushsync uploads. Freedom
-    // gates its whole publish UI on `GET /node.beeMode == "light"`
-    // (PLAN.md J.4.1), so surface it here. Captured before `upload` is
-    // moved into the node future below.
+    // The node is "light" (publish-capable) once it can stamp + pushsync
+    // uploads — i.e. whenever an upload runtime exists. With a chain RPC
+    // configured that's true even before any batch is bought, so Freedom
+    // (which gates its whole publish UI on `GET /node.beeMode == "light"`,
+    // PLAN.md J.4.1) can buy a batch at runtime and immediately upload.
+    // Captured before `upload` is moved into the node future below.
     let light_mode = upload.is_some();
 
     // `antctl upload` job manager. Built unconditionally — listing
@@ -507,13 +510,28 @@ async fn main() -> Result<()> {
     // until the operator wires postage. Persistent state lives at
     // `<data-dir>/uploads/<job_id>.json`, atomically rewritten on
     // each checkpoint (same idiom as `StampIssuer`).
-    let upload_manager = ant_node::UploadManager::new(data_dir.join("uploads"), cmd_tx.clone())
-        .with_context(|| {
-            format!(
-                "open upload state dir at {}",
-                data_dir.join("uploads").display()
-            )
-        })?;
+    // Default batch for `antctl upload` jobs that don't name one: the
+    // operator's startup `--postage-batch`, if any. Gateway uploads pass
+    // the batch via the `Swarm-Postage-Batch-Id` header instead.
+    let default_upload_batch = opt
+        .postage_batch
+        .clone()
+        .or_else(|| std::env::var("STORAGE_STAMP_BATCH_ID").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .and_then(|hex_id| {
+            let stripped = strip_0x(&hex_id);
+            let mut out = [0u8; 32];
+            hex::decode_to_slice(stripped, &mut out).ok().map(|()| out)
+        });
+    let upload_manager =
+        ant_node::UploadManager::new(data_dir.join("uploads"), cmd_tx.clone(), default_upload_batch)
+            .with_context(|| {
+                format!(
+                    "open upload state dir at {}",
+                    data_dir.join("uploads").display()
+                )
+            })?;
     let restored_jobs = upload_manager
         .rehydrate_from_disk(!opt.no_resume_uploads)
         .with_context(|| {
@@ -1073,102 +1091,180 @@ fn load_or_create_identity(
     Ok((signing_secret, overlay_nonce, kp))
 }
 
-/// Build a [`UploadRuntime`] from CLI flags + env. Returns `Ok(None)`
-/// when the operator opts out of uploads (no `--postage-batch` /
-/// `STORAGE_STAMP_BATCH_ID`), so `antd` keeps booting in read-only mode.
+/// Build a [`UploadRuntime`] — the live registry of postage batches the
+/// node can stamp uploads with.
 ///
-/// On success, fetches `batchOwner / batchDepth / batchBucketDepth /
-/// batchImmutableFlag` from the on-chain `PostageStamp` contract,
-/// cross-checks the configured signing key against the chain-recorded
-/// owner, and opens the persistent [`StampIssuer`] at
-/// `<data_dir>/postage/<batch_id>.bin`. The store is created on first
-/// boot and reloaded thereafter so a restart picks up stamps from
-/// where the previous process left off (M3 Phase 8 — without this, a
-/// restart would reissue indices the network already saw and bee
-/// peers would reject our stamps as double-spends).
+/// The node wallet (`signing_secret` / `node_eth`) owns every batch it
+/// buys on-chain, so a single stamp key signs for all of them; the
+/// registry is keyed by batch id and grows at runtime via
+/// [`ant_control::ControlCommand::RegisterBatch`] when Freedom buys a
+/// batch through `POST /stamps/{amount}/{depth}`.
+///
+/// At startup we:
+///  1. **Reload persisted batches** by scanning `<data_dir>/postage/*.bin`
+///     and reopening each [`StampIssuer`] from its header, so a restart
+///     resumes every previously-bought batch's counters (no index is
+///     ever re-issued — bee peers reject double-spends).
+///  2. **Pre-register `--postage-batch`** (back-compat for operators):
+///     fetch its on-chain `batchOwner / depth / bucketDepth / immutable`,
+///     check the owner against the stamp key, and open its store.
+///
+/// Returns `Ok(None)` (ultra-light, read-only) only when the node can
+/// neither buy (no RPC / chain writer) nor stamp an existing batch.
+/// Whenever an RPC endpoint is configured we return `Some` even with an
+/// empty registry, so `GET /node` reports `beeMode:"light"` and Freedom
+/// lets the publish flow proceed.
+///
+/// `cli_key` (`--postage-owner-key` / `STORAGE_STAMP_PRIVATE_KEY`) keeps
+/// the legacy single-owner behaviour: when set it becomes the stamp key
+/// and the configured batch must be owned by it. When absent the node's
+/// own wallet key signs stamps (the bee light-node model).
 async fn build_upload_runtime(
     cli_rpc: Option<String>,
     postage_contract: String,
     cli_batch: Option<String>,
     cli_key: Option<String>,
+    signing_secret: [u8; SECP256K1_SECRET_LEN],
+    node_eth: [u8; 20],
     data_dir: PathBuf,
 ) -> Result<Option<Arc<UploadRuntime>>> {
-    let batch_hex = cli_batch
-        .or_else(|| std::env::var("STORAGE_STAMP_BATCH_ID").ok())
-        .map(|s| s.trim().to_string());
-    let Some(batch_hex) = batch_hex.filter(|s| !s.is_empty()) else {
-        tracing::info!(
-            target: "antd",
-            "uploads disabled: pass --postage-batch (or set STORAGE_STAMP_BATCH_ID) to enable POST /chunks",
-        );
-        return Ok(None);
-    };
-    let key_hex = cli_key
-        .or_else(|| std::env::var("STORAGE_STAMP_PRIVATE_KEY").ok())
-        .ok_or_else(|| {
-            anyhow!(
-                "--postage-batch set but --postage-owner-key / STORAGE_STAMP_PRIVATE_KEY missing"
-            )
-        })?;
+    let postage_dir = data_dir.join("postage");
+
     let rpc_url = cli_rpc
         .or_else(|| std::env::var("GNOSIS_RPC_URL").ok())
-        .ok_or_else(|| {
-            anyhow!("--postage-batch set but --gnosis-rpc-url / GNOSIS_RPC_URL missing")
-        })?;
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let can_stamp = rpc_url.is_some();
 
-    let mut batch_id = [0u8; 32];
-    hex::decode_to_slice(strip_0x(&batch_hex), &mut batch_id)
-        .with_context(|| format!("decode batch id {batch_hex}"))?;
-    let mut stamp_key = [0u8; SECP256K1_SECRET_LEN];
-    hex::decode_to_slice(strip_0x(&key_hex), &mut stamp_key).context("decode postage owner key")?;
+    let batch_hex = cli_batch
+        .or_else(|| std::env::var("STORAGE_STAMP_BATCH_ID").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let key_hex = cli_key
+        .or_else(|| std::env::var("STORAGE_STAMP_PRIVATE_KEY").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
-    let signer_eth = {
-        let sk =
-            SigningKey::from_bytes((&stamp_key).into()).context("postage owner key invalid")?;
-        ethereum_address_from_public_key(sk.verifying_key())
+    // Stamp key + owner. Default to the node wallet so batches bought at
+    // runtime (owned by the node EOA) validate; a legacy owner key keeps
+    // the old single-owner pre-configured-batch behaviour.
+    let (stamp_key, batch_owner) = match &key_hex {
+        Some(k) => {
+            let mut sk = [0u8; SECP256K1_SECRET_LEN];
+            hex::decode_to_slice(strip_0x(k), &mut sk).context("decode postage owner key")?;
+            let eth = {
+                let s = SigningKey::from_bytes((&sk).into()).context("postage owner key invalid")?;
+                ethereum_address_from_public_key(s.verifying_key())
+            };
+            (sk, eth)
+        }
+        None => (signing_secret, node_eth),
     };
 
-    let chain = ant_chain::ChainClient::new(rpc_url);
-    let meta = ant_chain::fetch_postage_batch_meta(&chain, &postage_contract, &batch_id)
-        .await
-        .with_context(|| format!("fetch postage batch meta from {postage_contract}"))?;
+    let mut issuers: std::collections::HashMap<[u8; 32], ant_postage::StampIssuer> =
+        std::collections::HashMap::new();
 
-    if signer_eth != meta.batch_owner_eth {
-        return Err(anyhow!(
-            "postage owner key 0x{} does not match on-chain batchOwner 0x{} for batch {}",
-            hex::encode(signer_eth),
-            hex::encode(meta.batch_owner_eth),
-            batch_hex,
-        ));
+    // 1. Reload batches persisted from a previous run.
+    if postage_dir.is_dir() {
+        match std::fs::read_dir(&postage_dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("bin") {
+                        continue;
+                    }
+                    match ant_postage::StampIssuer::open_existing(path.clone()) {
+                        Ok(iss) => {
+                            let id = *iss.batch_id();
+                            tracing::info!(
+                                target: "antd",
+                                batch = %format!("0x{}", hex::encode(id)),
+                                store = %path.display(),
+                                resumed_indices = iss.issued_count(),
+                                "reloaded persisted postage batch",
+                            );
+                            issuers.insert(id, iss);
+                        }
+                        Err(e) => tracing::warn!(
+                            target: "antd",
+                            store = %path.display(),
+                            "skipping unreadable postage store: {e}",
+                        ),
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(
+                target: "antd",
+                dir = %postage_dir.display(),
+                "scan postage dir: {e}",
+            ),
+        }
     }
 
-    let postage_dir = data_dir.join("postage");
-    let store_path = postage_dir.join(format!("{}.bin", hex::encode(batch_id)));
-    let issuer = ant_postage::StampIssuer::open_or_new(
-        store_path.clone(),
-        batch_id,
-        meta.depth,
-        meta.bucket_depth,
-        meta.immutable,
-    )
-    .map_err(|e| anyhow!("StampIssuer: {e}"))?;
-    let resumed_count = issuer.issued_count();
+    // 2. Pre-register an operator-configured batch (--postage-batch).
+    if let Some(batch_hex) = &batch_hex {
+        let rpc = rpc_url.clone().ok_or_else(|| {
+            anyhow!("--postage-batch set but --gnosis-rpc-url / GNOSIS_RPC_URL missing")
+        })?;
+        let mut batch_id = [0u8; 32];
+        hex::decode_to_slice(strip_0x(batch_hex), &mut batch_id)
+            .with_context(|| format!("decode batch id {batch_hex}"))?;
+        let chain = ant_chain::ChainClient::new(rpc);
+        let meta = ant_chain::fetch_postage_batch_meta(&chain, &postage_contract, &batch_id)
+            .await
+            .with_context(|| format!("fetch postage batch meta from {postage_contract}"))?;
+        if batch_owner != meta.batch_owner_eth {
+            return Err(anyhow!(
+                "postage stamp owner 0x{} does not match on-chain batchOwner 0x{} for batch {}",
+                hex::encode(batch_owner),
+                hex::encode(meta.batch_owner_eth),
+                batch_hex,
+            ));
+        }
+        let store_path = postage_dir.join(format!("{}.bin", hex::encode(batch_id)));
+        let issuer = ant_postage::StampIssuer::open_or_new(
+            store_path.clone(),
+            batch_id,
+            meta.depth,
+            meta.bucket_depth,
+            meta.immutable,
+        )
+        .map_err(|e| anyhow!("StampIssuer: {e}"))?;
+        tracing::info!(
+            target: "antd",
+            batch = %format!("0x{}", hex::encode(batch_id)),
+            owner = %format!("0x{}", hex::encode(meta.batch_owner_eth)),
+            depth = meta.depth,
+            bucket_depth = meta.bucket_depth,
+            immutable = meta.immutable,
+            store = %store_path.display(),
+            "pre-registered operator postage batch",
+        );
+        issuers.insert(batch_id, issuer);
+    }
+
+    // Nothing to stamp with and no way to buy → ultra-light.
+    if !can_stamp && issuers.is_empty() {
+        tracing::info!(
+            target: "antd",
+            "uploads disabled: no blockchain-rpc-endpoint and no postage batch — node is ultra-light (read-only)",
+        );
+        return Ok(None);
+    }
+
     tracing::info!(
         target: "antd",
-        batch = %format!("0x{}", hex::encode(batch_id)),
-        owner = %format!("0x{}", hex::encode(meta.batch_owner_eth)),
-        depth = meta.depth,
-        bucket_depth = meta.bucket_depth,
-        immutable = meta.immutable,
-        store = %store_path.display(),
-        resumed_indices = resumed_count,
-        "uploads enabled (postage stamping ready)",
+        batches = issuers.len(),
+        can_buy = can_stamp,
+        owner = %format!("0x{}", hex::encode(batch_owner)),
+        "upload runtime ready (postage stamping)",
     );
 
     Ok(Some(Arc::new(UploadRuntime {
-        issuer: std::sync::Mutex::new(issuer),
+        issuers: std::sync::Mutex::new(issuers),
         stamp_key,
-        batch_owner: meta.batch_owner_eth,
+        batch_owner,
+        postage_dir,
     })))
 }
 

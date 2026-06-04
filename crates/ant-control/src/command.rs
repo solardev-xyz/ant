@@ -141,8 +141,12 @@ pub enum ControlCommand {
         ack: mpsc::Sender<ControlAck>,
     },
     /// Gateway `POST /chunks`: stamp locally (postage issuer) then pushsync.
+    /// `batch_id` selects which registered postage batch issues the
+    /// stamp; the node loop rejects the push if no issuer is registered
+    /// for it (`ControlAck::Error "batch … not usable"`).
     PushChunk {
         wire: Vec<u8>,
+        batch_id: [u8; 32],
         ack: oneshot::Sender<ControlAck>,
     },
     /// Gateway `POST /soc/{owner}/{id}`: stamp the SOC at `address` and
@@ -154,6 +158,25 @@ pub enum ControlCommand {
     PushSoc {
         address: [u8; 32],
         wire: Vec<u8>,
+        batch_id: [u8; 32],
+        ack: oneshot::Sender<ControlAck>,
+    },
+    /// Register (or refresh) a postage batch with the running node so it
+    /// can stamp uploads against it without a restart. Sent by the
+    /// gateway right after a successful on-chain `createBatch`
+    /// (`POST /stamps/{amount}/{depth}`) and after a `dilute`. The node
+    /// opens (or reopens) the issuer's persistent `.bin` at
+    /// `<data-dir>/postage/<batch_id>.bin` and inserts it into the live
+    /// issuer registry. Idempotent: re-registering an existing batch
+    /// reopens the same counters; a higher `depth` bumps the live
+    /// issuer's depth in place (dilute). `bucket_depth` must equal the
+    /// value baked into the `createBatch` transaction (bee uses 16) or
+    /// the resulting stamps won't validate.
+    RegisterBatch {
+        batch_id: [u8; 32],
+        depth: u8,
+        bucket_depth: u8,
+        immutable: bool,
         ack: oneshot::Sender<ControlAck>,
     },
     /// Create a new upload job. The node loop forwards to its
@@ -203,8 +226,14 @@ pub enum ControlCommand {
     },
     /// Snapshot of the local postage stamp issuer (capacity, fill,
     /// per-bucket extremes). Pure local read — no chain RPC, no
-    /// network round-trip.
+    /// network round-trip. With multiple registered batches this returns
+    /// the first one (back-compat for `antctl postage status`); use
+    /// [`ControlCommand::PostageList`] to enumerate every batch.
     PostageStatus { ack: oneshot::Sender<ControlAck> },
+    /// Snapshot of **every** registered postage batch. Backs the
+    /// gateway's `GET /stamps`, which bee-js / Freedom poll to learn the
+    /// set of usable batches. Pure local read.
+    PostageList { ack: oneshot::Sender<ControlAck> },
     /// Write a single CAC chunk straight into the local disk chunk
     /// cache (no postage stamp, no pushsync). Backs `antctl pin`,
     /// which lets an operator make a previously-uploaded file
@@ -302,6 +331,9 @@ pub enum ControlAck {
     /// Local postage stamp issuer snapshot. Terminal ack on
     /// `PostageStatus`.
     PostageStatus(PostageStatusView),
+    /// Snapshot of every registered postage batch. Terminal ack on
+    /// `PostageList`.
+    PostageList(Vec<PostageStatusView>),
     /// Successful feed resolution: the SOC `id`
     /// (`keccak256(topic ‖ index_be8)`) of the resolved update, the
     /// reference its CAC payload points at, the sequence index it lived

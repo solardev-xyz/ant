@@ -54,14 +54,55 @@ pub enum RunError {
 
 /// Postage stamping + signing key wired at daemon startup for pushsync uploads.
 ///
-/// `issuer` lives behind a `Mutex` because each chunk push needs to atomically
-/// pick the next slot in its collision bucket and increment the counter; bee
-/// `stampissuer.go::increment` does the same. `Arc` lets the runtime be cloned
-/// into per-`PushChunk` spawned tasks.
+/// The node wallet owns every batch it buys on-chain, so a single
+/// `stamp_key` (the node's signing secret) signs stamps for *all*
+/// batches; we keep one [`ant_postage::StampIssuer`] per batch in
+/// `issuers`, keyed by 32-byte batch id. New batches are added at
+/// runtime via [`ControlCommand::RegisterBatch`] (after a
+/// `POST /stamps/{amount}/{depth}` buy) so Freedom can buy a batch and
+/// immediately upload against it with no restart.
+///
+/// The map lives behind a `Mutex` because each chunk push needs to
+/// atomically pick the next slot in its collision bucket and increment
+/// the counter; bee `stampissuer.go::increment` does the same. `Arc`
+/// lets the runtime be cloned into per-`PushChunk` spawned tasks.
 pub struct UploadRuntime {
-    pub issuer: std::sync::Mutex<ant_postage::StampIssuer>,
+    pub issuers: std::sync::Mutex<HashMap<[u8; 32], ant_postage::StampIssuer>>,
     pub stamp_key: [u8; SECP256K1_SECRET_LEN],
     pub batch_owner: [u8; 20],
+    /// Directory holding each batch's persistent counter file
+    /// (`<batch_id>.bin`). Used to open issuers for batches registered
+    /// at runtime.
+    pub postage_dir: PathBuf,
+}
+
+/// Map a [`ant_postage::BucketStats`] snapshot to the control-plane
+/// [`ant_control::PostageStatusView`] reported over `PostageStatus` /
+/// `PostageList`.
+fn postage_status_view(stats: &ant_postage::BucketStats) -> ant_control::PostageStatusView {
+    ant_control::PostageStatusView {
+        enabled: true,
+        batch_id: format!("0x{}", hex::encode(stats.batch_id)),
+        batch_depth: stats.batch_depth,
+        bucket_depth: stats.bucket_depth,
+        immutable: stats.immutable,
+        bucket_count: stats.bucket_count,
+        bucket_capacity: stats.bucket_capacity,
+        total_capacity_chunks: stats.total_capacity,
+        issued_chunks: stats.issued,
+        bucket_fill_min: stats.bucket_fill_min,
+        bucket_fill_max: stats.bucket_fill_max,
+        remaining_total_chunks: stats.remaining_total,
+        worst_case_remaining_chunks: stats.worst_case_remaining,
+    }
+}
+
+/// The `enabled: false` view returned when no batch is registered.
+fn postage_status_disabled() -> ant_control::PostageStatusView {
+    ant_control::PostageStatusView {
+        enabled: false,
+        ..Default::default()
+    }
 }
 
 pub struct RunConfig {
@@ -1453,10 +1494,14 @@ fn handle_control_command(
                 let _ = ack.send(reply);
             });
         }
-        ControlCommand::PushChunk { wire, ack } => {
+        ControlCommand::PushChunk {
+            wire,
+            batch_id,
+            ack,
+        } => {
             let Some(upload) = upload.clone() else {
                 let _ = ack.send(ControlAck::Error {
-                    message: "uploads not configured: pass --postage-batch and --postage-owner-key (or set the env vars) at startup".into(),
+                    message: "uploads not configured: node cannot stamp (set a blockchain-rpc-endpoint or pass --postage-batch at startup)".into(),
                 });
                 return;
             };
@@ -1481,15 +1526,23 @@ fn handle_control_command(
                 return;
             };
 
-            // Stamp under the issuer mutex so concurrent pushes can't
-            // collide on the same bucket index — bee's `stampissuer`
-            // does exactly this.
+            // Stamp under the issuer-registry mutex so concurrent pushes
+            // can't collide on the same bucket index — bee's `stampissuer`
+            // does exactly this. The batch must be registered (bought or
+            // pre-configured); an unknown id is rejected up-front so we
+            // don't pushsync an unstamped chunk.
             let stamp = {
-                let mut issuer = match upload.issuer.lock() {
+                let mut issuers = match upload.issuers.lock() {
                     Ok(g) => g,
                     Err(p) => p.into_inner(),
                 };
-                match ant_postage::sign_stamp_bytes(&upload.stamp_key, &mut issuer, &addr) {
+                let Some(issuer) = issuers.get_mut(&batch_id) else {
+                    let _ = ack.send(ControlAck::Error {
+                        message: format!("batch 0x{} not usable", hex::encode(batch_id)),
+                    });
+                    return;
+                };
+                match ant_postage::sign_stamp_bytes(&upload.stamp_key, issuer, &addr) {
                     Ok(s) => s,
                     Err(e) => {
                         let _ = ack.send(ControlAck::Error {
@@ -1528,10 +1581,15 @@ fn handle_control_command(
                 let _ = ack.send(reply);
             });
         }
-        ControlCommand::PushSoc { address, wire, ack } => {
+        ControlCommand::PushSoc {
+            address,
+            wire,
+            batch_id,
+            ack,
+        } => {
             let Some(upload) = upload.clone() else {
                 let _ = ack.send(ControlAck::NotReady {
-                    message: "uploads not configured: pass --postage-batch and --postage-owner-key (or set the env vars) at startup".into(),
+                    message: "uploads not configured: node cannot stamp (set a blockchain-rpc-endpoint or pass --postage-batch at startup)".into(),
                 });
                 return;
             };
@@ -1559,11 +1617,17 @@ fn handle_control_command(
             // `bee/pkg/postage/stampissuer.go::Issue` which signs over
             // the chunk's address bytes regardless of CAC vs SOC.
             let stamp = {
-                let mut issuer = match upload.issuer.lock() {
+                let mut issuers = match upload.issuers.lock() {
                     Ok(g) => g,
                     Err(p) => p.into_inner(),
                 };
-                match ant_postage::sign_stamp_bytes(&upload.stamp_key, &mut issuer, &address) {
+                let Some(issuer) = issuers.get_mut(&batch_id) else {
+                    let _ = ack.send(ControlAck::Error {
+                        message: format!("batch 0x{} not usable", hex::encode(batch_id)),
+                    });
+                    return;
+                };
+                match ant_postage::sign_stamp_bytes(&upload.stamp_key, issuer, &address) {
                     Ok(s) => s,
                     Err(e) => {
                         let _ = ack.send(ControlAck::Error {
@@ -1959,35 +2023,106 @@ fn handle_control_command(
             // mutex `PushChunk` uses, so a status request can't
             // race a stamp increment to a half-updated bucket
             // count. `2^bucket_depth` is 65 536 entries at the bee
-            // default, so the walk completes in microseconds.
+            // default, so the walk completes in microseconds. With
+            // multiple batches we report the first registered one for
+            // back-compat with `antctl postage status`.
             let view = match upload {
                 Some(rt) => {
-                    let stats = match rt.issuer.lock() {
-                        Ok(g) => g.stats(),
-                        Err(p) => p.into_inner().stats(),
+                    let issuers = match rt.issuers.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
                     };
-                    ant_control::PostageStatusView {
-                        enabled: true,
-                        batch_id: format!("0x{}", hex::encode(stats.batch_id)),
-                        batch_depth: stats.batch_depth,
-                        bucket_depth: stats.bucket_depth,
-                        immutable: stats.immutable,
-                        bucket_count: stats.bucket_count,
-                        bucket_capacity: stats.bucket_capacity,
-                        total_capacity_chunks: stats.total_capacity,
-                        issued_chunks: stats.issued,
-                        bucket_fill_min: stats.bucket_fill_min,
-                        bucket_fill_max: stats.bucket_fill_max,
-                        remaining_total_chunks: stats.remaining_total,
-                        worst_case_remaining_chunks: stats.worst_case_remaining,
-                    }
+                    issuers
+                        .values()
+                        .next()
+                        .map_or_else(postage_status_disabled, |iss| {
+                            postage_status_view(&iss.stats())
+                        })
                 }
-                None => ant_control::PostageStatusView {
-                    enabled: false,
-                    ..Default::default()
-                },
+                None => postage_status_disabled(),
             };
             let _ = ack.send(ControlAck::PostageStatus(view));
+        }
+        ControlCommand::PostageList { ack } => {
+            // Every registered batch, one view each — backs the
+            // gateway's `GET /stamps`.
+            let views = match upload {
+                Some(rt) => {
+                    let issuers = match rt.issuers.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    issuers
+                        .values()
+                        .map(|iss| postage_status_view(&iss.stats()))
+                        .collect()
+                }
+                None => Vec::new(),
+            };
+            let _ = ack.send(ControlAck::PostageList(views));
+        }
+        ControlCommand::RegisterBatch {
+            batch_id,
+            depth,
+            bucket_depth,
+            immutable,
+            ack,
+        } => {
+            let Some(rt) = upload.as_ref() else {
+                let _ = ack.send(ControlAck::Error {
+                    message: "cannot register batch: node has no upload runtime (configure a blockchain-rpc-endpoint)".into(),
+                });
+                return;
+            };
+            let mut issuers = match rt.issuers.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            // Idempotent: if the batch is already live, a dilute may have
+            // raised its depth — bump it in place. Otherwise open (or
+            // create) its persistent counter file and insert it.
+            if let Some(existing) = issuers.get_mut(&batch_id) {
+                if depth > existing.batch_depth() {
+                    if let Err(e) = existing.set_batch_depth(depth) {
+                        let _ = ack.send(ControlAck::Error {
+                            message: format!("update batch depth: {e}"),
+                        });
+                        return;
+                    }
+                }
+                let _ = ack.send(ControlAck::Ok {
+                    message: format!("batch 0x{} refreshed", hex::encode(batch_id)),
+                });
+                return;
+            }
+            let path = rt.postage_dir.join(format!("{}.bin", hex::encode(batch_id)));
+            match ant_postage::StampIssuer::open_or_new(
+                path,
+                batch_id,
+                depth,
+                bucket_depth,
+                immutable,
+            ) {
+                Ok(issuer) => {
+                    issuers.insert(batch_id, issuer);
+                    info!(
+                        target: "ant_p2p",
+                        batch = %format!("0x{}", hex::encode(batch_id)),
+                        depth,
+                        bucket_depth,
+                        immutable,
+                        "registered postage batch for runtime stamping",
+                    );
+                    let _ = ack.send(ControlAck::Ok {
+                        message: format!("batch 0x{} registered", hex::encode(batch_id)),
+                    });
+                }
+                Err(e) => {
+                    let _ = ack.send(ControlAck::Error {
+                        message: format!("register batch: {e}"),
+                    });
+                }
+            }
         }
         ControlCommand::PutChunkLocal { wire, ack } => {
             handle_put_chunk_local(state, wire, ack);

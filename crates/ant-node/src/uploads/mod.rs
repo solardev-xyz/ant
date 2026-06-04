@@ -224,6 +224,11 @@ struct UploadManagerInner {
     cmd_tx: mpsc::Sender<ControlCommand>,
     jobs: Mutex<HashMap<String, Arc<JobHandle>>>,
     id_counter: AtomicU64,
+    /// Batch id used when a job doesn't carry its own (`antctl upload`
+    /// without `--batch-id`). Set from the operator's startup
+    /// `--postage-batch`. `None` → jobs must name a batch or the push
+    /// is rejected by the node loop with "batch … not usable".
+    default_batch_id: Option<[u8; 32]>,
 }
 
 impl UploadManager {
@@ -233,7 +238,11 @@ impl UploadManager {
     /// HTTP gateway and `antctl` socket use; the manager dispatches
     /// `PushChunk` commands through it so the existing postage
     /// stamping + pushsync pipeline is reused unchanged.
-    pub fn new(state_dir: PathBuf, cmd_tx: mpsc::Sender<ControlCommand>) -> std::io::Result<Self> {
+    pub fn new(
+        state_dir: PathBuf,
+        cmd_tx: mpsc::Sender<ControlCommand>,
+        default_batch_id: Option<[u8; 32]>,
+    ) -> std::io::Result<Self> {
         std::fs::create_dir_all(&state_dir)?;
         Ok(Self {
             inner: Arc::new(UploadManagerInner {
@@ -241,6 +250,7 @@ impl UploadManager {
                 cmd_tx,
                 jobs: Mutex::new(HashMap::new()),
                 id_counter: AtomicU64::new(0),
+                default_batch_id,
             }),
         })
     }
@@ -598,6 +608,11 @@ impl UploadManager {
 
         let snap = handle.snapshot();
         let source_path = snap.source_path.clone();
+        // Resolve which postage batch stamps this job's chunks: the
+        // job's own `batch_id` (hex) if set, else the manager's startup
+        // default. A zeroed id means "none configured" — the node loop
+        // then rejects the push with a clear "batch … not usable".
+        let batch_id = resolve_batch_id(snap.batch_id.as_deref(), self.inner.default_batch_id);
 
         // Re-validate: file must exist, be the same size and mtime
         // we recorded at start. Resume across mtime change would
@@ -699,7 +714,7 @@ impl UploadManager {
                             // re-derived this address byte-for-byte.
                             continue;
                         }
-                        in_flight.push(self.dispatch_push(i, chunk));
+                        in_flight.push(self.dispatch_push(i, chunk, batch_id));
                     }
                     continue;
                 }
@@ -763,7 +778,7 @@ impl UploadManager {
             if i < resume_cursor {
                 continue;
             }
-            in_flight.push(self.dispatch_push(i, chunk));
+            in_flight.push(self.dispatch_push(i, chunk, batch_id));
         }
         // Drain the tail.
         self.drain_inflight(&mut in_flight, &mut ack_log, &handle)
@@ -793,7 +808,7 @@ impl UploadManager {
                 if i < resume_cursor {
                     continue;
                 }
-                in_flight.push(self.dispatch_push(i, chunk.clone()));
+                in_flight.push(self.dispatch_push(i, chunk.clone(), batch_id));
             }
             self.drain_inflight(&mut in_flight, &mut ack_log, &handle)
                 .await?;
@@ -882,7 +897,7 @@ impl UploadManager {
     /// `FuturesUnordered` queue can hold heterogeneous push types
     /// (data leaf vs intermediate vs manifest chunk — the wire
     /// shape is identical, but boxing keeps the type uniform).
-    fn dispatch_push(&self, index: u64, chunk: SplitChunk) -> PushFuture {
+    fn dispatch_push(&self, index: u64, chunk: SplitChunk, batch_id: [u8; 32]) -> PushFuture {
         let cmd_tx = self.inner.cmd_tx.clone();
         Box::pin(async move {
             let mut last_err: Option<String> = None;
@@ -891,6 +906,7 @@ impl UploadManager {
                 if cmd_tx
                     .send(ControlCommand::PushChunk {
                         wire: chunk.wire.clone(),
+                        batch_id,
                         ack: ack_tx,
                     })
                     .await
@@ -1177,6 +1193,25 @@ fn mtime_unix_ms(meta: &std::fs::Metadata) -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+/// Pick the 32-byte postage batch id for a job: its own hex `batch_id`
+/// (with or without `0x`) if present and well-formed, else the
+/// manager's startup default, else all-zeros (which the node loop
+/// rejects with "batch … not usable" so the operator gets a clear
+/// error rather than a silent miss-stamp).
+fn resolve_batch_id(job_batch: Option<&str>, default: Option<[u8; 32]>) -> [u8; 32] {
+    if let Some(hex_id) = job_batch.map(str::trim).filter(|s| !s.is_empty()) {
+        let stripped = hex_id
+            .strip_prefix("0x")
+            .or_else(|| hex_id.strip_prefix("0X"))
+            .unwrap_or(hex_id);
+        let mut out = [0u8; 32];
+        if hex::decode_to_slice(stripped, &mut out).is_ok() {
+            return out;
+        }
+    }
+    default.unwrap_or([0u8; 32])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1210,7 +1245,7 @@ mod tests {
         tokio::spawn(async move {
             while let Some(cmd) = rx.recv().await {
                 match cmd {
-                    ControlCommand::PushChunk { wire, ack } => {
+                    ControlCommand::PushChunk { wire, ack, .. } => {
                         // Recompute the address from the wire bytes
                         // (span ‖ payload) and accept only CAC-valid
                         // chunks — this is the same cross-check the
@@ -1260,7 +1295,7 @@ mod tests {
         let f = write_temp_file(&payload);
         let state_dir = tempfile::tempdir().expect("tempdir");
         let (tx, stats) = spawn_fake_pushsync();
-        let mgr = UploadManager::new(state_dir.path().to_path_buf(), tx).expect("manager");
+        let mgr = UploadManager::new(state_dir.path().to_path_buf(), tx, None).expect("manager");
 
         let id = mgr
             .start(f.path().to_path_buf(), None, None, None, false)
@@ -1322,7 +1357,7 @@ mod tests {
         let f = write_temp_file(&payload);
         let state_dir = tempfile::tempdir().expect("tempdir");
         let (tx, stats) = spawn_fake_pushsync();
-        let mgr = UploadManager::new(state_dir.path().to_path_buf(), tx).expect("manager");
+        let mgr = UploadManager::new(state_dir.path().to_path_buf(), tx, None).expect("manager");
 
         let id = mgr
             .start(f.path().to_path_buf(), None, None, None, true)
@@ -1385,7 +1420,7 @@ mod tests {
 
         // First pass: complete the upload normally.
         let (tx1, stats1) = spawn_fake_pushsync();
-        let mgr1 = UploadManager::new(state_dir.path().to_path_buf(), tx1).expect("manager");
+        let mgr1 = UploadManager::new(state_dir.path().to_path_buf(), tx1, None).expect("manager");
         let id = mgr1
             .start(f.path().to_path_buf(), None, None, None, false)
             .expect("start");
@@ -1417,7 +1452,7 @@ mod tests {
         // Second pass: rehydrate, auto-resume, expect to push
         // exactly `total_chunks - chunks_pushed` further commands.
         let (tx2, stats2) = spawn_fake_pushsync();
-        let mgr2 = UploadManager::new(state_dir.path().to_path_buf(), tx2).expect("manager");
+        let mgr2 = UploadManager::new(state_dir.path().to_path_buf(), tx2, None).expect("manager");
         let restored = mgr2.rehydrate_from_disk(true).expect("rehydrate");
         assert_eq!(restored, 1);
 
@@ -1466,7 +1501,7 @@ mod tests {
         let f = write_temp_file(&payload);
         let state_dir = tempfile::tempdir().expect("tempdir");
         let (tx, _stats) = spawn_fake_pushsync();
-        let mgr = UploadManager::new(state_dir.path().to_path_buf(), tx).expect("manager");
+        let mgr = UploadManager::new(state_dir.path().to_path_buf(), tx, None).expect("manager");
 
         let id = mgr
             .start(f.path().to_path_buf(), None, None, None, false)
@@ -1522,7 +1557,7 @@ mod tests {
             .expect("save");
 
         let (tx, _stats) = spawn_fake_pushsync();
-        let mgr = UploadManager::new(state_dir.path().to_path_buf(), tx).expect("manager");
+        let mgr = UploadManager::new(state_dir.path().to_path_buf(), tx, None).expect("manager");
         mgr.rehydrate_from_disk(true).expect("rehydrate");
 
         let mut rx = mgr.subscribe(&job_id).expect("subscribe");

@@ -81,6 +81,13 @@ const SWARM_TAG: HeaderName = HeaderName::from_static("swarm-tag");
 /// Bee response header on uploads: the tag uid bee-js polls via
 /// `GET /tags/{uid}` for progress (PLAN.md J.2.4 / J.4.5).
 const SWARM_TAG_UID: HeaderName = HeaderName::from_static("swarm-tag-uid");
+/// Bee request header on every upload: the 32-byte postage batch id
+/// (64 hex, optional `0x`) that stamps the uploaded chunks. bee-js sends
+/// it as `swarm-postage-batch-id` on `POST /bytes|/bzz|/chunks|/soc`.
+/// Required: the node selects the matching registered issuer, so a
+/// missing / malformed / unknown batch is a `400` (bee's shape).
+const SWARM_POSTAGE_BATCH_ID: HeaderName =
+    HeaderName::from_static("swarm-postage-batch-id");
 
 /// Concurrency cap on outbound `PushChunk` commands during a `POST /bzz`
 /// upload. Matched to the daemon-side
@@ -382,6 +389,28 @@ fn parse_hex_fixed<const N: usize>(s: &str) -> Result<[u8; N], String> {
     Ok(out)
 }
 
+/// Extract the postage batch id from the `swarm-postage-batch-id`
+/// request header. Returns a bee-shaped `400` response when the header
+/// is missing or not 32-byte hex — the node then selects the registered
+/// issuer for this id (an unknown batch fails the push with
+/// `"batch … not usable"`, which the upload handlers map to `400`).
+#[allow(clippy::result_large_err)]
+fn parse_postage_batch_header(headers: &HeaderMap) -> Result<[u8; 32], Response> {
+    let raw = headers
+        .get(&SWARM_POSTAGE_BATCH_ID)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            json_error(
+                StatusCode::BAD_REQUEST,
+                "missing required swarm-postage-batch-id header",
+            )
+        })?;
+    parse_hex_fixed::<32>(raw)
+        .map_err(|e| json_error(StatusCode::BAD_REQUEST, format!("bad swarm-postage-batch-id: {e}")))
+}
+
 /// `POST /chunks` — accept a single content-addressed chunk's wire
 /// bytes (`span(8 LE) || payload`), stamp it locally, and pushsync it
 /// to the closest neighbourhood peer. Body cap matches bee:
@@ -399,6 +428,11 @@ pub async fn upload_chunk(
         );
     }
 
+    let batch_id = match parse_postage_batch_header(&headers) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+
     let timeout = request_timeout(&headers, CHUNK_REQUEST_TIMEOUT);
 
     let guard = handle
@@ -408,6 +442,7 @@ pub async fn upload_chunk(
     let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
     let cmd = ControlCommand::PushChunk {
         wire: body.to_vec(),
+        batch_id,
         ack: ack_tx,
     };
     if handle.commands.send(cmd).await.is_err() {
@@ -447,7 +482,7 @@ pub async fn upload_chunk(
             // can fix it without a code change.
             let status = if message.starts_with("uploads not configured") {
                 StatusCode::SERVICE_UNAVAILABLE
-            } else if message.starts_with("chunk wire size") {
+            } else if message.starts_with("chunk wire size") || message.contains("not usable") {
                 StatusCode::BAD_REQUEST
             } else {
                 StatusCode::BAD_GATEWAY
@@ -547,6 +582,11 @@ pub async fn upload_soc(
         );
     }
 
+    let batch_id = match parse_postage_batch_header(&headers) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+
     let timeout = request_timeout(&headers, CHUNK_REQUEST_TIMEOUT);
 
     let guard = handle.activity.begin(
@@ -558,6 +598,7 @@ pub async fn upload_soc(
     let cmd = ControlCommand::PushSoc {
         address,
         wire,
+        batch_id,
         ack: ack_tx,
     };
     if handle.commands.send(cmd).await.is_err() {
@@ -593,7 +634,14 @@ pub async fn upload_soc(
             )
         }
         ControlAck::NotReady { message } => json_error(StatusCode::SERVICE_UNAVAILABLE, message),
-        ControlAck::Error { message } => json_error(StatusCode::BAD_GATEWAY, message),
+        ControlAck::Error { message } => {
+            let status = if message.contains("not usable") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            json_error(status, message)
+        }
         other => {
             warn!(target: "ant_gateway", ?other, "unexpected ack from PushSoc");
             json_error(StatusCode::INTERNAL_SERVER_ERROR, "unexpected node ack")
@@ -643,6 +691,11 @@ pub async fn upload_bzz(
         );
     }
 
+    let batch_id = match parse_postage_batch_header(&headers) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+
     let collection = headers
         .get(SWARM_COLLECTION)
         .and_then(|v| v.to_str().ok())
@@ -674,7 +727,7 @@ pub async fn upload_bzz(
     );
     guard.update(0, total_chunks as u64, total_chunks as u32, 0);
 
-    if let Err(err_resp) = push_chunks(&handle, &assembled.chunks, timeout, &guard).await {
+    if let Err(err_resp) = push_chunks(&handle, &assembled.chunks, batch_id, timeout, &guard).await {
         return err_resp;
     }
 
@@ -741,6 +794,11 @@ pub async fn upload_bytes(
         );
     }
 
+    let batch_id = match parse_postage_batch_header(&headers) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+
     let timeout = request_timeout(&headers, DEFAULT_REQUEST_TIMEOUT);
     let guard = handle
         .activity
@@ -757,7 +815,7 @@ pub async fn upload_bytes(
     );
     guard.update(0, total_chunks as u64, total_chunks as u32, 0);
 
-    if let Err(err_resp) = push_chunks(&handle, &split.chunks, timeout, &guard).await {
+    if let Err(err_resp) = push_chunks(&handle, &split.chunks, batch_id, timeout, &guard).await {
         return err_resp;
     }
 
@@ -808,6 +866,11 @@ pub async fn create_feed(
         }
     }
 
+    let batch_id = match parse_postage_batch_header(&headers) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+
     let timeout = request_timeout(&headers, CHUNK_REQUEST_TIMEOUT);
     let guard = handle.activity.begin(
         GatewayRequestKind::Feed,
@@ -821,7 +884,7 @@ pub async fn create_feed(
     let total_chunks = manifest.chunks.len();
     guard.update(0, total_chunks as u64, total_chunks as u32, 0);
 
-    if let Err(err_resp) = push_chunks(&handle, &manifest.chunks, timeout, &guard).await {
+    if let Err(err_resp) = push_chunks(&handle, &manifest.chunks, batch_id, timeout, &guard).await {
         return err_resp;
     }
 
@@ -1022,6 +1085,7 @@ fn map_manifest_error(e: ant_retrieval::manifest_writer::ManifestWriteError) -> 
 async fn push_chunks(
     handle: &GatewayHandle,
     chunks: &[SplitChunk],
+    batch_id: [u8; 32],
     timeout: std::time::Duration,
     guard: &ActiveRequestGuard,
 ) -> Result<(), Response> {
@@ -1036,6 +1100,7 @@ async fn push_chunks(
             let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
             let cmd = ControlCommand::PushChunk {
                 wire: chunk.wire.clone(),
+                batch_id,
                 ack: ack_tx,
             };
             if handle.commands.send(cmd).await.is_err() {
@@ -1065,6 +1130,8 @@ async fn push_chunks(
                 Ok(Ok(ControlAck::Error { message })) => {
                     let status = if message.starts_with("uploads not configured") {
                         StatusCode::SERVICE_UNAVAILABLE
+                    } else if message.contains("not usable") {
+                        StatusCode::BAD_REQUEST
                     } else {
                         StatusCode::BAD_GATEWAY
                     };

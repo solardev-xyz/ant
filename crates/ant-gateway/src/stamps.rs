@@ -2,25 +2,23 @@
 //!
 //! Freedom's publish pre-flight (`checkSwarmPreFlight`) refuses to
 //! publish unless `GET /stamps` lists at least one **usable** batch
-//! (PLAN.md J.4 / J.7.2). `antd` already supports a single
-//! operator-configured batch (`--postage-batch`, validated on-chain at
-//! startup and stamped locally for every upload). This module surfaces
-//! that batch in bee's `/stamps` JSON shape so an unmodified bee-js /
-//! Freedom client sees a usable stamp and lets the publish flow
-//! proceed end-to-end.
+//! (PLAN.md J.4 / J.7.2). `antd` keeps a live registry of postage
+//! batches — any pre-configured `--postage-batch` plus every batch
+//! bought at runtime via `POST /stamps/{amount}/{depth}`. This module
+//! enumerates them in bee's `/stamps` JSON shape so an unmodified
+//! bee-js / Freedom client sees the usable stamps and lets the publish
+//! flow proceed end-to-end.
 //!
-//! The live counters come from the daemon over the existing
-//! [`ControlCommand::PostageStatus`] channel — the same snapshot
-//! `antctl postage status` renders — so no new node-loop wiring is
-//! needed. Fields the daemon can't know locally without an extra chain
-//! read (`amount` per-chunk balance, `batchTTL`) are filled with
-//! safe placeholders; see the field comments.
+//! The live counters come from the daemon over the
+//! [`ControlCommand::PostageList`] channel (one view per registered
+//! batch). Fields the daemon can't know locally without an extra chain
+//! read (`amount` per-chunk balance, `batchTTL`) are filled with safe
+//! placeholders; see the field comments.
 //!
 //! On-chain **writes** (`POST /stamps/{amount}/{depth}` to buy,
-//! `PATCH /stamps/topup|dilute/...`) are intentionally *not* routed
-//! here: they require live-mainnet validation and dynamic batch
-//! registration with the running issuer, which is tracked separately
-//! (PLAN.md J.5.B). They fall through to the `501` fallback.
+//! `PATCH /stamps/topup|dilute/...`) live in [`crate::chain`]; a buy
+//! registers the new issuer with the running node before returning, so
+//! the bought batch shows up here as `usable` within seconds.
 
 use std::time::Duration;
 
@@ -118,15 +116,15 @@ impl StampEntry {
     }
 }
 
-/// Fetch the daemon's postage snapshot over the control channel.
+/// Fetch every registered postage batch over the control channel.
 /// Returns `Err(response)` already shaped as an HTTP error when the
 /// node loop is gone or replies unexpectedly.
 #[allow(clippy::result_large_err)]
-async fn fetch_postage(handle: &GatewayHandle) -> Result<PostageStatusView, Response> {
+async fn fetch_postage_list(handle: &GatewayHandle) -> Result<Vec<PostageStatusView>, Response> {
     let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
     if handle
         .commands
-        .send(ControlCommand::PostageStatus { ack: ack_tx })
+        .send(ControlCommand::PostageList { ack: ack_tx })
         .await
         .is_err()
     {
@@ -136,53 +134,55 @@ async fn fetch_postage(handle: &GatewayHandle) -> Result<PostageStatusView, Resp
         ));
     }
     match tokio::time::timeout(POSTAGE_STATUS_TIMEOUT, ack_rx).await {
-        Ok(Ok(ControlAck::PostageStatus(view))) => Ok(view),
+        Ok(Ok(ControlAck::PostageList(views))) => Ok(views),
         Ok(Ok(other)) => Err(json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("unexpected node ack for postage status: {other:?}"),
+            format!("unexpected node ack for postage list: {other:?}"),
         )),
         Ok(Err(_)) => Err(json_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "node loop dropped the postage status request",
+            "node loop dropped the postage list request",
         )),
         Err(_) => Err(json_error(
             StatusCode::GATEWAY_TIMEOUT,
-            "postage status request timed out",
+            "postage list request timed out",
         )),
     }
 }
 
-/// `GET /stamps`. Lists the configured batch (or an empty list when
-/// uploads are disabled), bee-shaped.
+/// `GET /stamps`. Lists every registered batch (those bought at runtime
+/// plus any pre-configured one), bee-shaped — or an empty list when
+/// none are registered.
 pub async fn stamps(State(handle): State<GatewayHandle>) -> Response {
-    let view = match fetch_postage(&handle).await {
+    let views = match fetch_postage_list(&handle).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let stamps = StampEntry::from_view(&view).into_iter().collect();
+    let stamps = views.iter().filter_map(StampEntry::from_view).collect();
     json_ok(&StampsBody { stamps })
 }
 
-/// `GET /stamps/{id}`. Returns the single configured batch if `id`
-/// matches it, else `404` (bee's "batch not found"). Used by bee-js's
+/// `GET /stamps/{id}`. Returns the registered batch whose id matches,
+/// else `404` (bee's "batch not found"). Used by bee-js's
 /// extension-cost math (PLAN.md J.2.2).
 pub async fn stamp(State(handle): State<GatewayHandle>, Path(id): Path<String>) -> Response {
-    let view = match fetch_postage(&handle).await {
+    let views = match fetch_postage_list(&handle).await {
         Ok(v) => v,
         Err(resp) => return resp,
-    };
-    let Some(entry) = StampEntry::from_view(&view) else {
-        return json_error(StatusCode::NOT_FOUND, "no postage batch configured");
     };
     let want = id
         .strip_prefix("0x")
         .or_else(|| id.strip_prefix("0X"))
         .unwrap_or(&id)
         .to_ascii_lowercase();
-    if want != entry.batch_id {
-        return json_error(StatusCode::NOT_FOUND, "batch not found");
+    match views
+        .iter()
+        .filter_map(StampEntry::from_view)
+        .find(|e| e.batch_id == want)
+    {
+        Some(entry) => json_ok(&entry),
+        None => json_error(StatusCode::NOT_FOUND, "batch not found"),
     }
-    json_ok(&entry)
 }
 
 fn json_ok<T: Serialize>(value: &T) -> Response {

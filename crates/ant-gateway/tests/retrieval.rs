@@ -753,6 +753,10 @@ async fn post_chunks_returns_bee_shaped_reference() {
             .method(Method::POST)
             .uri("/chunks")
             .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(
+                "swarm-postage-batch-id",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
             .body(Body::from(wire))
             .unwrap(),
     )
@@ -806,7 +810,7 @@ async fn post_bzz_single_file_returns_manifest_reference() {
     let router = router_with_dispatcher(move |cmd| {
         let pushed = pushed.clone();
         async move {
-            if let ControlCommand::PushChunk { wire, ack } = cmd {
+            if let ControlCommand::PushChunk { wire, ack, .. } = cmd {
                 let mut span = [0u8; 8];
                 span.copy_from_slice(&wire[..8]);
                 let payload = &wire[8..];
@@ -825,6 +829,10 @@ async fn post_bzz_single_file_returns_manifest_reference() {
             .method(Method::POST)
             .uri("/bzz?name=hello.txt")
             .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .header(
+                "swarm-postage-batch-id",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
             .body(Body::from(payload.clone()))
             .unwrap(),
     )
@@ -885,7 +893,7 @@ async fn post_bzz_collection_uploads_tar_archive() {
     let router = router_with_dispatcher(move |cmd| {
         let pushed = pushed.clone();
         async move {
-            if let ControlCommand::PushChunk { wire, ack } = cmd {
+            if let ControlCommand::PushChunk { wire, ack, .. } = cmd {
                 let mut span = [0u8; 8];
                 span.copy_from_slice(&wire[..8]);
                 let payload = &wire[8..];
@@ -904,6 +912,10 @@ async fn post_bzz_collection_uploads_tar_archive() {
             .method(Method::POST)
             .uri("/bzz")
             .header("swarm-collection", "true")
+            .header(
+                "swarm-postage-batch-id",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
             .body(Body::from(tar_bytes))
             .unwrap(),
     )
@@ -1898,6 +1910,10 @@ async fn post_soc_returns_bee_shaped_reference() {
             .uri(soc_uri(&fx.owner, &fx.id))
             .header(SOC_SIGNATURE_HEADER, hex::encode(fx.signature))
             .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(
+                "swarm-postage-batch-id",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
             .body(Body::from(fx.inner_cac_wire))
             .unwrap(),
     )
@@ -1929,6 +1945,10 @@ async fn post_soc_accepts_0x_prefixed_hex() {
             .header(
                 SOC_SIGNATURE_HEADER,
                 format!("0x{}", hex::encode(fx.signature)),
+            )
+            .header(
+                "swarm-postage-batch-id",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             )
             .body(Body::from(fx.inner_cac_wire))
             .unwrap(),
@@ -1963,7 +1983,10 @@ async fn post_soc_dispatches_expected_address_and_wire() {
     let router = router_with_dispatcher(move |cmd| {
         let captured = captured_for_dispatch.clone();
         async move {
-            if let ControlCommand::PushSoc { address, wire, ack } = cmd {
+            if let ControlCommand::PushSoc {
+                address, wire, ack, ..
+            } = cmd
+            {
                 *captured.lock().await = Some(Captured { wire, address });
                 let _ = ack.send(ControlAck::ChunkUploaded {
                     reference: format!("0x{}", hex::encode(address)),
@@ -1978,6 +2001,10 @@ async fn post_soc_dispatches_expected_address_and_wire() {
             .method(Method::POST)
             .uri(soc_uri(&fx.owner, &fx.id))
             .header(SOC_SIGNATURE_HEADER, hex::encode(fx.signature))
+            .header(
+                "swarm-postage-batch-id",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
             .body(Body::from(fx.inner_cac_wire.clone()))
             .unwrap(),
     )
@@ -2006,6 +2033,10 @@ async fn post_soc_omits_immutable_cache_control() {
             .method(Method::POST)
             .uri(soc_uri(&fx.owner, &fx.id))
             .header(SOC_SIGNATURE_HEADER, hex::encode(fx.signature))
+            .header(
+                "swarm-postage-batch-id",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
             .body(Body::from(fx.inner_cac_wire))
             .unwrap(),
     )
@@ -2260,6 +2291,10 @@ async fn post_soc_maps_not_ready_to_503() {
             .method(Method::POST)
             .uri(soc_uri(&fx.owner, &fx.id))
             .header(SOC_SIGNATURE_HEADER, hex::encode(fx.signature))
+            .header(
+                "swarm-postage-batch-id",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
             .body(Body::from(fx.inner_cac_wire))
             .unwrap(),
     )
@@ -2290,6 +2325,10 @@ async fn post_soc_maps_pushsync_failure_to_502() {
             .method(Method::POST)
             .uri(soc_uri(&fx.owner, &fx.id))
             .header(SOC_SIGNATURE_HEADER, hex::encode(fx.signature))
+            .header(
+                "swarm-postage-batch-id",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
             .body(Body::from(fx.inner_cac_wire))
             .unwrap(),
     )

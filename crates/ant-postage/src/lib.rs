@@ -206,6 +206,52 @@ impl StampIssuer {
         Ok(issuer)
     }
 
+    /// Reload a persisted issuer from `path`, taking every parameter
+    /// (`batch_id`, depths, immutability) from the file header rather
+    /// than the caller. Used at daemon startup to rescan
+    /// `<data-dir>/postage/*.bin` and resurrect every batch the node
+    /// previously bought without a sidecar registry — the filename is
+    /// the batch id and the header carries the rest.
+    pub fn open_existing(path: PathBuf) -> Result<Self, PostageError> {
+        let bytes = std::fs::read(&path)
+            .map_err(|e| PostageError::Load(format!("{}: {e}", path.display())))?;
+        let header = decode_header(&bytes)?;
+        let buckets = decode_buckets(&bytes, header.bucket_depth)?;
+        Ok(Self {
+            batch_id: header.batch_id,
+            batch_depth: header.batch_depth,
+            bucket_depth: header.bucket_depth,
+            immutable: header.immutable,
+            buckets,
+            persist_path: Some(path),
+        })
+    }
+
+    /// Raise the batch depth in place after an on-chain `increaseDepth`
+    /// ("dilute"). The collision-bucket count is `2^bucket_depth`, which
+    /// is unchanged by a dilute, so the bucket vector keeps its length;
+    /// only each bucket's index ceiling (`2^(batch_depth − bucket_depth)`)
+    /// grows. We therefore just update the header field and re-persist —
+    /// no counter is touched, so no index is ever re-issued. Refuses to
+    /// lower the depth (that would shrink capacity below already-issued
+    /// indices and let the network reject our stamps).
+    pub fn set_batch_depth(&mut self, new_depth: u8) -> Result<(), PostageError> {
+        if new_depth <= self.bucket_depth {
+            return Err(PostageError::Msg(format!(
+                "new depth {new_depth} must exceed bucket_depth {}",
+                self.bucket_depth
+            )));
+        }
+        if new_depth < self.batch_depth {
+            return Err(PostageError::Msg(format!(
+                "refusing to lower batch depth {} → {new_depth}",
+                self.batch_depth
+            )));
+        }
+        self.batch_depth = new_depth;
+        self.persist()
+    }
+
     fn build(
         batch_id: [u8; 32],
         batch_depth: u8,
@@ -373,7 +419,6 @@ struct StoreHeader {
     batch_id: [u8; 32],
     batch_depth: u8,
     bucket_depth: u8,
-    #[allow(dead_code)]
     immutable: bool,
 }
 
