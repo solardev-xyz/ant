@@ -1683,7 +1683,7 @@ This is the working order to close it, fastest-payoff first:
 | 6 | `/feeds/{owner}/{topic}` GET/POST + `/soc/{owner}/{id}` POST | ~2-3 d | ✅ shipped | `/feeds` GET/POST + `/soc/{owner}/{id}` GET/POST routed. |
 | 7 | `/stewardship/{ref}` GET/PUT, `/envelope/{addr}` POST | ~½-1 d | ⬜ open | Not routed yet → 501. |
 | 8 | Reed-Solomon erasure decoding (`--swarm-redundancy=1..3` interop) | ~2-3 d | ⬜ open | Read-path protocol work; not started. |
-| 9 | `/topology` known/visible-peer population (kademlia "known" set) | ~1 day | ⬜ open | Reporting-only gap: `population == connected` (~100). bee-shaped clients read "visible peers" as `sum(bins[*].population)`; bee reports thousands. See "Open: visible-peers" below. |
+| 9 | `/topology` known/visible-peer population (kademlia "known" set) | ~1 day | ✅ shipped | Bounded `KnownPeers` book (deduped by overlay, per-bin cap + TTL) fed by hive gossip + handshakes; `GET /topology` reports per-bin `population` from the known book, `connected` from the live table, and a real saturation `depth`. Live-verified: `connected≈100` while visible `population` climbs into the thousands (`depth=5`). See "Open: visible-peers" below. |
 
 #### Open: chequebook auto-bootstrap (bee-parity) — row 5
 
@@ -1727,7 +1727,19 @@ This is the working order to close it, fastest-payoff first:
   chequebook for the same node EOA — identical to bee's own behaviour against a
   fresh statestore.
 
-#### Open: visible-peers / known-peer book (bee-parity) — row 9
+#### visible-peers / known-peer book (bee-parity) — row 9 ✅ shipped (0.5.9)
+
+**Shipped in 0.5.9** as specified below: a bounded `KnownPeers` book
+(`crates/ant-p2p/src/routing.rs`) deduped by overlay with a per-bin cap +
+TTL, fed in `enqueue_hint` (before the dial-dedup early-returns) and on
+handshake success, pruned on the 30 s peerstore-flush tick, never cleared on
+disconnect. `RoutingInfo` carries additive `known_size` / `known_bins`
+(`#[serde(default)]`; `size`/`bins` stay connected for `antop` back-compat),
+and `GET /topology` reports per-bin `population` from the known book,
+`connected` from the live table, top-level `population = known_size`, and a
+real saturation `depth`. Live-verified on mainnet: after ~2.5 min,
+`connected = 100` / `GET /peers = 100` while visible `population = 1163` and
+climbing, `depth = 5`.
 
 **Reporting-only** change — `antd` keeps its ~100-peer working set; it just also
 *tracks and reports* the larger hive-discovered population, exactly like bee's
