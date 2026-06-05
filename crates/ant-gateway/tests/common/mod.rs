@@ -146,6 +146,7 @@ pub fn snapshot_with_one_peer() -> StatusSnapshot {
                     bins[5] = 1;
                     bins
                 },
+                ..Default::default()
             },
         },
         listeners: vec!["/ip4/127.0.0.1/tcp/1634".to_string()],

@@ -509,12 +509,23 @@ pub struct RoutingInfo {
     /// daemon has no peers and hasn't computed it yet.
     #[serde(default)]
     pub base_overlay: String,
-    /// Total entries in the routing table (== number of BZZ peers we have).
+    /// Total entries in the routing table (== number of connected BZZ
+    /// peers we have).
     #[serde(default)]
     pub size: u32,
-    /// Per-bin peer counts. Always 32 elements when populated.
+    /// Per-bin connected peer counts. Always 32 elements when populated.
     #[serde(default)]
     pub bins: Vec<u32>,
+    /// Total known peers (connected + hive-discovered-but-unconnected),
+    /// deduped by overlay. Always `>= size`. Zero on older daemons that
+    /// didn't track a known-peer book.
+    #[serde(default)]
+    pub known_size: u32,
+    /// Per-bin known-peer counts (connected + discovered). Always 32
+    /// elements when populated; empty on older daemons. bee-shaped
+    /// clients read "visible peers" as `sum(known_bins)`.
+    #[serde(default)]
+    pub known_bins: Vec<u32>,
 }
 
 /// Connection / pipeline state for a peer, aligned with the daemon’s swarm view.

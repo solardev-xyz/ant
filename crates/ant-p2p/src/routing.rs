@@ -27,6 +27,7 @@
 use libp2p::PeerId;
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 /// Number of XOR bins we partition peers into. Matches `swarm.MaxBins =
 /// MaxPO + 1 = 32`.
@@ -203,6 +204,120 @@ impl RoutingTable {
     }
 }
 
+/// Default time-to-live for a known-but-unconnected peer entry. After
+/// this long without a fresh hive advert / handshake, the entry is
+/// pruned so a peer that left the network eventually stops counting
+/// toward "visible peers". 45 min sits in the middle of bee's
+/// kademlia retention window.
+pub const DEFAULT_KNOWN_TTL: Duration = Duration::from_mins(45);
+
+/// Default per-bin cap on the known-peer book. Bounds memory and
+/// stops gateway-style churn (a firehose of distinct overlays in the
+/// far bins) from growing the book without limit. 32 bins × 512 ≈ 16K
+/// overlays max (~1 MB), comfortably in the "thousands of visible
+/// peers" range bee reports while staying bounded.
+pub const DEFAULT_KNOWN_PER_BIN_CAP: u32 = 512;
+
+/// One entry in the [`KnownPeers`] book. Keyed by overlay (not
+/// `PeerId`) because hive can re-advertise the same overlay under a
+/// fresh `PeerId`; the overlay is the stable network identity and the
+/// thing bee counts.
+#[derive(Debug, Clone, Copy)]
+struct KnownEntry {
+    po: u8,
+    last_seen: Instant,
+}
+
+/// Bounded book of peers we *know about* — connected peers plus those
+/// discovered via hive gossip but not (yet / currently) connected.
+///
+/// This is the "known" side of bee's kademlia, distinct from the
+/// "connected" [`RoutingTable`]: bee-shaped clients read **visible
+/// peers** as `sum(bins[*].population)`, which is the size of this book
+/// per PO bin, while **connected peers** stay the smaller working set.
+/// Entries are deduped by overlay, bounded by a per-bin cap, and pruned
+/// on TTL so the book tracks the live population without growing
+/// unbounded.
+#[derive(Debug, Clone)]
+pub struct KnownPeers {
+    base: Overlay,
+    entries: HashMap<Overlay, KnownEntry>,
+    bins: [u32; NUM_BINS],
+    ttl: Duration,
+    per_bin_cap: u32,
+}
+
+impl KnownPeers {
+    #[must_use]
+    pub fn new(base: Overlay) -> Self {
+        Self::with_limits(base, DEFAULT_KNOWN_TTL, DEFAULT_KNOWN_PER_BIN_CAP)
+    }
+
+    #[must_use]
+    pub fn with_limits(base: Overlay, ttl: Duration, per_bin_cap: u32) -> Self {
+        Self {
+            base,
+            entries: HashMap::new(),
+            bins: [0u32; NUM_BINS],
+            ttl,
+            per_bin_cap,
+        }
+    }
+
+    /// Note that we've seen `overlay` (from a hive hint or a successful
+    /// handshake). Idempotent: a repeat refreshes `last_seen` without
+    /// double-counting; a first insert bumps `bins[po]` unless the bin
+    /// is already at the per-bin cap (in which case the overlay is
+    /// dropped to keep the book bounded). Returns `true` on first
+    /// insert.
+    pub fn note(&mut self, overlay: Overlay) -> bool {
+        let now = Instant::now();
+        if let Some(e) = self.entries.get_mut(&overlay) {
+            e.last_seen = now;
+            return false;
+        }
+        let po = proximity(&self.base, &overlay);
+        if self.bins[po as usize] >= self.per_bin_cap {
+            return false;
+        }
+        self.entries
+            .insert(overlay, KnownEntry { po, last_seen: now });
+        self.bins[po as usize] += 1;
+        true
+    }
+
+    /// Drop entries not seen within the TTL, decrementing their bins.
+    /// `now` is taken as a parameter so the caller can drive it off the
+    /// existing periodic tick (and tests can simulate elapsed time).
+    pub fn prune(&mut self, now: Instant) {
+        let ttl = self.ttl;
+        let bins = &mut self.bins;
+        self.entries.retain(|_, e| {
+            let keep = now.saturating_duration_since(e.last_seen) <= ttl;
+            if !keep {
+                bins[e.po as usize] = bins[e.po as usize].saturating_sub(1);
+            }
+            keep
+        });
+    }
+
+    /// Per-bin known-peer counts. Length is always `NUM_BINS`.
+    #[must_use]
+    pub fn bin_counts(&self) -> [u32; NUM_BINS] {
+        self.bins
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,5 +454,61 @@ mod tests {
     fn closest_peer_empty_table_is_none() {
         let table = RoutingTable::new([0u8; 32]);
         assert!(table.closest_peer(&[0u8; 32], &[]).is_none());
+    }
+
+    /// `note` dedups by overlay (a re-advert refreshes, doesn't
+    /// double-count) and places overlays into the right PO bin.
+    #[test]
+    fn known_peers_note_dedups_and_bins() {
+        let mut known = KnownPeers::new([0u8; 32]);
+        let mut o1 = [0u8; 32];
+        o1[0] = 0x80; // PO 0
+        let mut o2 = [0u8; 32];
+        o2[0] = 0x01; // PO 7
+
+        assert!(known.note(o1), "first insert returns true");
+        assert!(!known.note(o1), "re-note is a refresh, not a new entry");
+        assert!(known.note(o2));
+        assert_eq!(known.len(), 2);
+        let bins = known.bin_counts();
+        assert_eq!(bins[0], 1);
+        assert_eq!(bins[7], 1);
+    }
+
+    /// The per-bin cap bounds the book: once a bin is full, further
+    /// distinct overlays in that bin are dropped.
+    #[test]
+    fn known_peers_per_bin_cap_bounds_growth() {
+        let mut known = KnownPeers::with_limits([0u8; 32], DEFAULT_KNOWN_TTL, 2);
+        // All these overlays start with 0x80 → PO 0, but differ in
+        // later bytes so they're distinct entries.
+        for i in 0u8..5 {
+            let mut o = [0u8; 32];
+            o[0] = 0x80;
+            o[31] = i;
+            known.note(o);
+        }
+        assert_eq!(known.bin_counts()[0], 2, "bin 0 capped at 2");
+        assert_eq!(known.len(), 2);
+    }
+
+    /// Pruning drops entries older than the TTL and decrements bins.
+    #[test]
+    fn known_peers_prune_expires_by_ttl() {
+        let ttl = Duration::from_mins(1);
+        let mut known = KnownPeers::with_limits([0u8; 32], ttl, DEFAULT_KNOWN_PER_BIN_CAP);
+        let mut o = [0u8; 32];
+        o[0] = 0x80;
+        known.note(o);
+        assert_eq!(known.len(), 1);
+
+        // Not yet expired.
+        known.prune(Instant::now());
+        assert_eq!(known.len(), 1);
+
+        // Well past the TTL → pruned, bin decremented.
+        known.prune(Instant::now() + ttl + Duration::from_secs(1));
+        assert_eq!(known.len(), 0);
+        assert_eq!(known.bin_counts()[0], 0);
     }
 }

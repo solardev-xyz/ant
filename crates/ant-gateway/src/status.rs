@@ -194,43 +194,84 @@ pub async fn topology(State(handle): State<GatewayHandle>) -> Response {
         strip_0x(&routing.base_overlay).to_string()
     };
 
-    let mut bins = BTreeMap::new();
-    let bin_counts: Vec<u32> = if routing.bins.is_empty() {
-        vec![0u32; 32]
+    // `connected_bins` = peers we have live BZZ sessions with;
+    // `known_bins` = those plus hive-discovered-but-unconnected peers
+    // (deduped by overlay). bee-shaped dashboards show two counters:
+    // Connected Peers ← `GET /peers` length ≈ sum(connected), and
+    // Visible Peers ← `sum(bins[*].population)`. We mirror that by
+    // reporting per-bin population from the known book and connected
+    // from the live table. Older daemons send no `known_bins`, so fall
+    // back to connected == population (the pre-row-9 behaviour).
+    let connected_bins = pad32(&routing.bins);
+    let known_bins = if routing.known_bins.is_empty() {
+        connected_bins.clone()
     } else {
-        let mut padded = routing.bins.clone();
-        padded.resize(32, 0);
-        padded
+        pad32(&routing.known_bins)
     };
-    for (i, count) in bin_counts.iter().enumerate() {
+
+    let mut bins = BTreeMap::new();
+    for i in 0..32 {
         bins.insert(
             format!("bin_{i}"),
             BinInfo {
-                population: *count,
-                connected: *count,
+                population: known_bins[i],
+                connected: connected_bins[i],
                 disconnected_peers: Vec::new(),
                 connected_peers: Vec::new(),
             },
         );
     }
 
-    let connected: u32 = bin_counts.iter().sum();
+    let connected: u32 = connected_bins.iter().sum();
+    let population = if routing.known_size > 0 {
+        routing.known_size
+    } else {
+        routing.size
+    };
+    let depth = neighborhood_depth(&connected_bins);
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
 
     Json(TopologyBody {
         base_addr,
-        population: routing.size,
+        population,
         connected,
         timestamp: format_rfc3339(now_unix),
         nn_low_watermark: 0,
-        depth: 0,
+        depth,
         reachability: "Unknown",
         network_availability: "Unknown",
         bins,
     })
     .into_response()
+}
+
+/// Right-pad (or truncate) a per-bin count vector to exactly 32 entries.
+fn pad32(bins: &[u32]) -> Vec<u32> {
+    let mut out = bins.to_vec();
+    out.resize(32, 0);
+    out
+}
+
+/// Saturation depth from connected per-bin counts: the lowest PO bin
+/// that is *not* saturated (fewer than `SATURATION` connected peers).
+/// bee derives storage/neighborhood depth the same way — every bin
+/// below the depth has a healthy fan-out, so the depth is where our
+/// connectivity thins out. Returns 0 when bin 0 is already unsaturated
+/// (or we have no peers), matching bee's "no neighborhood yet" state.
+fn neighborhood_depth(connected_bins: &[u32]) -> u32 {
+    /// Per-bin connected count bee treats as a healthy, saturated bin.
+    const SATURATION: u32 = 4;
+    let mut depth = 0u32;
+    for (i, &c) in connected_bins.iter().enumerate() {
+        if c >= SATURATION {
+            depth = (i as u32) + 1;
+        } else {
+            break;
+        }
+    }
+    depth
 }
 
 /// RFC3339 timestamp for the current wall-clock second. Shared with
@@ -279,4 +320,39 @@ fn strip_0x(s: &str) -> &str {
     s.strip_prefix("0x")
         .or_else(|| s.strip_prefix("0X"))
         .unwrap_or(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{neighborhood_depth, pad32};
+
+    #[test]
+    fn pad32_resizes_to_32() {
+        assert_eq!(pad32(&[]).len(), 32);
+        assert_eq!(pad32(&[1, 2, 3]).len(), 32);
+        // Over-long input is truncated to 32.
+        assert_eq!(pad32(&[7u32; 40]).len(), 32);
+        assert_eq!(pad32(&[1, 2, 3])[1], 2);
+    }
+
+    #[test]
+    fn depth_zero_when_no_neighborhood() {
+        assert_eq!(neighborhood_depth(&[0u32; 32]), 0);
+        // Bin 0 below saturation → depth 0 even if higher bins are full.
+        let mut bins = vec![0u32; 32];
+        bins[3] = 10;
+        assert_eq!(neighborhood_depth(&bins), 0);
+    }
+
+    #[test]
+    fn depth_counts_contiguous_saturated_bins() {
+        let mut bins = vec![0u32; 32];
+        // Bins 0,1,2 saturated (>=4), bin 3 not → depth 3.
+        bins[0] = 4;
+        bins[1] = 8;
+        bins[2] = 5;
+        bins[3] = 1;
+        bins[4] = 9; // gap after the break is ignored
+        assert_eq!(neighborhood_depth(&bins), 3);
+    }
 }

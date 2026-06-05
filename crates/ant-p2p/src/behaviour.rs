@@ -7,7 +7,7 @@ use crate::handshake::{
     PROTOCOL_HANDSHAKE_V15,
 };
 use crate::peerstore::PeerStore;
-use crate::routing::{Overlay, RoutingTable};
+use crate::routing::{KnownPeers, Overlay, RoutingTable};
 use crate::sinks;
 use ant_control::{
     CacheInfo, ControlAck, ControlCommand, DiskCacheInfo, ExternalAddressInfo, GatewayActivity,
@@ -636,6 +636,14 @@ struct SwarmState {
     /// peer to ask for a given chunk. Mirrors `bzz_peers` but carries the
     /// overlay alongside the peer-id and indexes by proximity order.
     routing: RoutingTable,
+    /// Bounded book of *known* peers — connected peers plus those
+    /// discovered via hive gossip but not currently connected, deduped
+    /// by overlay. Fed in [`SwarmState::enqueue_hint`] and on handshake
+    /// success, pruned on the periodic tick, and never cleared on
+    /// disconnect (a known peer persists until its TTL lapses). bee
+    /// reports `sum(bins[*].population)` from this as "visible peers",
+    /// distinct from the smaller connected `routing` working set.
+    known: KnownPeers,
     /// All peer ids we've ever had a hint for, whether enqueued or already
     /// dialed. Stops hive's Peers broadcasts from queueing the same peer
     /// repeatedly as every bootnode gossips its neighbourhood to us.
@@ -793,6 +801,7 @@ impl SwarmState {
             bzz_peers: HashSet::new(),
             ready_in_ms: HashMap::new(),
             routing: RoutingTable::new(base_overlay),
+            known: KnownPeers::new(base_overlay),
             seen_hints: HashSet::new(),
             hint_queue: VecDeque::new(),
             target_peers,
@@ -876,6 +885,14 @@ impl SwarmState {
     }
 
     fn enqueue_hint(&mut self, hint: sinks::PeerHint, local_peer_id: PeerId) {
+        // Record the overlay in the known-peer book *before* the
+        // dial-dedup early-returns below: every hive advert counts
+        // toward "visible peers" even when we never dial it (the peer
+        // set is already full, or we've seen its peer-id before). Skip
+        // our own overlay.
+        if hint.peer_id != local_peer_id {
+            self.known.note(hint.overlay);
+        }
         if hint.peer_id == local_peer_id
             || self.bzz_peers.contains(&hint.peer_id)
             || self.pending.contains_key(&hint.peer_id)
@@ -1027,7 +1044,7 @@ fn sync_peer_pipeline(status: Option<&watch::Sender<StatusSnapshot>>, state: &mu
     const FAIL_TTL: Duration = Duration::from_mins(1);
     state.failed.retain(|f| f.at.elapsed() < FAIL_TTL);
     let Some(tx) = status else { return };
-    let routing = routing_snapshot(&state.routing);
+    let routing = routing_snapshot(&state.routing, &state.known);
     let retrieval = build_retrieval_info(state);
     tx.send_modify(|st| {
         st.peers.peer_pipeline = build_peer_pipeline_entries(state, &st.peers.connected_peers);
@@ -1086,21 +1103,28 @@ fn build_retrieval_info(state: &SwarmState) -> RetrievalInfo {
 /// Build a `RoutingInfo` that mirrors the live routing table for the
 /// control snapshot. Cheap (32 entries) so we recompute on every pipeline
 /// sync rather than try to track deltas.
-fn routing_snapshot(table: &RoutingTable) -> RoutingInfo {
+fn routing_snapshot(table: &RoutingTable, known: &KnownPeers) -> RoutingInfo {
     let counts = table.bin_counts();
+    let known_counts = known.bin_counts();
     RoutingInfo {
         base_overlay: format!("0x{}", hex::encode(table.base())),
         size: table.len() as u32,
         bins: counts.iter().map(|c| u32::from(*c)).collect(),
+        known_size: known.len() as u32,
+        known_bins: known_counts.to_vec(),
     }
 }
 
 /// Push a routing-only update to the status snapshot. Used right after
 /// `routing.admit` so `antop` reflects new peers without waiting for
 /// the next pipeline-sync tick.
-fn sync_routing_snapshot(status: Option<&watch::Sender<StatusSnapshot>>, table: &RoutingTable) {
+fn sync_routing_snapshot(
+    status: Option<&watch::Sender<StatusSnapshot>>,
+    table: &RoutingTable,
+    known: &KnownPeers,
+) {
     let Some(tx) = status else { return };
-    let routing = routing_snapshot(table);
+    let routing = routing_snapshot(table, known);
     tx.send_modify(|st| st.peers.routing = routing);
 }
 
@@ -1400,6 +1424,11 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
             }
             _ = flush_timer.tick() => {
                 peerstore.flush();
+                // Age out known-but-unconnected peers so a peer that
+                // left the network eventually stops counting toward
+                // "visible peers". Cheap (one retain over a bounded
+                // book); 30 s cadence is well below the 45 min TTL.
+                state.known.prune(Instant::now());
             }
             _ = status_pulse.tick() => {
                 // No-op arm: the loop-top `sync_peer_pipeline` call
@@ -3476,6 +3505,9 @@ fn handle_drive_outcome(
             // (signature recovers to an Ethereum address whose overlay
             // matches the declared one), so admitting it is safe.
             state.routing.admit(peer, info.remote_overlay);
+            // A connected peer is also a known peer (so population is
+            // always >= connected). Idempotent if hive already noted it.
+            state.known.note(info.remote_overlay);
             // Record the peer's beneficiary EOA in the shared registry
             // so the pushsync-side SWAP settlement (Phase 7b) can look
             // it up later when emitting cheques. Cheap (one HashMap
@@ -3500,7 +3532,7 @@ fn handle_drive_outcome(
                 &info,
                 peer_agents.get(&peer).cloned(),
             );
-            sync_routing_snapshot(cfg.status.as_ref(), &state.routing);
+            sync_routing_snapshot(cfg.status.as_ref(), &state.routing, &state.known);
             // Persist the working dial address. We only ever record outbound
             // peers — for inbound connections we don't yet have a guaranteed-
             // reachable multiaddr, so we let those become hints via hive
