@@ -235,8 +235,9 @@ pub fn verify_bzz_address_signature(
     timestamp: i64,
     chequebook: &[u8],
 ) -> Result<[u8; 20], CryptoError> {
-    let sign_data =
-        handshake_sign_data(version, underlay, overlay, network_id, nonce, timestamp, chequebook);
+    let sign_data = handshake_sign_data(
+        version, underlay, overlay, network_id, nonce, timestamp, chequebook,
+    );
     let vk = recover_public_key(signature, &sign_data)?;
     let eth = ethereum_address_from_public_key(&vk);
     let expected = overlay_from_ethereum_address(&eth, network_id, nonce);
@@ -369,8 +370,14 @@ mod tests {
             timestamp,
             &chequebook,
         );
-        assert_eq!(v14.len() + OVERLAY_NONCE_LEN + 8 + HANDSHAKE_CHEQUEBOOK_LEN, v15.len());
-        assert!(v15.starts_with(&v14), "V15 preimage must be V14 extended in-place");
+        assert_eq!(
+            v14.len() + OVERLAY_NONCE_LEN + 8 + HANDSHAKE_CHEQUEBOOK_LEN,
+            v15.len()
+        );
+        assert!(
+            v15.starts_with(&v14),
+            "V15 preimage must be V14 extended in-place"
+        );
         assert!(v15.ends_with(&chequebook));
 
         // Empty chequebook on V15 zero-pads to 20 bytes inside the preimage.

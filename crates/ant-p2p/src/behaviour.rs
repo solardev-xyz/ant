@@ -6,7 +6,6 @@ use crate::handshake::{
     handshake_outbound, HandshakeError, HandshakeInfo, PROTOCOL_HANDSHAKE_V14,
     PROTOCOL_HANDSHAKE_V15,
 };
-use ant_crypto::HandshakeWireVersion;
 use crate::peerstore::PeerStore;
 use crate::routing::{Overlay, RoutingTable};
 use crate::sinks;
@@ -15,6 +14,7 @@ use ant_control::{
     GetProgress, HandshakeReport, PeerConnectionInfo, PeerConnectionState, PeerPipelineEntry,
     RetrievalInfo, RoutingInfo, StatusSnapshot, StreamRange,
 };
+use ant_crypto::HandshakeWireVersion;
 use ant_crypto::{
     ethereum_address_from_public_key, overlay_from_ethereum_address, OVERLAY_NONCE_LEN,
     SECP256K1_SECRET_LEN,
@@ -1564,8 +1564,8 @@ fn handle_control_command(
             let pushsync_swap = state.pushsync_swap.clone();
             let push_skip = state.push_skip.clone();
             tokio::spawn(async move {
-                let mut fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx)
-                    .with_push_skip(push_skip);
+                let mut fetcher =
+                    ant_retrieval::RoutingFetcher::new(control, peers_rx).with_push_skip(push_skip);
                 if let Some(svc) = pushsync_swap {
                     let s: Arc<dyn ant_retrieval::PushsyncSettlement> = svc;
                     fetcher = fetcher.with_pushsync_settlement(s);
@@ -1649,8 +1649,8 @@ fn handle_control_command(
             let pushsync_swap = state.pushsync_swap.clone();
             let push_skip = state.push_skip.clone();
             tokio::spawn(async move {
-                let mut fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx)
-                    .with_push_skip(push_skip);
+                let mut fetcher =
+                    ant_retrieval::RoutingFetcher::new(control, peers_rx).with_push_skip(push_skip);
                 if let Some(svc) = pushsync_swap {
                     let s: Arc<dyn ant_retrieval::PushsyncSettlement> = svc;
                     fetcher = fetcher.with_pushsync_settlement(s);
@@ -2095,7 +2095,9 @@ fn handle_control_command(
                 });
                 return;
             }
-            let path = rt.postage_dir.join(format!("{}.bin", hex::encode(batch_id)));
+            let path = rt
+                .postage_dir
+                .join(format!("{}.bin", hex::encode(batch_id)));
             match ant_postage::StampIssuer::open_or_new(
                 path,
                 batch_id,
@@ -3509,7 +3511,13 @@ fn handle_drive_outcome(
             // restarts. `record_success` won't downgrade V15 → V14 on a
             // subsequent V14 reconnect (see peerstore unit tests).
             let bzz_ts: u64 = u64::try_from(info.remote_timestamp).unwrap_or(0);
-            peerstore.record_success(peer, addrs, info.remote_overlay, bzz_ts, info.remote_chequebook);
+            peerstore.record_success(
+                peer,
+                addrs,
+                info.remote_overlay,
+                bzz_ts,
+                info.remote_chequebook,
+            );
         }
         DriveOutcome::OpenFailed(e) => {
             debug!(target: "ant_p2p", %peer, "open handshake stream: {e}");
@@ -3913,10 +3921,7 @@ fn log_handshake_ok(
 /// resolved bootnode multiaddr through `dial_tx`. The main `select!` reads
 /// the receiver and calls `swarm.dial()` from the event-loop task, which
 /// is what `swarm.dial()` requires anyway.
-fn spawn_bootstrap_dial(
-    bootnodes: &[Multiaddr],
-    dial_tx: mpsc::Sender<Multiaddr>,
-) {
+fn spawn_bootstrap_dial(bootnodes: &[Multiaddr], dial_tx: mpsc::Sender<Multiaddr>) {
     if bootnodes.is_empty() {
         return;
     }
@@ -3953,11 +3958,7 @@ fn spawn_bootstrap_dial(
 /// dialing), records `dial_started` for the cold-start metric, and
 /// pins a `dial_hint_addr` so the handshake driver knows which underlay
 /// to advertise in `BzzAddress.underlays`.
-fn handle_bootnode_dial(
-    swarm: &mut Swarm<AntBehaviour>,
-    state: &mut SwarmState,
-    addr: Multiaddr,
-) {
+fn handle_bootnode_dial(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmState, addr: Multiaddr) {
     let Some(peer) = crate::dial::extract_peer_id(&addr) else {
         return;
     };
@@ -4150,8 +4151,7 @@ mod tests {
     /// snapshot that resolves the feed cleanly.
     #[test]
     fn is_manifest_transient_classifies_feed_fetch_as_transient() {
-        let inner: Box<dyn std::error::Error + Send + Sync> =
-            "no BZZ peers available".into();
+        let inner: Box<dyn std::error::Error + Send + Sync> = "no BZZ peers available".into();
         let e = ant_retrieval::ManifestError::Feed(ant_retrieval::FeedError::Fetch(inner));
         assert!(
             is_manifest_transient(&e),

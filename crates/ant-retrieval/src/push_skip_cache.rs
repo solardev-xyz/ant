@@ -172,7 +172,7 @@ mod tests {
         let cache = PushSkipCache::new();
         let p1 = pid();
         let p2 = pid();
-        cache.note_failure(p1, Duration::from_secs(60));
+        cache.note_failure(p1, Duration::from_mins(1));
         assert!(cache.is_skipped(p1));
         assert!(!cache.is_skipped(p2));
         assert_eq!(cache.len(), 1);
@@ -191,7 +191,7 @@ mod tests {
     fn clear_removes_entry_immediately() {
         let cache = PushSkipCache::new();
         let p1 = pid();
-        cache.note_failure(p1, Duration::from_secs(60));
+        cache.note_failure(p1, Duration::from_mins(1));
         assert!(cache.is_skipped(p1));
         cache.clear(p1);
         assert!(!cache.is_skipped(p1));

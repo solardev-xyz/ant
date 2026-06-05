@@ -47,9 +47,10 @@ mod tests {
 
     #[test]
     fn extract_peer_id_finds_p2p() {
-        let a: Multiaddr = "/ip4/1.2.3.4/tcp/1634/p2p/QmTxX73q8dDiVbmXU7GqMNwG3gWmjSFECuMoCsTW4xp6CK"
-            .parse()
-            .unwrap();
+        let a: Multiaddr =
+            "/ip4/1.2.3.4/tcp/1634/p2p/QmTxX73q8dDiVbmXU7GqMNwG3gWmjSFECuMoCsTW4xp6CK"
+                .parse()
+                .unwrap();
         assert!(extract_peer_id(&a).is_some());
     }
 

@@ -142,7 +142,7 @@ async fn chequebook_address_reports_configured_address() {
     let router = status_router_with_chain(snapshot_with_one_peer(), chain_ctx(Some(cb)));
     let (status, json) = get(router, "/chequebook/address").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(json["chequebookAddress"], format!("0x{}", hex::encode(cb)),);
+    assert_eq!(json["chequebookAddress"], format!("0x{}", hex::encode(cb)));
 }
 
 #[tokio::test]

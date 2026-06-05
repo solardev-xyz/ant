@@ -188,8 +188,7 @@ async fn post_feeds_epoch_is_501() {
 /// bee-shaped stamp so Freedom's pre-flight lets publishing proceed
 /// (PLAN.md J.5.B). The `batchID` drops the `0x` prefix bee never uses.
 const TEST_BATCH_0X: &str = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778800";
-const TEST_BATCH_BARE: &str =
-    "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778800";
+const TEST_BATCH_BARE: &str = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778800";
 
 fn enabled_postage_router() -> axum::Router {
     router_with_dispatcher(|cmd| async move {

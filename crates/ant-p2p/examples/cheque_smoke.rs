@@ -76,8 +76,8 @@
 //!                                advertise as light node
 //!   `RUST_LOG`                   - tracing filter; default "`ant_p2p=info`"
 
-use ant_p2p::swap::{emit_cheque, issue_cheque};
 use ant_crypto::HandshakeWireVersion;
+use ant_p2p::swap::{emit_cheque, issue_cheque};
 use ant_p2p::{handshake_outbound_with_role, PROTOCOL_HANDSHAKE};
 use futures::StreamExt;
 use libp2p::core::ConnectedPoint;

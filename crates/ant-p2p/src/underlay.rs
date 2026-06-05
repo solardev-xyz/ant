@@ -40,8 +40,8 @@ pub enum UnderlayError {
 }
 
 /// Sort + truncate `addrs` to fit inside bee 2.8's count and byte
-/// caps, prioritising IPv4 public TCP > IPv4 public WS/WSS > private
-/// > loopback / non-IPv4. Mirrors `bzz.SortUnderlaysByPriority` +
+/// caps, prioritising IPv4 public TCP > IPv4 public WS/WSS > private >
+/// loopback / non-IPv4. Mirrors `bzz.SortUnderlaysByPriority` +
 /// `bzz.TruncateUnderlays`. Returns the truncated list in priority
 /// order; callers should pass this into [`serialize_underlays`].
 #[must_use]
@@ -83,7 +83,7 @@ fn underlay_score(addr: &Multiaddr) -> i32 {
     let mut has_ip4 = false;
     let mut is_loopback = false;
     let mut is_private = false;
-    for p in addr.iter() {
+    for p in addr {
         match p {
             Protocol::Ip4(ip) => {
                 has_ip4 = true;
@@ -119,7 +119,7 @@ fn transport_priority(addr: &Multiaddr) -> i32 {
     let mut tcp = false;
     let mut ws = false;
     let mut wss = false;
-    for p in addr.iter() {
+    for p in addr {
         match p {
             Protocol::Tcp(_) => tcp = true,
             Protocol::Ws(_) => ws = true,
@@ -243,8 +243,9 @@ mod tests {
 
     #[test]
     fn truncate_drops_low_priority_when_over_cap() {
-        let mut addrs: Vec<Multiaddr> =
-            (0..MAX_UNDERLAYS_PER_PEER + 5).map(|i| ma(&format!("/ip6/::1/tcp/{i}"))).collect();
+        let mut addrs: Vec<Multiaddr> = (0..MAX_UNDERLAYS_PER_PEER + 5)
+            .map(|i| ma(&format!("/ip6/::1/tcp/{i}")))
+            .collect();
         // One IPv4 public TCP entry should always survive truncation.
         let must_keep = ma("/ip4/1.2.3.4/tcp/1634");
         addrs.push(must_keep.clone());
@@ -255,8 +256,9 @@ mod tests {
 
     #[test]
     fn serialize_checked_rejects_oversize_count() {
-        let addrs: Vec<Multiaddr> =
-            (0..MAX_UNDERLAYS_PER_PEER + 1).map(|i| ma(&format!("/ip4/127.0.0.1/tcp/{i}"))).collect();
+        let addrs: Vec<Multiaddr> = (0..=MAX_UNDERLAYS_PER_PEER)
+            .map(|i| ma(&format!("/ip4/127.0.0.1/tcp/{i}")))
+            .collect();
         let err = serialize_underlays_checked(&addrs).unwrap_err();
         matches!(err, UnderlayError::CountExceeded(_));
     }
@@ -275,7 +277,7 @@ mod tests {
         let b = addr.to_vec();
         let mut enc = unsigned_varint::encode::u64_buffer();
         let v = unsigned_varint::encode::u64(b.len() as u64, &mut enc).to_vec();
-        for _ in 0..(MAX_UNDERLAYS_PER_PEER + 1) {
+        for _ in 0..=MAX_UNDERLAYS_PER_PEER {
             buf.extend_from_slice(&v);
             buf.extend_from_slice(&b);
         }

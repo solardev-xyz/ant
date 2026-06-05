@@ -134,7 +134,7 @@ pub struct Syn {
 ///
 /// * V14 dialers populate tags 1-3 only;
 /// * V15 dialers also populate tags 4 (nonce), 5 (timestamp), and 6
-///   (chequebook_address — zero-length when the peer has no
+///   (`chequebook_address` — zero-length when the peer has no
 ///   chequebook).
 ///
 /// The `nonce` field shares tag 4 with the V14 `Ack.nonce` slot — we
@@ -571,7 +571,7 @@ mod tests {
     use prost::Message;
 
     /// Encode the bee 2.8 Ack shape (V15: nonce / timestamp /
-    /// chequebook inside BzzAddress, `Ack.nonce` empty) and decode it
+    /// chequebook inside `BzzAddress`, `Ack.nonce` empty) and decode it
     /// back — verifies the prost field-tag layout matches what bee
     /// emits on the wire.
     #[test]
@@ -595,13 +595,19 @@ mod tests {
         ack.encode(&mut buf).unwrap();
         let decoded = Ack::decode(&buf[..]).unwrap();
         assert_eq!(decoded.address.as_ref().unwrap().timestamp, 1_715_000_000);
-        assert_eq!(decoded.address.as_ref().unwrap().chequebook_address.len(), 20);
-        assert_eq!(decoded.address.as_ref().unwrap().nonce.len(), OVERLAY_NONCE_LEN);
+        assert_eq!(
+            decoded.address.as_ref().unwrap().chequebook_address.len(),
+            20
+        );
+        assert_eq!(
+            decoded.address.as_ref().unwrap().nonce.len(),
+            OVERLAY_NONCE_LEN
+        );
         assert!(decoded.nonce.is_empty(), "V15 leaves Ack.nonce empty");
         assert_eq!(decoded.welcome_message, "welcome");
     }
 
-    /// V14 shape: nonce lives on `Ack`, BzzAddress only carries the
+    /// V14 shape: nonce lives on `Ack`, `BzzAddress` only carries the
     /// underlay / signature / overlay tags. The new V15 fields stay
     /// at proto-default so old bee 2.7 decoders read them as absent.
     #[test]

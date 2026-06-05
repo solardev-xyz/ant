@@ -842,10 +842,9 @@ fn draw_retrieval_metrics(
             format_percentage(r.disk.used_bytes, r.disk.capacity_bytes),
             format_count(r.disk.hits_total),
         );
-        let avg = if r.disk.chunks > 0 {
-            format_bytes(r.disk.used_bytes / r.disk.chunks)
-        } else {
-            "—".to_string()
+        let avg = match r.disk.used_bytes.checked_div(r.disk.chunks) {
+            Some(per_chunk) if r.disk.chunks > 0 => format_bytes(per_chunk),
+            _ => "—".to_string(),
         };
         let detail = format!(
             "{} chunks · {} avg · {} read workers · {}",
@@ -879,10 +878,7 @@ fn draw_retrieval_metrics(
     };
     let bandwidth_row = format!("{bw_now}  (peak {bw_peak})");
 
-    let mut rows = vec![
-        kv("Mem cache", &mem_cache),
-        kv("Disk cache", &disk_cache),
-    ];
+    let mut rows = vec![kv("Mem cache", &mem_cache), kv("Disk cache", &disk_cache)];
     if let Some(detail) = disk_detail.as_deref() {
         // Empty key keeps the indent of the parent `Disk cache` row.
         rows.push(kv("", detail));

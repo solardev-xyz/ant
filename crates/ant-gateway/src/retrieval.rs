@@ -86,8 +86,7 @@ const SWARM_TAG_UID: HeaderName = HeaderName::from_static("swarm-tag-uid");
 /// it as `swarm-postage-batch-id` on `POST /bytes|/bzz|/chunks|/soc`.
 /// Required: the node selects the matching registered issuer, so a
 /// missing / malformed / unknown batch is a `400` (bee's shape).
-const SWARM_POSTAGE_BATCH_ID: HeaderName =
-    HeaderName::from_static("swarm-postage-batch-id");
+const SWARM_POSTAGE_BATCH_ID: HeaderName = HeaderName::from_static("swarm-postage-batch-id");
 
 /// Concurrency cap on outbound `PushChunk` commands during a `POST /bzz`
 /// upload. Matched to the daemon-side
@@ -407,8 +406,12 @@ fn parse_postage_batch_header(headers: &HeaderMap) -> Result<[u8; 32], Response>
                 "missing required swarm-postage-batch-id header",
             )
         })?;
-    parse_hex_fixed::<32>(raw)
-        .map_err(|e| json_error(StatusCode::BAD_REQUEST, format!("bad swarm-postage-batch-id: {e}")))
+    parse_hex_fixed::<32>(raw).map_err(|e| {
+        json_error(
+            StatusCode::BAD_REQUEST,
+            format!("bad swarm-postage-batch-id: {e}"),
+        )
+    })
 }
 
 /// `POST /chunks` — accept a single content-addressed chunk's wire
@@ -549,10 +552,7 @@ pub async fn upload_soc(
     let sig = match parse_hex_fixed::<65>(sig_str) {
         Ok(s) => s,
         Err(e) => {
-            return json_error(
-                StatusCode::BAD_REQUEST,
-                format!("bad soc signature: {e}"),
-            );
+            return json_error(StatusCode::BAD_REQUEST, format!("bad soc signature: {e}"));
         }
     };
 
@@ -727,7 +727,8 @@ pub async fn upload_bzz(
     );
     guard.update(0, total_chunks as u64, total_chunks as u32, 0);
 
-    if let Err(err_resp) = push_chunks(&handle, &assembled.chunks, batch_id, timeout, &guard).await {
+    if let Err(err_resp) = push_chunks(&handle, &assembled.chunks, batch_id, timeout, &guard).await
+    {
         return err_resp;
     }
 
@@ -737,7 +738,13 @@ pub async fn upload_bzz(
         &serde_json::json!({ "reference": reference_hex }),
     );
     set_immutable_cache_headers(&mut resp);
-    finalize_upload_tag(&handle, &headers, total_chunks as u64, assembled.root, &mut resp);
+    finalize_upload_tag(
+        &handle,
+        &headers,
+        total_chunks as u64,
+        assembled.root,
+        &mut resp,
+    );
     resp
 }
 
@@ -825,7 +832,13 @@ pub async fn upload_bytes(
         &serde_json::json!({ "reference": reference_hex }),
     );
     set_immutable_cache_headers(&mut resp);
-    finalize_upload_tag(&handle, &headers, total_chunks as u64, split.root, &mut resp);
+    finalize_upload_tag(
+        &handle,
+        &headers,
+        total_chunks as u64,
+        split.root,
+        &mut resp,
+    );
     resp
 }
 

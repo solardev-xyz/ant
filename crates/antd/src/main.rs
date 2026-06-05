@@ -524,14 +524,17 @@ async fn main() -> Result<()> {
             let mut out = [0u8; 32];
             hex::decode_to_slice(stripped, &mut out).ok().map(|()| out)
         });
-    let upload_manager =
-        ant_node::UploadManager::new(data_dir.join("uploads"), cmd_tx.clone(), default_upload_batch)
-            .with_context(|| {
-                format!(
-                    "open upload state dir at {}",
-                    data_dir.join("uploads").display()
-                )
-            })?;
+    let upload_manager = ant_node::UploadManager::new(
+        data_dir.join("uploads"),
+        cmd_tx.clone(),
+        default_upload_batch,
+    )
+    .with_context(|| {
+        format!(
+            "open upload state dir at {}",
+            data_dir.join("uploads").display()
+        )
+    })?;
     let restored_jobs = upload_manager
         .rehydrate_from_disk(!opt.no_resume_uploads)
         .with_context(|| {
@@ -1153,7 +1156,8 @@ async fn build_upload_runtime(
             let mut sk = [0u8; SECP256K1_SECRET_LEN];
             hex::decode_to_slice(strip_0x(k), &mut sk).context("decode postage owner key")?;
             let eth = {
-                let s = SigningKey::from_bytes((&sk).into()).context("postage owner key invalid")?;
+                let s =
+                    SigningKey::from_bytes((&sk).into()).context("postage owner key invalid")?;
                 ethereum_address_from_public_key(s.verifying_key())
             };
             (sk, eth)

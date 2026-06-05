@@ -200,9 +200,15 @@ impl DiskChunkCache {
         let join = std::thread::Builder::new()
             .name("ant-disk-cache-writer".into())
             .spawn(move || {
-                if let Err(e) =
-                    writer_main(path_thread, write_rx, ready_tx, tb, tr, max_bytes, slack_bytes)
-                {
+                if let Err(e) = writer_main(
+                    path_thread,
+                    write_rx,
+                    ready_tx,
+                    tb,
+                    tr,
+                    max_bytes,
+                    slack_bytes,
+                ) {
                     warn!(
                         target: "ant_retrieval::disk_cache",
                         "writer thread exited with error: {e}",
@@ -566,12 +572,7 @@ fn writer_main(
         .query_row(
             "SELECT COALESCE(SUM(size), 0), COUNT(*) FROM chunks",
             [],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)? as u64,
-                    row.get::<_, i64>(1)? as u64,
-                ))
-            },
+            |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
         )
         .unwrap_or((0, 0));
     total_bytes.store(initial_total, Ordering::Relaxed);

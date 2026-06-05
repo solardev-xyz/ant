@@ -163,7 +163,10 @@ pub async fn create_tag(State(handle): State<GatewayHandle>) -> Response {
     match handle.tags.get(uid) {
         Some(view) => (StatusCode::CREATED, Json(view)).into_response(),
         // Unreachable: we just created it. Defensive only.
-        None => json_error(StatusCode::INTERNAL_SERVER_ERROR, "tag vanished after create"),
+        None => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "tag vanished after create",
+        ),
     }
 }
 

@@ -560,7 +560,13 @@ mod tests {
         let mut store = PeerStore::load(path.clone());
         let peer = fake_peer(50);
         let cb = [0xcd; 20];
-        store.record_success(peer, vec![fake_addr(1)], [0xab; 32], 1_715_000_000, Some(cb));
+        store.record_success(
+            peer,
+            vec![fake_addr(1)],
+            [0xab; 32],
+            1_715_000_000,
+            Some(cb),
+        );
         store.flush();
 
         let reloaded = PeerStore::load(path);

@@ -248,7 +248,10 @@ impl ChainClient {
     /// outpayment, bee's `/chainstate.totalAmount`. Combined with a
     /// batch's `normalisedBalance` this is what TTL math is derived from.
     pub async fn postage_total_amount(&self, postage_contract: &str) -> Result<u128, RpcError> {
-        let data = format!("0x{}", hex::encode(fn_selector(b"currentTotalOutPayment()")));
+        let data = format!(
+            "0x{}",
+            hex::encode(fn_selector(b"currentTotalOutPayment()"))
+        );
         let out = self.eth_call(postage_contract, &data).await?;
         abi_word_last_u128_be(&out)
     }
