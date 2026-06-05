@@ -1679,7 +1679,7 @@ This is the working order to close it, fastest-payoff first:
 | 2 | `/wallet`, `/chequebook/{address,balance,cheque[,/{peer}]}`, `/balances`, `/settlements`, `/timesettlements` reads | ~1 day | 🟡 partial | `/wallet`, `/chequebook/address`, `/chequebook/balance` shipped; `/balances`, `/settlements`, `/timesettlements`, `/chequebook/cheque` still fall through to 501. |
 | 3 | `/stamps` reads + `POST /stamps/{amount}/{depth}` + `PATCH /stamps/{topup,dilute}/...` | ~1 day | ✅ shipped | Live registry (0.5.8): buy/topup/dilute register a runtime issuer; `GET /stamps` + `/stamps/{id}` reflect it. |
 | 4 | `/tags` GET/POST + `/tags/{id}` GET/DELETE/PATCH | ~½ day | 🟡 partial | `POST /tags` + `GET /tags/{uid}` shipped (uploads echo `Swarm-Tag-Uid`); `DELETE`/`PATCH` not yet. |
-| 5 | `antctl chequebook deploy` + first-run auto-deploy in `antd` | ~½ day | ⬜ **OPEN** | **Last bee-parity blocker for the light-node upload flow.** `deploy_chequebook` calldata exists in `ant-chain::tx`, but `antd` never deploys/persists/reloads a chequebook — it only reads a manually-supplied `--chequebook`/`CHEQUEBOOK_ADDRESS`. See "Open: chequebook auto-bootstrap" below. |
+| 5 | `antctl chequebook deploy` + first-run auto-deploy in `antd` | ~½ day | ✅ shipped | On first light start with a funded node wallet and no chequebook configured/persisted, `antd` auto-deploys a factory-registered chequebook (issuer = node EOA), funds it with xBZZ, and persists it to `<data-dir>/chequebook.json` (deploy-once, reuse-forever). Manual `--chequebook`/`CHEQUEBOOK_ADDRESS` still wins; `--no-auto-chequebook` opts out. See "Open: chequebook auto-bootstrap" below. |
 | 6 | `/feeds/{owner}/{topic}` GET/POST + `/soc/{owner}/{id}` POST | ~2-3 d | ✅ shipped | `/feeds` GET/POST + `/soc/{owner}/{id}` GET/POST routed. |
 | 7 | `/stewardship/{ref}` GET/PUT, `/envelope/{addr}` POST | ~½-1 d | ⬜ open | Not routed yet → 501. |
 | 8 | Reed-Solomon erasure decoding (`--swarm-redundancy=1..3` interop) | ~2-3 d | ⬜ open | Read-path protocol work; not started. |
@@ -1696,27 +1696,36 @@ This is the working order to close it, fastest-payoff first:
   registry. Live-verified on Gnosis mainnet: buy → `usable:true` within seconds
   → upload with the batch header → readback.
 
-- **Chequebook lifecycle parity (table row 5) — ⬜ OPEN.** This is
-  the only remaining bee-parity gap for the light-node upload flow:
-  1. **Auto-deploy + fund** a chequebook on first light start when the node
-     wallet is funded and none is persisted: `deploy_chequebook(factory,
-     issuer = node EOA)` → fund with xBZZ → build the SWAP config from it +
-     `signing_secret`. The issuer is the node EOA already loaded from
-     `keys/swarm.key` — no external key injection.
-  2. **Persist + reload** the chequebook association in `antd`'s data-dir and
-     reload it on startup (deploy-once, reuse-forever — bee keeps this in its
-     statestore).
-  3. Today `antd` only honours a manually-supplied `--chequebook` /
-     `CHEQUEBOOK_ADDRESS` (`crates/antd/src/main.rs:675`, `:1282`); without one
-     `GET /chequebook/address` returns the zero address and sustained multi-MB
-     uploads stall after a few hundred chunks/peer.
+- **Chequebook lifecycle parity (table row 5) — ✅ shipped.** `antd`
+  now resolves the outbound-settlement chequebook in priority order
+  (`resolve_chequebook` in `crates/antd/src/main.rs`):
+  1. **Manual** — `--chequebook` (+ `--swap-key` / `CHEQUEBOOK_ADDRESS` +
+     `WALLET_PRIVATE_KEY`). Operator-managed; never auto-persisted. Wins over
+     everything else.
+  2. **Persisted** — a chequebook this node auto-deployed on an earlier start,
+     reloaded from `<data-dir>/chequebook.json` (deploy-once, reuse-forever —
+     the equivalent of the record bee keeps in its statestore, which `antd`
+     can't read). Issuer is the node EOA, so the node `signing_secret` signs
+     cheques.
+  3. **Auto-deploy** — on first light start with a funded node wallet and
+     neither of the above, deploy a fresh factory-registered chequebook
+     (`deploy_chequebook(factory, issuer = node EOA)`), fund it with xBZZ via
+     `erc20_transfer` (`--chequebook-deposit-plur`, default 0.1 BZZ, capped to
+     the wallet's balance), persist it, and build the SWAP config from it +
+     `signing_secret`. No external key injection. Gated on light mode + a
+     Gnosis RPC + a gas pre-flight; best-effort (a thin/unfunded wallet or a
+     flaky RPC logs and starts without settlement rather than failing).
+     `--no-auto-chequebook` opts out.
 
-  Already shipped: the read endpoints (`GET /chequebook/{address,balance}`,
-  `/wallet`) and manual, factory-verified chequebook config. One-time caveat: a
-  chequebook previously deployed by bee lives in bee's LevelDB statestore (which
-  `antd` can't read) and isn't reverse-lookupable on-chain, so first light start
-  deploys a *fresh* chequebook for the same node EOA — identical to bee's own
-  behaviour against a fresh statestore.
+  `GET /chequebook/{address,balance}`, `POST /chequebook/deposit`, and
+  `/wallet` all report whichever chequebook was resolved above. A standalone
+  swap key that nominates a *non-node* issuer EOA (without a contract) keeps
+  the historical "settlement disabled" behaviour rather than silently deploying
+  one issued by the node. One-time caveat: a chequebook previously deployed by
+  bee lives in bee's LevelDB statestore (which `antd` can't read) and isn't
+  reverse-lookupable on-chain, so first light start deploys a *fresh*
+  chequebook for the same node EOA — identical to bee's own behaviour against a
+  fresh statestore.
 
 #### Open: visible-peers / known-peer book (bee-parity) — row 9
 

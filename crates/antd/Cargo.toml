@@ -18,7 +18,7 @@ ant-postage = { path = "../ant-postage" }
 ant-retrieval = { path = "../ant-retrieval" }
 anyhow.workspace = true
 async-trait.workspace = true
-clap.workspace = true
+clap = { workspace = true, features = ["env"] }
 dirs = "6.0.0"
 fs4 = "1.0.2"
 hex.workspace = true

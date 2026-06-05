@@ -38,6 +38,14 @@ const AGENT: &str = concat!("antd/", env!("CARGO_PKG_VERSION"));
 /// agnostic and can be reused in other embedders.
 const BEE_API_VERSION: &str = "7.2.0";
 
+/// Default BZZ deposit for an auto-deployed chequebook, in PLUR
+/// (1 BZZ = 1e16 PLUR). 0.1 BZZ is a modest float that lets the
+/// chequebook honour the first wave of cashed cheques without
+/// draining a thin wallet of the BZZ it also needs for postage; the
+/// actual transfer is capped to the wallet's BZZ balance, so this is
+/// an upper bound, not a hard requirement.
+const DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR: u128 = 1_000_000_000_000_000;
+
 #[derive(Parser, Debug)]
 #[command(name = "antd", version, about = "Ant Swarm light node (M1.0)")]
 struct Opt {
@@ -258,6 +266,30 @@ struct Opt {
     /// answer.
     #[arg(long, default_value_t = false)]
     chequebook_allow_unverified: bool,
+
+    /// Disable first-run chequebook auto-deploy. By default, on the
+    /// first light start with a funded node wallet and no chequebook
+    /// configured (`--chequebook`) or persisted, `antd` deploys a
+    /// fresh factory-registered chequebook (issuer = node EOA),
+    /// funds it with `--chequebook-deposit-plur` xBZZ, and persists
+    /// the association at `<data-dir>/chequebook.json` so subsequent
+    /// starts reuse it (deploy-once, reuse-forever — same shape as
+    /// bee's statestore). Pass this to opt out and run without
+    /// outbound SWAP settlement until you supply a chequebook
+    /// manually.
+    #[arg(long, default_value_t = false)]
+    no_auto_chequebook: bool,
+
+    /// BZZ to deposit into an auto-deployed chequebook, in PLUR
+    /// (1 BZZ = 1e16 PLUR). Capped to the node wallet's BZZ balance
+    /// so a thin wallet still gets a (smaller, or zero) deposit
+    /// rather than a failed transfer — a factory-registered but
+    /// unfunded chequebook already unblocks uploads (bee accepts the
+    /// cheque; cashing waits for a later deposit). Ignored when a
+    /// chequebook is supplied manually or reloaded from disk. Falls
+    /// back to `CHEQUEBOOK_DEPOSIT_PLUR` env.
+    #[arg(long, env = "CHEQUEBOOK_DEPOSIT_PLUR", default_value_t = DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR)]
+    chequebook_deposit_plur: u128,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -564,71 +596,20 @@ async fn main() -> Result<()> {
         events_tx: None,
     };
 
-    // Outbound SWAP settlement (Phase 7b). Built when the operator has
-    // configured both `--chequebook` and `--swap-key` (or their env
-    // fallbacks). Without it, sustained pushsync uploads stall after
-    // a few hundred chunks per peer.
-    let pushsync_swap_cfg = build_pushsync_swap_config(
-        opt.chequebook.clone(),
-        opt.swap_key.clone(),
-        data_dir.clone(),
-    )?;
-
-    // Pre-flight: every cheque we issue is rejected by bee's
-    // `chequeStore.ReceiveCheque` if `factory.deployedContracts(addr)`
-    // returns false, and the rejection is silent (just a closed
-    // pushsync stream from the peer's side). Catch it loudly here
-    // — turning pushsync-swap off when the check fails is strictly
-    // better than wasting bandwidth on cheques nobody honours.
-    let pushsync_swap_cfg = match (
-        pushsync_swap_cfg,
-        opt.gnosis_rpc_url
-            .clone()
-            .or_else(|| std::env::var("GNOSIS_RPC_URL").ok()),
-    ) {
-        (Some(cfg), Some(rpc)) => {
-            match verify_chequebook_with_factory(&rpc, &cfg.chequebook).await {
-                Ok(true) => {
-                    tracing::info!(
-                        target: "antd",
-                        chequebook = %format!("0x{}", hex::encode(cfg.chequebook)),
-                        "factory check passed — chequebook is registered with the Swarm chequebook factory",
-                    );
-                    Some(cfg)
-                }
-                Ok(false) if opt.chequebook_allow_unverified => {
-                    tracing::warn!(
-                        target: "antd",
-                        chequebook = %format!("0x{}", hex::encode(cfg.chequebook)),
-                        "chequebook is NOT registered with the Swarm chequebook factory, but --chequebook-allow-unverified was set; bee will reject cheques drawn on this chequebook",
-                    );
-                    Some(cfg)
-                }
-                Ok(false) => {
-                    tracing::error!(
-                        target: "antd",
-                        chequebook = %format!("0x{}", hex::encode(cfg.chequebook)),
-                        "chequebook is NOT registered with the Swarm chequebook factory; \
-                         bee will silently reject every cheque we emit. \
-                         Disabling outbound SWAP settlement. \
-                         Run `antctl chequebook deploy` to deploy a new factory-registered chequebook, \
-                         or pass --chequebook-allow-unverified to override (devnet only).",
-                    );
-                    None
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "antd",
-                        chequebook = %format!("0x{}", hex::encode(cfg.chequebook)),
-                        error = %e,
-                        "factory.deployedContracts call failed; skipping startup factory check",
-                    );
-                    Some(cfg)
-                }
-            }
-        }
-        (cfg, _) => cfg,
-    };
+    // Outbound SWAP settlement (Phase 7b). Resolve the chequebook in
+    // priority order: an operator-supplied `--chequebook` (+ `--swap-key`),
+    // else a chequebook this node auto-deployed on an earlier start and
+    // persisted at `<data-dir>/chequebook.json`, else — on first light
+    // start with a funded node wallet — a freshly deployed,
+    // factory-registered chequebook issued by the node EOA. The returned
+    // address is what the chain context reports via `GET /chequebook/*`;
+    // the config (when present and factory-verified) is what pushsync
+    // signs cheques with. Without any of these, sustained pushsync
+    // uploads stall after a few hundred chunks per peer.
+    let ResolvedChequebook {
+        address: chequebook_addr,
+        pushsync: pushsync_swap_cfg,
+    } = resolve_chequebook(&opt, &data_dir, signing_secret, eth, light_mode).await?;
 
     if pushsync_swap_cfg.is_some() {
         tracing::info!(
@@ -639,8 +620,9 @@ async fn main() -> Result<()> {
         tracing::warn!(
             target: "antd",
             "outbound SWAP settlement NOT configured — pushsync uploads will stall \
-             after ~20K chunks across the peer set; pass --chequebook + --swap-key \
-             (or set CHEQUEBOOK_ADDRESS + WALLET_PRIVATE_KEY in the environment) to enable",
+             after ~20K chunks across the peer set; fund the node wallet (xDAI + xBZZ) \
+             so antd can auto-deploy a chequebook on the next start, or pass \
+             --chequebook + --swap-key (CHEQUEBOOK_ADDRESS + WALLET_PRIVATE_KEY)",
         );
     }
 
@@ -672,16 +654,10 @@ async fn main() -> Result<()> {
             .clone()
             .or_else(|| std::env::var("GNOSIS_RPC_URL").ok())
             .filter(|s| !s.trim().is_empty());
-        let chequebook_addr = opt
-            .chequebook
-            .clone()
-            .or_else(|| std::env::var("CHEQUEBOOK_ADDRESS").ok())
-            .and_then(|s| {
-                let mut a = [0u8; 20];
-                hex::decode_to_slice(strip_0x(s.trim()), &mut a)
-                    .ok()
-                    .map(|()| a)
-            });
+        // `chequebook_addr` was resolved above (manual flag, persisted
+        // auto-deploy, or a fresh first-run deploy), so `GET
+        // /chequebook/{address,balance}` and the deposit write endpoint
+        // all report the chequebook pushsync is actually drawing on.
         // The node's own signing key funds postage buys / chequebook
         // deposits and is the batch owner — same key that derives `eth`.
         chainreader::build(
@@ -1272,67 +1248,478 @@ async fn build_upload_runtime(
     })))
 }
 
-/// Build a [`PushsyncSwapConfig`] from the `--chequebook` /
-/// `--swap-key` flags, falling back to env. Returns `Ok(None)` when
-/// neither side is configured (the operator is consciously running
-/// without outbound settlement). Returns `Err` if exactly one side is
-/// configured (mismatch is almost certainly an operator bug — silent
-/// fallback would hide it).
-fn build_pushsync_swap_config(
-    cli_chequebook: Option<String>,
-    cli_swap_key: Option<String>,
-    data_dir: PathBuf,
-) -> Result<Option<ant_p2p::PushsyncSwapConfig>> {
-    let cb_hex = cli_chequebook.or_else(|| std::env::var("CHEQUEBOOK_ADDRESS").ok());
-    let key_hex = cli_swap_key
+/// Persisted association between this node's data-dir and a
+/// chequebook it auto-deployed. Written once on first deploy and
+/// reloaded on every subsequent start (deploy-once, reuse-forever —
+/// the equivalent of the chequebook record bee keeps in its
+/// statestore, which `antd` can't read). The issuer baked into the
+/// chequebook is always the node EOA, so the node `signing_secret`
+/// is the cheque signer; the extra fields are pure provenance for
+/// operator debugging / on-chain cross-referencing.
+#[derive(Serialize, Deserialize)]
+struct ChequebookFile {
+    /// Deployed `SimpleSwap` contract address (`0x` + 40 hex).
+    chequebook: String,
+    /// Issuer EOA baked into the chequebook (the node's own address).
+    issuer: String,
+    /// CREATE2 salt used for the deploy (hex).
+    #[serde(default)]
+    salt: String,
+    /// Deploy tx hash (hex).
+    #[serde(default)]
+    deploy_tx: String,
+}
+
+/// Outcome of resolving the outbound-settlement chequebook: the
+/// address to report through the chain context's `GET /chequebook/*`
+/// endpoints, and the (factory-verified) pushsync config used to sign
+/// cheques. Both are `None` when no settlement is configured.
+struct ResolvedChequebook {
+    address: Option<[u8; 20]>,
+    pushsync: Option<ant_p2p::PushsyncSwapConfig>,
+}
+
+/// Resolve the chequebook for outbound SWAP settlement, in priority
+/// order:
+///
+/// 1. **Manual** — an operator-supplied `--chequebook` (+ `--swap-key`
+///    / env). Never auto-persisted; the operator owns its lifecycle.
+/// 2. **Persisted** — a chequebook this node auto-deployed on an
+///    earlier start, reloaded from `<data-dir>/chequebook.json`. Issuer
+///    is the node EOA, so the node `signing_secret` signs cheques.
+/// 3. **Auto-deploy** — on first light start with a funded node wallet
+///    and neither of the above, deploy a fresh factory-registered
+///    chequebook (issuer = node EOA), fund it with xBZZ, and persist it.
+///
+/// A standalone `--swap-key` without a chequebook keeps the historical
+/// "disabled" behaviour rather than auto-deploying with a non-node
+/// issuer — auto-deploy never injects an external key.
+async fn resolve_chequebook(
+    opt: &Opt,
+    data_dir: &Path,
+    signing_secret: [u8; SECP256K1_SECRET_LEN],
+    node_eth: [u8; 20],
+    light_mode: bool,
+) -> Result<ResolvedChequebook> {
+    let rpc_url = opt
+        .gnosis_rpc_url
+        .clone()
+        .or_else(|| std::env::var("GNOSIS_RPC_URL").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let manual_cb = opt
+        .chequebook
+        .clone()
+        .or_else(|| std::env::var("CHEQUEBOOK_ADDRESS").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let manual_key = opt
+        .swap_key
+        .clone()
         .or_else(|| std::env::var("SWAP_OWNER_KEY").ok())
-        .or_else(|| std::env::var("WALLET_PRIVATE_KEY").ok());
-    match (cb_hex, key_hex) {
-        (None, None) => Ok(None),
-        (Some(_), None) => Err(anyhow!(
-            "--chequebook is set but no --swap-key / SWAP_OWNER_KEY / WALLET_PRIVATE_KEY found; \
-             outbound SWAP settlement needs both",
-        )),
-        (None, Some(_)) => {
-            // Swap key alone (e.g. WALLET_PRIVATE_KEY in the dev env)
-            // is the common case; logging at info level instead of
-            // failing is the friendlier UX. Without a chequebook we
-            // can't sign cheques, so disable settlement.
+        .or_else(|| std::env::var("WALLET_PRIVATE_KEY").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let ledger_path = data_dir.join("pushsync_outbound.json");
+    let persist_path = data_dir.join("chequebook.json");
+
+    // 1. Manual chequebook — operator-managed, never auto-persisted.
+    if let Some(cb_hex) = manual_cb {
+        let mut chequebook = [0u8; 20];
+        hex::decode_to_slice(strip_0x(&cb_hex), &mut chequebook)
+            .with_context(|| format!("decode --chequebook {cb_hex}"))?;
+        let Some(key_hex) = manual_key else {
+            return Err(anyhow!(
+                "--chequebook is set but no --swap-key / SWAP_OWNER_KEY / WALLET_PRIVATE_KEY \
+                 found; outbound SWAP settlement needs both",
+            ));
+        };
+        let mut swap_secret = [0u8; SECP256K1_SECRET_LEN];
+        hex::decode_to_slice(strip_0x(&key_hex), &mut swap_secret).context("decode --swap-key")?;
+        let swap_eoa = {
+            let sk = SigningKey::from_bytes((&swap_secret).into()).context("--swap-key invalid")?;
+            ethereum_address_from_public_key(sk.verifying_key())
+        };
+        tracing::info!(
+            target: "antd",
+            chequebook = %format!("0x{}", hex::encode(chequebook)),
+            issuer_eoa = %format!("0x{}", hex::encode(swap_eoa)),
+            "outbound SWAP settlement: chequebook + issuer key configured (manual)",
+        );
+        let pushsync = verify_then_build_swap(
+            chequebook,
+            swap_secret,
+            rpc_url.as_deref(),
+            opt.chequebook_allow_unverified,
+            &ledger_path,
+        )
+        .await;
+        return Ok(ResolvedChequebook {
+            address: Some(chequebook),
+            pushsync,
+        });
+    }
+
+    // A standalone swap key without a chequebook: if it nominates a
+    // *different* issuer EOA than the node, the operator wants a
+    // specific issuer but hasn't deployed its contract — keep the
+    // historical "disabled" behaviour rather than auto-deploying one
+    // issued by the node EOA. If it just matches the node key (the
+    // common case — e.g. `WALLET_PRIVATE_KEY` == the node identity in a
+    // dev `.env`), fall through to persisted / auto-deploy.
+    if let Some(key_hex) = &manual_key {
+        let mut swap_secret = [0u8; SECP256K1_SECRET_LEN];
+        hex::decode_to_slice(strip_0x(key_hex), &mut swap_secret)
+            .context("decode SWAP_OWNER_KEY / WALLET_PRIVATE_KEY")?;
+        let swap_eoa = {
+            let sk = SigningKey::from_bytes((&swap_secret).into())
+                .context("SWAP_OWNER_KEY / WALLET_PRIVATE_KEY invalid")?;
+            ethereum_address_from_public_key(sk.verifying_key())
+        };
+        if swap_eoa != node_eth {
             tracing::info!(
                 target: "antd",
-                "swap key found but no --chequebook / CHEQUEBOOK_ADDRESS; outbound SWAP settlement disabled",
-            );
-            Ok(None)
-        }
-        (Some(cb), Some(key)) => {
-            let mut chequebook = [0u8; 20];
-            hex::decode_to_slice(strip_0x(&cb), &mut chequebook)
-                .with_context(|| format!("decode --chequebook {cb}"))?;
-            let mut swap_secret = [0u8; SECP256K1_SECRET_LEN];
-            hex::decode_to_slice(strip_0x(&key), &mut swap_secret).context("decode --swap-key")?;
-            let swap_eoa = {
-                let sk =
-                    SigningKey::from_bytes((&swap_secret).into()).context("--swap-key invalid")?;
-                ethereum_address_from_public_key(sk.verifying_key())
-            };
-            tracing::info!(
-                target: "antd",
-                chequebook = %format!("0x{}", hex::encode(chequebook)),
                 issuer_eoa = %format!("0x{}", hex::encode(swap_eoa)),
-                "outbound SWAP settlement: chequebook + issuer key configured",
+                "swap key nominates a non-node issuer EOA but no --chequebook / \
+                 CHEQUEBOOK_ADDRESS; outbound SWAP settlement disabled (run \
+                 `antctl chequebook deploy` for that issuer, or unset the swap key to let \
+                 antd auto-deploy a chequebook issued by the node EOA)",
             );
-            // Use a placeholder PeerEthMap; `ant-node::run_node`
-            // overwrites the field with the live one shared with the
-            // swarm loop before the config reaches `run`.
-            Ok(Some(ant_p2p::PushsyncSwapConfig::new(
-                chequebook,
-                swap_secret,
-                ant_chain::tx::GNOSIS_CHAIN_ID,
-                data_dir.join("pushsync_outbound.json"),
-                ant_p2p::PeerEthMap::new(),
-            )))
+            return Ok(ResolvedChequebook {
+                address: None,
+                pushsync: None,
+            });
         }
     }
+
+    // 2. Persisted auto-deployed chequebook — reuse forever.
+    if let Some(persisted) = load_persisted_chequebook(&persist_path)? {
+        tracing::info!(
+            target: "antd",
+            chequebook = %format!("0x{}", hex::encode(persisted)),
+            store = %persist_path.display(),
+            "reusing persisted auto-deployed chequebook (issuer = node EOA)",
+        );
+        let pushsync = verify_then_build_swap(
+            persisted,
+            signing_secret,
+            rpc_url.as_deref(),
+            opt.chequebook_allow_unverified,
+            &ledger_path,
+        )
+        .await;
+        return Ok(ResolvedChequebook {
+            address: Some(persisted),
+            pushsync,
+        });
+    }
+
+    // 3. First-run auto-deploy. Gated on light mode (we only issue
+    //    cheques when we can upload), an RPC endpoint, and the operator
+    //    not opting out.
+    if opt.no_auto_chequebook {
+        return Ok(ResolvedChequebook {
+            address: None,
+            pushsync: None,
+        });
+    }
+    let Some(rpc) = rpc_url.clone() else {
+        return Ok(ResolvedChequebook {
+            address: None,
+            pushsync: None,
+        });
+    };
+    if !light_mode {
+        tracing::info!(
+            target: "antd",
+            "node is read-only (no upload runtime); skipping chequebook auto-deploy",
+        );
+        return Ok(ResolvedChequebook {
+            address: None,
+            pushsync: None,
+        });
+    }
+
+    match auto_deploy_chequebook(
+        &rpc,
+        signing_secret,
+        node_eth,
+        opt.chequebook_deposit_plur,
+        &persist_path,
+    )
+    .await
+    {
+        Ok(cb) => {
+            // Freshly factory-deployed, so it's registered by construction
+            // — skip the redundant `deployedContracts` round-trip.
+            let pushsync = ant_p2p::PushsyncSwapConfig::new(
+                cb,
+                signing_secret,
+                ant_chain::tx::GNOSIS_CHAIN_ID,
+                ledger_path,
+                ant_p2p::PeerEthMap::new(),
+            );
+            Ok(ResolvedChequebook {
+                address: Some(cb),
+                pushsync: Some(pushsync),
+            })
+        }
+        Err(e) => {
+            // Auto-deploy is best-effort: a thin/unfunded wallet or a
+            // flaky RPC must not stop the node from starting (reads,
+            // small uploads still work). Log loudly and run without
+            // outbound settlement.
+            tracing::warn!(
+                target: "antd",
+                error = %format!("{e:#}"),
+                "chequebook auto-deploy failed; starting without outbound SWAP settlement",
+            );
+            Ok(ResolvedChequebook {
+                address: None,
+                pushsync: None,
+            })
+        }
+    }
+}
+
+/// Run the startup `factory.deployedContracts(chequebook)` check and,
+/// unless it fails (and `--chequebook-allow-unverified` is unset),
+/// build the pushsync swap config. Cheques drawn on a chequebook the
+/// factory doesn't know about are silently dropped by bee's
+/// `chequeStore.ReceiveCheque`, so emitting them just wastes bandwidth.
+/// Without an RPC we can't check and build unconditionally, matching
+/// the historical manual behaviour.
+async fn verify_then_build_swap(
+    chequebook: [u8; 20],
+    swap_secret: [u8; SECP256K1_SECRET_LEN],
+    rpc_url: Option<&str>,
+    allow_unverified: bool,
+    ledger_path: &Path,
+) -> Option<ant_p2p::PushsyncSwapConfig> {
+    if let Some(rpc) = rpc_url {
+        match verify_chequebook_with_factory(rpc, &chequebook).await {
+            Ok(true) => tracing::info!(
+                target: "antd",
+                chequebook = %format!("0x{}", hex::encode(chequebook)),
+                "factory check passed — chequebook is registered with the Swarm chequebook factory",
+            ),
+            Ok(false) if allow_unverified => tracing::warn!(
+                target: "antd",
+                chequebook = %format!("0x{}", hex::encode(chequebook)),
+                "chequebook is NOT registered with the Swarm chequebook factory, but --chequebook-allow-unverified was set; bee will reject cheques drawn on this chequebook",
+            ),
+            Ok(false) => {
+                tracing::error!(
+                    target: "antd",
+                    chequebook = %format!("0x{}", hex::encode(chequebook)),
+                    "chequebook is NOT registered with the Swarm chequebook factory; \
+                     bee will silently reject every cheque we emit. \
+                     Disabling outbound SWAP settlement. \
+                     Run `antctl chequebook deploy` to deploy a new factory-registered chequebook, \
+                     or pass --chequebook-allow-unverified to override (devnet only).",
+                );
+                return None;
+            }
+            Err(e) => tracing::warn!(
+                target: "antd",
+                chequebook = %format!("0x{}", hex::encode(chequebook)),
+                error = %e,
+                "factory.deployedContracts call failed; skipping startup factory check",
+            ),
+        }
+    }
+    // Placeholder `PeerEthMap`; `ant-node::run_node` overwrites the
+    // field with the live one shared with the swarm loop before the
+    // config reaches `run`.
+    Some(ant_p2p::PushsyncSwapConfig::new(
+        chequebook,
+        swap_secret,
+        ant_chain::tx::GNOSIS_CHAIN_ID,
+        ledger_path.to_path_buf(),
+        ant_p2p::PeerEthMap::new(),
+    ))
+}
+
+/// Load the persisted auto-deployed chequebook address, if any. A
+/// malformed file is a hard error — silently ignoring it would
+/// re-trigger a deploy and waste gas on every restart.
+fn load_persisted_chequebook(path: &Path) -> Result<Option<[u8; 20]>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("read chequebook association {}", path.display()))?;
+    let file: ChequebookFile = serde_json::from_str(&raw)
+        .with_context(|| format!("parse chequebook association {}", path.display()))?;
+    let mut cb = [0u8; 20];
+    hex::decode_to_slice(strip_0x(file.chequebook.trim()), &mut cb)
+        .with_context(|| format!("decode persisted chequebook {}", file.chequebook))?;
+    Ok(Some(cb))
+}
+
+/// Atomically persist the chequebook association (write-tmp + rename),
+/// so a crash mid-write can't leave a half-written file that a later
+/// start would reject.
+fn persist_chequebook(path: &Path, file: &ChequebookFile) -> Result<()> {
+    let json = serde_json::to_string_pretty(file).context("serialize chequebook association")?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json.as_bytes()).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    Ok(())
+}
+
+/// Deploy a fresh factory-registered chequebook (issuer = node EOA),
+/// persist the association, then fund it best-effort with xBZZ. The
+/// node wallet (`signing_secret`) both pays gas and is the issuer, so
+/// no external key is ever injected — matching bee's own first-start
+/// behaviour against a fresh statestore. Returns the deployed
+/// chequebook address.
+async fn auto_deploy_chequebook(
+    rpc_url: &str,
+    signing_secret: [u8; SECP256K1_SECRET_LEN],
+    node_eth: [u8; 20],
+    deposit_plur: u128,
+    persist_path: &Path,
+) -> Result<[u8; 20]> {
+    use ant_chain::chequebook::{
+        extract_deployed_chequebook, random_chequebook_salt, DEFAULT_HARD_DEPOSIT_TIMEOUT_SECS,
+        GNOSIS_BZZ_TOKEN_BYTES, GNOSIS_CHEQUEBOOK_FACTORY,
+    };
+    use ant_chain::tx::{
+        Wallet, DEFAULT_GAS_PRICE_WEI, ERC20_TRANSFER_GAS, FACTORY_DEPLOY_CHEQUEBOOK_GAS,
+    };
+    use ant_chain::ChainClient;
+    use primitive_types::U256;
+
+    let client = ChainClient::new(rpc_url);
+
+    // Gas pre-flight: a deploy we can't pay for just burns a failed-tx
+    // wait. Require enough xDAI to cover the deploy + a funding transfer
+    // at our default gas price before signing anything.
+    let need_gas_wei = U256::from(DEFAULT_GAS_PRICE_WEI).saturating_mul(U256::from(
+        FACTORY_DEPLOY_CHEQUEBOOK_GAS + ERC20_TRANSFER_GAS,
+    ));
+    let native = client
+        .eth_get_balance_lower128(&node_eth)
+        .await
+        .context("read node xDAI balance")?;
+    if U256::from(native) < need_gas_wei {
+        bail!(
+            "node wallet 0x{} has {} wei xDAI, needs ~{} wei to deploy + fund a chequebook; \
+             fund the wallet or pass --no-auto-chequebook",
+            hex::encode(node_eth),
+            native,
+            need_gas_wei,
+        );
+    }
+
+    let wallet = Wallet::new(signing_secret, ant_chain::tx::GNOSIS_CHAIN_ID)
+        .context("derive node wallet")?;
+    let salt = random_chequebook_salt();
+
+    tracing::info!(
+        target: "antd",
+        factory = %format!("0x{}", hex::encode(GNOSIS_CHEQUEBOOK_FACTORY)),
+        issuer = %format!("0x{}", hex::encode(node_eth)),
+        "no chequebook configured or persisted — auto-deploying a factory-registered chequebook (issuer = node EOA)",
+    );
+
+    let receipt = wallet
+        .deploy_chequebook(
+            &client,
+            &GNOSIS_CHEQUEBOOK_FACTORY,
+            &node_eth,
+            U256::from(DEFAULT_HARD_DEPOSIT_TIMEOUT_SECS),
+            &salt,
+        )
+        .await
+        .context("factory.deploySimpleSwap")?;
+
+    let cb = extract_deployed_chequebook(&receipt).ok_or_else(|| {
+        anyhow!(
+            "deploy tx 0x{} confirmed (block {}) but emitted no SimpleSwapDeployed log",
+            hex::encode(receipt.tx_hash),
+            receipt.block_number,
+        )
+    })?;
+
+    tracing::info!(
+        target: "antd",
+        chequebook = %format!("0x{}", hex::encode(cb)),
+        tx = %format!("0x{}", hex::encode(receipt.tx_hash)),
+        block = receipt.block_number,
+        "auto-deployed chequebook",
+    );
+
+    // Persist immediately, before funding, so a crash between the deploy
+    // and the transfer still reuses this chequebook on the next start
+    // (deploy-once forever) rather than deploying a second one.
+    persist_chequebook(
+        persist_path,
+        &ChequebookFile {
+            chequebook: format!("0x{}", hex::encode(cb)),
+            issuer: format!("0x{}", hex::encode(node_eth)),
+            salt: format!("0x{}", hex::encode(salt)),
+            deploy_tx: format!("0x{}", hex::encode(receipt.tx_hash)),
+        },
+    )
+    .with_context(|| {
+        format!(
+            "persist chequebook association at {}",
+            persist_path.display()
+        )
+    })?;
+
+    // Best-effort funding: cap the deposit to the wallet's BZZ balance
+    // so we never overdraw, and never fail over it — a factory-registered
+    // but unfunded chequebook already unblocks the upload flow (bee
+    // accepts the cheque; cashing waits for a later deposit).
+    if deposit_plur > 0 {
+        match client
+            .erc20_balance_of_lower128(ant_chain::GNOSIS_BZZ_TOKEN, &node_eth)
+            .await
+        {
+            Ok(bzz_bal) => {
+                let deposit = deposit_plur.min(bzz_bal);
+                if deposit == 0 {
+                    tracing::warn!(
+                        target: "antd",
+                        chequebook = %format!("0x{}", hex::encode(cb)),
+                        "node wallet holds no xBZZ; deployed an unfunded chequebook (cheques are still accepted; deposit BZZ later via POST /chequebook/deposit)",
+                    );
+                } else {
+                    match wallet
+                        .erc20_transfer(&client, &GNOSIS_BZZ_TOKEN_BYTES, &cb, U256::from(deposit))
+                        .await
+                    {
+                        Ok(r) => tracing::info!(
+                            target: "antd",
+                            chequebook = %format!("0x{}", hex::encode(cb)),
+                            deposit_plur = deposit,
+                            tx = %format!("0x{}", hex::encode(r.tx_hash)),
+                            "funded chequebook with xBZZ",
+                        ),
+                        Err(e) => tracing::warn!(
+                            target: "antd",
+                            chequebook = %format!("0x{}", hex::encode(cb)),
+                            error = %e,
+                            "chequebook funding transfer failed; chequebook is deployed and usable but unfunded",
+                        ),
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(
+                target: "antd",
+                error = %e,
+                "could not read node xBZZ balance; deployed chequebook left unfunded",
+            ),
+        }
+    }
+
+    Ok(cb)
 }
 
 fn strip_0x(s: &str) -> &str {
