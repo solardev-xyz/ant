@@ -1673,16 +1673,106 @@ recovery).
 
 This is the working order to close it, fastest-payoff first:
 
-| # | Item                                                                    | Effort  | Why first                                                                                                              |
-| - | ----------------------------------------------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------- |
-| 1 | Auto-settlement trigger from `accounting` ↔ `swap::issue_and_emit`      | ~1 day  | Closes Phase 7. Peers stop disconnecting us under sustained fetch. Flips `/node` → `beeMode: "light"`.                 |
-| 2 | `/wallet`, `/chequebook/{address,balance,cheque[,/{peer}]}`, `/balances`, `/settlements`, `/timesettlements` reads | ~1 day  | All read-only, all backed by data we already have on disk or one `eth_call` away. Big perceived-coverage win.          |
-| 3 | `/stamps` reads + `POST /stamps/{amount}/{depth}` + `PATCH /stamps/{topup,dilute}/...` | ~1 day  | Wraps the same `Wallet` calls `antctl postage` already makes. Lets bee-js apps buy + manage stamps without antctl.     |
-| 4 | `/tags` GET/POST + `/tags/{id}` GET/DELETE/PATCH                        | ~½ day  | Every bee uploader UI shows progress via tags. The `SplitterFan` already counts the chunks we'd report.                |
-| 5 | `antctl chequebook deploy` + first-run auto-deploy in `antd`            | ~½ day  | `deploy_chequebook_calldata` is already in `ant-chain`; just needs the `Wallet::send_to` plumbing + bootstrap branch.  |
-| 6 | `/feeds/{owner}/{topic}` GET/POST + `/soc/{owner}/{id}` POST            | ~2-3 d  | Feeds are time-indexed SOCs; build SOC first, feeds on top. Largest single item but unblocks ENS + mutable-resource apps. |
-| 7 | `/stewardship/{ref}` GET/PUT, `/envelope/{addr}` POST                   | ~½-1 d  | Pure re-stamp + pushsync of an existing tree; envelopes are the same, scoped to one chunk.                             |
-| 8 | Reed-Solomon erasure decoding (`--swarm-redundancy=1..3` interop)       | ~2-3 d  | Required before sites uploaded with redundancy round-trip cleanly under any churn. Real read-path protocol work.       |
+| # | Item | Effort | Status | Why first / notes |
+| - | ---- | ------ | ------ | ----------------- |
+| 1 | Auto-settlement trigger from `accounting` ↔ `swap::issue_and_emit` | ~1 day | ✅ shipped | `pushsync_swap` emits a cheque when debt crosses `DEFAULT_CHEQUE_TRIGGER` (= ½ `LIGHT_PAYMENT_THRESHOLD`). Flips `/node` → `beeMode:"light"`. |
+| 2 | `/wallet`, `/chequebook/{address,balance,cheque[,/{peer}]}`, `/balances`, `/settlements`, `/timesettlements` reads | ~1 day | 🟡 partial | `/wallet`, `/chequebook/address`, `/chequebook/balance` shipped; `/balances`, `/settlements`, `/timesettlements`, `/chequebook/cheque` still fall through to 501. |
+| 3 | `/stamps` reads + `POST /stamps/{amount}/{depth}` + `PATCH /stamps/{topup,dilute}/...` | ~1 day | ✅ shipped | Live registry (0.5.8): buy/topup/dilute register a runtime issuer; `GET /stamps` + `/stamps/{id}` reflect it. |
+| 4 | `/tags` GET/POST + `/tags/{id}` GET/DELETE/PATCH | ~½ day | 🟡 partial | `POST /tags` + `GET /tags/{uid}` shipped (uploads echo `Swarm-Tag-Uid`); `DELETE`/`PATCH` not yet. |
+| 5 | `antctl chequebook deploy` + first-run auto-deploy in `antd` | ~½ day | ⬜ **OPEN** | **Last bee-parity blocker for the light-node upload flow.** `deploy_chequebook` calldata exists in `ant-chain::tx`, but `antd` never deploys/persists/reloads a chequebook — it only reads a manually-supplied `--chequebook`/`CHEQUEBOOK_ADDRESS`. See "Open: chequebook auto-bootstrap" below. |
+| 6 | `/feeds/{owner}/{topic}` GET/POST + `/soc/{owner}/{id}` POST | ~2-3 d | ✅ shipped | `/feeds` GET/POST + `/soc/{owner}/{id}` GET/POST routed. |
+| 7 | `/stewardship/{ref}` GET/PUT, `/envelope/{addr}` POST | ~½-1 d | ⬜ open | Not routed yet → 501. |
+| 8 | Reed-Solomon erasure decoding (`--swarm-redundancy=1..3` interop) | ~2-3 d | ⬜ open | Read-path protocol work; not started. |
+| 9 | `/topology` known/visible-peer population (kademlia "known" set) | ~1 day | ⬜ open | Reporting-only gap: `population == connected` (~100). bee-shaped clients read "visible peers" as `sum(bins[*].population)`; bee reports thousands. See "Open: visible-peers" below. |
+
+#### Open: chequebook auto-bootstrap (bee-parity) — row 5
+
+**Status as of `antd` 0.5.8 (2026-06-05).** Two related runtime light-node items:
+
+- **Runtime postage batch parity — ✅ shipped in 0.5.8.**
+  Runtime batch registry, buy/dilute → `RegisterBatch`, `Swarm-Postage-Batch-Id`
+  upload header, `beeMode=light` decoupled from `--postage-batch`, persisted
+  issuers rescanned on startup, `GET /stamps[/{id}]` reflecting the live
+  registry. Live-verified on Gnosis mainnet: buy → `usable:true` within seconds
+  → upload with the batch header → readback.
+
+- **Chequebook lifecycle parity (table row 5) — ⬜ OPEN.** This is
+  the only remaining bee-parity gap for the light-node upload flow:
+  1. **Auto-deploy + fund** a chequebook on first light start when the node
+     wallet is funded and none is persisted: `deploy_chequebook(factory,
+     issuer = node EOA)` → fund with xBZZ → build the SWAP config from it +
+     `signing_secret`. The issuer is the node EOA already loaded from
+     `keys/swarm.key` — no external key injection.
+  2. **Persist + reload** the chequebook association in `antd`'s data-dir and
+     reload it on startup (deploy-once, reuse-forever — bee keeps this in its
+     statestore).
+  3. Today `antd` only honours a manually-supplied `--chequebook` /
+     `CHEQUEBOOK_ADDRESS` (`crates/antd/src/main.rs:675`, `:1282`); without one
+     `GET /chequebook/address` returns the zero address and sustained multi-MB
+     uploads stall after a few hundred chunks/peer.
+
+  Already shipped: the read endpoints (`GET /chequebook/{address,balance}`,
+  `/wallet`) and manual, factory-verified chequebook config. One-time caveat: a
+  chequebook previously deployed by bee lives in bee's LevelDB statestore (which
+  `antd` can't read) and isn't reverse-lookupable on-chain, so first light start
+  deploys a *fresh* chequebook for the same node EOA — identical to bee's own
+  behaviour against a fresh statestore.
+
+#### Open: visible-peers / known-peer book (bee-parity) — row 9
+
+**Reporting-only** change — `antd` keeps its ~100-peer working set; it just also
+*tracks and reports* the larger hive-discovered population, exactly like bee's
+kademlia distinguishes "known" from "connected".
+
+**Why:** bee-shaped clients show two peer counters — **Connected Peers** ←
+`GET /peers` array length, and **Visible Peers** ← `GET /topology`
+`sum(bins[*].population)`. bee reports thousands of visible peers; `antd`
+currently sets `population == connected` (~100), so both counters read the same.
+
+**Current state (verified against `origin/main`):**
+- `GET /topology` (`crates/ant-gateway/src/status.rs::topology`) emits per-bin
+  `population == connected` (same value), top-level `population = routing.size`,
+  and `depth: 0` (hardcoded).
+- The counted `RoutingTable` (`crates/ant-p2p/src/routing.rs`) holds only
+  currently-connected, handshaked peers: `admit` on BZZ-handshake success
+  (`behaviour.rs` ~3341), `forget` on `ConnectionClosed` (~3214), bounded by
+  `DEFAULT_TARGET_PEERS` (~100).
+- Hive-discovered peers are **not retained**: `run_hive` (`sinks.rs`) decodes
+  `PeerHint { peer_id, overlay }` → `hint_tx`; `enqueue_hint` (`behaviour.rs`
+  ~837) only uses them to fill the dial queue (deduped via `seen_hints`) and
+  drops the rest. No known-but-unconnected address book.
+- Snapshot: `routing_snapshot` (`behaviour.rs` ~1048) → `RoutingInfo
+  { base_overlay, size, bins }` (`ant-control/src/protocol.rs:507`,
+  `bins: Vec<u32>` = connected counts) → `StatusSnapshot.peers.routing`.
+
+**Required:**
+1. **Known-peer book** (`crates/ant-p2p/src/routing.rs`, new `KnownPeers`):
+   `entries: HashMap<PeerId, { overlay, po, last_seen }>` + `bins: [u32; 32]`.
+   `note(peer, overlay)` (idempotent insert/update, bump `bins[po]` on first
+   insert), `prune(now)` (TTL ~30–60 min and/or per-bin cap, decrement bins),
+   `bin_counts()`, `len()`. Dedup by **overlay** (hive can re-advertise an
+   overlay under a new `PeerId`).
+2. **Feed the book** (`behaviour.rs`): call `state.known.note(...)` in
+   `enqueue_hint` **before** the dial-dedup early-returns, and again next to
+   `state.routing.admit(...)` on handshake success. Do **not** remove on
+   `ConnectionClosed` (known persists). Add `known: KnownPeers` to `SwarmState`;
+   `prune` on the existing periodic tick.
+3. **Carry both counts in the snapshot:** extend `RoutingInfo` with
+   `#[serde(default)] known_size: u32` + `#[serde(default)] known_bins: Vec<u32>`
+   (keep `size`/`bins` = connected for `antop` back-compat); fill them in
+   `routing_snapshot`.
+4. **Report in `/topology`** (`status.rs::topology`): per-bin `population =
+   known_bins[i]`, `connected = connected_bins[i]`; top-level `population =
+   known_size`, `connected = sum(connected)`; compute a real `depth` from the
+   connected bins (highest PO where cumulative connected ≥ saturation, e.g. 4)
+   instead of `0`.
+
+**Constraints:** don't raise `DEFAULT_TARGET_PEERS` or change the dialer; bound
+the book (TTL + per-bin cap) so gateway-style churn can't grow it without limit;
+new snapshot fields are additive/`#[serde(default)]`. **Acceptance:** after a few
+minutes `sum(bins[*].population)` is in the thousands and climbing while
+`connected`/`GET /peers` stays ~100; `population ≥ connected` always; `depth > 0`
+once a neighborhood forms.
 
 After (1)–(7) an unmodified bee-js script doing
 `bee.uploadFile / downloadFile / createTag / createPostageBatch /
