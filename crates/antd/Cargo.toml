@@ -14,7 +14,10 @@ ant-crypto = { path = "../ant-crypto" }
 ant-gateway = { path = "../ant-gateway" }
 ant-node = { path = "../ant-node" }
 ant-p2p = { path = "../ant-p2p" }
-ant-postage = { path = "../ant-postage" }
+# `bee-recover`: read a carried-over bee `stamperstore` to seed the
+# bucket counters of a rediscovered postage batch (PLAN.md recovery,
+# Feature 1 option a).
+ant-postage = { path = "../ant-postage", features = ["bee-recover"] }
 ant-retrieval = { path = "../ant-retrieval" }
 anyhow.workspace = true
 async-trait.workspace = true

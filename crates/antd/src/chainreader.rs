@@ -66,6 +66,13 @@ impl ChainReader for AntChainReader {
             .await
             .map_err(|e| e.to_string())
     }
+
+    async fn batch_remaining_balance(&self, batch_id: [u8; 32]) -> Result<u128, String> {
+        self.client
+            .postage_remaining_balance(&self.postage_contract, &batch_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// Default postage bucket depth (bee's constant). A batch's `depth` must

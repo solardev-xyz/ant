@@ -158,8 +158,59 @@ pub async fn stamps(State(handle): State<GatewayHandle>) -> Response {
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let stamps = views.iter().filter_map(StampEntry::from_view).collect();
+    let mut stamps: Vec<StampEntry> = views.iter().filter_map(StampEntry::from_view).collect();
+    enrich_with_chain(&mut stamps, &handle).await;
     json_ok(&StampsBody { stamps })
+}
+
+/// Gnosis block time (seconds). Used to convert a batch's remaining
+/// per-chunk balance (denominated in price-per-block units) into a TTL,
+/// matching bee's `estimateBatchTTL` (`((value-totalAmount)/price) *
+/// blockTime`).
+const GNOSIS_BLOCK_TIME_SECS: u128 = 5;
+
+/// How long the per-batch chain enrichment may take before `/stamps`
+/// gives up and returns the placeholder `amount` / `batchTTL`. The
+/// listing must stay responsive even if the RPC is slow.
+const STAMPS_ENRICH_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Fill in bee's `amount` (the batch's normalised per-chunk balance)
+/// and `batchTTL` from the chain when a chain context is configured.
+/// Best-effort: any RPC failure / absent chain leaves the placeholders
+/// (`amount = "0"`, a long TTL), which already keep bee-js / Freedom
+/// happy. `amount = remainingBalance + totalOutPayment` and
+/// `batchTTL = (remainingBalance / currentPrice) * blockTime`, matching
+/// bee.
+async fn enrich_with_chain(stamps: &mut [StampEntry], handle: &GatewayHandle) {
+    let Some(chain) = handle.chain.clone() else {
+        return;
+    };
+    if stamps.is_empty() {
+        return;
+    }
+    let _ = tokio::time::timeout(STAMPS_ENRICH_TIMEOUT, async {
+        let price = chain.reader.current_price().await.unwrap_or(0);
+        let total_out = chain.reader.total_amount().await.unwrap_or(0);
+        for entry in stamps.iter_mut() {
+            let mut id = [0u8; 32];
+            if hex::decode_to_slice(&entry.batch_id, &mut id).is_err() {
+                continue;
+            }
+            let Ok(remaining) = chain.reader.batch_remaining_balance(id).await else {
+                continue;
+            };
+            // Normalised per-chunk balance bee reports as `amount`.
+            entry.amount = remaining.saturating_add(total_out).to_string();
+            entry.batch_ttl = match remaining
+                .saturating_mul(GNOSIS_BLOCK_TIME_SECS)
+                .checked_div(price)
+            {
+                Some(ttl) => i64::try_from(ttl).unwrap_or(i64::MAX),
+                None => -1, // price == 0 → never expires (bee semantics)
+            };
+        }
+    })
+    .await;
 }
 
 /// `GET /stamps/{id}`. Returns the registered batch whose id matches,
@@ -180,7 +231,12 @@ pub async fn stamp(State(handle): State<GatewayHandle>, Path(id): Path<String>) 
         .filter_map(StampEntry::from_view)
         .find(|e| e.batch_id == want)
     {
-        Some(entry) => json_ok(&entry),
+        Some(entry) => {
+            let mut one = [entry];
+            enrich_with_chain(&mut one, &handle).await;
+            let [entry] = one;
+            json_ok(&entry)
+        }
         None => json_error(StatusCode::NOT_FOUND, "batch not found"),
     }
 }

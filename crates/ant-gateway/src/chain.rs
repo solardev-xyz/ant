@@ -48,6 +48,14 @@ pub trait ChainReader: Send + Sync {
     async fn bzz_balance(&self, who: [u8; 20]) -> Result<u128, String>;
     async fn native_balance(&self, who: [u8; 20]) -> Result<u128, String>;
     async fn chequebook_balance(&self, chequebook: [u8; 20]) -> Result<u128, String>;
+    /// `PostageStamp.remainingBalance(batchId)` — per-chunk balance left
+    /// on a batch. Used to enrich `GET /stamps` with bee's `amount` /
+    /// `batchTTL`. Defaulted to "unsupported" so non-chain readers (test
+    /// fakes / embedders) needn't implement it; `/stamps` then keeps its
+    /// placeholders.
+    async fn batch_remaining_balance(&self, _batch_id: [u8; 32]) -> Result<u128, String> {
+        Err("batch_remaining_balance unsupported".to_string())
+    }
 }
 
 /// On-chain write surface backing the postage-buy / topup / dilute and

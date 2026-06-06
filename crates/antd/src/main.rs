@@ -202,6 +202,22 @@ struct Opt {
     #[arg(long)]
     gnosis_rpc_url: Option<String>,
 
+    /// Gnosis RPC endpoint used **only** for the startup recovery log
+    /// scans (`eth_getLogs` over the xBZZ `Transfer` event) that
+    /// rediscover this node's owned postage batches and chequebook from
+    /// its EOA. Kept separate from `--gnosis-rpc-url` because many
+    /// general-purpose RPCs (e.g. Alchemy's free tier, capped at a
+    /// 10-block `eth_getLogs` range) cannot serve a wide historical log
+    /// scan, while the default public endpoint here can. Falls back to
+    /// the `GNOSIS_LOGS_RPC_URL` env. Set to an empty string to disable
+    /// on-chain recovery entirely.
+    #[arg(
+        long,
+        env = "GNOSIS_LOGS_RPC_URL",
+        default_value = "https://rpc.gnosischain.com"
+    )]
+    gnosis_logs_rpc_url: String,
+
     /// `PostageStamp` contract address (mainnet default keeps matching
     /// upstream bee). Override only when running against a fork.
     #[arg(long, default_value = "0x45a1502382541Cd610CC9068e88727426b696293")]
@@ -517,6 +533,7 @@ async fn main() -> Result<()> {
 
     let upload = build_upload_runtime(
         opt.gnosis_rpc_url.clone(),
+        resolve_logs_rpc(&opt),
         opt.postage_contract.clone(),
         opt.postage_batch.clone(),
         opt.postage_owner_key.clone(),
@@ -1098,8 +1115,13 @@ fn load_or_create_identity(
 /// the legacy single-owner behaviour: when set it becomes the stamp key
 /// and the configured batch must be owned by it. When absent the node's
 /// own wallet key signs stamps (the bee light-node model).
+// Startup wiring: each argument is an independent config/identity input
+// threaded from `main`; bundling them into a struct would only move the
+// list elsewhere without improving clarity.
+#[allow(clippy::too_many_arguments)]
 async fn build_upload_runtime(
     cli_rpc: Option<String>,
+    logs_rpc: Option<String>,
     postage_contract: String,
     cli_batch: Option<String>,
     cli_key: Option<String>,
@@ -1223,6 +1245,59 @@ async fn build_upload_runtime(
         issuers.insert(batch_id, issuer);
     }
 
+    // 3. Rediscover owned batches from chain (bee-parity recovery). A
+    //    node started on a bee data dir owns funded batches on-chain
+    //    that aren't in any local registry; surface them as usable
+    //    issuers, carrying over bee's bucket counters when a
+    //    `stamperstore` is present. Independent of storage incentives
+    //    (a light node tracks its own batches). Best-effort: a flaky or
+    //    range-capped RPC must never stop the daemon from starting.
+    if let Some(logs_rpc) = logs_rpc {
+        let client = ant_chain::ChainClient::new(logs_rpc);
+        match ant_chain::discover::discover_owned_batches(
+            &client,
+            &postage_contract,
+            ant_chain::GNOSIS_BZZ_TOKEN,
+            &batch_owner,
+            ant_chain::discover::GNOSIS_XBZZ_DEPLOY_BLOCK,
+        )
+        .await
+        {
+            Ok(found) => {
+                let stamperstore = data_dir.join("stamperstore");
+                for b in found {
+                    if issuers.contains_key(&b.batch_id) {
+                        continue; // already reloaded / pre-registered
+                    }
+                    let store_path = postage_dir.join(format!("{}.bin", hex::encode(b.batch_id)));
+                    match open_recovered_issuer(&stamperstore, &store_path, &b) {
+                        Ok(iss) => {
+                            tracing::info!(
+                                target: "antd",
+                                batch = %format!("0x{}", hex::encode(b.batch_id)),
+                                depth = b.depth,
+                                bucket_depth = b.bucket_depth,
+                                immutable = b.immutable,
+                                remaining_balance = b.remaining_balance,
+                                "rediscovered owned postage batch from chain",
+                            );
+                            issuers.insert(b.batch_id, iss);
+                        }
+                        Err(e) => tracing::warn!(
+                            target: "antd",
+                            batch = %format!("0x{}", hex::encode(b.batch_id)),
+                            "could not open rediscovered batch: {e}",
+                        ),
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(
+                target: "antd",
+                "postage batch rediscovery scan failed: {e}; continuing without it",
+            ),
+        }
+    }
+
     // Nothing to stamp with and no way to buy → ultra-light.
     if !can_stamp && issuers.is_empty() {
         tracing::info!(
@@ -1246,6 +1321,77 @@ async fn build_upload_runtime(
         batch_owner,
         postage_dir,
     })))
+}
+
+/// Open a [`ant_postage::StampIssuer`] for a batch rediscovered on
+/// chain, carrying over bee's per-bucket counters from a
+/// `stamperstore` when one is present (option a) and falling back to a
+/// fresh issuer with all-zero counters otherwise (option b). The
+/// counters are the only batch state not on-chain; seeding them keeps
+/// the node from re-stamping `(batchId, bucket, index)` slots the
+/// network has already seen.
+fn open_recovered_issuer(
+    stamperstore: &Path,
+    store_path: &Path,
+    b: &ant_chain::discover::DiscoveredBatch,
+) -> Result<ant_postage::StampIssuer> {
+    let want = 1usize << u32::from(b.bucket_depth);
+    let fresh = || {
+        ant_postage::StampIssuer::open_or_new(
+            store_path.to_path_buf(),
+            b.batch_id,
+            b.depth,
+            b.bucket_depth,
+            b.immutable,
+        )
+        .map_err(|e| anyhow!("{e}"))
+    };
+    match ant_postage::beestore::recover_bee_buckets(stamperstore, &b.batch_id) {
+        Ok(Some(rec)) if rec.bucket_depth == b.bucket_depth && rec.buckets.len() == want => {
+            let issued: u64 = rec.buckets.iter().map(|&c| u64::from(c)).sum();
+            tracing::info!(
+                target: "antd",
+                batch = %format!("0x{}", hex::encode(b.batch_id)),
+                issued,
+                "carried over bee stamp-issuer bucket counters (recovery option a)",
+            );
+            ant_postage::StampIssuer::open_or_new_seeded(
+                store_path.to_path_buf(),
+                b.batch_id,
+                b.depth,
+                b.bucket_depth,
+                b.immutable,
+                &rec.buckets,
+            )
+            .map_err(|e| anyhow!("{e}"))
+        }
+        Ok(Some(rec)) => {
+            tracing::warn!(
+                target: "antd",
+                batch = %format!("0x{}", hex::encode(b.batch_id)),
+                bee_bucket_depth = rec.bucket_depth,
+                chain_bucket_depth = b.bucket_depth,
+                "bee bucket-counter shape mismatch; starting issuer fresh (recovery option b)",
+            );
+            fresh()
+        }
+        Ok(None) => {
+            tracing::info!(
+                target: "antd",
+                batch = %format!("0x{}", hex::encode(b.batch_id)),
+                "no bee stamperstore counters for batch; fresh issuer at 0 (recovery option b)",
+            );
+            fresh()
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "antd",
+                batch = %format!("0x{}", hex::encode(b.batch_id)),
+                "bee stamperstore recovery failed: {e}; fresh issuer at 0 (recovery option b)",
+            );
+            fresh()
+        }
+    }
 }
 
 /// Persisted association between this node's data-dir and a
@@ -1287,8 +1433,11 @@ struct ResolvedChequebook {
 /// 2. **Persisted** — a chequebook this node auto-deployed on an
 ///    earlier start, reloaded from `<data-dir>/chequebook.json`. Issuer
 ///    is the node EOA, so the node `signing_secret` signs cheques.
-/// 3. **Auto-deploy** — on first light start with a funded node wallet
-///    and neither of the above, deploy a fresh factory-registered
+/// 3. **Rediscovered** — on a data dir carried over from bee (or one
+///    whose `chequebook.json` was lost), the node EOA's chequebook is
+///    rediscovered on-chain from the node key, adopted, and persisted.
+/// 4. **Auto-deploy** — on first light start with a funded node wallet
+///    and none of the above, deploy a fresh factory-registered
 ///    chequebook (issuer = node EOA), fund it with xBZZ, and persist it.
 ///
 /// A standalone `--swap-key` without a chequebook keeps the historical
@@ -1416,7 +1565,74 @@ async fn resolve_chequebook(
         });
     }
 
-    // 3. First-run auto-deploy. Gated on light mode (we only issue
+    // 3. Rediscover a chequebook this node already deployed (bee-parity
+    //    recovery). On a data dir carried over from bee, or one whose
+    //    `chequebook.json` was lost, the node EOA's chequebook is
+    //    rediscoverable on-chain from the node key. Adopt it (persist
+    //    the association so future starts skip the scan) rather than
+    //    deploying a fresh one and stranding the old balance.
+    if let Some(logs_rpc) = resolve_logs_rpc(opt) {
+        match ant_chain::discover::discover_owned_chequebook(
+            &ant_chain::ChainClient::new(logs_rpc),
+            &ant_chain::chequebook::GNOSIS_CHEQUEBOOK_FACTORY,
+            &opt.postage_contract,
+            ant_chain::GNOSIS_BZZ_TOKEN,
+            &node_eth,
+            ant_chain::discover::GNOSIS_XBZZ_DEPLOY_BLOCK,
+        )
+        .await
+        {
+            Ok(Some(cb)) => {
+                tracing::info!(
+                    target: "antd",
+                    chequebook = %format!("0x{}", hex::encode(cb)),
+                    issuer = %format!("0x{}", hex::encode(node_eth)),
+                    "rediscovered node-owned chequebook on-chain; adopting it (no fresh deploy)",
+                );
+                // Persist so subsequent starts reload it directly (the
+                // scan becomes a one-time cost). Salt / deploy tx are
+                // unknown for a rediscovered chequebook; the issuer is
+                // the node EOA, so `signing_secret` signs cheques.
+                if let Err(e) = persist_chequebook(
+                    &persist_path,
+                    &ChequebookFile {
+                        chequebook: format!("0x{}", hex::encode(cb)),
+                        issuer: format!("0x{}", hex::encode(node_eth)),
+                        salt: String::new(),
+                        deploy_tx: String::new(),
+                    },
+                ) {
+                    tracing::warn!(
+                        target: "antd",
+                        error = %format!("{e:#}"),
+                        "could not persist rediscovered chequebook association; will rediscover next start",
+                    );
+                }
+                let pushsync = verify_then_build_swap(
+                    cb,
+                    signing_secret,
+                    rpc_url.as_deref(),
+                    opt.chequebook_allow_unverified,
+                    &ledger_path,
+                )
+                .await;
+                return Ok(ResolvedChequebook {
+                    address: Some(cb),
+                    pushsync,
+                });
+            }
+            Ok(None) => tracing::info!(
+                target: "antd",
+                "no node-owned chequebook found on-chain; will auto-deploy if enabled",
+            ),
+            Err(e) => tracing::warn!(
+                target: "antd",
+                "chequebook rediscovery scan failed: {e}; will auto-deploy if enabled",
+            ),
+        }
+    }
+
+    // 4. First-run auto-deploy. Gated on light mode (we only issue
     //    cheques when we can upload), an RPC endpoint, and the operator
     //    not opting out.
     if opt.no_auto_chequebook {
@@ -1720,6 +1936,18 @@ async fn auto_deploy_chequebook(
     }
 
     Ok(cb)
+}
+
+/// Resolve the RPC endpoint used for the startup recovery log scans.
+/// Defaults to the public Gnosis endpoint (`--gnosis-logs-rpc-url`);
+/// an empty value disables on-chain recovery entirely.
+fn resolve_logs_rpc(opt: &Opt) -> Option<String> {
+    let s = opt.gnosis_logs_rpc_url.trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
 }
 
 fn strip_0x(s: &str) -> &str {

@@ -371,6 +371,51 @@ impl ChainClient {
         Ok(out)
     }
 
+    /// One-shot `eth_getTransactionReceipt`. Returns `Ok(None)` when the
+    /// tx isn't mined yet (or is unknown to the node), `Ok(Some(_))`
+    /// with the parsed logs once it is. Unlike [`Self::wait_for_receipt`]
+    /// this does not poll and does not treat a reverted tx as an error —
+    /// the recovery scan only reads logs from already-confirmed txs and
+    /// just needs whatever events are present.
+    pub async fn eth_get_transaction_receipt(
+        &self,
+        tx_hash: &[u8; 32],
+    ) -> Result<Option<TxReceipt>, RpcError> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1u64,
+            "method": "eth_getTransactionReceipt",
+            "params": [format!("0x{}", hex::encode(tx_hash))],
+        });
+        let v: serde_json::Value = self
+            .http()
+            .post(self.url())
+            .json(&body)
+            .send()
+            .await?
+            .json()
+            .await?;
+        if let Some(err) = v.get("error") {
+            return Err(RpcError::Rpc(err.to_string()));
+        }
+        let Some(receipt) = v.get("result").filter(|r| !r.is_null()) else {
+            return Ok(None);
+        };
+        let block_number = receipt
+            .get("blockNumber")
+            .and_then(|s| s.as_str())
+            .unwrap_or("");
+        let logs = receipt.get("logs").and_then(|l| l.as_array()).map_or_else(
+            || Ok(Vec::new()),
+            |arr| arr.iter().map(parse_log).collect::<Result<Vec<_>, _>>(),
+        )?;
+        Ok(Some(TxReceipt {
+            tx_hash: *tx_hash,
+            block_number: parse_hex_u64(block_number).unwrap_or(0),
+            logs,
+        }))
+    }
+
     /// Poll `eth_getTransactionReceipt` until the receipt arrives or
     /// `wait` elapses. Returns the receipt as a structured `TxReceipt`;
     /// reverted txs become `TxError::Reverted` so a successful return

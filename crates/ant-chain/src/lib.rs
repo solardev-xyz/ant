@@ -6,6 +6,10 @@
 //! `deployChequebook` and `cashChequeBeneficiary`.
 
 pub mod chequebook;
+/// On-chain recovery of node-owned state (postage batches, chequebook)
+/// from the node EOA. RPC-driven, so it needs the `chain-rpc` feature.
+#[cfg(feature = "chain-rpc")]
+pub mod discover;
 pub mod tx;
 
 #[cfg(feature = "chain-rpc")]

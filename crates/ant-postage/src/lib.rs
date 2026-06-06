@@ -36,6 +36,9 @@
 //! any sane disk, and the typical upload-shaped workload only issues a
 //! few hundred increments at a time interleaved with pushsync RTTs.
 
+#[cfg(feature = "bee-recover")]
+pub mod beestore;
+
 use std::path::{Path, PathBuf};
 
 use ant_crypto::{
@@ -202,6 +205,44 @@ impl StampIssuer {
             });
         }
         let issuer = Self::build(batch_id, batch_depth, bucket_depth, immutable, Some(path))?;
+        issuer.persist()?;
+        Ok(issuer)
+    }
+
+    /// Open (or create) an on-disk store at `path`, seeding the bucket
+    /// counters from `buckets` **only when the file does not already
+    /// exist**. Used by the on-chain recovery path
+    /// (`antd` startup) to adopt a batch rediscovered from the node EOA,
+    /// carrying over the per-bucket counters recovered from a bee
+    /// `stamperstore` so the node never re-stamps a slot the network has
+    /// already seen.
+    ///
+    /// If a store already exists at `path` its counters win (they are
+    /// at-least-as-current as anything we could seed) and `buckets` is
+    /// ignored — exactly [`Self::open_or_new`]. `buckets.len()` must
+    /// equal `2^bucket_depth`.
+    pub fn open_or_new_seeded(
+        path: PathBuf,
+        batch_id: [u8; 32],
+        batch_depth: u8,
+        bucket_depth: u8,
+        immutable: bool,
+        buckets: &[u32],
+    ) -> Result<Self, PostageError> {
+        if path.exists() {
+            return Self::open_or_new(path, batch_id, batch_depth, bucket_depth, immutable);
+        }
+        let n = 1usize
+            .checked_shl(u32::from(bucket_depth))
+            .ok_or_else(|| PostageError::Msg("bucket bitmap too large".into()))?;
+        if buckets.len() != n {
+            return Err(PostageError::Msg(format!(
+                "seed buckets len {} != 2^bucket_depth {n}",
+                buckets.len(),
+            )));
+        }
+        let mut issuer = Self::build(batch_id, batch_depth, bucket_depth, immutable, Some(path))?;
+        issuer.buckets = buckets.to_vec();
         issuer.persist()?;
         Ok(issuer)
     }
