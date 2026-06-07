@@ -771,6 +771,12 @@ struct SwarmState {
     /// times across a multi-chunk upload. See
     /// [`ant_retrieval::PushSkipCache`] for the design rationale.
     push_skip: ant_retrieval::PushSkipCache,
+    /// Clone of the shared pseudosettle hot-hint sender, retained so a
+    /// runtime [`ControlCommand::EnablePushsyncSwap`] can wire it into
+    /// a freshly-built [`crate::PushsyncSwap`] the same way startup
+    /// wiring does. `None` until `run` populates it (and in tests /
+    /// builds without the pseudosettle driver).
+    hot_hint: Option<mpsc::Sender<ant_retrieval::accounting::HotHint>>,
 }
 
 impl SwarmState {
@@ -822,6 +828,7 @@ impl SwarmState {
             peer_eth,
             pushsync_swap: None,
             push_skip: ant_retrieval::PushSkipCache::new(),
+            hot_hint: None,
         }
     }
 
@@ -1255,6 +1262,10 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     // reference-counted internally so cloning is cheap and only
     // the last drop closes the receiver side.
     let hot_hint_tx_for_pushsync = hot_hint_tx.clone();
+    // Retain a clone so a runtime `EnablePushsyncSwap` (FFI first-buy
+    // chequebook bootstrap) can wire the same driver into a swap
+    // service built after startup, matching the startup path below.
+    state.hot_hint = Some(hot_hint_tx.clone());
     let accounting =
         Arc::new(ant_retrieval::accounting::Accounting::new().with_hot_hint(hot_hint_tx));
     tokio::spawn(crate::pseudosettle::run_driver(
@@ -2196,6 +2207,52 @@ fn handle_control_command(
                     });
                 }
             }
+        }
+        ControlCommand::EnablePushsyncSwap {
+            chequebook,
+            swap_secret,
+            chain_id,
+            outbound_ledger_path,
+            ack,
+        } => {
+            // Idempotent: a chequebook is deployed once and reused
+            // forever, so a repeat install (e.g. a second storage buy
+            // in the same session) must not rebuild the ledger / lose
+            // the in-flight per-peer debt counters.
+            if let Some(existing) = state.pushsync_swap.as_ref() {
+                if existing.chequebook() == chequebook {
+                    let _ = ack.send(ControlAck::Ok {
+                        message: format!(
+                            "outbound SWAP settlement already enabled (chequebook 0x{})",
+                            hex::encode(chequebook),
+                        ),
+                    });
+                    return;
+                }
+            }
+            let cfg = crate::PushsyncSwapConfig::new(
+                chequebook,
+                swap_secret,
+                chain_id,
+                PathBuf::from(outbound_ledger_path),
+                state.peer_eth.clone(),
+            );
+            let mut svc = crate::PushsyncSwap::new(cfg, control.clone());
+            if let Some(tx) = state.hot_hint.clone() {
+                svc = svc.with_hot_hint(tx);
+            }
+            state.pushsync_swap = Some(Arc::new(svc));
+            info!(
+                target: "ant_p2p::pushsync_swap",
+                chequebook = %hex::encode(chequebook),
+                "outbound SWAP settlement enabled at runtime — pushsync will emit cheques",
+            );
+            let _ = ack.send(ControlAck::Ok {
+                message: format!(
+                    "outbound SWAP settlement enabled (chequebook 0x{})",
+                    hex::encode(chequebook),
+                ),
+            });
         }
         ControlCommand::PutChunkLocal { wire, ack } => {
             handle_put_chunk_local(state, wire, ack);

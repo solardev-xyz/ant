@@ -569,6 +569,15 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
                     .into(),
             });
         }
+        // Outbound SWAP settlement bootstrap is an `ant-ffi`-only path
+        // (first storage buy on a phone node); the gateway never emits
+        // it, so the fixture just acks OK rather than modelling a
+        // chequebook install.
+        ControlCommand::EnablePushsyncSwap { ack, .. } => {
+            let _ = ack.send(ControlAck::Ok {
+                message: "settlement enable ignored (test fixture)".into(),
+            });
+        }
     }
 }
 

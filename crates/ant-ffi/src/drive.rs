@@ -88,6 +88,74 @@ pub(crate) fn reload_persisted_issuers(
 }
 
 // ---------------------------------------------------------------------------
+// Chequebook association (outbound SWAP settlement bootstrap)
+// ---------------------------------------------------------------------------
+
+/// On-disk record of the chequebook this node auto-deployed (or
+/// rediscovered) for outbound pushsync settlement. Same shape `antd`
+/// writes at `<data-dir>/chequebook.json`, so a data dir is portable
+/// between the daemon and the embedded node. Only `chequebook` is read
+/// back on startup; the rest is provenance for debugging.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct ChequebookFile {
+    pub(crate) chequebook: String,
+    pub(crate) issuer: String,
+    pub(crate) salt: String,
+    pub(crate) deploy_tx: String,
+}
+
+/// Path of the persisted chequebook association inside `data_dir`.
+pub(crate) fn chequebook_path(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("chequebook.json")
+}
+
+/// Outbound cumulative-payout ledger path inside `data_dir`. Shared by
+/// the startup wiring and the runtime `EnablePushsyncSwap` install so a
+/// chequebook deployed mid-session and one reloaded next launch settle
+/// against the same cumulative.
+pub(crate) fn outbound_ledger_path(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("pushsync_outbound.json")
+}
+
+/// Load the persisted chequebook address, if any. A malformed file is
+/// treated as "none" (we log and move on) rather than a hard error:
+/// the embedded node must always come up for reads, and a fresh
+/// deploy on the next storage buy is self-healing.
+pub(crate) fn load_persisted_chequebook(data_dir: &std::path::Path) -> Option<[u8; 20]> {
+    let path = chequebook_path(data_dir);
+    if !path.exists() {
+        return None;
+    }
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(target: "ant-ffi", path = %path.display(), "read chequebook association: {e}");
+            return None;
+        }
+    };
+    let file: ChequebookFile = match serde_json::from_str(&raw) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(target: "ant-ffi", path = %path.display(), "parse chequebook association: {e}");
+            return None;
+        }
+    };
+    let s = file
+        .chequebook
+        .trim()
+        .strip_prefix("0x")
+        .unwrap_or(file.chequebook.trim());
+    let mut cb = [0u8; 20];
+    match hex::decode_to_slice(s, &mut cb) {
+        Ok(()) => Some(cb),
+        Err(e) => {
+            tracing::warn!(target: "ant-ffi", chequebook = %file.chequebook, "decode persisted chequebook: {e}");
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Uploads
 // ---------------------------------------------------------------------------
 
@@ -492,6 +560,7 @@ pub(crate) fn storage_buy(
     let cmd_tx = h.cmd_tx.clone();
     let secret = h.signing_secret;
     let owner = h.eth;
+    let data_dir = h.data_dir.clone();
     h.runtime.block_on(async move {
         use primitive_types::U256;
 
@@ -527,6 +596,10 @@ pub(crate) fn storage_buy(
         let batch_id = ant_chain::tx::extract_created_batch_id(&receipt)
             .ok_or_else(|| DriveError::Op("storage purchase receipt had no batch".into()))?;
         register_batch(&cmd_tx, batch_id, depth, POSTAGE_BUCKET_DEPTH, immutable).await?;
+        // Now that the wallet is funded and a batch exists, make sure
+        // outbound settlement is on so the upload actually reaches the
+        // network (best-effort; never fails the purchase).
+        ensure_settlement(&cmd_tx, &client, &wallet, &data_dir, secret, owner).await;
         postage_status_json(&cmd_tx).await
     })
 }
@@ -558,6 +631,7 @@ pub(crate) fn storage_buy_xdai(
     let cmd_tx = h.cmd_tx.clone();
     let secret = h.signing_secret;
     let owner = h.eth;
+    let data_dir = h.data_dir.clone();
     h.runtime.block_on(async move {
         use primitive_types::U256;
 
@@ -632,8 +706,216 @@ pub(crate) fn storage_buy_xdai(
         let batch_id = ant_chain::tx::extract_created_batch_id(&receipt)
             .ok_or_else(|| DriveError::Op("storage purchase receipt had no batch".into()))?;
         register_batch(&cmd_tx, batch_id, depth, POSTAGE_BUCKET_DEPTH, immutable).await?;
+        // Now that the wallet is funded and a batch exists, make sure
+        // outbound settlement is on so the upload actually reaches the
+        // network (best-effort; never fails the purchase).
+        ensure_settlement(&cmd_tx, &client, &wallet, &data_dir, secret, owner).await;
         postage_status_json(&cmd_tx).await
     })
+}
+
+/// Ensure this node has a factory-registered chequebook and switch on
+/// outbound SWAP settlement for the *running* node, so the batch the
+/// user just bought can actually be pushed to the network. Without a
+/// chequebook, bee's accounting locks us out after ~20 K chunks across
+/// the peer set and the upload stalls — the user sees "uploaded" but
+/// the content never propagates.
+///
+/// Resolution order mirrors `antd`:
+///   1. **Persisted / startup** — a chequebook we deployed on an
+///      earlier run (already enabled at `ant_init`); re-send the enable
+///      command (idempotent) so a chequebook deployed *this* session is
+///      also covered.
+///   2. **Rediscover** — a chequebook this node EOA already owns
+///      on-chain (e.g. a reinstalled app with the same backed-up key);
+///      adopt + persist it rather than stranding its balance.
+///   3. **Auto-deploy** — first run with a funded wallet: deploy a
+///      fresh factory-registered chequebook (issuer = node EOA),
+///      persist it, leave it unfunded (bee still accepts the cheques;
+///      it's cashed once the user deposits BZZ).
+///
+/// Best-effort: never fails the surrounding storage purchase. A thin
+/// wallet (no spare xDAI for the one-time deploy) or flaky RPC just
+/// logs a warning; settlement enables on the next buy or app launch.
+/// The node wallet both pays gas and is the issuer, so no external key
+/// is ever introduced.
+#[cfg(feature = "chain")]
+pub(crate) async fn ensure_settlement(
+    cmd_tx: &mpsc::Sender<ControlCommand>,
+    client: &ant_chain::ChainClient,
+    wallet: &ant_chain::tx::Wallet,
+    data_dir: &std::path::Path,
+    swap_secret: [u8; 32],
+    node_eth: [u8; 20],
+) {
+    let chequebook = match resolve_or_deploy_chequebook(client, wallet, data_dir, node_eth).await {
+        Ok(Some(cb)) => cb,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(
+                target: "ant-ffi",
+                "could not enable network settlement (uploads still work for a while, \
+                 then stall until a chequebook exists): {e}",
+            );
+            return;
+        }
+    };
+
+    let (ack_tx, ack_rx) = oneshot::channel();
+    if send(
+        cmd_tx,
+        ControlCommand::EnablePushsyncSwap {
+            chequebook,
+            swap_secret,
+            chain_id: GNOSIS_CHAIN_ID,
+            outbound_ledger_path: outbound_ledger_path(data_dir)
+                .to_string_lossy()
+                .into_owned(),
+            ack: ack_tx,
+        },
+    )
+    .await
+    .is_err()
+    {
+        return;
+    }
+    match recv_oneshot(ack_rx).await {
+        Ok(ControlAck::Ok { message }) => {
+            tracing::info!(target: "ant-ffi", "{message}");
+        }
+        Ok(ControlAck::Error { message }) => {
+            tracing::warn!(target: "ant-ffi", "enable settlement: {message}");
+        }
+        _ => {}
+    }
+}
+
+/// Reuse / rediscover / deploy a chequebook for `node_eth`, persisting
+/// the association so future launches reload it directly. Returns the
+/// 20-byte chequebook address, or `None` when the wallet can't afford
+/// the one-time deploy (a soft skip, not an error).
+#[cfg(feature = "chain")]
+async fn resolve_or_deploy_chequebook(
+    client: &ant_chain::ChainClient,
+    wallet: &ant_chain::tx::Wallet,
+    data_dir: &std::path::Path,
+    node_eth: [u8; 20],
+) -> Result<Option<[u8; 20]>, DriveError> {
+    use ant_chain::chequebook::{
+        extract_deployed_chequebook, random_chequebook_salt, DEFAULT_HARD_DEPOSIT_TIMEOUT_SECS,
+        GNOSIS_CHEQUEBOOK_FACTORY,
+    };
+    use ant_chain::tx::{DEFAULT_GAS_PRICE_WEI, FACTORY_DEPLOY_CHEQUEBOOK_GAS};
+    use primitive_types::U256;
+
+    // 1. Already known (persisted from a prior run / this session).
+    if let Some(cb) = load_persisted_chequebook(data_dir) {
+        return Ok(Some(cb));
+    }
+
+    // 2. Rediscover a chequebook this node EOA already owns on-chain
+    //    (reinstall with a restored key). Adopt + persist it.
+    match ant_chain::discover::discover_owned_chequebook(
+        client,
+        &GNOSIS_CHEQUEBOOK_FACTORY,
+        ant_chain::GNOSIS_POSTAGE_STAMP,
+        ant_chain::GNOSIS_BZZ_TOKEN,
+        &node_eth,
+        ant_chain::discover::GNOSIS_XBZZ_DEPLOY_BLOCK,
+    )
+    .await
+    {
+        Ok(Some(cb)) => {
+            persist_chequebook(data_dir, cb, node_eth, String::new(), String::new());
+            tracing::info!(
+                target: "ant-ffi",
+                chequebook = %format!("0x{}", hex::encode(cb)),
+                "rediscovered node-owned chequebook on-chain; adopting it",
+            );
+            return Ok(Some(cb));
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(target: "ant-ffi", "chequebook rediscovery scan failed: {e}"),
+    }
+
+    // 3. Auto-deploy. Gas pre-flight first: a deploy we can't pay for
+    //    just burns a failed-tx wait, so skip softly instead.
+    let need_gas_wei =
+        U256::from(DEFAULT_GAS_PRICE_WEI).saturating_mul(U256::from(FACTORY_DEPLOY_CHEQUEBOOK_GAS));
+    let native = client
+        .eth_get_balance_lower128(&node_eth)
+        .await
+        .map_err(|e| DriveError::Op(format!("read xDAI balance: {e}")))?;
+    if U256::from(native) < need_gas_wei {
+        tracing::warn!(
+            target: "ant-ffi",
+            "not enough spare xDAI to deploy a chequebook (need ~{need_gas_wei} wei); \
+             network settlement will turn on after you add a little more xDAI and buy again",
+        );
+        return Ok(None);
+    }
+
+    let salt = random_chequebook_salt();
+    let receipt = wallet
+        .deploy_chequebook(
+            client,
+            &GNOSIS_CHEQUEBOOK_FACTORY,
+            &node_eth,
+            U256::from(DEFAULT_HARD_DEPOSIT_TIMEOUT_SECS),
+            &salt,
+        )
+        .await
+        .map_err(|e| DriveError::Op(format!("deploy chequebook: {e}")))?;
+    let cb = extract_deployed_chequebook(&receipt)
+        .ok_or_else(|| DriveError::Op("deploy tx emitted no SimpleSwapDeployed log".into()))?;
+    persist_chequebook(
+        data_dir,
+        cb,
+        node_eth,
+        format!("0x{}", hex::encode(salt)),
+        format!("0x{}", hex::encode(receipt.tx_hash)),
+    );
+    tracing::info!(
+        target: "ant-ffi",
+        chequebook = %format!("0x{}", hex::encode(cb)),
+        tx = %format!("0x{}", hex::encode(receipt.tx_hash)),
+        "auto-deployed factory-registered chequebook (issuer = node EOA)",
+    );
+    Ok(Some(cb))
+}
+
+/// Atomically persist the chequebook association (write-tmp + rename).
+/// Best-effort: a write failure only means we re-resolve next launch.
+#[cfg(feature = "chain")]
+fn persist_chequebook(
+    data_dir: &std::path::Path,
+    chequebook: [u8; 20],
+    issuer: [u8; 20],
+    salt: String,
+    deploy_tx: String,
+) {
+    let file = ChequebookFile {
+        chequebook: format!("0x{}", hex::encode(chequebook)),
+        issuer: format!("0x{}", hex::encode(issuer)),
+        salt,
+        deploy_tx,
+    };
+    let path = chequebook_path(data_dir);
+    let json = match serde_json::to_string_pretty(&file) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::warn!(target: "ant-ffi", "serialize chequebook association: {e}");
+            return;
+        }
+    };
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
+        tracing::warn!(target: "ant-ffi", path = %tmp.display(), "write chequebook association: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        tracing::warn!(target: "ant-ffi", path = %path.display(), "persist chequebook association: {e}");
+    }
 }
 
 /// Render a PLUR amount as a short xBZZ decimal string (4 dp).

@@ -80,6 +80,11 @@ const NO_PEERS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 /// media files or a couple of long-form videos.
 const DISK_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
+/// Gnosis chain id. Baked into the EIP-712 cheque domain separator for
+/// both the inbound SWAP listener and outbound settlement; bee's
+/// chequebook code is hard-coded to expect `chainId = 100` on mainnet.
+const GNOSIS_CHAIN_ID: u64 = 100;
+
 /// Per-request joiner size ceiling. `ant_retrieval::DEFAULT_MAX_FILE_BYTES`
 /// is 32 MiB, which is the right cap for interactive `antctl get` but
 /// trips on realistic bzz payloads (photos, short videos, archives).
@@ -126,6 +131,14 @@ pub struct AntHandle {
     /// The node's Ethereum address (derived from `signing_secret`). The
     /// postage batch owner and the "account address" `AntDrive` shows.
     eth: [u8; 20],
+    /// The node's data directory (the path passed to `ant_init`). Held
+    /// so the on-chain storage flow can persist the auto-deployed
+    /// chequebook association (`chequebook.json`) and locate the
+    /// outbound cheque ledger (`pushsync_outbound.json`) next to the
+    /// rest of the node state. Only the on-chain storage flow reads it,
+    /// so it's dead weight in the download-only (`chain`-off) slice.
+    #[cfg_attr(not(feature = "chain"), allow(dead_code))]
+    data_dir: PathBuf,
 }
 
 /// Live snapshot of the in-flight download, maintained by the
@@ -351,6 +364,44 @@ fn init_inner(data_dir: &Path) -> Result<AntHandle, FfiError> {
         tracing::warn!(target: "ant-ffi", "rehydrate upload jobs: {e}");
     }
 
+    // SWAP settlement (parity with `antd`'s startup wiring).
+    //
+    // Inbound listener: always on. Accepting cheques doesn't require us
+    // to own a chequebook (we're the beneficiary, not the issuer), so
+    // the node can be paid for serving content from the very first
+    // launch. The credit ledger persists across restarts.
+    let swap_cfg = ant_p2p::SwapConfig {
+        our_beneficiary: eth,
+        chain_id: GNOSIS_CHAIN_ID,
+        ledger_path: data_dir.join("swap_credits.json"),
+        events_tx: None,
+    };
+    // Outbound settlement: wire it now only if this device already
+    // deployed a chequebook on an earlier run (persisted at
+    // `<data_dir>/chequebook.json`, issuer = node EOA, so the node
+    // signing key signs cheques). On a fresh install there's no
+    // chequebook yet — the node wallet is unfunded until the user buys
+    // storage — so it stays disabled here and gets installed at runtime
+    // by `storage_buy*` once a chequebook exists (see
+    // `drive::ensure_settlement`). Without an RPC at init we can't run
+    // the factory-registration check; the chequebook was factory-built
+    // when we deployed it, so building unconditionally matches antd's
+    // no-RPC manual path.
+    let pushsync_cfg = drive::load_persisted_chequebook(data_dir).map(|chequebook| {
+        tracing::info!(
+            target: "ant-ffi",
+            chequebook = %format!("0x{}", hex::encode(chequebook)),
+            "reusing persisted chequebook — outbound SWAP settlement enabled at startup",
+        );
+        ant_p2p::PushsyncSwapConfig::new(
+            chequebook,
+            signing_secret,
+            GNOSIS_CHAIN_ID,
+            drive::outbound_ledger_path(data_dir),
+            ant_p2p::PeerEthMap::new(),
+        )
+    });
+
     let cfg = NodeConfig::mainnet_default(signing_secret, overlay_nonce, bootnodes, libp2p_keypair)
         .with_status(status_tx)
         .with_process_start(process_start)
@@ -358,6 +409,8 @@ fn init_inner(data_dir: &Path) -> Result<AntHandle, FfiError> {
         .with_commands(cmd_rx)
         .with_disk_cache(disk_cache)
         .with_upload(Some(upload_runtime))
+        .with_swap(Some(swap_cfg))
+        .with_pushsync_swap(pushsync_cfg)
         .with_upload_manager(Some(upload_manager));
 
     runtime.spawn(async move {
@@ -384,6 +437,7 @@ fn init_inner(data_dir: &Path) -> Result<AntHandle, FfiError> {
         cancel_notify: Notify::new(),
         signing_secret,
         eth,
+        data_dir: data_dir.to_path_buf(),
     })
 }
 

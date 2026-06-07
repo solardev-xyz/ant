@@ -179,6 +179,28 @@ pub enum ControlCommand {
         immutable: bool,
         ack: oneshot::Sender<ControlAck>,
     },
+    /// Install (or replace) the outbound SWAP settlement subsystem on
+    /// the running node, so pushsync starts emitting cheques without a
+    /// restart. Sent by `ant-ffi` right after it deploys / rediscovers
+    /// the node's chequebook on first storage purchase: at that point
+    /// the node wallet is funded and a factory-registered chequebook
+    /// exists, but the swarm loop came up (at `ant_init`) before either
+    /// was true. Without this the freshly bought batch would upload at
+    /// most ~20 K chunks across the peer set before bee's accounting
+    /// locks us out, and settlement would only take effect on the next
+    /// app launch (when init reloads the persisted chequebook).
+    ///
+    /// `swap_secret` is the 32-byte secp256k1 secret of the
+    /// chequebook's issuer EOA (the node identity key for an
+    /// auto-deployed chequebook). Idempotent: re-installing the same
+    /// `chequebook` is a no-op that re-acks `Ok`.
+    EnablePushsyncSwap {
+        chequebook: [u8; 20],
+        swap_secret: [u8; 32],
+        chain_id: u64,
+        outbound_ledger_path: String,
+        ack: oneshot::Sender<ControlAck>,
+    },
     /// Create a new upload job. The node loop forwards to its
     /// `UploadManager`, which writes the persistent manifest, spawns
     /// the driver task, and acks with the assigned job id.
