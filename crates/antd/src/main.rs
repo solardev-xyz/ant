@@ -15,7 +15,7 @@ use ant_crypto::{
 use ant_gateway::{Gateway, GatewayHandle, GatewayIdentity, TagRegistry};
 use ant_node::{run_node, NodeConfig};
 use ant_p2p::UploadRuntime;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::parser::ValueSource;
 use clap::{CommandFactory, FromArgMatches, Parser};
 use fs4::{FileExt, TryLockError};
@@ -1394,28 +1394,6 @@ fn open_recovered_issuer(
     }
 }
 
-/// Persisted association between this node's data-dir and a
-/// chequebook it auto-deployed. Written once on first deploy and
-/// reloaded on every subsequent start (deploy-once, reuse-forever —
-/// the equivalent of the chequebook record bee keeps in its
-/// statestore, which `antd` can't read). The issuer baked into the
-/// chequebook is always the node EOA, so the node `signing_secret`
-/// is the cheque signer; the extra fields are pure provenance for
-/// operator debugging / on-chain cross-referencing.
-#[derive(Serialize, Deserialize)]
-struct ChequebookFile {
-    /// Deployed `SimpleSwap` contract address (`0x` + 40 hex).
-    chequebook: String,
-    /// Issuer EOA baked into the chequebook (the node's own address).
-    issuer: String,
-    /// CREATE2 salt used for the deploy (hex).
-    #[serde(default)]
-    salt: String,
-    /// Deploy tx hash (hex).
-    #[serde(default)]
-    deploy_tx: String,
-}
-
 /// Outcome of resolving the outbound-settlement chequebook: the
 /// address to report through the chain context's `GET /chequebook/*`
 /// endpoints, and the (factory-verified) pushsync config used to sign
@@ -1544,7 +1522,8 @@ async fn resolve_chequebook(
     }
 
     // 2. Persisted auto-deployed chequebook — reuse forever.
-    if let Some(persisted) = load_persisted_chequebook(&persist_path)? {
+    if let Some(persisted) = ant_chain::chequebook_store::load_persisted_chequebook(&persist_path)?
+    {
         tracing::info!(
             target: "antd",
             chequebook = %format!("0x{}", hex::encode(persisted)),
@@ -1593,14 +1572,9 @@ async fn resolve_chequebook(
                 // scan becomes a one-time cost). Salt / deploy tx are
                 // unknown for a rediscovered chequebook; the issuer is
                 // the node EOA, so `signing_secret` signs cheques.
-                if let Err(e) = persist_chequebook(
+                if let Err(e) = ant_chain::chequebook_store::persist_chequebook(
                     &persist_path,
-                    &ChequebookFile {
-                        chequebook: format!("0x{}", hex::encode(cb)),
-                        issuer: format!("0x{}", hex::encode(node_eth)),
-                        salt: String::new(),
-                        deploy_tx: String::new(),
-                    },
+                    &ant_chain::chequebook_store::ChequebookFile::rediscovered(&cb, &node_eth),
                 ) {
                     tracing::warn!(
                         target: "antd",
@@ -1658,10 +1632,25 @@ async fn resolve_chequebook(
         });
     }
 
-    match auto_deploy_chequebook(
-        &rpc,
-        signing_secret,
-        node_eth,
+    let client = ant_chain::ChainClient::new(&rpc);
+    let wallet = match ant_chain::tx::Wallet::new(signing_secret, ant_chain::tx::GNOSIS_CHAIN_ID) {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!(
+                target: "antd",
+                error = %format!("{e:#}"),
+                "could not derive node wallet for chequebook auto-deploy; starting without outbound SWAP settlement",
+            );
+            return Ok(ResolvedChequebook {
+                address: None,
+                pushsync: None,
+            });
+        }
+    };
+    match ant_chain::chequebook_store::auto_deploy_chequebook(
+        &client,
+        &wallet,
+        &node_eth,
         opt.chequebook_deposit_plur,
         &persist_path,
     )
@@ -1715,7 +1704,10 @@ async fn verify_then_build_swap(
     ledger_path: &Path,
 ) -> Option<ant_p2p::PushsyncSwapConfig> {
     if let Some(rpc) = rpc_url {
-        match verify_chequebook_with_factory(rpc, &chequebook).await {
+        let client = ant_chain::ChainClient::new(rpc);
+        match ant_chain::chequebook_store::verify_chequebook_with_factory(&client, &chequebook)
+            .await
+        {
             Ok(true) => tracing::info!(
                 target: "antd",
                 chequebook = %format!("0x{}", hex::encode(chequebook)),
@@ -1758,186 +1750,6 @@ async fn verify_then_build_swap(
     ))
 }
 
-/// Load the persisted auto-deployed chequebook address, if any. A
-/// malformed file is a hard error — silently ignoring it would
-/// re-trigger a deploy and waste gas on every restart.
-fn load_persisted_chequebook(path: &Path) -> Result<Option<[u8; 20]>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("read chequebook association {}", path.display()))?;
-    let file: ChequebookFile = serde_json::from_str(&raw)
-        .with_context(|| format!("parse chequebook association {}", path.display()))?;
-    let mut cb = [0u8; 20];
-    hex::decode_to_slice(strip_0x(file.chequebook.trim()), &mut cb)
-        .with_context(|| format!("decode persisted chequebook {}", file.chequebook))?;
-    Ok(Some(cb))
-}
-
-/// Atomically persist the chequebook association (write-tmp + rename),
-/// so a crash mid-write can't leave a half-written file that a later
-/// start would reject.
-fn persist_chequebook(path: &Path, file: &ChequebookFile) -> Result<()> {
-    let json = serde_json::to_string_pretty(file).context("serialize chequebook association")?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json.as_bytes()).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
-    Ok(())
-}
-
-/// Deploy a fresh factory-registered chequebook (issuer = node EOA),
-/// persist the association, then fund it best-effort with xBZZ. The
-/// node wallet (`signing_secret`) both pays gas and is the issuer, so
-/// no external key is ever injected — matching bee's own first-start
-/// behaviour against a fresh statestore. Returns the deployed
-/// chequebook address.
-async fn auto_deploy_chequebook(
-    rpc_url: &str,
-    signing_secret: [u8; SECP256K1_SECRET_LEN],
-    node_eth: [u8; 20],
-    deposit_plur: u128,
-    persist_path: &Path,
-) -> Result<[u8; 20]> {
-    use ant_chain::chequebook::{
-        extract_deployed_chequebook, random_chequebook_salt, DEFAULT_HARD_DEPOSIT_TIMEOUT_SECS,
-        GNOSIS_BZZ_TOKEN_BYTES, GNOSIS_CHEQUEBOOK_FACTORY,
-    };
-    use ant_chain::tx::{
-        Wallet, DEFAULT_GAS_PRICE_WEI, ERC20_TRANSFER_GAS, FACTORY_DEPLOY_CHEQUEBOOK_GAS,
-    };
-    use ant_chain::ChainClient;
-    use primitive_types::U256;
-
-    let client = ChainClient::new(rpc_url);
-
-    // Gas pre-flight: a deploy we can't pay for just burns a failed-tx
-    // wait. Require enough xDAI to cover the deploy + a funding transfer
-    // at our default gas price before signing anything.
-    let need_gas_wei = U256::from(DEFAULT_GAS_PRICE_WEI).saturating_mul(U256::from(
-        FACTORY_DEPLOY_CHEQUEBOOK_GAS + ERC20_TRANSFER_GAS,
-    ));
-    let native = client
-        .eth_get_balance_lower128(&node_eth)
-        .await
-        .context("read node xDAI balance")?;
-    if U256::from(native) < need_gas_wei {
-        bail!(
-            "node wallet 0x{} has {} wei xDAI, needs ~{} wei to deploy + fund a chequebook; \
-             fund the wallet or pass --no-auto-chequebook",
-            hex::encode(node_eth),
-            native,
-            need_gas_wei,
-        );
-    }
-
-    let wallet = Wallet::new(signing_secret, ant_chain::tx::GNOSIS_CHAIN_ID)
-        .context("derive node wallet")?;
-    let salt = random_chequebook_salt();
-
-    tracing::info!(
-        target: "antd",
-        factory = %format!("0x{}", hex::encode(GNOSIS_CHEQUEBOOK_FACTORY)),
-        issuer = %format!("0x{}", hex::encode(node_eth)),
-        "no chequebook configured or persisted — auto-deploying a factory-registered chequebook (issuer = node EOA)",
-    );
-
-    let receipt = wallet
-        .deploy_chequebook(
-            &client,
-            &GNOSIS_CHEQUEBOOK_FACTORY,
-            &node_eth,
-            U256::from(DEFAULT_HARD_DEPOSIT_TIMEOUT_SECS),
-            &salt,
-        )
-        .await
-        .context("factory.deploySimpleSwap")?;
-
-    let cb = extract_deployed_chequebook(&receipt).ok_or_else(|| {
-        anyhow!(
-            "deploy tx 0x{} confirmed (block {}) but emitted no SimpleSwapDeployed log",
-            hex::encode(receipt.tx_hash),
-            receipt.block_number,
-        )
-    })?;
-
-    tracing::info!(
-        target: "antd",
-        chequebook = %format!("0x{}", hex::encode(cb)),
-        tx = %format!("0x{}", hex::encode(receipt.tx_hash)),
-        block = receipt.block_number,
-        "auto-deployed chequebook",
-    );
-
-    // Persist immediately, before funding, so a crash between the deploy
-    // and the transfer still reuses this chequebook on the next start
-    // (deploy-once forever) rather than deploying a second one.
-    persist_chequebook(
-        persist_path,
-        &ChequebookFile {
-            chequebook: format!("0x{}", hex::encode(cb)),
-            issuer: format!("0x{}", hex::encode(node_eth)),
-            salt: format!("0x{}", hex::encode(salt)),
-            deploy_tx: format!("0x{}", hex::encode(receipt.tx_hash)),
-        },
-    )
-    .with_context(|| {
-        format!(
-            "persist chequebook association at {}",
-            persist_path.display()
-        )
-    })?;
-
-    // Best-effort funding: cap the deposit to the wallet's BZZ balance
-    // so we never overdraw, and never fail over it — a factory-registered
-    // but unfunded chequebook already unblocks the upload flow (bee
-    // accepts the cheque; cashing waits for a later deposit).
-    if deposit_plur > 0 {
-        match client
-            .erc20_balance_of_lower128(ant_chain::GNOSIS_BZZ_TOKEN, &node_eth)
-            .await
-        {
-            Ok(bzz_bal) => {
-                let deposit = deposit_plur.min(bzz_bal);
-                if deposit == 0 {
-                    tracing::warn!(
-                        target: "antd",
-                        chequebook = %format!("0x{}", hex::encode(cb)),
-                        "node wallet holds no xBZZ; deployed an unfunded chequebook (cheques are still accepted; deposit BZZ later via POST /chequebook/deposit)",
-                    );
-                } else {
-                    match wallet
-                        .erc20_transfer(&client, &GNOSIS_BZZ_TOKEN_BYTES, &cb, U256::from(deposit))
-                        .await
-                    {
-                        Ok(r) => tracing::info!(
-                            target: "antd",
-                            chequebook = %format!("0x{}", hex::encode(cb)),
-                            deposit_plur = deposit,
-                            tx = %format!("0x{}", hex::encode(r.tx_hash)),
-                            "funded chequebook with xBZZ",
-                        ),
-                        Err(e) => tracing::warn!(
-                            target: "antd",
-                            chequebook = %format!("0x{}", hex::encode(cb)),
-                            error = %e,
-                            "chequebook funding transfer failed; chequebook is deployed and usable but unfunded",
-                        ),
-                    }
-                }
-            }
-            Err(e) => tracing::warn!(
-                target: "antd",
-                error = %e,
-                "could not read node xBZZ balance; deployed chequebook left unfunded",
-            ),
-        }
-    }
-
-    Ok(cb)
-}
-
 /// Resolve the RPC endpoint used for the startup recovery log scans.
 /// Defaults to the public Gnosis endpoint (`--gnosis-logs-rpc-url`);
 /// an empty value disables on-chain recovery entirely.
@@ -1954,36 +1766,6 @@ fn strip_0x(s: &str) -> &str {
     s.strip_prefix("0x")
         .or_else(|| s.strip_prefix("0X"))
         .unwrap_or(s)
-}
-
-/// One `eth_call` to the Swarm chequebook factory's
-/// `deployedContracts(address)` view. Returns `Ok(true)` iff the
-/// factory has a record of having deployed `chequebook` itself —
-/// which is exactly the predicate bee's `chequeStore.ReceiveCheque`
-/// uses to decide whether to accept a cheque drawn on it. Any RPC
-/// failure surfaces as `Err`, distinguishable from the legitimate
-/// "no, that contract is unknown to us" answer.
-async fn verify_chequebook_with_factory(rpc_url: &str, chequebook: &[u8; 20]) -> Result<bool> {
-    use ant_chain::chequebook::{factory_deployed_contracts_calldata, GNOSIS_CHEQUEBOOK_FACTORY};
-    use ant_chain::ChainClient;
-
-    let client = ChainClient::new(rpc_url);
-    let calldata = factory_deployed_contracts_calldata(chequebook);
-    let v = client
-        .eth_call(
-            &format!("0x{}", hex::encode(GNOSIS_CHEQUEBOOK_FACTORY)),
-            &format!("0x{}", hex::encode(&calldata)),
-        )
-        .await
-        .context("factory.deployedContracts eth_call")?;
-    if v.len() < 32 {
-        bail!(
-            "factory.deployedContracts returned <32 bytes (got {} bytes)",
-            v.len()
-        );
-    }
-    let last_word = &v[v.len() - 32..];
-    Ok(last_word.iter().any(|&b| b != 0))
 }
 
 fn secp256k1_keypair_from_signing_secret(secret: &[u8; SECP256K1_SECRET_LEN]) -> Result<Keypair> {

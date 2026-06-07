@@ -6,6 +6,10 @@
 //! `deployChequebook` and `cashChequeBeneficiary`.
 
 pub mod chequebook;
+/// Chequebook bootstrap shared by `antd` and `ant-ffi`: the persisted
+/// association record plus resolve / auto-deploy / factory-verify
+/// mechanics for outbound SWAP settlement.
+pub mod chequebook_store;
 /// On-chain recovery of node-owned state (postage batches, chequebook)
 /// from the node EOA. RPC-driven, so it needs the `chain-rpc` feature.
 #[cfg(feature = "chain-rpc")]

@@ -382,25 +382,41 @@ fn init_inner(data_dir: &Path) -> Result<AntHandle, FfiError> {
     // signing key signs cheques). On a fresh install there's no
     // chequebook yet — the node wallet is unfunded until the user buys
     // storage — so it stays disabled here and gets installed at runtime
-    // by `storage_buy*` once a chequebook exists (see
+    // by the storage-buy flow once a chequebook exists (see
     // `drive::ensure_settlement`). Without an RPC at init we can't run
     // the factory-registration check; the chequebook was factory-built
     // when we deployed it, so building unconditionally matches antd's
-    // no-RPC manual path.
-    let pushsync_cfg = drive::load_persisted_chequebook(data_dir).map(|chequebook| {
-        tracing::info!(
-            target: "ant-ffi",
-            chequebook = %format!("0x{}", hex::encode(chequebook)),
-            "reusing persisted chequebook — outbound SWAP settlement enabled at startup",
-        );
-        ant_p2p::PushsyncSwapConfig::new(
-            chequebook,
-            signing_secret,
-            GNOSIS_CHAIN_ID,
-            drive::outbound_ledger_path(data_dir),
-            ant_p2p::PeerEthMap::new(),
-        )
-    });
+    // no-RPC manual path. Gated on `chain`: a download-only build never
+    // uploads, so it never needs (or can deploy) a chequebook.
+    #[cfg(feature = "chain")]
+    let pushsync_cfg = match ant_chain::chequebook_store::load_persisted_chequebook(
+        &data_dir.join("chequebook.json"),
+    ) {
+        Ok(Some(chequebook)) => {
+            tracing::info!(
+                target: "ant-ffi",
+                chequebook = %format!("0x{}", hex::encode(chequebook)),
+                "reusing persisted chequebook — outbound SWAP settlement enabled at startup",
+            );
+            Some(ant_p2p::PushsyncSwapConfig::new(
+                chequebook,
+                signing_secret,
+                GNOSIS_CHAIN_ID,
+                data_dir.join("pushsync_outbound.json"),
+                ant_p2p::PeerEthMap::new(),
+            ))
+        }
+        Ok(None) => None,
+        Err(e) => {
+            // Self-healing: a malformed association must not stop the
+            // node coming up for reads; a fresh deploy on the next buy
+            // overwrites it.
+            tracing::warn!(target: "ant-ffi", "ignoring chequebook association: {e}");
+            None
+        }
+    };
+    #[cfg(not(feature = "chain"))]
+    let pushsync_cfg: Option<ant_p2p::PushsyncSwapConfig> = None;
 
     let cfg = NodeConfig::mainnet_default(signing_secret, overlay_nonce, bootnodes, libp2p_keypair)
         .with_status(status_tx)
