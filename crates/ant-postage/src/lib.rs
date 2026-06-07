@@ -709,12 +709,20 @@ mod tests {
     use std::path::PathBuf;
 
     fn tmpdir() -> PathBuf {
+        // A bare nanosecond timestamp collides when two tests start
+        // within the same clock tick (coarse on some platforms), and
+        // their per-test `remove_dir_all` then races — one test wipes
+        // another's `batch.bin`. A per-call atomic counter guarantees a
+        // distinct directory regardless of clock resolution.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let p = std::env::temp_dir().join(format!(
-            "ant-postage-test-{}",
+            "ant-postage-test-{}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            n,
         ));
         std::fs::create_dir_all(&p).unwrap();
         p

@@ -205,6 +205,164 @@ pub async fn join_with_options(
     join_subtree(fetcher, payload, span, 0).await
 }
 
+/// Flat inventory of the chunk addresses that make up a file's data
+/// tree, produced by [`enumerate_chunk_tree`].
+///
+/// `intermediates` are the addresses of the tree's interior nodes
+/// (including the data root) — enumeration has to *fetch* each of these
+/// to read its child references, so by the time enumeration returns
+/// successfully every intermediate is known to be retrievable.
+/// `leaves` are the addresses of the data-bearing chunks; enumeration
+/// does **not** fetch them (their addresses are listed in their parent
+/// intermediate), so a caller that wants to confirm leaves are
+/// retrievable must probe them separately — typically a bounded random
+/// sample rather than the whole set.
+#[derive(Debug, Default, Clone)]
+pub struct ChunkInventory {
+    pub leaves: Vec<[u8; 32]>,
+    pub intermediates: Vec<[u8; 32]>,
+}
+
+impl ChunkInventory {
+    /// Total chunk count of the data tree (leaves + interior nodes).
+    #[must_use]
+    pub fn total(&self) -> usize {
+        self.leaves.len() + self.intermediates.len()
+    }
+}
+
+/// Enumerate every chunk address in the data tree rooted at `root_addr`
+/// without downloading the whole file.
+///
+/// Interior nodes are fetched through `fetcher` (so their child
+/// references can be read and so they're proven retrievable); leaf
+/// addresses are collected from their parents but **not** fetched. Pass
+/// a cache-free fetcher to make the interior-node fetches go to the
+/// network rather than a local store. `root_chunk_data` is the data
+/// root's full wire bytes (`span (8 LE) || payload`), which the caller
+/// has typically just fetched to learn the file size.
+///
+/// Used by the propagation-verification path to learn a file's exact
+/// chunk layout and then probe a sample of real data leaves, instead of
+/// only checking the root reference.
+pub async fn enumerate_chunk_tree(
+    fetcher: &dyn ChunkFetcher,
+    root_addr: [u8; 32],
+    root_chunk_data: &[u8],
+    max_bytes: usize,
+    options: JoinOptions,
+) -> Result<ChunkInventory, JoinError> {
+    let (span_raw, payload) = split_chunk(root_chunk_data, 0)?;
+    let span_raw = if is_redundancy_none(span_raw) {
+        span_raw
+    } else if options.allow_degraded_redundancy {
+        let mut masked = span_raw;
+        masked[7] = 0;
+        masked
+    } else {
+        return Err(JoinError::UnsupportedRedundancy { level: span_raw[7] });
+    };
+    let span = u64::from_le_bytes(span_raw);
+    if span > max_bytes as u64 {
+        return Err(JoinError::TooLarge {
+            span,
+            cap: max_bytes,
+        });
+    }
+
+    let mut inv = ChunkInventory::default();
+    // A root whose span fits within its own payload *is* the single data
+    // leaf — there are no interior nodes to walk.
+    if span <= payload.len() as u64 {
+        inv.leaves.push(root_addr);
+        return Ok(inv);
+    }
+    inv.intermediates.push(root_addr);
+    let sub = enumerate_subtree(fetcher, payload, span, 0).await?;
+    inv.leaves.extend(sub.leaves);
+    inv.intermediates.extend(sub.intermediates);
+    Ok(inv)
+}
+
+/// Recursively collect the inventory of an intermediate node's subtree.
+/// Mirrors [`join_subtree`]'s spec computation (`subtrie_section`,
+/// zero-pad stripping, last-child remainder) but only fetches interior
+/// nodes and records addresses rather than reconstructing bytes. Walks
+/// sequentially — interior nodes are ~1/128 of all chunks, so there's
+/// no need for the fan-out the byte-joiner uses.
+fn enumerate_subtree<'a>(
+    fetcher: &'a dyn ChunkFetcher,
+    chunk_payload: &'a [u8],
+    subtree_span: u64,
+    offset: u64,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<ChunkInventory, JoinError>> + Send + 'a>,
+> {
+    Box::pin(async move {
+        if !chunk_payload.len().is_multiple_of(32) {
+            return Err(JoinError::MalformedChunk {
+                offset,
+                detail: format!(
+                    "intermediate payload len {} not a multiple of 32",
+                    chunk_payload.len()
+                ),
+            });
+        }
+        let effective = effective_payload_size(chunk_payload);
+        if effective == 0 {
+            return Err(JoinError::MalformedChunk {
+                offset,
+                detail: "intermediate chunk has no non-zero refs".into(),
+            });
+        }
+        let chunk_payload = &chunk_payload[..effective];
+        let refs = chunk_payload.len() / 32;
+        if refs > MAX_BRANCHES {
+            return Err(JoinError::MalformedChunk {
+                offset,
+                detail: format!("intermediate ref count {refs} out of range"),
+            });
+        }
+        let branch_size = subtrie_section(refs, subtree_span);
+
+        let mut inv = ChunkInventory::default();
+        let mut remaining = subtree_span;
+        let mut child_offset = offset;
+        for i in 0..refs {
+            let mut child_addr = [0u8; 32];
+            child_addr.copy_from_slice(&chunk_payload[i * 32..(i + 1) * 32]);
+            let child_span = if i == refs - 1 {
+                remaining
+            } else {
+                branch_size.min(remaining)
+            };
+            // A child covering at most one chunk's worth of bytes is a
+            // data leaf; anything larger is another interior node we
+            // must fetch to read its own children.
+            if child_span <= CHUNK_SIZE as u64 {
+                inv.leaves.push(child_addr);
+            } else {
+                inv.intermediates.push(child_addr);
+                let child = fetcher
+                    .fetch(child_addr)
+                    .await
+                    .map_err(|e| JoinError::FetchChunk {
+                        addr: hex::encode(child_addr),
+                        source: e,
+                    })?;
+                let (_, child_payload) = split_chunk(&child, child_offset)?;
+                let sub =
+                    enumerate_subtree(fetcher, child_payload, child_span, child_offset).await?;
+                inv.leaves.extend(sub.leaves);
+                inv.intermediates.extend(sub.intermediates);
+            }
+            remaining = remaining.saturating_sub(child_span);
+            child_offset = child_offset.saturating_add(child_span);
+        }
+        Ok(inv)
+    })
+}
+
 /// Stream a joined file in byte order without materialising the entire
 /// body in one `Vec<u8>`.
 ///
@@ -1283,6 +1441,57 @@ mod tests {
         root_wire.extend_from_slice(&total_span.to_le_bytes());
         root_wire.extend_from_slice(&root_payload);
         (root_wire, expected)
+    }
+
+    /// A single-chunk file enumerates to exactly one leaf (the root)
+    /// and no interior nodes, and never touches the fetcher.
+    #[tokio::test]
+    async fn enumerate_single_chunk_file() {
+        let payload = b"hello swarm".to_vec();
+        let (addr, wire) = cac_new(&payload).unwrap();
+        let fetcher = MapFetcher::new();
+        let inv = enumerate_chunk_tree(
+            &fetcher,
+            addr,
+            &wire,
+            DEFAULT_MAX_FILE_BYTES,
+            JoinOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(inv.leaves, vec![addr]);
+        assert!(inv.intermediates.is_empty());
+        assert_eq!(inv.total(), 1);
+    }
+
+    /// The 130-leaf 3-level tree enumerates to 130 leaves and 3 interior
+    /// nodes (root + the two L1 intermediates), and the leaf addresses
+    /// match the tree's data chunks. The two L1 intermediates must be
+    /// fetched during the walk; the leaves must NOT be (the fixture's
+    /// `MapFetcher` panics on missing chunks, but leaves are present
+    /// anyway, so we instead assert the addresses line up).
+    #[tokio::test]
+    async fn enumerate_three_level_tree() {
+        let mut fetcher = MapFetcher::new();
+        let (root_wire, _expected) = build_three_level_fixture(&mut fetcher);
+        let root_addr = chunk_addr(
+            &root_wire[8..],
+            u64::from_le_bytes(root_wire[..8].try_into().unwrap()),
+        );
+        let inv = enumerate_chunk_tree(
+            &fetcher,
+            root_addr,
+            &root_wire,
+            DEFAULT_MAX_FILE_BYTES,
+            JoinOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(inv.leaves.len(), 130, "130 data leaves");
+        assert_eq!(inv.intermediates.len(), 3, "root + 2 L1 interior nodes");
+        assert_eq!(inv.total(), 133);
+        // The root must be the first recorded interior node.
+        assert_eq!(inv.intermediates[0], root_addr);
     }
 
     /// Drain the streaming joiner into a single buffer for comparison.

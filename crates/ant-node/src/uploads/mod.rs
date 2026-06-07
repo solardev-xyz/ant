@@ -53,7 +53,7 @@ use ant_retrieval::{
 // `ManifestWriteError` is re-exported from `ant-retrieval`'s root.
 use futures::stream::{FuturesUnordered, StreamExt};
 use memmap2::Mmap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -152,6 +152,31 @@ fn backoff_for_retry(attempt: u32) -> std::time::Duration {
     let ms = 250u64.saturating_mul(1u64 << attempt).min(4_000);
     std::time::Duration::from_millis(ms)
 }
+
+/// Post-upload self-heal: after every chunk has been pushed, read the
+/// whole file back from the network and re-push any chunk that didn't
+/// land, repeating up to this many rounds. Sized small — pushsync's own
+/// retry budget already absorbs transient per-chunk failures, so heal
+/// only has to mop up the rare chunk that a storer dropped after acking;
+/// 3 read-back/re-push rounds is plenty in practice.
+const MAX_HEAL_ROUNDS: usize = 3;
+
+/// Wait this long before each heal read-back so freshly-pushed chunks
+/// have a moment to replicate across the neighbourhood. Without it the
+/// first read-back races propagation and re-pushes chunks that were
+/// about to be reachable anyway (harmless — pushsync is idempotent —
+/// but wasteful).
+const HEAL_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Address-set batch size per [`ControlCommand::VerifyChunksPresent`]
+/// so each ack's JSON stays bounded on a large file.
+const HEAL_VERIFY_BATCH: usize = 512;
+
+/// Skip the heal pass for files above this chunk count (~200 MB at
+/// 4 KiB leaves). A full network read-back of a multi-GB file would
+/// cost as much as a re-download; the per-chunk pushsync receipts on
+/// the way up are the reliability mechanism for those. Tunable.
+const HEAL_MAX_CHUNKS: usize = 50_000;
 
 /// Future returned by [`UploadManager::dispatch_push`]: a chunk-emit
 /// index (so the ack log can advance the in-order cursor) plus the
@@ -664,6 +689,15 @@ impl UploadManager {
         let mut bytes_emitted: u64 = 0;
         let mut leaf_iter = LeafIter::new(body.as_deref(), snap.source_size);
 
+        // Every chunk address this file produces (data leaves,
+        // intermediates, manifest), regardless of the resume cursor —
+        // the post-upload heal pass reads them all back. Collection
+        // stops (and heal is skipped) once the file exceeds
+        // `HEAL_MAX_CHUNKS` so a multi-GB upload doesn't buffer millions
+        // of addresses or trigger a full re-download to verify.
+        let mut heal_addrs: Vec<[u8; 32]> = Vec::new();
+        let mut heal_overflow = false;
+
         loop {
             // Cancellation check at the top of every loop turn —
             // no chunk dispatch can sneak in after a `cancel` call.
@@ -705,6 +739,7 @@ impl UploadManager {
                     for chunk in chunks {
                         let i = next_index;
                         next_index += 1;
+                        note_heal_addr(&mut heal_addrs, &mut heal_overflow, chunk.address);
                         if i < resume_cursor {
                             // Already pushed in a previous run.
                             // No stamp consumed, no command
@@ -775,6 +810,7 @@ impl UploadManager {
         for chunk in tail {
             let i = next_index;
             next_index += 1;
+            note_heal_addr(&mut heal_addrs, &mut heal_overflow, chunk.address);
             if i < resume_cursor {
                 continue;
             }
@@ -805,6 +841,7 @@ impl UploadManager {
             for chunk in &manifest.chunks {
                 let i = next_index;
                 next_index += 1;
+                note_heal_addr(&mut heal_addrs, &mut heal_overflow, chunk.address);
                 if i < resume_cursor {
                     continue;
                 }
@@ -841,6 +878,41 @@ impl UploadManager {
             bytes = snap.bytes_pushed,
             "upload completed",
         );
+
+        // Self-heal, in the background so the job reports `Completed`
+        // immediately. Reads every chunk back from the network and
+        // re-pushes any that didn't land, so the file ends up actually
+        // retrievable rather than merely pushed-once. Best-effort and
+        // bounded; skipped for very large files (see `HEAL_MAX_CHUNKS`).
+        if heal_overflow {
+            info!(
+                target: "ant_node::uploads",
+                job_id = %snap.job_id,
+                "skipping post-upload heal: file exceeds heal chunk cap",
+            );
+        } else if !handle.cancel_requested.load(Ordering::SeqCst) {
+            let mgr = self.clone();
+            let job_id = snap.job_id.clone();
+            let source_path = source_path.clone();
+            let source_size = snap.source_size;
+            let raw = snap.raw;
+            let name = snap.name.clone();
+            let content_type = snap.content_type.clone();
+            tokio::spawn(async move {
+                mgr.verify_and_heal(
+                    &job_id,
+                    &heal_addrs,
+                    batch_id,
+                    &source_path,
+                    source_size,
+                    raw,
+                    name.as_deref(),
+                    content_type.as_deref(),
+                )
+                .await;
+            });
+        }
+
         // Defensive: silence "unused" lint for `bytes_emitted` —
         // we keep the counter on the side as a debug aid for
         // tracing slow uploads even though `info.bytes_pushed`
@@ -948,6 +1020,218 @@ impl UploadManager {
             )
         })
     }
+
+    /// Post-upload self-heal loop. Reads `all_addrs` back from the
+    /// network (via [`ControlCommand::VerifyChunksPresent`]); any chunk
+    /// that didn't come back is re-derived from the source file and
+    /// re-pushed. Repeats up to [`MAX_HEAL_ROUNDS`] times, with a settle
+    /// delay before each read-back. Best-effort: a daemon-gone or
+    /// no-peers condition ends the loop quietly, and a re-push failure
+    /// is logged rather than failing the (already pushed) upload.
+    #[allow(clippy::too_many_arguments)]
+    async fn verify_and_heal(
+        &self,
+        job_id: &str,
+        all_addrs: &[[u8; 32]],
+        batch_id: [u8; 32],
+        source_path: &Path,
+        source_size: u64,
+        raw: bool,
+        name: Option<&str>,
+        content_type: Option<&str>,
+    ) {
+        for round in 0..MAX_HEAL_ROUNDS {
+            tokio::time::sleep(HEAL_SETTLE_DELAY).await;
+            let missing = self.query_missing(all_addrs).await;
+            if missing.is_empty() {
+                info!(
+                    target: "ant_node::uploads",
+                    job_id, round, chunks = all_addrs.len(),
+                    "post-upload heal: all chunks reachable",
+                );
+                return;
+            }
+            warn!(
+                target: "ant_node::uploads",
+                job_id, round, missing = missing.len(), total = all_addrs.len(),
+                "post-upload heal: re-pushing unreachable chunks",
+            );
+            let missing_set: HashSet<[u8; 32]> = missing.into_iter().collect();
+            if let Err(e) = self
+                .repush_missing(
+                    &missing_set,
+                    batch_id,
+                    source_path,
+                    source_size,
+                    raw,
+                    name,
+                    content_type,
+                )
+                .await
+            {
+                warn!(
+                    target: "ant_node::uploads",
+                    job_id, "post-upload heal re-push failed: {e}",
+                );
+                return;
+            }
+        }
+        // One final read-back after the last re-push round.
+        tokio::time::sleep(HEAL_SETTLE_DELAY).await;
+        let missing = self.query_missing(all_addrs).await;
+        if missing.is_empty() {
+            info!(
+                target: "ant_node::uploads",
+                job_id, chunks = all_addrs.len(),
+                "post-upload heal: all chunks reachable after re-push",
+            );
+        } else {
+            warn!(
+                target: "ant_node::uploads",
+                job_id, missing = missing.len(), total = all_addrs.len(), rounds = MAX_HEAL_ROUNDS,
+                "post-upload heal: chunks still unreachable after all rounds",
+            );
+        }
+    }
+
+    /// Ask the node loop which of `all_addrs` aren't retrievable from
+    /// the network, batching the address list so each ack stays bounded.
+    /// Returns an empty list (i.e. "nothing to heal") on any transport
+    /// error or not-ready condition — heal is best-effort.
+    async fn query_missing(&self, all_addrs: &[[u8; 32]]) -> Vec<[u8; 32]> {
+        let mut missing = Vec::new();
+        for batch in all_addrs.chunks(HEAL_VERIFY_BATCH) {
+            let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
+            if self
+                .inner
+                .cmd_tx
+                .send(ControlCommand::VerifyChunksPresent {
+                    addresses: batch.to_vec(),
+                    ack: ack_tx,
+                })
+                .await
+                .is_err()
+            {
+                return missing;
+            }
+            match ack_rx.await {
+                Ok(ControlAck::Ok { message }) => {
+                    if let Some(batch_missing) = parse_missing(&message) {
+                        missing.extend(batch_missing);
+                    }
+                }
+                // No peers yet, or an unexpected ack — can't verify now,
+                // so report nothing missing and let heal end this round.
+                _ => return missing,
+            }
+        }
+        missing
+    }
+
+    /// Re-derive every chunk of the source file via the deterministic
+    /// streaming splitter and re-push the ones whose address is in
+    /// `missing`. Re-streaming keeps memory flat (we never hold the
+    /// whole file's wire bytes at once) at the cost of re-walking the
+    /// tree; heal runs rarely and on bounded files, so that's fine.
+    #[allow(clippy::too_many_arguments)]
+    async fn repush_missing(
+        &self,
+        missing: &HashSet<[u8; 32]>,
+        batch_id: [u8; 32],
+        source_path: &Path,
+        source_size: u64,
+        raw: bool,
+        name: Option<&str>,
+        content_type: Option<&str>,
+    ) -> Result<(), UploadError> {
+        let file = std::fs::File::open(source_path)?;
+        let body: Option<Mmap> = if source_size == 0 {
+            None
+        } else {
+            // SAFETY: same contract as the upload path — the file is
+            // immutable for the duration; resume already refused on
+            // mtime change before we got here.
+            Some(unsafe { Mmap::map(&file)? })
+        };
+
+        let mut splitter = StreamingSplitter::new();
+        let leaf_iter = LeafIter::new(body.as_deref(), source_size);
+        let mut in_flight: FuturesUnordered<PushFuture> = FuturesUnordered::new();
+
+        // Dispatch `chunk` if it's one of the missing ones, holding the
+        // in-flight window at `MAX_PUSH_CONCURRENCY`.
+        macro_rules! maybe_push {
+            ($chunk:expr) => {{
+                let chunk = $chunk;
+                if missing.contains(&chunk.address) {
+                    if in_flight.len() >= MAX_PUSH_CONCURRENCY {
+                        if let Some((_, res)) = in_flight.next().await {
+                            res?;
+                        }
+                    }
+                    in_flight.push(self.dispatch_push(0, chunk, batch_id));
+                }
+            }};
+        }
+
+        for leaf in leaf_iter {
+            for chunk in splitter.push_leaf(leaf) {
+                maybe_push!(chunk);
+            }
+        }
+        let (data_root, _bytes, tail) = splitter.finish();
+        for chunk in tail {
+            maybe_push!(chunk);
+        }
+        if !raw {
+            let filename = name.unwrap_or("blob.bin").to_string();
+            let manifest = build_single_file_manifest(&filename, content_type, data_root)?;
+            for chunk in &manifest.chunks {
+                maybe_push!(chunk.clone());
+            }
+        }
+        while let Some((_, res)) = in_flight.next().await {
+            res?;
+        }
+        Ok(())
+    }
+}
+
+/// Record a chunk address for the heal pass, capping memory: once the
+/// file crosses [`HEAL_MAX_CHUNKS`] we set `overflow`, drop what we've
+/// collected, and stop — the caller then skips heal for this upload.
+fn note_heal_addr(addrs: &mut Vec<[u8; 32]>, overflow: &mut bool, addr: [u8; 32]) {
+    if *overflow {
+        return;
+    }
+    if addrs.len() >= HEAL_MAX_CHUNKS {
+        *overflow = true;
+        addrs.clear();
+        addrs.shrink_to_fit();
+        return;
+    }
+    addrs.push(addr);
+}
+
+/// Parse the `{"checked":N,"missing":["0x..",...]}` body of a
+/// [`ControlCommand::VerifyChunksPresent`] ack into the missing chunk
+/// addresses. Malformed entries are skipped; a wholly unparseable body
+/// yields `None`.
+fn parse_missing(message: &str) -> Option<Vec<[u8; 32]>> {
+    #[derive(serde::Deserialize)]
+    struct Resp {
+        missing: Vec<String>,
+    }
+    let resp: Resp = serde_json::from_str(message).ok()?;
+    let mut out = Vec::with_capacity(resp.missing.len());
+    for s in resp.missing {
+        let hexstr = s.strip_prefix("0x").unwrap_or(&s);
+        let mut addr = [0u8; 32];
+        if hex::decode_to_slice(hexstr, &mut addr).is_ok() {
+            out.push(addr);
+        }
+    }
+    Some(out)
 }
 
 /// Iterator over the source file in `CHUNK_SIZE`-byte windows. The
@@ -1264,6 +1548,26 @@ mod tests {
                             reference: format!("0x{}", hex::encode(addr)),
                         });
                     }
+                    ControlCommand::VerifyChunksPresent { addresses, ack } => {
+                        // The background heal pass fires after every
+                        // completed upload. Report every pushed chunk as
+                        // present (nothing missing) so heal no-ops and
+                        // the exact dispatch-count assertions below hold.
+                        let present = stats_for_task.lock().expect("stats");
+                        let missing: Vec<String> = addresses
+                            .iter()
+                            .filter(|a| !present.unique_addresses.contains(*a))
+                            .map(|a| format!("0x{}", hex::encode(a)))
+                            .collect();
+                        drop(present);
+                        let body = serde_json::json!({
+                            "checked": addresses.len(),
+                            "missing": missing,
+                        });
+                        let _ = ack.send(ControlAck::Ok {
+                            message: body.to_string(),
+                        });
+                    }
                     ControlCommand::PushSoc { ack, .. } => {
                         // Upload pipeline never emits PushSoc; surface a
                         // bug if it ever does.
@@ -1283,6 +1587,103 @@ mod tests {
         f.write_all(bytes).expect("write");
         f.flush().expect("flush");
         f
+    }
+
+    /// State for the self-heal harness: which chunks are "present" on
+    /// the fake network, how many times each was pushed, and the
+    /// address we force to look missing on the first read-back.
+    struct HealHarness {
+        present: Mutex<HashSet<[u8; 32]>>,
+        dispatches: Mutex<HashMap<[u8; 32], u32>>,
+        forced_target: Mutex<Option<[u8; 32]>>,
+        verify_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl HealHarness {
+        fn target(&self) -> Option<[u8; 32]> {
+            *self.forced_target.lock().expect("target mutex")
+        }
+        fn dispatch_count(&self, addr: [u8; 32]) -> u32 {
+            self.dispatches
+                .lock()
+                .expect("dispatch mutex")
+                .get(&addr)
+                .copied()
+                .unwrap_or(0)
+        }
+    }
+
+    /// Fake node loop that accepts `PushChunk` (recording every push and
+    /// marking the chunk present) and answers `VerifyChunksPresent`. On
+    /// the *first* read-back it forces the first queried address to look
+    /// missing, simulating a chunk a storer dropped after acking — the
+    /// upload's heal loop must then re-push exactly that chunk.
+    fn spawn_fake_pushsync_with_heal() -> (mpsc::Sender<ControlCommand>, Arc<HealHarness>) {
+        let (tx, mut rx) = mpsc::channel::<ControlCommand>(64);
+        let h = Arc::new(HealHarness {
+            present: Mutex::new(HashSet::new()),
+            dispatches: Mutex::new(HashMap::new()),
+            forced_target: Mutex::new(None),
+            verify_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let hc = h.clone();
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                match cmd {
+                    ControlCommand::PushChunk { wire, ack, .. } => {
+                        let mut span = [0u8; 8];
+                        span.copy_from_slice(&wire[..8]);
+                        let addr =
+                            ant_crypto::bmt::bmt_hash_with_span(&span, &wire[8..]).expect("BMT");
+                        {
+                            hc.present.lock().expect("present").insert(addr);
+                            *hc.dispatches
+                                .lock()
+                                .expect("dispatch")
+                                .entry(addr)
+                                .or_insert(0) += 1;
+                        }
+                        let _ = ack.send(ControlAck::ChunkUploaded {
+                            reference: format!("0x{}", hex::encode(addr)),
+                        });
+                    }
+                    ControlCommand::VerifyChunksPresent { addresses, ack } => {
+                        let mut missing: Vec<String> = {
+                            let present = hc.present.lock().expect("present");
+                            addresses
+                                .iter()
+                                .filter(|a| !present.contains(*a))
+                                .map(|a| format!("0x{}", hex::encode(a)))
+                                .collect()
+                        };
+                        let n = hc.verify_calls.fetch_add(1, Ordering::SeqCst);
+                        if n == 0 {
+                            if let Some(first) = addresses.first().copied() {
+                                *hc.forced_target.lock().expect("target") = Some(first);
+                                let hexs = format!("0x{}", hex::encode(first));
+                                if !missing.contains(&hexs) {
+                                    missing.push(hexs);
+                                }
+                            }
+                        }
+                        let body = serde_json::json!({
+                            "checked": addresses.len(),
+                            "missing": missing,
+                        });
+                        let _ = ack.send(ControlAck::Ok {
+                            message: body.to_string(),
+                        });
+                    }
+                    ControlCommand::PushSoc { ack, .. } => {
+                        let _ = ack.send(ControlAck::Error {
+                            message: "PushSoc unexpected in heal test".into(),
+                        });
+                    }
+                    other => panic!("unexpected control command in heal test: {other:?}"),
+                }
+            }
+        });
+        (tx, h)
     }
 
     /// End-to-end happy path: a multi-MiB file ends in `Completed`
@@ -1340,6 +1741,54 @@ mod tests {
             s.total_dispatches,
             estimate,
             estimate + 4,
+        );
+    }
+
+    /// After an upload reports `Completed`, the background self-heal
+    /// loop reads every chunk back and re-pushes any that aren't
+    /// reachable. The harness forces one chunk to look missing on the
+    /// first read-back; the heal loop must then re-push exactly that
+    /// chunk (dispatch count for it reaches 2).
+    #[tokio::test]
+    async fn upload_self_heals_unreachable_chunk() {
+        // A few leaves + an intermediate so `all_addrs` is non-trivial.
+        let len = 20_000usize;
+        let payload: Vec<u8> = (0..len).map(|i| ((i * 13) % 251) as u8).collect();
+        let f = write_temp_file(&payload);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let (tx, harness) = spawn_fake_pushsync_with_heal();
+        let mgr = UploadManager::new(state_dir.path().to_path_buf(), tx, None).expect("manager");
+
+        let id = mgr
+            .start(f.path().to_path_buf(), None, None, None, false)
+            .expect("start");
+
+        let mut rx = mgr.subscribe(&id).expect("subscribe");
+        loop {
+            let snap = rx.borrow().clone();
+            if snap.status.is_terminal() {
+                assert_eq!(snap.status, UploadStatus::Completed);
+                break;
+            }
+            rx.changed().await.expect("watch");
+        }
+
+        // The heal task runs in the background after Completed; poll for
+        // the forced-missing chunk to be re-pushed (settle delay is a
+        // few seconds, so allow generous slack).
+        let mut healed = false;
+        for _ in 0..80 {
+            if let Some(t) = harness.target() {
+                if harness.dispatch_count(t) >= 2 {
+                    healed = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        assert!(
+            healed,
+            "self-heal should have re-pushed the chunk forced missing on first read-back",
         );
     }
 

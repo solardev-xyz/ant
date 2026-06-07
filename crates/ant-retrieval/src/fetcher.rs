@@ -194,6 +194,14 @@ pub struct RoutingFetcher {
     /// across the per-chunk fetcher lifetime. `None` keeps the
     /// legacy per-chunk-only skip behaviour for unit tests.
     push_skip: Option<PushSkipCache>,
+    /// Swarm network id used to derive the storer overlay when
+    /// verifying a pushsync receipt's signature (see
+    /// [`crate::pushsync::push_chunk_to_peer`]). `Some(1)` on mainnet;
+    /// `None` skips receipt verification entirely, which is what the
+    /// unit tests want (a mock peer can't produce a real storer
+    /// signature). The daemon sets this so a push only counts as
+    /// success when a genuine neighbourhood storer signed the receipt.
+    push_network_id: Option<u64>,
 }
 
 impl RoutingFetcher {
@@ -229,7 +237,21 @@ impl RoutingFetcher {
             counters: None,
             pushsync_settlement: None,
             push_skip: None,
+            push_network_id: None,
         }
+    }
+
+    /// Set the swarm network id used to verify pushsync receipt
+    /// signatures. When set, [`Self::push_stamped_chunk`] only treats a
+    /// push as successful if the receipt carries a storer signature
+    /// that recovers an overlay genuinely inside the chunk's
+    /// neighbourhood. Left unset, receipts are accepted on an address
+    /// match alone (the legacy behaviour, used by unit tests whose mock
+    /// peers can't sign).
+    #[must_use]
+    pub fn with_network_id(mut self, network_id: u64) -> Self {
+        self.push_network_id = Some(network_id);
+        self
     }
 
     /// Attach the daemon-wide push-side peer skip cache. Same
@@ -499,26 +521,32 @@ impl RoutingFetcher {
                 s.note_pushsync(peer, 0).await;
             }
 
-            let mut err =
-                match push_chunk_to_peer(&mut control, peer, chunk_addr, wire.as_slice(), &stamp)
-                    .await
-                {
-                    Ok(()) => {
-                        if let Some(s) = self.pushsync_settlement.as_ref() {
-                            s.note_pushsync(peer, chunk_price).await;
-                        }
-                        // Clear any pre-existing cool-down: a
-                        // peer that successfully accepts a chunk is
-                        // healthy *right now*, so the next chunk's
-                        // ranking should put it back at the top
-                        // instead of waiting out the TTL.
-                        if let Some(s) = self.push_skip.as_ref() {
-                            s.clear(peer);
-                        }
-                        return Ok(());
+            let mut err = match push_chunk_to_peer(
+                &mut control,
+                peer,
+                chunk_addr,
+                wire.as_slice(),
+                &stamp,
+                self.push_network_id,
+            )
+            .await
+            {
+                Ok(()) => {
+                    if let Some(s) = self.pushsync_settlement.as_ref() {
+                        s.note_pushsync(peer, chunk_price).await;
                     }
-                    Err(e) => e,
-                };
+                    // Clear any pre-existing cool-down: a
+                    // peer that successfully accepts a chunk is
+                    // healthy *right now*, so the next chunk's
+                    // ranking should put it back at the top
+                    // instead of waiting out the TTL.
+                    if let Some(s) = self.push_skip.as_ref() {
+                        s.clear(peer);
+                    }
+                    return Ok(());
+                }
+                Err(e) => e,
+            };
 
             for _ in 0..Self::PER_PEER_RETRY_BUDGET {
                 if !is_transient_pushsync_error(&err) {
@@ -531,8 +559,15 @@ impl RoutingFetcher {
                     "pushsync attempt failed; retrying same peer once on a fresh stream",
                 );
                 tokio::time::sleep(Duration::from_millis(150)).await;
-                match push_chunk_to_peer(&mut control, peer, chunk_addr, wire.as_slice(), &stamp)
-                    .await
+                match push_chunk_to_peer(
+                    &mut control,
+                    peer,
+                    chunk_addr,
+                    wire.as_slice(),
+                    &stamp,
+                    self.push_network_id,
+                )
+                .await
                 {
                     Ok(()) => {
                         if let Some(s) = self.pushsync_settlement.as_ref() {

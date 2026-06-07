@@ -25,6 +25,9 @@ struct StorageView: View {
                     meterCard
                     if node.plan?.enabled == true {
                         planCard
+                        if node.settlement?.enabled == false {
+                            settlementWarningCard
+                        }
                     } else {
                         connectCard
                     }
@@ -134,6 +137,32 @@ struct StorageView: View {
                     pillButton("Renew", icon: "arrow.clockwise") {
                         flash("Renew needs an on-chain top-up — coming soon")
                     }
+                }
+            }
+        }
+    }
+
+    // MARK: settlement warning
+
+    /// Shown when a plan is connected but outbound settlement is off:
+    /// uploads will stamp and look "uploaded" locally but won't reach
+    /// the network until the one-time chequebook setup runs, which needs
+    /// a little xDAI for gas. Re-running "Find my storage" retries it.
+    private var settlementWarningCard: some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 12) {
+                Label("Uploads won't reach the network yet", systemImage: "exclamationmark.triangle.fill")
+                    .font(.headline)
+                    .foregroundStyle(.orange)
+                Text("Network settlement isn't set up. There's a one-time setup that needs a little xDAI in your account for gas. Add a small amount of xDAI, then run setup again.")
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.75))
+                HStack(spacing: 12) {
+                    pillButton("Add xDAI", icon: "plus") {
+                        if let addr = node.account?.ethAddress { copy(addr) }
+                        flash("Send a little xDAI to your account (copied)")
+                    }
+                    pillButton("Run setup", icon: "arrow.clockwise") { showConnect = true }
                 }
             }
         }

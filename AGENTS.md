@@ -25,3 +25,52 @@
  lets us correlate behaviour to a specific build. Use the same patch
  number across all crates; we ship them as one unit. Bump minor or
  major only when the user asks for it explicitly.
+
+## Driving the iOS Drive app on the simulator (idb + log capture)
+
+The example app lives in `examples/ios-drive` (bundle id
+`at.vibing.ant.drive`). The booted simulator we use is UDID
+`FCDD32E4-137A-45C4-9C7D-BB89340DF6EA` (confirm with `xcrun simctl list
+devices booted` — it can change).
+
+**Build / install / launch:**
+```bash
+cd examples/ios-drive
+xcodebuild -project AntDrive.xcodeproj -scheme AntDrive -configuration Debug \
+  -destination 'platform=iOS Simulator,id=<UDID>' -derivedDataPath build build
+APP=build/Build/Products/Debug-iphonesimulator/AntDrive.app
+xcrun simctl install <UDID> "$APP" && xcrun simctl launch <UDID> at.vibing.ant.drive
+```
+The Xcode build phase recompiles the `ant-ffi` Rust slice, so a plain
+`xcodebuild` picks up workspace crate changes.
+
+**Capturing the embedded node's logs.** The FFI routes `tracing` to
+**stderr**, which the simulator does **not** forward to the unified log
+(`log stream` / `log show` won't see it). To read logs, relaunch with a
+console attached:
+```bash
+xcrun simctl terminate <UDID> at.vibing.ant.drive
+nohup xcrun simctl launch --console-pty --terminate-running-process <UDID> \
+  at.vibing.ant.drive > /tmp/app_console.txt 2>&1 &
+# then: grep -niE "upload completed|post-upload heal" /tmp/app_console.txt
+```
+Relaunching restarts the embedded node, so wait ~20 s for the bzz
+handshakes (`peer_set_size` climbs to ~100) before exercising uploads.
+
+**Driving the UI with idb.** Only `idb_companion` is installed via brew;
+the friendly `idb` CLI is the Python `fb-idb` package and is **not** on
+PATH. It needs Python ≤3.11 (it breaks on 3.14). Set up a venv once
+(use a persistent path like `~/.idb-venv`, not `/tmp`):
+```bash
+python3.11 -m venv ~/.idb-venv && ~/.idb-venv/bin/pip install fb-idb
+IDB=~/.idb-venv/bin/idb
+$IDB connect <UDID>
+$IDB ui describe-all --udid <UDID>      # a11y tree: labels + frames (in points)
+$IDB ui tap --udid <UDID> <x> <y>       # coordinates are POINTS, not pixels
+```
+Screenshots (`xcrun simctl io <UDID> screenshot f.png`) are at the
+device's pixel scale (e.g. 1206×2622 px = 402×874 pt → divide by 3).
+Out-of-process system UI (the Photos picker) is invisible to
+`describe-all`; tap it by point coordinates derived from a screenshot.
+Upload flow: tap **Add** → "Upload photos" → tap a photo thumbnail →
+tap the **✓** (Done) button top-right.

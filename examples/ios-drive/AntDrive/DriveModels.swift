@@ -102,19 +102,88 @@ struct StoragePlan: Codable, Equatable {
 
     var totalBytes: UInt64 { totalCapacityChunks * Self.bytesPerChunk }
     var usedBytes: UInt64 { issuedChunks * Self.bytesPerChunk }
-    /// Conservative free space (room left in the fullest bucket, scaled).
-    var freeBytes: UInt64 { worstCaseRemainingChunks * Self.bytesPerChunk }
+    /// Free space the user actually has: total capacity minus what's
+    /// been issued. This is the batch's true `remaining_total`
+    /// (`Σ free indices`), not `worstCaseRemainingChunks` — the latter
+    /// is a pessimistic pre-flight budget (room left in the *fullest*
+    /// bucket, scaled) that collapses to 0 as soon as a single bucket
+    /// saturates, which is misleading as a free-space meter.
+    var freeBytes: UInt64 { totalBytes - usedBytes }
 
     var usedFraction: Double {
         guard totalBytes > 0 else { return 0 }
         return min(1.0, Double(usedBytes) / Double(totalBytes))
     }
 
-    /// "Expiring soon" heuristic: less than 10% of the plan's worst-case
-    /// budget left relative to its capacity.
+    /// "Running low" heuristic: less than 10% of the plan's capacity
+    /// left, consistent with the free-space figure and meter bar.
     var isLow: Bool {
         guard totalCapacityChunks > 0 else { return false }
-        return Double(worstCaseRemainingChunks) / Double(totalCapacityChunks) < 0.10
+        return Double(issuedChunks) / Double(totalCapacityChunks) > 0.90
+    }
+}
+
+/// Outbound-settlement status, as returned by
+/// `ant_storage_settlement_status`. `enabled` is what lets uploads
+/// actually reach the network: without a deployed chequebook the node
+/// can't pay peers for pushsync and they stop accepting its chunks, so
+/// files look "uploaded" locally but never propagate.
+struct SettlementInfo: Codable, Equatable {
+    let enabled: Bool
+    let chequebook: String?
+}
+
+/// Deep read-back propagation result, as returned by
+/// `ant_storage_verify_propagation`. The daemon resolves the manifest,
+/// enumerates the file's chunk tree, fetches every interior node
+/// network-only, then probes a sample of the real data leaves across
+/// distinct closest peers. This verifies the *actual data chunks* are
+/// retrievable from the network — a much stronger signal than a job's
+/// "Online" status (which only means the upload was *attempted*) or a
+/// root-only reachability check.
+struct PropagationInfo: Codable, Equatable {
+    let reference: String
+    let retrievable: Bool
+    /// Total chunks in the file's data tree (leaves + interior nodes).
+    let totalChunks: UInt32
+    let leafChunks: UInt32
+    let intermediateChunks: UInt32
+    /// Interior nodes (all) + sampled leaves actually probed.
+    let checkedChunks: UInt32
+    let retrievableChunks: UInt32
+    let sampledLeaves: UInt32
+    /// Minimum distinct-route count across sampled leaves — a
+    /// replication floor.
+    let sources: UInt32
+    /// Present only when verification couldn't complete (e.g. the
+    /// manifest or data root wasn't retrievable).
+    let error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case reference
+        case retrievable
+        case totalChunks = "total_chunks"
+        case leafChunks = "leaf_chunks"
+        case intermediateChunks = "intermediate_chunks"
+        case checkedChunks = "checked_chunks"
+        case retrievableChunks = "retrievable_chunks"
+        case sampledLeaves = "sampled_leaves"
+        case sources
+        case error
+    }
+
+    /// Short, friendly verdict for a file row badge.
+    var label: String {
+        if !retrievable {
+            if totalChunks == 0 { return "Not found on network" }
+            let missing = checkedChunks - retrievableChunks
+            return "\(missing) of \(checkedChunks) chunks missing"
+        }
+        let suffix = sources > 1 ? " · \(sources)×" : ""
+        if checkedChunks >= totalChunks {
+            return "Verified · all \(totalChunks) chunks\(suffix)"
+        }
+        return "Verified · \(checkedChunks)/\(totalChunks) chunks\(suffix)"
     }
 }
 
@@ -234,6 +303,16 @@ enum DriveDecoder {
     static func account(from json: String) -> AccountInfo? {
         guard let data = json.data(using: .utf8) else { return nil }
         return try? JSONDecoder().decode(AccountInfo.self, from: data)
+    }
+
+    static func settlement(from json: String) -> SettlementInfo? {
+        guard let data = json.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(SettlementInfo.self, from: data)
+    }
+
+    static func propagation(from json: String) -> PropagationInfo? {
+        guard let data = json.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(PropagationInfo.self, from: data)
     }
 
     static func quote(from json: String) -> StorageQuote? {

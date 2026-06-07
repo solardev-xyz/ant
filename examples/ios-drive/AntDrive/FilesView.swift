@@ -307,6 +307,7 @@ private struct ShareItem: Identifiable {
 /// that changes with state (progress ring while uploading, a menu when
 /// done, a retry/cancel pair when paused or failed).
 private struct FileRow: View {
+    @EnvironmentObject var node: AntNode
     let job: UploadJob
     let onShare: (UploadJob) -> Void
     let onPause: (UploadJob) -> Void
@@ -334,10 +335,51 @@ private struct FileRow: View {
                             .tint(.white.opacity(0.9))
                             .padding(.top, 2)
                     }
+                    if job.isDone { propagationBadge }
                 }
                 Spacer(minLength: 8)
                 trailing
             }
+        }
+        // Auto-verify a completed file once: probe the network for its
+        // reference chunk (bypassing our local copy) so the row shows a
+        // real "retrievable" verdict instead of just the local "Online"
+        // state. Cached in `node.propagation`, so this fires at most
+        // once per file per session.
+        .task(id: autoVerifyKey) {
+            if job.isDone, job.reference?.isEmpty == false,
+               node.peerCount > 0, node.propagation[job.id] == nil {
+                await node.verifyPropagation(job)
+            }
+        }
+    }
+
+    /// Re-trigger the auto-verify when the job reaches the completed
+    /// state *and* once peers are actually connected — a probe issued
+    /// before the node has any peers just comes back "not ready" and
+    /// would otherwise never retry. The status + has-peers flag are
+    /// part of the key so the task re-runs on those transitions.
+    private var autoVerifyKey: String {
+        "\(job.id)#\(job.status)#\(node.peerCount > 0 ? "peers" : "none")"
+    }
+
+    /// Read-back verdict for a completed file: a spinner while probing,
+    /// then a green "verified · N chunks" or an orange "chunks missing"
+    /// once the network has been asked. The check resolves the manifest,
+    /// walks the chunk tree, and probes a sample of the real data chunks
+    /// — distinct from the job's "Online" status, which only means the
+    /// upload was attempted locally.
+    @ViewBuilder private var propagationBadge: some View {
+        if node.verifying.contains(job.id) {
+            Label("Verifying chunks…", systemImage: "antenna.radiowaves.left.and.right")
+                .font(.caption2)
+                .foregroundStyle(.white.opacity(0.6))
+                .padding(.top, 1)
+        } else if let p = node.propagation[job.id] {
+            Label(p.label, systemImage: p.retrievable ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(p.retrievable ? .green.opacity(0.9) : .orange)
+                .padding(.top, 1)
         }
     }
 
@@ -359,6 +401,11 @@ private struct FileRow: View {
         } else if job.isDone {
             Menu {
                 Button { onShare(job) } label: { Label("Copy share link", systemImage: "link") }
+                Button {
+                    Task { await node.verifyPropagation(job, samples: 16, probes: 3) }
+                } label: {
+                    Label("Verify chunks", systemImage: "antenna.radiowaves.left.and.right")
+                }
             } label: {
                 Image(systemName: "square.and.arrow.up")
                     .font(.title3).foregroundStyle(.white.opacity(0.85))

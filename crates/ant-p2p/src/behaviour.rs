@@ -1448,7 +1448,7 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
                 // live during gateway-only / fully-idle periods.
             }
             Some(cmd) = recv_command(commands.as_mut()) => {
-                handle_control_command(&mut state, &mut peerstore, &control, cfg.upload.clone(), cmd);
+                handle_control_command(&mut state, &mut peerstore, &control, cfg.upload.clone(), cfg.network_id, cmd);
             }
             _ = &mut shutdown => {
                 info!(target: "ant_p2p", "shutdown signal; flushing peerstore");
@@ -1480,6 +1480,7 @@ fn handle_control_command(
     peerstore: &mut PeerStore,
     control: &Control,
     upload: Option<Arc<UploadRuntime>>,
+    network_id: u64,
     cmd: ControlCommand,
 ) {
     match cmd {
@@ -1532,6 +1533,67 @@ fn handle_control_command(
                     }
                 };
                 let _ = ack.send(reply);
+            });
+        }
+        ControlCommand::VerifyPropagation {
+            reference,
+            samples,
+            probes,
+            ack,
+        } => {
+            // Deep read-back propagation check. Resolve the manifest,
+            // enumerate the file's chunk tree, and probe a sample of the
+            // *actual data leaves* across distinct closest peers — all
+            // network-only so a store-then-push local copy can't mask a
+            // failed push. The heavy lifting runs in a spawned task
+            // (`verify_propagation_deep`); here we only snapshot the peer
+            // pool synchronously so we don't borrow `state` into the task.
+            let samples = if samples == 0 { 6 } else { samples.min(32) } as usize;
+            let probes = if probes == 0 { 2 } else { probes.min(8) } as usize;
+            let peers: Vec<(PeerId, Overlay)> = state.peers_watch.subscribe().borrow().clone();
+            if peers.is_empty() {
+                let _ = ack.send(ControlAck::NotReady {
+                    message: "no peers available; wait for handshakes to complete".into(),
+                });
+                return;
+            }
+            let peers_rx = state.peers_watch.subscribe();
+            let control = control.clone();
+            tokio::spawn(async move {
+                let body =
+                    verify_propagation_deep(control, peers_rx, peers, reference, samples, probes)
+                        .await;
+                let _ = ack.send(ControlAck::Ok {
+                    message: body.to_string(),
+                });
+            });
+        }
+        ControlCommand::VerifyChunksPresent { addresses, ack } => {
+            // Read-back presence check for a specific address set (upload
+            // self-heal). Cache-free `RoutingFetcher` so each fetch takes
+            // the real network path; we report which addresses didn't
+            // come back so the caller can re-push exactly those.
+            let peers_rx = state.peers_watch.subscribe();
+            if peers_rx.borrow().is_empty() {
+                let _ = ack.send(ControlAck::NotReady {
+                    message: "no peers available; wait for handshakes to complete".into(),
+                });
+                return;
+            }
+            let control = control.clone();
+            tokio::spawn(async move {
+                let fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx);
+                let missing = verify_chunks_present(&fetcher, &addresses).await;
+                let body = serde_json::json!({
+                    "checked": addresses.len(),
+                    "missing": missing
+                        .iter()
+                        .map(|a| format!("0x{}", hex::encode(a)))
+                        .collect::<Vec<_>>(),
+                });
+                let _ = ack.send(ControlAck::Ok {
+                    message: body.to_string(),
+                });
             });
         }
         ControlCommand::PushChunk {
@@ -1628,8 +1690,9 @@ fn handle_control_command(
                         );
                     }
                 }
-                let mut fetcher =
-                    ant_retrieval::RoutingFetcher::new(control, peers_rx).with_push_skip(push_skip);
+                let mut fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx)
+                    .with_push_skip(push_skip)
+                    .with_network_id(network_id);
                 if let Some(svc) = pushsync_swap {
                     let s: Arc<dyn ant_retrieval::PushsyncSettlement> = svc;
                     fetcher = fetcher.with_pushsync_settlement(s);
@@ -1731,8 +1794,9 @@ fn handle_control_command(
                         );
                     }
                 }
-                let mut fetcher =
-                    ant_retrieval::RoutingFetcher::new(control, peers_rx).with_push_skip(push_skip);
+                let mut fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx)
+                    .with_push_skip(push_skip)
+                    .with_network_id(network_id);
                 if let Some(svc) = pushsync_swap {
                     let s: Arc<dyn ant_retrieval::PushsyncSettlement> = svc;
                     fetcher = fetcher.with_pushsync_settlement(s);
@@ -3057,6 +3121,216 @@ fn clamp_max_bytes(max_bytes: Option<u64>) -> usize {
         Some(n) => usize::try_from(n).unwrap_or(usize::MAX),
         None => DEFAULT_MAX_FILE_BYTES,
     }
+}
+
+/// Spread `max` sample indices evenly across `[0, len)`. Returns every
+/// index when `len <= max`, otherwise a strided subset so the sample
+/// covers the file front-to-back rather than clustering at the start.
+fn sample_indices(len: usize, max: usize) -> Vec<usize> {
+    if len == 0 {
+        return Vec::new();
+    }
+    if len <= max {
+        return (0..len).collect();
+    }
+    (0..max).map(|k| k * len / max).collect()
+}
+
+/// Probe a single chunk address across the `probes` closest distinct
+/// peers, network-only, and return how many returned it (a per-chunk
+/// route-diversity / replication count). Peers are ranked by XOR
+/// distance to `addr` — the same ordering [`RoutingFetcher`] uses — so
+/// we hit the chunk's natural neighbourhood first.
+async fn probe_leaf_sources(
+    control: &Control,
+    peers: &[(PeerId, Overlay)],
+    addr: [u8; 32],
+    probes: usize,
+    probe_timeout: std::time::Duration,
+) -> u32 {
+    let mut ranked: Vec<(PeerId, Overlay)> = peers.to_vec();
+    ranked.sort_by(|(_, a), (_, b)| {
+        for i in 0..32 {
+            let da = a[i] ^ addr[i];
+            let db = b[i] ^ addr[i];
+            if da != db {
+                return da.cmp(&db);
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+    let candidates: Vec<PeerId> = ranked.into_iter().take(probes).map(|(p, _)| p).collect();
+    let probes_iter = candidates.into_iter().map(|peer| {
+        let mut control = control.clone();
+        async move {
+            matches!(
+                tokio::time::timeout(
+                    probe_timeout,
+                    ant_retrieval::retrieve_chunk(&mut control, peer, addr),
+                )
+                .await,
+                Ok(Ok(_))
+            )
+        }
+    });
+    futures::future::join_all(probes_iter)
+        .await
+        .into_iter()
+        .filter(|hit| *hit)
+        .count() as u32
+}
+
+/// Read back a specific set of chunk addresses network-only and return
+/// the subset that could not be retrieved. Uses the cache-free
+/// `RoutingFetcher` (the real download path: closest-first through
+/// forwarder peers, hedged, with error backfill) and a bounded
+/// concurrency window so a large file's heal check doesn't open
+/// thousands of simultaneous streams. Backs the upload self-heal loop.
+async fn verify_chunks_present(
+    fetcher: &ant_retrieval::RoutingFetcher,
+    addresses: &[[u8; 32]],
+) -> Vec<[u8; 32]> {
+    use ant_retrieval::ChunkFetcher;
+    use futures::stream::StreamExt;
+
+    const CONCURRENCY: usize = 16;
+    const PER_CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+
+    futures::stream::iter(addresses.iter().copied().map(|addr| async move {
+        let reachable = matches!(
+            tokio::time::timeout(PER_CHUNK_TIMEOUT, fetcher.fetch(addr)).await,
+            Ok(Ok(_))
+        );
+        (addr, reachable)
+    }))
+    .buffer_unordered(CONCURRENCY)
+    .filter_map(|(addr, reachable)| async move { (!reachable).then_some(addr) })
+    .collect()
+    .await
+}
+
+/// Deep propagation check: resolve the manifest at `reference` to its
+/// data root, enumerate the file's chunk tree (fetching every interior
+/// node network-only, which proves the skeleton is retrievable), then
+/// probe an evenly-spread sample of up to `samples` data leaves across
+/// up to `probes` distinct closest peers each. Returns the JSON body
+/// described on [`ControlCommand::VerifyPropagation`].
+async fn verify_propagation_deep(
+    control: Control,
+    peers_rx: watch::Receiver<Vec<(PeerId, Overlay)>>,
+    peers: Vec<(PeerId, Overlay)>,
+    reference: [u8; 32],
+    samples: usize,
+    probes: usize,
+) -> serde_json::Value {
+    use ant_retrieval::{
+        enumerate_chunk_tree, lookup_path, ChunkFetcher, JoinOptions, ManifestError,
+        DEFAULT_MAX_FILE_BYTES,
+    };
+
+    let ref_hex = format!("0x{}", hex::encode(reference));
+    let err_body = |msg: String| {
+        serde_json::json!({
+            "reference": ref_hex,
+            "retrievable": false,
+            "total_chunks": 0,
+            "leaf_chunks": 0,
+            "intermediate_chunks": 0,
+            "checked_chunks": 0,
+            "retrievable_chunks": 0,
+            "sampled_leaves": 0,
+            "sources": 0,
+            "error": msg,
+        })
+    };
+
+    // Cache-free fetcher: manifest resolution and interior-node fetches
+    // must hit the network, never the daemon's local store-then-push copy.
+    let fetcher = ant_retrieval::RoutingFetcher::new(control.clone(), peers_rx);
+
+    // Resolve the manifest to its data root; a non-manifest reference is
+    // treated as a raw `/bytes/` data root.
+    let data_ref = match lookup_path(&fetcher, reference, "").await {
+        Ok(r) => r.data_ref,
+        Err(ManifestError::NotAManifest) => reference,
+        Err(e) => return err_body(format!("manifest resolve: {e}")),
+    };
+
+    let root = match fetcher.fetch(data_ref).await {
+        Ok(r) => r,
+        Err(e) => return err_body(format!("fetch data root: {e}")),
+    };
+
+    let inv = match enumerate_chunk_tree(
+        &fetcher,
+        data_ref,
+        &root,
+        DEFAULT_MAX_FILE_BYTES,
+        JoinOptions {
+            allow_degraded_redundancy: true,
+        },
+    )
+    .await
+    {
+        Ok(i) => i,
+        Err(e) => return err_body(format!("enumerate chunk tree: {e}")),
+    };
+
+    let leaf_chunks = inv.leaves.len();
+    let intermediate_chunks = inv.intermediates.len();
+    let total_chunks = inv.total();
+
+    // Every interior node (and the data root) was fetched network-only
+    // above, so the skeleton is retrievable. Now sample real leaves.
+    let probe_timeout = std::time::Duration::from_secs(10);
+    let sample_idx = sample_indices(leaf_chunks, samples);
+    let sampled_leaves = sample_idx.len();
+    let mut leaves_retrievable = 0usize;
+    let mut min_sources = u32::MAX;
+    for idx in sample_idx {
+        let addr = inv.leaves[idx];
+        // Authoritative reachability uses the *same* network path a real
+        // download takes: the cache-free `RoutingFetcher`, which walks
+        // closest-first through forwarder peers, hedges, and backfills
+        // on error. A single direct probe to the few closest *connected*
+        // peers would falsely flag a leaf "missing" whenever its storers
+        // are only reachable via a different forwarder.
+        let reachable = matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(20), fetcher.fetch(addr)).await,
+            Ok(Ok(_))
+        );
+        if reachable {
+            leaves_retrievable += 1;
+        }
+        // Informational replication floor: how many of the chunk's own
+        // closest peers hold it directly (route diversity), separate
+        // from whether it's reachable at all.
+        let s = probe_leaf_sources(&control, &peers, addr, probes, probe_timeout).await;
+        min_sources = min_sources.min(s);
+    }
+    let min_sources = if min_sources == u32::MAX {
+        0
+    } else {
+        min_sources
+    };
+
+    let checked_chunks = intermediate_chunks + sampled_leaves;
+    let retrievable_chunks = intermediate_chunks + leaves_retrievable;
+    // Intermediates are retrievable by construction (enumeration fetched
+    // them); the verdict turns on whether every sampled leaf came back.
+    let retrievable = total_chunks > 0 && leaves_retrievable == sampled_leaves;
+
+    serde_json::json!({
+        "reference": ref_hex,
+        "retrievable": retrievable,
+        "total_chunks": total_chunks,
+        "leaf_chunks": leaf_chunks,
+        "intermediate_chunks": intermediate_chunks,
+        "checked_chunks": checked_chunks,
+        "retrievable_chunks": retrievable_chunks,
+        "sampled_leaves": sampled_leaves,
+        "sources": min_sources,
+    })
 }
 
 /// Spawned task body for `Request::GetBzz`. Walks the manifest at

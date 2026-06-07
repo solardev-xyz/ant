@@ -1,5 +1,9 @@
 //! Pushsync dialer (`/swarm/pushsync/1.3.1/pushsync`) — bee `pkg/pushsync`.
 
+use ant_crypto::{
+    ethereum_address_from_public_key, overlay_from_ethereum_address, recover_public_key,
+    OVERLAY_NONCE_LEN,
+};
 use futures::io::AsyncWriteExt;
 use libp2p::{PeerId, StreamProtocol};
 use libp2p_stream::Control;
@@ -51,6 +55,19 @@ pub enum PushSyncError {
     Remote(String),
     #[error("receipt mismatch")]
     ReceiptMismatch,
+    /// The receipt's storer signature could not be recovered, or the
+    /// nonce/signature fields were the wrong length. A peer that ACKs a
+    /// chunk address without a valid storer signature is not proof the
+    /// chunk was stored anywhere; treat it as a failed push.
+    #[error("unverifiable receipt: {0}")]
+    UnverifiableReceipt(String),
+    /// The receipt recovered a real storer, but that storer sits
+    /// *shallower* to the chunk than its own reported storage radius —
+    /// i.e. it is not actually in the chunk's neighbourhood, so the
+    /// chunk did not durably land where it can be retrieved. Mirrors
+    /// bee `pushsync.ErrShallowReceipt`.
+    #[error("shallow receipt: storer proximity {po} < storage radius {storage_radius}")]
+    ShallowReceipt { po: u8, storage_radius: u32 },
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -74,24 +91,37 @@ pub(crate) struct PbPushReceipt {
     #[prost(string, tag = "4")]
     pub(crate) err: String,
     #[prost(uint32, tag = "5")]
-    #[allow(dead_code)]
     pub(crate) storage_radius: u32,
 }
 
 /// Push one CAC chunk to a single peer — headers + protobuf `Delivery` + read `Receipt`.
 ///
-/// Returns `Ok(())` when the peer `ACKed` the chunk address; the receipt
-/// signature is currently dropped because we don't yet keep cheques.
+/// Returns `Ok(())` only when the peer returns a receipt that both
+/// names our chunk address *and* (when `network_id` is `Some`) carries
+/// a storer signature that recovers an overlay genuinely inside the
+/// chunk's neighbourhood. Without that check a peer could ACK the
+/// address without any storer actually keeping the chunk, so the
+/// upload would falsely report success while the content never became
+/// retrievable. Pass `None` to skip verification (unit tests with a
+/// mock peer that can't produce real signatures).
 pub async fn push_chunk_to_peer(
     control: &mut Control,
     peer: PeerId,
     chunk_addr: [u8; 32],
     wire_span_payload: &[u8],
     stamp_binary: &[u8; ant_postage::STAMP_SIZE],
+    network_id: Option<u64>,
 ) -> Result<(), PushSyncError> {
     tokio::time::timeout(
         PUSHSYNC_TIMEOUT,
-        push_chunk_inner(control, peer, chunk_addr, wire_span_payload, stamp_binary),
+        push_chunk_inner(
+            control,
+            peer,
+            chunk_addr,
+            wire_span_payload,
+            stamp_binary,
+            network_id,
+        ),
     )
     .await
     .map_err(|_| PushSyncError::Timeout(PUSHSYNC_TIMEOUT))?
@@ -103,6 +133,7 @@ async fn push_chunk_inner(
     chunk_addr: [u8; 32],
     wire_span_payload: &[u8],
     stamp_binary: &[u8; ant_postage::STAMP_SIZE],
+    network_id: Option<u64>,
 ) -> Result<(), PushSyncError> {
     let proto = StreamProtocol::new(PROTOCOL_PUSH);
     let mut stream = control
@@ -150,7 +181,79 @@ async fn push_chunk_inner(
         return Err(PushSyncError::ReceiptMismatch);
     }
 
+    if let Some(network_id) = network_id {
+        verify_receipt(&rep_addr, &receipt, network_id)?;
+    }
+
     Ok(())
+}
+
+/// Verify a pushsync receipt the way bee's `pushsync.checkReceipt`
+/// does: recover the storer's public key from the signature over the
+/// chunk address, derive its overlay (`keccak256(eth ‖ network_id_le ‖
+/// nonce)`, the same scheme as the BZZ handshake), and confirm that
+/// overlay is at least as close to the chunk as the storer's reported
+/// `storage_radius`. An honest storer only keeps a chunk when its own
+/// proximity to it is `>= radius`, so a genuine receipt always passes;
+/// an ACK from a peer that didn't actually store the chunk (no
+/// signature, a self-signature far from the chunk, …) does not.
+///
+/// Bee signs the receipt with its default `crypto.Signer`, which is the
+/// same EIP-191-prefixed scheme `recover_public_key` inverts (verified
+/// against a live SOC fixture in `ant_crypto::soc`), so we recover over
+/// the raw 32-byte chunk address — exactly bee's
+/// `crypto.Recover(receipt.Signature, addr.Bytes())`.
+fn verify_receipt(
+    chunk_addr: &[u8; 32],
+    receipt: &PbPushReceipt,
+    network_id: u64,
+) -> Result<(), PushSyncError> {
+    let signature: [u8; 65] = receipt
+        .signature
+        .as_slice()
+        .try_into()
+        .map_err(|_| PushSyncError::UnverifiableReceipt("signature not 65 bytes".into()))?;
+    let nonce: [u8; OVERLAY_NONCE_LEN] = receipt
+        .nonce
+        .as_slice()
+        .try_into()
+        .map_err(|_| PushSyncError::UnverifiableReceipt("nonce not 32 bytes".into()))?;
+
+    let pubkey = recover_public_key(&signature, chunk_addr)
+        .map_err(|e| PushSyncError::UnverifiableReceipt(format!("recover storer key: {e}")))?;
+    let storer_eth = ethereum_address_from_public_key(&pubkey);
+    let storer_overlay = overlay_from_ethereum_address(&storer_eth, network_id, &nonce);
+
+    let po = proximity(chunk_addr, &storer_overlay);
+    if u32::from(po) < receipt.storage_radius {
+        return Err(PushSyncError::ShallowReceipt {
+            po,
+            storage_radius: receipt.storage_radius,
+        });
+    }
+    Ok(())
+}
+
+/// XOR-distance proximity order between two 32-byte addresses, matching
+/// `bee/pkg/swarm/swarm.go::Proximity`: the number of leading zero bits
+/// in `a XOR b`, capped at `MAX_PO = 31` (storage radii on mainnet are
+/// far below this, so the cap never interferes with the shallow check).
+fn proximity(a: &[u8; 32], b: &[u8; 32]) -> u8 {
+    const MAX_PO: u8 = 31;
+    let mut po = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let xor = x ^ y;
+        if xor == 0 {
+            po = po.saturating_add(8);
+            if po >= MAX_PO {
+                return MAX_PO;
+            }
+            continue;
+        }
+        po = po.saturating_add(xor.leading_zeros() as u8);
+        return po.min(MAX_PO);
+    }
+    MAX_PO
 }
 
 fn map_retrieval(e: RetrievalError) -> PushSyncError {
@@ -166,5 +269,126 @@ fn map_retrieval(e: RetrievalError) -> PushSyncError {
         RetrievalError::Remote(s) => PushSyncError::Remote(s),
         RetrievalError::InvalidChunk => PushSyncError::Remote("invalid chunk hint".into()),
         RetrievalError::BadPayloadSize(_) => PushSyncError::Remote("bad payload size".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ant_crypto::sign_handshake_data;
+    use k256::ecdsa::{SigningKey, VerifyingKey};
+
+    const NETWORK_ID: u64 = 1;
+
+    /// Storer Ethereum address for a test secret.
+    fn storer_eth(secret: &[u8; 32]) -> [u8; 20] {
+        let sk = SigningKey::from_bytes(secret.into()).unwrap();
+        ethereum_address_from_public_key(&VerifyingKey::from(&sk))
+    }
+
+    /// Build a receipt the way an honest bee storer does: sign the
+    /// chunk address with the storer's key (EIP-191, bee's
+    /// `crypto.Signer.Sign`) and stamp it with the storer's nonce +
+    /// reported storage radius.
+    fn signed_receipt(
+        secret: &[u8; 32],
+        chunk_addr: &[u8; 32],
+        nonce: &[u8; OVERLAY_NONCE_LEN],
+        storage_radius: u32,
+    ) -> PbPushReceipt {
+        let sig = sign_handshake_data(secret, chunk_addr).unwrap();
+        PbPushReceipt {
+            address: chunk_addr.to_vec(),
+            signature: sig.to_vec(),
+            nonce: nonce.to_vec(),
+            err: String::new(),
+            storage_radius,
+        }
+    }
+
+    #[test]
+    fn proximity_identical_is_max() {
+        let a = [0x5cu8; 32];
+        assert_eq!(proximity(&a, &a), 31);
+    }
+
+    #[test]
+    fn proximity_first_bit_differs_is_zero() {
+        let a = [0u8; 32];
+        let mut b = [0u8; 32];
+        b[0] = 0x80; // differ in the most-significant bit
+        assert_eq!(proximity(&a, &b), 0);
+    }
+
+    /// A genuine storer (its overlay *is* the chunk's neighbourhood)
+    /// returning a properly-signed receipt is accepted.
+    #[test]
+    fn accepts_genuine_storer_receipt() {
+        let secret = [7u8; 32];
+        let nonce = [0xabu8; OVERLAY_NONCE_LEN];
+        // Put the chunk exactly at the storer's overlay so proximity is
+        // maximal — the storer is unambiguously responsible for it.
+        let chunk_addr = overlay_from_ethereum_address(&storer_eth(&secret), NETWORK_ID, &nonce);
+        let receipt = signed_receipt(&secret, &chunk_addr, &nonce, 10);
+        assert!(verify_receipt(&chunk_addr, &receipt, NETWORK_ID).is_ok());
+    }
+
+    /// A correctly-signed receipt whose storer sits *outside* the
+    /// chunk's neighbourhood (shallower than its own reported radius) is
+    /// a shallow receipt: the chunk did not land where it's retrievable.
+    #[test]
+    fn rejects_shallow_receipt() {
+        let secret = [9u8; 32];
+        let nonce = [0x11u8; OVERLAY_NONCE_LEN];
+        let overlay = overlay_from_ethereum_address(&storer_eth(&secret), NETWORK_ID, &nonce);
+        // Chunk differs from the storer in the top bit → proximity 0.
+        let mut chunk_addr = overlay;
+        chunk_addr[0] ^= 0x80;
+        let receipt = signed_receipt(&secret, &chunk_addr, &nonce, 5);
+        match verify_receipt(&chunk_addr, &receipt, NETWORK_ID) {
+            Err(PushSyncError::ShallowReceipt { po, storage_radius }) => {
+                assert_eq!(po, 0);
+                assert_eq!(storage_radius, 5);
+            }
+            other => panic!("expected ShallowReceipt, got {other:?}"),
+        }
+    }
+
+    /// A peer that ACKs the address with no usable signature can't prove
+    /// any storer kept the chunk; the receipt is unverifiable.
+    #[test]
+    fn rejects_short_signature() {
+        let nonce = [0x22u8; OVERLAY_NONCE_LEN];
+        let chunk_addr = [0x33u8; 32];
+        let receipt = PbPushReceipt {
+            address: chunk_addr.to_vec(),
+            signature: vec![0u8; 10],
+            nonce: nonce.to_vec(),
+            err: String::new(),
+            storage_radius: 0,
+        };
+        assert!(matches!(
+            verify_receipt(&chunk_addr, &receipt, NETWORK_ID),
+            Err(PushSyncError::UnverifiableReceipt(_)),
+        ));
+    }
+
+    /// A receipt whose nonce isn't 32 bytes can't yield a storer overlay.
+    #[test]
+    fn rejects_bad_nonce_length() {
+        let secret = [4u8; 32];
+        let chunk_addr = [0x44u8; 32];
+        let sig = sign_handshake_data(&secret, &chunk_addr).unwrap();
+        let receipt = PbPushReceipt {
+            address: chunk_addr.to_vec(),
+            signature: sig.to_vec(),
+            nonce: vec![0u8; 8],
+            err: String::new(),
+            storage_radius: 0,
+        };
+        assert!(matches!(
+            verify_receipt(&chunk_addr, &receipt, NETWORK_ID),
+            Err(PushSyncError::UnverifiableReceipt(_)),
+        ));
     }
 }

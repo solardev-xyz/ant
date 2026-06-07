@@ -33,6 +33,14 @@ final class AntNode: ObservableObject {
     @Published private(set) var jobs: [UploadJob] = []
     @Published private(set) var plan: StoragePlan?
     @Published private(set) var account: AccountInfo?
+    @Published private(set) var settlement: SettlementInfo?
+    /// Read-back propagation results, keyed by upload job id. Populated
+    /// on demand by `verifyPropagation(_:)`; `nil` for a job means "not
+    /// checked yet".
+    @Published private(set) var propagation: [String: PropagationInfo] = [:]
+    /// Job ids with an in-flight propagation check, so the UI can show a
+    /// spinner and avoid firing duplicate probes.
+    @Published private(set) var verifying: Set<String> = []
 
     private var handle: OpaquePointer?
     private var peerPollTask: Task<Void, Never>?
@@ -193,6 +201,29 @@ final class AntNode: ObservableObject {
         await refreshAll()
     }
 
+    // MARK: - Propagation verification
+
+    /// Check that a completed upload actually propagated by resolving its
+    /// manifest, enumerating the file's chunk tree, and probing a sample
+    /// of the real data leaves over the network — bypassing our local
+    /// copy. Stores the result in `propagation[job.id]` for the file row.
+    /// `samples` caps how many data leaves to probe (evenly spread,
+    /// clamped 1…32); `probes` is how many distinct closest peers to ask
+    /// per chunk (route diversity / replication, clamped 1…8).
+    @discardableResult
+    func verifyPropagation(_ job: UploadJob, samples: UInt8 = 6, probes: UInt8 = 2) async -> PropagationInfo? {
+        guard let h = handle, let reference = job.reference, !reference.isEmpty else { return nil }
+        if verifying.contains(job.id) { return propagation[job.id] }
+        verifying.insert(job.id)
+        defer { verifying.remove(job.id) }
+        guard let json = try? await Self.string(name: "verify propagation", { errPtr in
+            reference.withCString { ant_storage_verify_propagation(h, $0, samples, probes, errPtr) }
+        }) else { return nil }
+        let info = DriveDecoder.propagation(from: json)
+        if let info { propagation[job.id] = info }
+        return info
+    }
+
     // MARK: - Account
 
     func exportKey() async throws -> String {
@@ -208,6 +239,7 @@ final class AntNode: ObservableObject {
         await refreshJobs()
         await refreshPlan()
         await refreshAccount()
+        await refreshSettlement()
     }
 
     func refreshJobs() async {
@@ -234,6 +266,15 @@ final class AntNode: ObservableObject {
             ant_account_info(h, errPtr)
         }) {
             account = DriveDecoder.account(from: json)
+        }
+    }
+
+    func refreshSettlement() async {
+        guard let h = handle else { return }
+        if let json = try? await Self.string(name: "settlement status", { errPtr in
+            ant_storage_settlement_status(h, errPtr)
+        }) {
+            settlement = DriveDecoder.settlement(from: json)
         }
     }
 

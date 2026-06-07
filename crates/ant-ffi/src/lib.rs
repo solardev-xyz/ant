@@ -1426,6 +1426,85 @@ pub unsafe extern "C" fn ant_storage_status(
     }
 }
 
+/// Outbound-settlement status as JSON `{"enabled":bool,"chequebook":…}`.
+/// `enabled` is `true` once a chequebook is deployed, which is what lets
+/// uploads actually propagate (bee charges the uploader per pushed chunk
+/// and freezes out a node that can't pay). The Storage tab reads this to
+/// warn when a connected plan still won't upload reliably. On a build
+/// without `chain` support settlement is never available, so this
+/// reports `{"enabled":false,"chequebook":null}`.
+///
+/// # Safety
+///
+/// See [`ant_upload_start`].
+#[no_mangle]
+pub unsafe extern "C" fn ant_storage_settlement_status(
+    handle: *const AntHandle,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_storage_settlement_status", || {
+            let h = handle.as_ref().ok_or_else(null_handle)?;
+            #[cfg(feature = "chain")]
+            {
+                drive::settlement_status(h).map_err(|e| e.to_string())
+            }
+            #[cfg(not(feature = "chain"))]
+            {
+                let _ = h;
+                Ok(r#"{"enabled":false,"chequebook":null}"#.to_string())
+            }
+        })
+    }
+}
+
+/// Deep read-back propagation check for an uploaded `reference`.
+///
+/// Resolves the manifest at `reference` to its data root, enumerates the
+/// file's chunk tree (fetching every interior node network-only, which
+/// proves the skeleton is retrievable), then probes an evenly-spread
+/// sample of up to `samples` real data **leaves** across up to `probes`
+/// distinct closest BZZ peers each. All probes bypass the daemon's local
+/// caches so our own store-then-push copy can't mask a failed push.
+///
+/// Returns JSON `{"reference","retrievable","total_chunks",
+/// "leaf_chunks","intermediate_chunks","checked_chunks",
+/// "retrievable_chunks","sampled_leaves","sources","error"?}`.
+/// `retrievable` is true iff the data root and every interior node were
+/// fetched and every sampled leaf came back from at least one peer;
+/// `sources` is the minimum distinct-route count observed across sampled
+/// leaves (a replication floor).
+///
+/// `reference` accepts a bare/`0x` 64-hex address, a `bytes://` ref, or
+/// a `bzz://<ref>/<path>` URL (the root address is used; the path is
+/// ignored — verification always resolves the manifest's default file).
+/// `samples` is clamped to `1..=32` and `probes` to `1..=8` by the node
+/// loop; pass `0` for either to use a sensible default.
+///
+/// # Safety
+///
+/// See [`ant_upload_start`]. `reference` must be a valid NUL-terminated
+/// UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn ant_storage_verify_propagation(
+    handle: *const AntHandle,
+    reference: *const c_char,
+    samples: u8,
+    probes: u8,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_storage_verify_propagation", || {
+            let h = handle.as_ref().ok_or_else(null_handle)?;
+            let reference = cstr_to_string(reference)?;
+            let root = match parse_reference(&reference).map_err(|e| e.to_string())? {
+                ParsedRef::Bytes(root) | ParsedRef::Bzz { root, .. } => root,
+            };
+            drive::verify_propagation(h, root, samples, probes).map_err(|e| e.to_string())
+        })
+    }
+}
+
 /// Account identity as a JSON object
 /// `{"eth_address","overlay","peer_id","agent"}`.
 ///

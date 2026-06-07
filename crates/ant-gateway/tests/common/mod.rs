@@ -578,6 +578,54 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
                 message: "settlement enable ignored (test fixture)".into(),
             });
         }
+        // Read-back propagation check. The fixture has a single source
+        // (the `DirFetcher`), so report `sources = 1` when the chunk is
+        // present and `0` otherwise, matching the production JSON shape.
+        ControlCommand::VerifyPropagation {
+            reference,
+            samples,
+            probes,
+            ack,
+        } => {
+            // The gateway fixture's `DirFetcher` is a flat chunk store,
+            // not a manifest resolver, so this stand-in just reports
+            // root reachability in the deep check's JSON shape.
+            let retrievable = fetcher.fetch(reference).await.is_ok();
+            let checked = u64::from(retrievable);
+            let _ = (samples, probes);
+            let body = serde_json::json!({
+                "reference": format!("0x{}", hex::encode(reference)),
+                "retrievable": retrievable,
+                "total_chunks": 1,
+                "leaf_chunks": 1,
+                "intermediate_chunks": 0,
+                "checked_chunks": checked,
+                "retrievable_chunks": checked,
+                "sampled_leaves": checked,
+                "sources": checked,
+            });
+            let _ = ack.send(ControlAck::Ok {
+                message: body.to_string(),
+            });
+        }
+        ControlCommand::VerifyChunksPresent { addresses, ack } => {
+            // Stand-in: the fixture's `DirFetcher` is the source of
+            // truth for "present", so report any address it can't serve
+            // as missing, in the heal loop's JSON shape.
+            let mut missing = Vec::new();
+            for addr in &addresses {
+                if fetcher.fetch(*addr).await.is_err() {
+                    missing.push(format!("0x{}", hex::encode(addr)));
+                }
+            }
+            let body = serde_json::json!({
+                "checked": addresses.len(),
+                "missing": missing,
+            });
+            let _ = ack.send(ControlAck::Ok {
+                message: body.to_string(),
+            });
+        }
     }
 }
 

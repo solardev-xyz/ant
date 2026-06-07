@@ -189,6 +189,44 @@ pub(crate) fn storage_status(h: &AntHandle) -> Result<String, DriveError> {
         .block_on(async move { postage_status_json(&cmd_tx).await })
 }
 
+/// Read-back propagation check for an uploaded `reference` (the root
+/// chunk / manifest address). Asks the node loop to probe up to
+/// `probes` distinct closest peers with a network-only retrieval and
+/// returns the JSON `{reference, retrievable, sources, probes}` the
+/// handler builds. `sources` counts how many distinct entry peers
+/// served the chunk back — a route-diversity / replication estimate —
+/// so the app can show a "verified retrievable" badge instead of the
+/// bare "online" state, which only reflects that we *attempted* the
+/// push.
+pub(crate) fn verify_propagation(
+    h: &AntHandle,
+    reference: [u8; 32],
+    samples: u8,
+    probes: u8,
+) -> Result<String, DriveError> {
+    let cmd_tx = h.cmd_tx.clone();
+    h.runtime.block_on(async move {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        send(
+            &cmd_tx,
+            ControlCommand::VerifyPropagation {
+                reference,
+                samples,
+                probes,
+                ack: ack_tx,
+            },
+        )
+        .await?;
+        match recv_oneshot(ack_rx).await? {
+            ControlAck::Ok { message } => Ok(message),
+            ControlAck::NotReady { message } | ControlAck::Error { message } => {
+                Err(DriveError::Op(message))
+            }
+            other => Err(unexpected(&other)),
+        }
+    })
+}
+
 async fn postage_status_json(cmd_tx: &mpsc::Sender<ControlCommand>) -> Result<String, DriveError> {
     let (ack_tx, ack_rx) = oneshot::channel();
     send(cmd_tx, ControlCommand::PostageStatus { ack: ack_tx }).await?;
@@ -234,6 +272,8 @@ pub(crate) fn storage_connect_batch(
     let batch_id = parse_batch_id(&batch_hex)?;
     let cmd_tx = h.cmd_tx.clone();
     let eth = h.eth;
+    let secret = h.signing_secret;
+    let data_dir = h.data_dir.clone();
     h.runtime.block_on(async move {
         let chain = ant_chain::ChainClient::new(rpc);
         let meta =
@@ -255,6 +295,12 @@ pub(crate) fn storage_connect_batch(
             meta.immutable,
         )
         .await?;
+        // Connecting a plan must also turn on outbound settlement —
+        // otherwise uploads stamp fine but never propagate (bee freezes
+        // an unpaying node out past its payment threshold). Best-effort:
+        // a thin wallet or flaky RPC just leaves settlement off, which
+        // the Storage UI surfaces via `settlement_status`.
+        ensure_settlement_best_effort(&cmd_tx, &chain, secret, &data_dir, eth).await;
         postage_status_json(&cmd_tx).await
     })
 }
@@ -266,6 +312,8 @@ pub(crate) fn storage_connect_batch(
 pub(crate) fn storage_discover(h: &AntHandle, rpc: String) -> Result<String, DriveError> {
     let cmd_tx = h.cmd_tx.clone();
     let eth = h.eth;
+    let secret = h.signing_secret;
+    let data_dir = h.data_dir.clone();
     h.runtime.block_on(async move {
         let chain = ant_chain::ChainClient::new(rpc);
         let found = ant_chain::discover::discover_owned_batches(
@@ -281,6 +329,12 @@ pub(crate) fn storage_discover(h: &AntHandle, rpc: String) -> Result<String, Dri
         for b in &found {
             register_batch(&cmd_tx, b.batch_id, b.depth, b.bucket_depth, b.immutable).await?;
             registered.push(format!("0x{}", hex::encode(b.batch_id)));
+        }
+        // If we connected at least one plan, make sure outbound
+        // settlement is on so uploads against it actually reach the
+        // network. Best-effort; never fails discovery.
+        if !registered.is_empty() {
+            ensure_settlement_best_effort(&cmd_tx, &chain, secret, &data_dir, eth).await;
         }
         let status = postage_status_json(&cmd_tx).await?;
         // `status` is already a JSON document; splice it in raw.
@@ -724,6 +778,47 @@ pub(crate) async fn ensure_settlement(
     }
 }
 
+/// Build the node wallet and run [`ensure_settlement`] — the wrapper the
+/// discover / connect flows use so they share the buy flow's settlement
+/// bootstrap. Best-effort: a wallet-init failure (bad key) just logs and
+/// leaves settlement off; the Storage UI then shows the "settlement not
+/// set up" state via [`settlement_status`].
+#[cfg(feature = "chain")]
+async fn ensure_settlement_best_effort(
+    cmd_tx: &mpsc::Sender<ControlCommand>,
+    client: &ant_chain::ChainClient,
+    secret: [u8; 32],
+    data_dir: &std::path::Path,
+    node_eth: [u8; 20],
+) {
+    match ant_chain::tx::Wallet::new(secret, GNOSIS_CHAIN_ID) {
+        Ok(wallet) => ensure_settlement(cmd_tx, client, &wallet, data_dir, secret, node_eth).await,
+        Err(e) => tracing::warn!(target: "ant-ffi", "settlement skipped (wallet init): {e}"),
+    }
+}
+
+/// Whether outbound SWAP settlement is active for this device, as a JSON
+/// object `{"enabled":bool,"chequebook":"0x…"|null}`. Settlement is the
+/// thing that lets uploads actually propagate (bee charges the uploader
+/// for every pushed chunk and freezes out a node that can't pay), so the
+/// Storage tab reads this to warn the user when a connected plan still
+/// won't upload reliably. Local + cheap: it just reads the persisted
+/// `chequebook.json` association (written when a chequebook was
+/// deployed), no chain round-trip.
+#[cfg(feature = "chain")]
+pub(crate) fn settlement_status(h: &AntHandle) -> Result<String, DriveError> {
+    let path = h.data_dir.join("chequebook.json");
+    let (enabled, chequebook) = match ant_chain::chequebook_store::load_persisted_chequebook(&path)
+    {
+        Ok(Some(cb)) => (true, Some(format!("0x{}", hex::encode(cb)))),
+        _ => (false, None),
+    };
+    to_json(&SettlementStatus {
+        enabled,
+        chequebook,
+    })
+}
+
 /// Reuse / rediscover / deploy a chequebook for `node_eth`, persisting
 /// the association so future launches reload it directly. Returns the
 /// 20-byte chequebook address, or `None` when the wallet can't afford
@@ -864,6 +959,17 @@ struct AccountInfo {
     overlay: String,
     peer_id: String,
     agent: String,
+}
+
+/// Wire shape for [`settlement_status`].
+#[cfg(feature = "chain")]
+#[derive(Serialize)]
+struct SettlementStatus {
+    /// `true` once a chequebook is deployed + persisted, i.e. outbound
+    /// pushsync cheques can be issued and uploads will propagate.
+    enabled: bool,
+    /// `0x`-prefixed chequebook contract address when enabled.
+    chequebook: Option<String>,
 }
 
 #[cfg(feature = "chain")]

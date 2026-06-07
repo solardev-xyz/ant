@@ -269,6 +269,48 @@ pub enum ControlCommand {
         wire: Vec<u8>,
         ack: oneshot::Sender<ControlAck>,
     },
+    /// Deep read-back propagation check for a freshly-uploaded
+    /// reference. Resolves `reference` as a mantaray manifest (falling
+    /// back to treating it as a raw `/bytes/` data root if it isn't
+    /// one), then enumerates the file's chunk tree and probes the
+    /// *actual data chunks* — not just the root reference.
+    ///
+    /// Every interior (intermediate) node of the tree is fetched
+    /// network-only to walk it, so reaching the end proves the whole
+    /// skeleton is retrievable. A bounded, evenly-spread sample of up
+    /// to `samples` data **leaves** is then probed across up to
+    /// `probes` distinct closest BZZ peers each (closest-first, skipping
+    /// peers that already answered), again network-only so the daemon's
+    /// own store-then-push copy can't mask a failed push.
+    ///
+    /// The ack is a [`ControlAck::Ok`] whose `message` is a JSON
+    /// document `{reference, retrievable, total_chunks, leaf_chunks,
+    /// intermediate_chunks, checked_chunks, retrievable_chunks,
+    /// sampled_leaves, sources, error?}`. `retrievable` is true iff the
+    /// data root and every interior node were fetched and every sampled
+    /// leaf returned from at least one peer; `sources` is the minimum
+    /// distinct-route count observed across sampled leaves (a
+    /// replication floor). `samples`/`probes` of `0` fall back to
+    /// sensible defaults.
+    VerifyPropagation {
+        reference: [u8; 32],
+        samples: u8,
+        probes: u8,
+        ack: oneshot::Sender<ControlAck>,
+    },
+    /// Read-back presence check for a specific set of chunk addresses.
+    /// Backs the upload self-heal loop: each address is fetched
+    /// network-only (cache-free, the same robust closest-first /
+    /// forwarder-walking path a real download takes), so the daemon's
+    /// own store-then-push copy can't make an un-propagated chunk look
+    /// present. The ack is a [`ControlAck::Ok`] whose `message` is JSON
+    /// `{"checked":N,"missing":["0x..",...]}` listing the addresses
+    /// that could not be retrieved from the network. Callers batch the
+    /// address list to keep each ack bounded.
+    VerifyChunksPresent {
+        addresses: Vec<[u8; 32]>,
+        ack: oneshot::Sender<ControlAck>,
+    },
     /// Resolve a sequence feed `(owner, topic)` to its latest update.
     /// Backs the gateway's `GET /feeds/{owner}/{topic}` endpoint. The
     /// handler uses the same `RoutingFetcher` machinery `GetBytes` does,

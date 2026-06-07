@@ -276,6 +276,41 @@ char *ant_upload_cancel(const AntHandle *handle, const char *job_id, char **out_
 char *ant_storage_status(const AntHandle *handle, char **out_err);
 
 /*
+ * Outbound-settlement status as a JSON object:
+ *   {"enabled":bool,"chequebook":"0x…"|null}
+ * `enabled=true` once a chequebook is deployed, which is what lets
+ * uploads actually propagate (bee charges the uploader per pushed chunk
+ * and freezes out a node that can't pay). Builds without the `chain`
+ * feature always report {"enabled":false,"chequebook":null}.
+ */
+char *ant_storage_settlement_status(const AntHandle *handle, char **out_err);
+
+/*
+ * Deep read-back propagation check for an uploaded reference. Resolves
+ * the manifest to its data root, enumerates the file's chunk tree
+ * (fetching every interior node network-only, which proves the skeleton
+ * is retrievable), then probes an evenly-spread sample of up to
+ * `samples` real data leaves across up to `probes` distinct closest
+ * peers each. All probes bypass local caches so our own store-then-push
+ * copy can't mask a failed push. Returns JSON:
+ *   {"reference","retrievable":bool,"total_chunks":int,"leaf_chunks":int,
+ *    "intermediate_chunks":int,"checked_chunks":int,
+ *    "retrievable_chunks":int,"sampled_leaves":int,"sources":int,
+ *    "error"?:string}
+ * `retrievable` is true iff the root and every interior node were
+ * fetched and every sampled leaf came back; `sources` is the minimum
+ * distinct-route count across sampled leaves (a replication floor).
+ * `reference` accepts a bare/0x 64-hex address, a `bytes://` ref, or a
+ * `bzz://<ref>/<path>` URL (path ignored). `samples` is clamped to
+ * 1..=32 and `probes` to 1..=8; pass 0 for either to use a default.
+ */
+char *ant_storage_verify_propagation(const AntHandle *handle,
+                                     const char *reference,
+                                     uint8_t samples,
+                                     uint8_t probes,
+                                     char **out_err);
+
+/*
  * Account identity as a JSON object:
  *   {"eth_address","overlay","peer_id","agent"}
  */
