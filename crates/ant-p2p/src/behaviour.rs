@@ -1592,7 +1592,31 @@ fn handle_control_command(
             let control = control.clone();
             let pushsync_swap = state.pushsync_swap.clone();
             let push_skip = state.push_skip.clone();
+            let disk_cache = state.disk_cache.clone();
+            let mem_cache = state.chunk_cache.clone();
             tokio::spawn(async move {
+                // Land the chunk in our own local store *before* pushsync,
+                // mirroring bee's store-then-push upload model. Without
+                // this a node can't retrieve content it just uploaded:
+                // the chunk only exists on whatever neighbourhood storer
+                // accepted the push, and fresh content is not reliably
+                // retrievable from the network for the first few seconds
+                // (the gateway / AntDrive then "hits an unretrievable
+                // chunk" and the read truncates). Keeping a local copy
+                // makes our own uploads retrievable immediately and
+                // survives a slow/partial network push.
+                if let Some(mem) = &mem_cache {
+                    mem.put(addr, wire.clone());
+                }
+                if let Some(disk) = &disk_cache {
+                    if let Err(e) = disk.put(addr, wire.clone()).await {
+                        warn!(
+                            target: "ant_p2p",
+                            addr = %hex::encode(addr),
+                            "failed to cache uploaded chunk locally: {e}",
+                        );
+                    }
+                }
                 let mut fetcher =
                     ant_retrieval::RoutingFetcher::new(control, peers_rx).with_push_skip(push_skip);
                 if let Some(svc) = pushsync_swap {
@@ -1677,7 +1701,25 @@ fn handle_control_command(
             let control = control.clone();
             let pushsync_swap = state.pushsync_swap.clone();
             let push_skip = state.push_skip.clone();
+            let disk_cache = state.disk_cache.clone();
+            let mem_cache = state.chunk_cache.clone();
             tokio::spawn(async move {
+                // Keep a local copy of our own upload before pushsync, so
+                // the node can serve the SOC it just stamped without
+                // waiting for network propagation. See the matching note
+                // in the `PushChunk` handler.
+                if let Some(mem) = &mem_cache {
+                    mem.put(address, wire.clone());
+                }
+                if let Some(disk) = &disk_cache {
+                    if let Err(e) = disk.put(address, wire.clone()).await {
+                        warn!(
+                            target: "ant_p2p",
+                            addr = %hex::encode(address),
+                            "failed to cache uploaded soc locally: {e}",
+                        );
+                    }
+                }
                 let mut fetcher =
                     ant_retrieval::RoutingFetcher::new(control, peers_rx).with_push_skip(push_skip);
                 if let Some(svc) = pushsync_swap {
