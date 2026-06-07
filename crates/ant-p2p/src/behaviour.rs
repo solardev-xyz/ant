@@ -1644,6 +1644,32 @@ fn handle_control_command(
                     });
                     return;
                 };
+                // Headroom guard: refuse to stamp a chunk whose collision
+                // bucket is already full. On a mutable batch the issuer
+                // would otherwise wrap the bucket and re-issue an
+                // already-used slot, which bee resolves by evicting the
+                // older chunk — silently dropping content (often from the
+                // same upload) and making it unretrievable network-wide.
+                // Failing loudly here surfaces an under-sized batch (e.g.
+                // depth 17, only 2 slots/bucket) instead of producing a
+                // phantom "uploaded" file. Buy/dilute to a larger batch.
+                if issuer.bucket_is_full(&addr) {
+                    warn!(
+                        target: "ant_p2p",
+                        batch = %hex::encode(batch_id),
+                        depth = issuer.batch_depth(),
+                        addr = %hex::encode(addr),
+                        "refusing to stamp: collision bucket full — batch is saturated, stamping would evict an existing chunk (batch depth too small; buy/dilute a larger batch)",
+                    );
+                    let _ = ack.send(ControlAck::Error {
+                        message: format!(
+                            "batch 0x{} saturated: collision bucket full at depth {} — stamping would evict an existing chunk; buy or dilute to a larger batch",
+                            hex::encode(batch_id),
+                            issuer.batch_depth(),
+                        ),
+                    });
+                    return;
+                }
                 match ant_postage::sign_stamp_bytes(&upload.stamp_key, issuer, &addr) {
                     Ok(s) => s,
                     Err(e) => {

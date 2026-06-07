@@ -94,22 +94,10 @@ struct GetStartedView: View {
             GlassCard {
                 HStack(spacing: 14) {
                     VStack(alignment: .leading, spacing: 4) {
-                        HStack(spacing: 8) {
-                            Text(tier.title)
-                                .font(.title3.weight(.bold))
-                                .foregroundStyle(.white)
-                            if tier.recommended {
-                                Text("POPULAR")
-                                    .font(.caption2.weight(.bold))
-                                    .foregroundStyle(.black)
-                                    .padding(.horizontal, 8).padding(.vertical, 3)
-                                    .background(.green, in: .capsule)
-                            }
-                        }
-                        Text(tier.subtitle)
-                            .font(.subheadline)
-                            .foregroundStyle(.white.opacity(0.7))
-                        Text("\(formatBytes(tier.capacityBytes)) · \(tier.durationLabel)")
+                        Text(tier.title)
+                            .font(.title3.weight(.bold))
+                            .foregroundStyle(.white)
+                        Text("Up to \(formatBytes(tier.safeLimitBytes)) · \(tier.durationLabel)")
                             .font(.caption.weight(.medium))
                             .foregroundStyle(.white.opacity(0.85))
                     }
@@ -151,7 +139,7 @@ struct GetStartedView: View {
                         Text(tier.title)
                             .font(.system(.title2, design: .rounded).weight(.bold))
                             .foregroundStyle(.white)
-                        Text("\(formatBytes(quote.capacityBytes)) for \(tier.durationLabel)")
+                        Text("Up to \(formatBytes(tier.safeLimitBytes)) for \(tier.durationLabel)")
                             .font(.subheadline)
                             .foregroundStyle(.white.opacity(0.7))
                     }

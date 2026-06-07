@@ -214,12 +214,20 @@ struct AccountInfo: Codable, Equatable {
 struct StoragePlanTier: Identifiable, Equatable {
     let id: String
     let title: String
-    let subtitle: String
     let depth: UInt8
     let days: UInt64
-    let recommended: Bool
+    /// Advertised SAFE upload limit — the amount of data the batch can
+    /// reliably store without risking chunk eviction. This is Swarm's
+    /// "effective volume" for the batch depth (the volume storable at a
+    /// ≤0.1% failure rate), which is far below the theoretical
+    /// `2^depth × 4 KiB`. We show this to the user instead of the
+    /// misleading theoretical figure so a plan never promises more than
+    /// it can durably hold. Effective volume per depth (unencrypted):
+    /// d19 ≈ 112 MB, d20 ≈ 688 MB, d21 ≈ 2.60 GB, d22 ≈ 7.73 GB.
+    let safeLimitBytes: UInt64
 
-    /// Theoretical capacity (2^depth chunks × 4 KiB), for display.
+    /// Theoretical capacity (2^depth chunks × 4 KiB). Retained for
+    /// reference; NOT shown to the user (see `safeLimitBytes`).
     var capacityBytes: UInt64 { (UInt64(1) << depth) &* StoragePlan.bytesPerChunk }
 
     /// Friendly duration label ("1 day" / "1 year").
@@ -232,22 +240,25 @@ struct StoragePlanTier: Identifiable, Equatable {
         }
     }
 
+    // Depths are chosen as the SMALLEST batch depth whose Swarm
+    // "effective volume" (≤0.1% failure) covers the advertised safe
+    // limit, so uploads up to the limit land durably without evicting
+    // earlier chunks. Never advertise more than the effective volume of
+    // the chosen depth, and never go below depth 19 (depth 17/18 have an
+    // effective volume of only ~45 kB / ~6.7 MB).
     static let all: [StoragePlanTier] = [
-        // Smallest valid batch (depth 17, the postage minimum) for just a
-        // day — cheapest possible, so it's the one to use when testing the
-        // real buy flow without spending much.
-        StoragePlanTier(id: "test", title: "Test",
-                        subtitle: "Smallest plan, for trying it out",
-                        depth: 17, days: 1, recommended: false),
+        // depth 20 → effective ≈ 688 MB (comfortable margin over 100 MB).
         StoragePlanTier(id: "starter", title: "Starter",
-                        subtitle: "For a few documents and photos",
-                        depth: 20, days: 365, recommended: false),
-        StoragePlanTier(id: "standard", title: "Standard",
-                        subtitle: "For everyday files and backups",
-                        depth: 22, days: 365, recommended: true),
+                        depth: 20, days: 30,
+                        safeLimitBytes: 100 * 1_000_000),
+        // depth 21 → effective ≈ 2.60 GB (comfortably covers 1 GB).
+        StoragePlanTier(id: "advanced", title: "Advanced",
+                        depth: 21, days: 180,
+                        safeLimitBytes: 1_000_000_000),
+        // depth 22 → effective ≈ 7.73 GB (covers a 5 GB safe limit).
         StoragePlanTier(id: "plus", title: "Plus",
-                        subtitle: "For large libraries and media",
-                        depth: 24, days: 365, recommended: false),
+                        depth: 22, days: 365,
+                        safeLimitBytes: 5 * 1_000_000_000),
     ]
 }
 

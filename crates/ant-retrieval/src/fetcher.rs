@@ -202,6 +202,21 @@ pub struct RoutingFetcher {
     /// signature). The daemon sets this so a push only counts as
     /// success when a genuine neighbourhood storer signed the receipt.
     push_network_id: Option<u64>,
+    /// Whether a *shallow* pushsync receipt may count as a successful
+    /// push. A shallow receipt proves a storer ran its `store()` path,
+    /// but at a proximity *shallower* than its own reported storage
+    /// radius — i.e. the chunk did **not** reach its true neighbourhood.
+    /// Such a chunk is retrievable transiently (the shallow forwarder
+    /// still holds it, and the uploading node keeps its own copy), which
+    /// is exactly why a single-node read-back can falsely report it
+    /// "reachable" — but an independent cold node, routing to the real
+    /// neighbourhood, finds nothing and the upload is unretrievable
+    /// network-wide. Default `false`: we hunt every candidate for a
+    /// deep storer and, if none is reachable, fail the push *loudly*
+    /// rather than reporting a non-durable upload as synced. Set `true`
+    /// (via [`Self::with_accept_shallow`]) only where bee-aligned soft
+    /// acceptance is explicitly wanted.
+    accept_shallow: bool,
 }
 
 impl RoutingFetcher {
@@ -238,7 +253,21 @@ impl RoutingFetcher {
             pushsync_settlement: None,
             push_skip: None,
             push_network_id: None,
+            accept_shallow: false,
         }
+    }
+
+    /// Opt back in to bee-aligned *soft* acceptance of shallow pushsync
+    /// receipts. When set, [`Self::push_stamped_chunk`] treats a shallow
+    /// receipt as success after exhausting the bounded deeper-storer hunt
+    /// (the pre-strict-mode behaviour). Left unset (the default), a chunk
+    /// that only ever draws shallow receipts fails the push so the upload
+    /// surfaces the non-durable placement instead of silently reporting
+    /// success. See [`Self::accept_shallow`] for the full rationale.
+    #[must_use]
+    pub fn with_accept_shallow(mut self, accept: bool) -> Self {
+        self.accept_shallow = accept;
+        self
     }
 
     /// Set the swarm network id used to verify pushsync receipt
@@ -570,18 +599,29 @@ impl RoutingFetcher {
                 }
             }
             let Some((peer, peer_overlay)) = ranked.first().copied() else {
-                // No candidates left to try. If a storer already accepted
-                // the chunk with a shallow receipt, the chunk is stored
-                // and retrievable — accept it rather than failing (e.g.
-                // the only reachable peer answered shallow). Bee-aligned.
+                // No candidates left to try. A shallow receipt means the
+                // chunk landed shallower than its storage radius, so it
+                // did not reach its true neighbourhood and is not durably
+                // retrievable network-wide. In strict mode (the default)
+                // we surface that as a failed push; only with
+                // `accept_shallow` do we treat it as bee-aligned success.
                 if let Some(shallow) = shallow_fallback.take() {
+                    if self.accept_shallow {
+                        warn!(
+                            target: "ant_retrieval::fetcher",
+                            addr = %hex::encode(chunk_addr),
+                            err = %shallow,
+                            "accepting shallow receipt; no deeper candidates remain (bee-aligned)",
+                        );
+                        return Ok(());
+                    }
                     warn!(
                         target: "ant_retrieval::fetcher",
                         addr = %hex::encode(chunk_addr),
                         err = %shallow,
-                        "accepting shallow receipt; no deeper candidates remain (bee-aligned)",
+                        "no deep storer reachable; chunk only landed shallow — failing push (not durably retrievable)",
                     );
-                    return Ok(());
+                    return Err(shallow);
                 }
                 return Err(crate::pushsync::PushSyncError::Remote("no peers".into()));
             };
@@ -682,7 +722,7 @@ impl RoutingFetcher {
                     shallow_attempts,
                     "pushsync got a shallow receipt; chunk is stored but shallow — trying for a deeper storer",
                 );
-                if accept_shallow_after(shallow_attempts) {
+                if self.accept_shallow && accept_shallow_after(shallow_attempts) {
                     warn!(
                         target: "ant_retrieval::fetcher",
                         addr = %hex::encode(chunk_addr),
@@ -714,18 +754,28 @@ impl RoutingFetcher {
             skipped.push(peer);
             last_err = Some(err);
         }
-        // Exhausted the candidate set. If at least one storer accepted the
-        // chunk with a shallow receipt, the chunk *is* stored and
-        // retrievable — accept it rather than failing the upload, exactly
-        // as bee's pusher does once it runs out of retries.
+        // Exhausted the candidate set. At least one storer accepted the
+        // chunk shallow. With `accept_shallow` we follow bee's pusher and
+        // report it synced; in strict mode (the default) a shallow-only
+        // placement is *not* durably retrievable network-wide, so we fail
+        // the push and let the uploader/self-heal surface it loudly.
         if let Some(shallow) = shallow_fallback {
+            if self.accept_shallow {
+                warn!(
+                    target: "ant_retrieval::fetcher",
+                    addr = %hex::encode(chunk_addr),
+                    err = %shallow,
+                    "accepting shallow receipt after exhausting all candidates (bee-aligned)",
+                );
+                return Ok(());
+            }
             warn!(
                 target: "ant_retrieval::fetcher",
                 addr = %hex::encode(chunk_addr),
                 err = %shallow,
-                "accepting shallow receipt after exhausting all candidates (bee-aligned)",
+                "exhausted all candidates with only shallow receipts — failing push (not durably retrievable)",
             );
-            return Ok(());
+            return Err(shallow);
         }
         Err(crate::pushsync::PushSyncError::Remote(format!(
             "exhausted pushsync peers (last: {})",

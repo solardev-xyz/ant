@@ -1094,11 +1094,31 @@ impl UploadManager {
                 job_id, chunks = all_addrs.len(),
                 "post-upload heal: all chunks reachable after re-push",
             ),
-            Some(missing) => warn!(
-                target: "ant_node::uploads",
-                job_id, missing = missing.len(), total = all_addrs.len(), rounds = MAX_HEAL_ROUNDS,
-                "post-upload heal: chunks still unreachable after all rounds",
-            ),
+            // A *conclusive* miss after every round means the upload is
+            // not durably retrievable — the chunks never reached their
+            // neighbourhood. Leaving the job at `Completed` would report
+            // an unretrievable upload as success (the exact symptom of
+            // "I can't verify uploads on other nodes"), so flip it to
+            // `Failed` with a descriptive error. The operator can
+            // `resume` to retry from the checkpoint; the recorded
+            // `reference` is preserved for inspection.
+            Some(missing) => {
+                let n = missing.len();
+                let total = all_addrs.len();
+                warn!(
+                    target: "ant_node::uploads",
+                    job_id, missing = n, total, rounds = MAX_HEAL_ROUNDS,
+                    "post-upload heal: chunks still unreachable after all rounds — marking job failed",
+                );
+                if let Ok(handle) = self.resolve(job_id) {
+                    self.mark_failed(
+                        &handle,
+                        format!(
+                            "post-upload heal: {n}/{total} chunks not retrievable from the network after {MAX_HEAL_ROUNDS} rounds (upload is not durably stored)",
+                        ),
+                    );
+                }
+            }
             None => warn!(
                 target: "ant_node::uploads",
                 job_id, total = all_addrs.len(), rounds = MAX_HEAL_ROUNDS,

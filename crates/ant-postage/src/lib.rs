@@ -392,6 +392,36 @@ impl StampIssuer {
         1u32 << u32::from(self.batch_depth - self.bucket_depth)
     }
 
+    /// True if the collision bucket the chunk at `addr` maps to is
+    /// already at capacity. The next stamp for such a chunk would, on a
+    /// mutable batch, wrap the bucket counter back to 0 and re-issue an
+    /// already-used `(bucket, index)` slot with a newer timestamp — which
+    /// bee storers resolve by keeping the newer chunk and **evicting**
+    /// the older one. On a too-small batch (e.g. depth 17, only
+    /// `2^(depth-bucket_depth)` slots per bucket) that silently drops
+    /// chunks — including chunks of the *same* upload — leaving the
+    /// content unretrievable network-wide. Callers that need durable
+    /// storage should refuse to stamp when this returns `true` rather
+    /// than evict. (An *immutable* batch already errors with
+    /// [`PostageError::BucketFull`] in [`Self::increment`].)
+    #[must_use]
+    pub fn bucket_is_full(&self, addr: &[u8; 32]) -> bool {
+        let b_idx = collision_bucket_from_addr(self.bucket_depth, addr);
+        self.buckets.get(b_idx as usize).copied().unwrap_or(0) >= self.bucket_upper_bound()
+    }
+
+    /// True when the fullest bucket is already at capacity, so *some*
+    /// chunk addresses can no longer be stamped without evicting an
+    /// earlier chunk (see [`Self::bucket_is_full`]). Equivalent to
+    /// `stats().worst_case_remaining == 0`, but without allocating /
+    /// walking for the full [`BucketStats`]. Use as a cheap pre-flight
+    /// "this batch is saturated" signal.
+    #[must_use]
+    pub fn is_saturated(&self) -> bool {
+        let upper = self.bucket_upper_bound();
+        self.buckets.iter().any(|&n| n >= upper)
+    }
+
     /// Reserve the next index in the bucket the chunk address falls in.
     ///
     /// **Persistence**: when this issuer was built via
@@ -748,6 +778,37 @@ mod tests {
             issuer.bucket_depth,
         )
         .unwrap();
+    }
+
+    /// The headroom predicates must flag a collision bucket as full once
+    /// it reaches capacity — the signal the upload path uses to refuse to
+    /// stamp (and thus silently evict) on an under-sized batch.
+    #[test]
+    fn bucket_full_predicate_flags_saturation() {
+        let batch_id = [0x5au8; 32];
+        // depth 17, bucket_depth 16 => 2^(17-16) = 2 slots per bucket
+        // (the postage minimum — exactly the batch that broke uploads).
+        let mut issuer = StampIssuer::new(batch_id, 17, 16, false).unwrap();
+        let chunk = [9u8; 32];
+
+        assert!(!issuer.bucket_is_full(&chunk));
+        assert!(!issuer.is_saturated());
+
+        // First slot used — still room for one more.
+        issuer.increment(&chunk).unwrap();
+        assert!(!issuer.bucket_is_full(&chunk));
+
+        // Second slot fills the bucket to capacity: a third stamp would
+        // wrap and evict, so the predicate must now refuse it.
+        issuer.increment(&chunk).unwrap();
+        assert!(issuer.bucket_is_full(&chunk));
+        assert!(issuer.is_saturated());
+
+        // A chunk routing to an untouched bucket is still stampable.
+        let mut other = [0u8; 32];
+        other[0] = 0xff;
+        other[1] = 0xff;
+        assert!(!issuer.bucket_is_full(&other));
     }
 
     /// Writing then re-loading the store must preserve every counter
