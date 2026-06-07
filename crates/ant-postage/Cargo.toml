@@ -1,6 +1,6 @@
 [package]
 name = "ant-postage"
-version = "0.5.10"
+version = "0.5.11"
 edition.workspace = true
 
 [dependencies]
