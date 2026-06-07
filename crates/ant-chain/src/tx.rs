@@ -71,6 +71,81 @@ pub const FACTORY_DEPLOY_CHEQUEBOOK_GAS: u64 = 1_500_000;
 /// Plain `IERC20.transfer(to, value)` to fund a freshly-deployed
 /// chequebook. Same shape as `approve`, so 100 K is plenty.
 pub const ERC20_TRANSFER_GAS: u64 = 100_000;
+/// One-time CREATE2 deployment of the `BzzSwapHelper` (~1.2 KB of init
+/// code) through the deterministic deployer. Empirically ~250 K; cap at
+/// 600 K for headroom.
+pub const SWAP_HELPER_DEPLOY_GAS: u64 = 600_000;
+/// `BzzSwapHelper.swapXdaiForBzz`: WXDAI `deposit` + a single V3 pool
+/// `swap` + ERC-20 transfer in the callback. Measured ~180 K; cap 400 K.
+pub const SWAP_HELPER_SWAP_GAS: u64 = 400_000;
+
+/// Creation bytecode for `contracts/BzzSwapHelper.sol`, compiled with
+/// `solc --optimize`. Embedded so the node can self-deploy the helper
+/// (via CREATE2) the first time anyone funds storage with xDAI. Keep in
+/// sync with the committed `.bin` artifact; [`tests`] pins its hash.
+pub const SWAP_HELPER_INITCODE_HEX: &str = include_str!("../../../contracts/BzzSwapHelper.bin");
+
+/// `BzzSwapHelper.swapXdaiForBzz(address recipient, uint256 amountOutMin)`.
+#[must_use]
+pub fn swap_helper_calldata(recipient: &[u8; 20], amount_out_min: &U256) -> Vec<u8> {
+    let mut data = Vec::with_capacity(4 + 32 + 32);
+    data.extend_from_slice(&keccak256(b"swapXdaiForBzz(address,uint256)")[0..4]);
+    data.extend_from_slice(&pad_word_address(recipient));
+    data.extend_from_slice(&u256_be_word(amount_out_min));
+    data
+}
+
+/// Salt used for the helper's CREATE2 deployment. Zero — the init code
+/// already fully determines the address, and we only ever want one
+/// canonical instance.
+const SWAP_HELPER_SALT: [u8; 32] = [0u8; 32];
+
+/// Decode a `0x`-prefixed 20-byte hex address constant. Panics on a
+/// malformed literal — only ever called on our own `const` strings, so a
+/// bad value is a build-time bug, not a runtime input.
+fn decode_addr_const(s: &str) -> [u8; 20] {
+    let s = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
+    let mut out = [0u8; 20];
+    hex::decode_to_slice(s, &mut out).expect("valid 20-byte address constant");
+    out
+}
+
+/// The helper's creation bytecode as bytes.
+#[must_use]
+pub fn swap_helper_initcode() -> Vec<u8> {
+    hex::decode(SWAP_HELPER_INITCODE_HEX.trim()).expect("valid helper initcode hex")
+}
+
+/// Deterministic address the `BzzSwapHelper` deploys to via the CREATE2
+/// deployer: `keccak256(0xff ‖ deployer ‖ salt ‖ keccak256(initcode))[12..]`.
+#[must_use]
+pub fn swap_helper_address() -> [u8; 20] {
+    let deployer = decode_addr_const(crate::CREATE2_DEPLOYER);
+    let init_hash = keccak256(&swap_helper_initcode());
+    let mut pre = Vec::with_capacity(1 + 20 + 32 + 32);
+    pre.push(0xff);
+    pre.extend_from_slice(&deployer);
+    pre.extend_from_slice(&SWAP_HELPER_SALT);
+    pre.extend_from_slice(&init_hash);
+    let h = keccak256(&pre);
+    let mut addr = [0u8; 20];
+    addr.copy_from_slice(&h[12..32]);
+    addr
+}
+
+/// Calldata for the deterministic deployer: `salt(32) ‖ initcode`.
+#[cfg(feature = "chain-rpc")]
+#[must_use]
+fn create2_deploy_calldata() -> Vec<u8> {
+    let init = swap_helper_initcode();
+    let mut data = Vec::with_capacity(32 + init.len());
+    data.extend_from_slice(&SWAP_HELPER_SALT);
+    data.extend_from_slice(&init);
+    data
+}
 
 #[derive(Debug, Error)]
 pub enum TxError {
@@ -767,6 +842,21 @@ impl Wallet {
         data: Vec<u8>,
         gas_limit: u64,
     ) -> Result<TxReceipt, TxError> {
+        self.send_signed_value(client, to, data, gas_limit, U256::zero())
+            .await
+    }
+
+    /// Like [`Self::send_signed`] but attaches native xDAI `value` — used
+    /// for the swap helper, which is `payable` and wraps the attached
+    /// xDAI into WXDAI before swapping.
+    async fn send_signed_value(
+        &self,
+        client: &ChainClient,
+        to: [u8; 20],
+        data: Vec<u8>,
+        gas_limit: u64,
+        value: U256,
+    ) -> Result<TxReceipt, TxError> {
         let nonce = client
             .eth_get_transaction_count_pending(&self.address)
             .await?;
@@ -775,13 +865,52 @@ impl Wallet {
             gas_price_wei: self.default_gas_price_wei,
             gas_limit,
             to,
-            value_wei: U256::zero(),
+            value_wei: value,
             data,
             chain_id: self.chain_id,
         };
         let (raw, _hash_local) = sign_legacy_tx(&self.secret, &tx)?;
         let tx_hash = client.eth_send_raw_transaction(&raw).await?;
         client.wait_for_receipt(&tx_hash, self.default_wait).await
+    }
+
+    /// Ensure the `BzzSwapHelper` is deployed and return its (constant,
+    /// CREATE2-derived) address. If no bytecode is present yet, deploy it
+    /// once through the deterministic deployer — a one-time cost the first
+    /// xDAI-funder pays; everyone afterwards reuses the same instance.
+    pub async fn ensure_swap_helper(&self, client: &ChainClient) -> Result<[u8; 20], TxError> {
+        let helper = swap_helper_address();
+        let code = client
+            .eth_get_code(&format!("0x{}", hex::encode(helper)))
+            .await?;
+        if !code.is_empty() {
+            return Ok(helper);
+        }
+        let deployer = decode_addr_const(crate::CREATE2_DEPLOYER);
+        self.send_signed(
+            client,
+            deployer,
+            create2_deploy_calldata(),
+            SWAP_HELPER_DEPLOY_GAS,
+        )
+        .await?;
+        Ok(helper)
+    }
+
+    /// Swap `value` wei of native xDAI into xBZZ via the helper,
+    /// delivering the xBZZ to `recipient` and reverting unless at least
+    /// `amount_out_min` (PLUR) comes out.
+    pub async fn swap_xdai_for_bzz(
+        &self,
+        client: &ChainClient,
+        helper: &[u8; 20],
+        recipient: &[u8; 20],
+        value: U256,
+        amount_out_min: U256,
+    ) -> Result<TxReceipt, TxError> {
+        let data = swap_helper_calldata(recipient, &amount_out_min);
+        self.send_signed_value(client, *helper, data, SWAP_HELPER_SWAP_GAS, value)
+            .await
     }
 }
 
@@ -804,6 +933,34 @@ mod tests {
     fn keccak_selector_matches_known() {
         let sel = &keccak256(b"transfer(address,uint256)")[0..4];
         assert_eq!(hex::encode(sel), "a9059cbb");
+    }
+
+    /// The embedded `BzzSwapHelper` bytecode must hash to the same value
+    /// it had when its CREATE2 address was computed — otherwise the node
+    /// would deploy to / look for the wrong address. Pins both the init
+    /// code hash and the resulting deterministic address (cross-checked
+    /// against a live Gnosis CREATE2-deployer `eth_call`).
+    #[test]
+    fn swap_helper_address_is_pinned() {
+        let init_hash = keccak256(&swap_helper_initcode());
+        assert_eq!(
+            hex::encode(init_hash),
+            "3f1b4a8dd6abc44dbf26a787aa9f7828520af83754f4b04df70bd8ffc2c3ea3a",
+            "helper bytecode changed — recompute the CREATE2 address"
+        );
+        assert_eq!(
+            hex::encode(swap_helper_address()),
+            "5f346eee2056edfae2a98e6675f63f34702c3f68",
+        );
+    }
+
+    /// `swapXdaiForBzz(address,uint256)` selector matches the compiled
+    /// dispatcher (`0x3b88d7af` in the helper's bytecode).
+    #[test]
+    fn swap_helper_selector() {
+        let calldata = swap_helper_calldata(&[0u8; 20], &U256::zero());
+        assert_eq!(hex::encode(&calldata[0..4]), "3b88d7af");
+        assert_eq!(calldata.len(), 4 + 32 + 32);
     }
 
     /// `approve(address,uint256)` known selector `0x095ea7b3`.

@@ -27,8 +27,17 @@ name = "ant_ffi"
 # `cargo xtask build-android-*` flips this on; everything else leaves
 # it off.
 jni = ["dep:jni"]
+# Compile the on-chain "connect storage" path in `src/drive.rs`
+# (`ant_storage_connect_batch` / `ant_storage_discover`). This pulls
+# `ant-chain`'s `chain-rpc` feature back in (reqwest + rustls), which the
+# mobile slice otherwise drops, so it is off by default. The AntDrive
+# example app turns it on via `cargo xtask build-ios-* --features chain`
+# because its Storage tab needs to read the user's postage batch from
+# Gnosis. The download-only `ios-download` app leaves it off.
+chain = ["dep:ant-chain", "ant-chain/chain-rpc", "dep:primitive-types"]
 
 [dependencies]
+ant-chain = { path = "../ant-chain", default-features = false, optional = true }
 ant-control = { path = "../ant-control" }
 ant-crypto = { path = "../ant-crypto" }
 # `default-features = false` removes the `chain-rpc` feature from the
@@ -39,6 +48,7 @@ ant-crypto = { path = "../ant-crypto" }
 # default-features = true import of ant-chain.
 ant-node = { path = "../ant-node", default-features = false }
 ant-p2p = { path = "../ant-p2p", default-features = false }
+ant-postage = { path = "../ant-postage" }
 ant-retrieval = { path = "../ant-retrieval" }
 hex.workspace = true
 # Optional JNI bindings. Pulled in only when the `jni` feature flag
@@ -51,6 +61,10 @@ jni = { version = "0.22.4", optional = true }
 k256.workspace = true
 libp2p.workspace = true
 percent-encoding = "2.3"
+# u256 math for the postage-buy `amount × 2^depth` approval value. Only
+# the `chain` feature (real on-chain createBatch) needs it; pinned to the
+# same version `ant-chain` already uses so the workspace stays on one.
+primitive-types = { version = "0.14.0", default-features = false, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

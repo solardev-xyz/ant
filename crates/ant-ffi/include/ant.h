@@ -215,6 +215,149 @@ int ant_stream_progress(const AntStream *stream, AntProgress *out);
  */
 void ant_stream_close(AntStream *stream);
 
+/* =========================================================================
+ * AntDrive: uploads, storage plan, account
+ *
+ * Each function returns a heap-allocated NUL-terminated string (JSON for
+ * the structured calls, a plain id / hex string otherwise), owned by ant
+ * and freed with ant_free_string. On failure they return NULL and write
+ * an allocated error string into *out_err (also freed with
+ * ant_free_string). Pass NULL for out_err to opt out of error reporting.
+ * =========================================================================
+ */
+
+/*
+ * Start an upload job for the file at `path`. `batch_id` selects the
+ * storage plan to stamp against (NULL = node default); `name` /
+ * `content_type` are optional manifest metadata (NULL to let the daemon
+ * infer). Returns the new job id (16 hex chars).
+ */
+char *ant_upload_start(const AntHandle *handle,
+                       const char *path,
+                       const char *batch_id,
+                       const char *name,
+                       const char *content_type,
+                       char **out_err);
+
+/*
+ * Snapshot every upload job as a JSON document:
+ *   {"jobs":[{"job_id","source_path","source_size","name","content_type",
+ *             "raw","status","bytes_pushed","chunks_pushed","chunks_total",
+ *             "created_at_unix","last_update_unix","last_error",
+ *             "reference"},...]}
+ * (optional fields are omitted when unknown).
+ */
+char *ant_upload_list(const AntHandle *handle, char **out_err);
+
+/*
+ * Snapshot one upload job by id (or unique 8-hex-char prefix) as a JSON
+ * object with the same shape as a `jobs[]` element above.
+ */
+char *ant_upload_status(const AntHandle *handle,
+                        const char *job_id,
+                        char **out_err);
+
+/*
+ * Pause / resume / cancel an upload job. Each returns the updated job
+ * JSON object.
+ */
+char *ant_upload_pause(const AntHandle *handle, const char *job_id, char **out_err);
+char *ant_upload_resume(const AntHandle *handle, const char *job_id, char **out_err);
+char *ant_upload_cancel(const AntHandle *handle, const char *job_id, char **out_err);
+
+/*
+ * Snapshot the local storage plan (postage issuer) as a JSON object:
+ *   {"enabled":bool,"batch_id","batch_depth","bucket_depth","immutable",
+ *    "bucket_count","bucket_capacity","total_capacity_chunks",
+ *    "issued_chunks","bucket_fill_min","bucket_fill_max",
+ *    "remaining_total_chunks","worst_case_remaining_chunks"}
+ * `enabled=false` means no plan is connected yet.
+ */
+char *ant_storage_status(const AntHandle *handle, char **out_err);
+
+/*
+ * Account identity as a JSON object:
+ *   {"eth_address","overlay","peer_id","agent"}
+ */
+char *ant_account_info(const AntHandle *handle, char **out_err);
+
+/*
+ * Export the account's raw secp256k1 signing key as 64 hex chars (no
+ * 0x). Secret material — handle accordingly.
+ */
+char *ant_account_export_key(const AntHandle *handle, char **out_err);
+
+/*
+ * Connect a storage plan this account already owns on Gnosis, by id.
+ * Reads the plan parameters from `gnosis_rpc`, verifies ownership,
+ * registers it for stamping, and returns the refreshed
+ * ant_storage_status JSON. Only functional when ant-ffi is built with
+ * the `chain` cargo feature; otherwise returns NULL + an error.
+ */
+char *ant_storage_connect_batch(const AntHandle *handle,
+                                const char *gnosis_rpc,
+                                const char *batch_id,
+                                char **out_err);
+
+/*
+ * Auto-discover and connect every funded storage plan this account owns
+ * on Gnosis (an on-chain log scan — can take a while). Returns
+ *   {"registered":[...ids],"status":<ant_storage_status object>}
+ * Requires the `chain` cargo feature.
+ */
+char *ant_storage_discover(const AntHandle *handle,
+                           const char *gnosis_rpc,
+                           char **out_err);
+
+/*
+ * Price a storage plan (no transaction). `depth` sets capacity
+ * (2^depth chunks × 4 KiB); `days` sets how long it should last.
+ * Returns a JSON object:
+ *   {"depth","days","amount_per_chunk","total_cost_plur",
+ *    "total_cost_bzz","capacity_bytes","account_bzz",
+ *    "account_bzz_display","account_xdai","account_xdai_display",
+ *    "needed_bzz","needed_bzz_display","xdai_required",
+ *    "xdai_required_display","xdai_to_send","xdai_to_send_display",
+ *    "sufficient_funds"}
+ * For the xDAI-only flow, `xdai_to_send_display` is exactly how much more
+ * xDAI to send; the node swaps it to xBZZ and buys the plan itself.
+ * Requires the `chain` cargo feature.
+ */
+char *ant_storage_quote(const AntHandle *handle,
+                        const char *gnosis_rpc,
+                        uint8_t depth,
+                        uint64_t days,
+                        char **out_err);
+
+/*
+ * Buy and activate a storage plan on Gnosis (approve + createBatch, then
+ * register it for stamping). `amount_per_chunk` is the value from
+ * ant_storage_quote so the charge matches the approved quote; `immutable`
+ * is 0 or 1. Returns the refreshed ant_storage_status JSON. SUBMITS REAL
+ * TRANSACTIONS AND SPENDS REAL FUNDS. Requires the `chain` cargo feature.
+ */
+char *ant_storage_buy(const AntHandle *handle,
+                      const char *gnosis_rpc,
+                      uint8_t depth,
+                      const char *amount_per_chunk,
+                      int immutable,
+                      char **out_err);
+
+/*
+ * Buy and activate a storage plan funding ONLY with xDAI: the node swaps
+ * the xBZZ shortfall on-chain (deploying a tiny stateless swap helper the
+ * first time) before approve + createBatch. `amount_per_chunk` is the
+ * value from ant_storage_quote; `immutable` is 0 or 1. Returns the
+ * refreshed ant_storage_status JSON. SUBMITS REAL TRANSACTIONS AND SPENDS
+ * REAL FUNDS. Requires the `chain` cargo feature.
+ */
+char *ant_storage_buy_xdai(const AntHandle *handle,
+                           const char *gnosis_rpc,
+                           uint8_t depth,
+                           const char *amount_per_chunk,
+                           int immutable,
+                           char **out_err);
+
 /*
  * Free a buffer returned by ant_download. `len` must be the exact
  * length the call wrote into *out_len. Null pointer / zero length is

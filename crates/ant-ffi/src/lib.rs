@@ -21,6 +21,7 @@
 //! `ant_download` calls are allowed and share the node's cache /
 //! retrieval pipeline; the mpsc command channel serialises dispatch.
 
+mod drive;
 #[cfg(feature = "jni")]
 mod jni;
 mod manifest;
@@ -33,12 +34,13 @@ use ant_crypto::{
     ethereum_address_from_public_key, overlay_from_ethereum_address, random_overlay_nonce,
     random_secp256k1_secret, OVERLAY_NONCE_LEN, SECP256K1_SECRET_LEN,
 };
-use ant_node::{run_node, NodeConfig};
+use ant_node::{run_node, NodeConfig, UploadManager};
+use ant_p2p::UploadRuntime;
 use ant_retrieval::DiskChunkCache;
 use k256::ecdsa::SigningKey;
 use libp2p::identity::{self, Keypair};
 use serde::{Deserialize, Serialize};
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{c_char, c_int, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -116,6 +118,14 @@ pub struct AntHandle {
     /// immediately instead of waiting up to the next progress tick
     /// (~150 ms) / backoff interval (2 s).
     cancel_notify: Notify,
+    /// The node's secp256k1 signing secret. Stamps every postage batch
+    /// the node owns (so `UploadRuntime::stamp_key` can sign) and backs
+    /// `ant_account_export_key` for the `AntDrive` "back up your account"
+    /// flow. Held here so the FFI doesn't re-read `identity.json`.
+    signing_secret: [u8; SECP256K1_SECRET_LEN],
+    /// The node's Ethereum address (derived from `signing_secret`). The
+    /// postage batch owner and the "account address" `AntDrive` shows.
+    eth: [u8; 20],
 }
 
 /// Live snapshot of the in-flight download, maintained by the
@@ -319,12 +329,36 @@ fn init_inner(data_dir: &Path) -> Result<AntHandle, FfiError> {
         }
     };
 
+    // Upload + postage wiring (`AntDrive`). The node wallet owns every
+    // batch it stamps with, so a single `stamp_key` (the node signing
+    // secret) signs for all of them. We reload any batch persisted from
+    // a previous run so the user's storage plan survives app restarts
+    // without re-reading the chain; new batches are registered at
+    // runtime by `ant_storage_connect_batch` (RegisterBatch). The
+    // `UploadManager` drives `antctl upload`-style jobs through the same
+    // PushChunk → postage → pushsync pipeline `antd` uses.
+    let postage_dir = data_dir.join("postage");
+    let issuers = drive::reload_persisted_issuers(&postage_dir);
+    let upload_runtime = Arc::new(UploadRuntime {
+        issuers: Mutex::new(issuers),
+        stamp_key: signing_secret,
+        batch_owner: eth,
+        postage_dir: postage_dir.clone(),
+    });
+    let upload_manager = UploadManager::new(data_dir.join("uploads"), cmd_tx.clone(), None)
+        .map_err(|e| FfiError::Io(format!("open upload state dir: {e}")))?;
+    if let Err(e) = upload_manager.rehydrate_from_disk(true) {
+        tracing::warn!(target: "ant-ffi", "rehydrate upload jobs: {e}");
+    }
+
     let cfg = NodeConfig::mainnet_default(signing_secret, overlay_nonce, bootnodes, libp2p_keypair)
         .with_status(status_tx)
         .with_process_start(process_start)
         .with_peerstore_path(peerstore_path)
         .with_commands(cmd_rx)
-        .with_disk_cache(disk_cache);
+        .with_disk_cache(disk_cache)
+        .with_upload(Some(upload_runtime))
+        .with_upload_manager(Some(upload_manager));
 
     runtime.spawn(async move {
         if let Err(e) = run_node(cfg).await {
@@ -348,6 +382,8 @@ fn init_inner(data_dir: &Path) -> Result<AntHandle, FfiError> {
         progress: Mutex::new(DownloadProgressState::default()),
         cancel_flag: AtomicBool::new(false),
         cancel_notify: Notify::new(),
+        signing_secret,
+        eth,
     })
 }
 
@@ -1145,6 +1181,486 @@ pub unsafe extern "C" fn ant_stream_close(stream: *mut AntStream) {
         }
         drop(Box::from_raw(stream));
     }
+}
+
+// ---------------------------------------------------------------------------
+// `AntDrive`: uploads, storage plan, account
+//
+// Each entry point returns a heap-allocated NUL-terminated string the
+// caller frees with `ant_free_string` (JSON for the structured calls,
+// a plain id / hex string for the rest). On failure it returns null and
+// writes an allocated error string into `*out_err`. The heavy lifting
+// lives in `drive.rs`; these wrappers only marshal C strings and trap
+// panics so a Rust panic can never unwind across the FFI boundary.
+// ---------------------------------------------------------------------------
+
+/// Start an upload job for the file at `path`. `batch_id` selects the
+/// storage plan to stamp against (pass null to use the node's default);
+/// `name` / `content_type` are optional manifest metadata (pass null to
+/// let the daemon infer them). Returns the new job id.
+///
+/// # Safety
+///
+/// * `handle` must come from [`ant_init`] and must not have been passed
+///   to [`ant_shutdown`].
+/// * `path` must be a valid NUL-terminated UTF-8 string; the optional
+///   args may each be null or a valid NUL-terminated UTF-8 string.
+/// * `out_err` must point at a writable slot or be null.
+#[no_mangle]
+pub unsafe extern "C" fn ant_upload_start(
+    handle: *const AntHandle,
+    path: *const c_char,
+    batch_id: *const c_char,
+    name: *const c_char,
+    content_type: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_upload_start", || {
+            let h = handle.as_ref().ok_or_else(null_handle)?;
+            let path = cstr_to_string(path)?;
+            let batch_id = cstr_to_opt_string(batch_id)?;
+            let name = cstr_to_opt_string(name)?;
+            let content_type = cstr_to_opt_string(content_type)?;
+            drive::upload_start(h, PathBuf::from(path), batch_id, name, content_type)
+                .map_err(|e| e.to_string())
+        })
+    }
+}
+
+/// Snapshot every upload job as a JSON document `{"jobs":[...]}`.
+///
+/// # Safety
+///
+/// See [`ant_upload_start`].
+#[no_mangle]
+pub unsafe extern "C" fn ant_upload_list(
+    handle: *const AntHandle,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_upload_list", || {
+            let h = handle.as_ref().ok_or_else(null_handle)?;
+            drive::upload_list(h).map_err(|e| e.to_string())
+        })
+    }
+}
+
+/// Snapshot one upload job by id (or unique 8-hex-char prefix) as a JSON
+/// object. See [`ant_upload_start`] for safety requirements.
+///
+/// # Safety
+///
+/// See [`ant_upload_start`].
+#[no_mangle]
+pub unsafe extern "C" fn ant_upload_status(
+    handle: *const AntHandle,
+    job_id: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        upload_job_call(
+            handle,
+            job_id,
+            out_err,
+            drive::JobCommand::Status,
+            "ant_upload_status",
+        )
+    }
+}
+
+/// Pause a running upload. Returns the updated job JSON.
+///
+/// # Safety
+///
+/// See [`ant_upload_start`].
+#[no_mangle]
+pub unsafe extern "C" fn ant_upload_pause(
+    handle: *const AntHandle,
+    job_id: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        upload_job_call(
+            handle,
+            job_id,
+            out_err,
+            drive::JobCommand::Pause,
+            "ant_upload_pause",
+        )
+    }
+}
+
+/// Resume a paused (or failed) upload. Returns the updated job JSON.
+///
+/// # Safety
+///
+/// See [`ant_upload_start`].
+#[no_mangle]
+pub unsafe extern "C" fn ant_upload_resume(
+    handle: *const AntHandle,
+    job_id: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        upload_job_call(
+            handle,
+            job_id,
+            out_err,
+            drive::JobCommand::Resume,
+            "ant_upload_resume",
+        )
+    }
+}
+
+/// Cancel an upload. Returns the updated job JSON.
+///
+/// # Safety
+///
+/// See [`ant_upload_start`].
+#[no_mangle]
+pub unsafe extern "C" fn ant_upload_cancel(
+    handle: *const AntHandle,
+    job_id: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        upload_job_call(
+            handle,
+            job_id,
+            out_err,
+            drive::JobCommand::Cancel,
+            "ant_upload_cancel",
+        )
+    }
+}
+
+/// Snapshot the local storage plan (postage issuer) as a JSON object.
+/// `{"enabled":false,...}` when no plan is connected yet; otherwise
+/// carries capacity / usage so the UI can render a "X GB of Y GB used"
+/// meter.
+///
+/// # Safety
+///
+/// See [`ant_upload_start`].
+#[no_mangle]
+pub unsafe extern "C" fn ant_storage_status(
+    handle: *const AntHandle,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_storage_status", || {
+            let h = handle.as_ref().ok_or_else(null_handle)?;
+            drive::storage_status(h).map_err(|e| e.to_string())
+        })
+    }
+}
+
+/// Account identity as a JSON object
+/// `{"eth_address","overlay","peer_id","agent"}`.
+///
+/// # Safety
+///
+/// See [`ant_upload_start`].
+#[no_mangle]
+pub unsafe extern "C" fn ant_account_info(
+    handle: *const AntHandle,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_account_info", || {
+            let h = handle.as_ref().ok_or_else(null_handle)?;
+            drive::account_info(h).map_err(|e| e.to_string())
+        })
+    }
+}
+
+/// Export the account's raw secp256k1 signing key as 64 hex chars, for a
+/// "back up your account" flow. Treat as a secret.
+///
+/// # Safety
+///
+/// See [`ant_upload_start`].
+#[no_mangle]
+pub unsafe extern "C" fn ant_account_export_key(
+    handle: *const AntHandle,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_account_export_key", || {
+            let h = handle.as_ref().ok_or_else(null_handle)?;
+            Ok(drive::account_export_key(h))
+        })
+    }
+}
+
+/// Connect a storage plan this account already owns on Gnosis by its id.
+/// Reads the plan's parameters from `gnosis_rpc`, verifies the account
+/// owns it, registers it for stamping, and returns the refreshed
+/// [`ant_storage_status`] JSON. Requires the `chain` build feature.
+///
+/// # Safety
+///
+/// See [`ant_upload_start`]. `gnosis_rpc` and `batch_id` must be valid
+/// NUL-terminated UTF-8 strings.
+#[no_mangle]
+pub unsafe extern "C" fn ant_storage_connect_batch(
+    handle: *const AntHandle,
+    gnosis_rpc: *const c_char,
+    batch_id: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_storage_connect_batch", || {
+            let h = handle.as_ref().ok_or_else(null_handle)?;
+            let rpc = cstr_to_string(gnosis_rpc)?;
+            let batch = cstr_to_string(batch_id)?;
+            #[cfg(feature = "chain")]
+            {
+                drive::storage_connect_batch(h, rpc, batch).map_err(|e| e.to_string())
+            }
+            #[cfg(not(feature = "chain"))]
+            {
+                let _ = (h, rpc, batch);
+                Err(
+                    "this build has no chain support (rebuild ant-ffi with --features chain)"
+                        .to_string(),
+                )
+            }
+        })
+    }
+}
+
+/// Auto-discover and connect every funded storage plan this account owns
+/// on Gnosis (an on-chain log scan, so it can take a while). Returns
+/// `{"registered":[...ids],"status":<plan>}`. Requires the `chain`
+/// build feature.
+///
+/// # Safety
+///
+/// See [`ant_upload_start`]. `gnosis_rpc` must be a valid NUL-terminated
+/// UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn ant_storage_discover(
+    handle: *const AntHandle,
+    gnosis_rpc: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_storage_discover", || {
+            let h = handle.as_ref().ok_or_else(null_handle)?;
+            let rpc = cstr_to_string(gnosis_rpc)?;
+            #[cfg(feature = "chain")]
+            {
+                drive::storage_discover(h, rpc).map_err(|e| e.to_string())
+            }
+            #[cfg(not(feature = "chain"))]
+            {
+                let _ = (h, rpc);
+                Err(
+                    "this build has no chain support (rebuild ant-ffi with --features chain)"
+                        .to_string(),
+                )
+            }
+        })
+    }
+}
+
+/// Price a storage plan: returns a JSON object with the plan cost
+/// (`total_cost_plur` / `total_cost_bzz`), the account's xBZZ / xDAI
+/// balances, and whether they cover it — the "payment information" the
+/// Get Started flow shows before activating. No transaction is sent.
+/// Requires the `chain` build feature.
+///
+/// # Safety
+///
+/// See [`ant_upload_start`]. `gnosis_rpc` must be a valid NUL-terminated
+/// UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn ant_storage_quote(
+    handle: *const AntHandle,
+    gnosis_rpc: *const c_char,
+    depth: u8,
+    days: u64,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_storage_quote", || {
+            let h = handle.as_ref().ok_or_else(null_handle)?;
+            let rpc = cstr_to_string(gnosis_rpc)?;
+            #[cfg(feature = "chain")]
+            {
+                drive::storage_quote(h, rpc, depth, days).map_err(|e| e.to_string())
+            }
+            #[cfg(not(feature = "chain"))]
+            {
+                let _ = (h, rpc, depth, days);
+                Err(
+                    "this build has no chain support (rebuild ant-ffi with --features chain)"
+                        .to_string(),
+                )
+            }
+        })
+    }
+}
+
+/// Buy and activate a storage plan on Gnosis (`approve` + `createBatch`,
+/// then register it so uploads can stamp against it). `amount_per_chunk`
+/// is the value returned by [`ant_storage_quote`] (so the charge matches
+/// the quote the user approved); `immutable` is 0 or 1. Returns the
+/// refreshed [`ant_storage_status`] JSON. Submits real transactions and
+/// spends real funds. Requires the `chain` build feature.
+///
+/// # Safety
+///
+/// See [`ant_upload_start`]. `gnosis_rpc` and `amount_per_chunk` must be
+/// valid NUL-terminated UTF-8 strings.
+#[no_mangle]
+pub unsafe extern "C" fn ant_storage_buy(
+    handle: *const AntHandle,
+    gnosis_rpc: *const c_char,
+    depth: u8,
+    amount_per_chunk: *const c_char,
+    immutable: c_int,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_storage_buy", || {
+            let h = handle.as_ref().ok_or_else(null_handle)?;
+            let rpc = cstr_to_string(gnosis_rpc)?;
+            let amount = cstr_to_string(amount_per_chunk)?;
+            let imm = immutable != 0;
+            #[cfg(feature = "chain")]
+            {
+                drive::storage_buy(h, rpc, depth, amount, imm).map_err(|e| e.to_string())
+            }
+            #[cfg(not(feature = "chain"))]
+            {
+                let _ = (h, rpc, depth, amount, imm);
+                Err(
+                    "this build has no chain support (rebuild ant-ffi with --features chain)"
+                        .to_string(),
+                )
+            }
+        })
+    }
+}
+
+/// Buy and activate a storage plan funding **only with xDAI**: the node
+/// swaps the xBZZ shortfall on-chain (deploying a tiny stateless swap
+/// helper the first time), then runs the same `approve` + `createBatch`
+/// flow as [`ant_storage_buy`]. `amount_per_chunk` is the value returned
+/// by [`ant_storage_quote`]; `immutable` is 0 or 1. Returns the refreshed
+/// [`ant_storage_status`] JSON. Submits real transactions and spends real
+/// funds. Requires the `chain` build feature.
+///
+/// # Safety
+///
+/// See [`ant_upload_start`]. `gnosis_rpc` and `amount_per_chunk` must be
+/// valid NUL-terminated UTF-8 strings.
+#[no_mangle]
+pub unsafe extern "C" fn ant_storage_buy_xdai(
+    handle: *const AntHandle,
+    gnosis_rpc: *const c_char,
+    depth: u8,
+    amount_per_chunk: *const c_char,
+    immutable: c_int,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_storage_buy_xdai", || {
+            let h = handle.as_ref().ok_or_else(null_handle)?;
+            let rpc = cstr_to_string(gnosis_rpc)?;
+            let amount = cstr_to_string(amount_per_chunk)?;
+            let imm = immutable != 0;
+            #[cfg(feature = "chain")]
+            {
+                drive::storage_buy_xdai(h, rpc, depth, amount, imm).map_err(|e| e.to_string())
+            }
+            #[cfg(not(feature = "chain"))]
+            {
+                let _ = (h, rpc, depth, amount, imm);
+                Err(
+                    "this build has no chain support (rebuild ant-ffi with --features chain)"
+                        .to_string(),
+                )
+            }
+        })
+    }
+}
+
+/// Shared body for the single-job upload commands (status / pause /
+/// resume / cancel), which all take a job id and return job JSON.
+unsafe fn upload_job_call(
+    handle: *const AntHandle,
+    job_id: *const c_char,
+    out_err: *mut *mut c_char,
+    kind: drive::JobCommand,
+    name: &'static str,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, name, || {
+            let h = handle.as_ref().ok_or_else(null_handle)?;
+            let job_id = cstr_to_string(job_id)?;
+            drive::upload_job_command(h, job_id, kind).map_err(|e| e.to_string())
+        })
+    }
+}
+
+/// Run `f`, trap panics, and marshal its `Result<String, String>` into
+/// an owned C string / `out_err` pair the Swift side can consume.
+unsafe fn run_string_call<F>(out_err: *mut *mut c_char, name: &str, f: F) -> *mut c_char
+where
+    F: FnOnce() -> Result<String, String>,
+{
+    unsafe {
+        clear_out_err(out_err);
+        match catch_unwind(AssertUnwindSafe(f)) {
+            Ok(Ok(s)) => {
+                if let Ok(cs) = CString::new(s.replace('\0', "?")) {
+                    cs.into_raw()
+                } else {
+                    write_out_err(out_err, "response contained a NUL byte");
+                    std::ptr::null_mut()
+                }
+            }
+            Ok(Err(msg)) => {
+                write_out_err(out_err, &msg);
+                std::ptr::null_mut()
+            }
+            Err(_) => {
+                write_out_err(out_err, &format!("panic in {name}"));
+                std::ptr::null_mut()
+            }
+        }
+    }
+}
+
+fn null_handle() -> String {
+    "null handle".to_string()
+}
+
+unsafe fn cstr_to_string(ptr: *const c_char) -> Result<String, String> {
+    unsafe {
+        cstr_to_str(ptr)
+            .map(str::to_string)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Like [`cstr_to_string`] but a null pointer (or empty string) maps to
+/// `None` rather than an error — used for the optional upload metadata
+/// args the Swift side leaves unset.
+unsafe fn cstr_to_opt_string(ptr: *const c_char) -> Result<Option<String>, String> {
+    if ptr.is_null() {
+        return Ok(None);
+    }
+    let s = unsafe { cstr_to_str(ptr).map_err(|e| e.to_string())? };
+    Ok(if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    })
 }
 
 // ---------------------------------------------------------------------------

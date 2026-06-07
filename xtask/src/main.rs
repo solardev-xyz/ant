@@ -122,6 +122,11 @@ enum IosFlavor {
 struct BuildOpts {
     target: &'static str,
     profile: Profile,
+    /// Extra cargo features to enable (`--features a,b`). The `AntDrive`
+    /// example app passes `chain` so its Storage tab can read the
+    /// account's postage batch from Gnosis; the download-only
+    /// `ios-download` app passes nothing.
+    features: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -155,6 +160,9 @@ fn build_ios(args: Vec<OsString>, flavor: IosFlavor) -> Result<()> {
     if matches!(opts.profile, Profile::Release) {
         cmd.arg("--release");
     }
+    if !opts.features.is_empty() {
+        cmd.arg("--features").arg(opts.features.join(","));
+    }
     // Xcode sets DEVELOPER_DIR / SDKROOT / IPHONEOS_DEPLOYMENT_TARGET
     // when driving xtask from a build phase. Propagating them by
     // default (no env scrubbing here) is what makes the script-phase
@@ -185,10 +193,23 @@ fn parse_build_opts(args: Vec<OsString>, flavor: IosFlavor) -> Result<BuildOpts>
         IosFlavor::Device => DEVICE_TARGET,
     };
     let mut profile = Profile::Release;
+    let mut features: Vec<String> = Vec::new();
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
         let arg = arg.to_string_lossy().into_owned();
         match arg.as_str() {
+            "--features" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| anyhow!("--features requires a value"))?
+                    .to_string_lossy()
+                    .into_owned();
+                features.extend(
+                    v.split([',', ' '])
+                        .filter(|s| !s.is_empty())
+                        .map(ToString::to_string),
+                );
+            }
             "--arch" => {
                 if matches!(flavor, IosFlavor::Device) {
                     bail!("--arch is only meaningful for build-ios-sim (device is always aarch64)");
@@ -219,7 +240,11 @@ fn parse_build_opts(args: Vec<OsString>, flavor: IosFlavor) -> Result<BuildOpts>
             other => bail!("unknown argument: {other}"),
         }
     }
-    Ok(BuildOpts { target, profile })
+    Ok(BuildOpts {
+        target,
+        profile,
+        features,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -280,7 +305,14 @@ fn parse_android_opts(args: &[OsString], target: &'static str) -> Result<BuildOp
             other => bail!("unknown argument: {other}"),
         }
     }
-    Ok(BuildOpts { target, profile })
+    Ok(BuildOpts {
+        target,
+        profile,
+        // Android always builds the cdylib with `--features jni` set
+        // directly in `run_android_build`; no extra features come from
+        // the command line here.
+        features: Vec::new(),
+    })
 }
 
 fn run_android_build(opts: &BuildOpts) -> Result<()> {

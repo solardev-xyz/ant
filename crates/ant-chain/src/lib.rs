@@ -50,6 +50,22 @@ pub const GNOSIS_POSTAGE_STAMP: &str = "0x45a1502382541Cd610CC9068e88727426b6962
 /// xBZZ on Gnosis.
 pub const GNOSIS_BZZ_TOKEN: &str = "0xdBF3Ea6F5beE45c02255B2c26a16F300502F68da";
 
+/// Wrapped xDAI on Gnosis — the native-token ERC-20 the BZZ DEX pool
+/// trades against (`token1` of the pool below, 18 decimals).
+pub const GNOSIS_WXDAI: &str = "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d";
+
+/// `SushiSwap` V3 BZZ/WXDAI 0.3% pool on Gnosis — the deepest BZZ market
+/// on the chain. `token0` = xBZZ (16 decimals), `token1` = WXDAI. The
+/// `swap` auto-funding flow swaps native xDAI through this pool.
+pub const GNOSIS_BZZ_WXDAI_POOL: &str = "0x7583b9C573FA4FB5Ea21C83454939c4Cf6aacBc3";
+
+/// Deterministic CREATE2 deployer (Arachnid's "deterministic deployment
+/// proxy"), present at the same address on Gnosis and most EVM chains.
+/// Called with `salt(32) ‖ initcode` to deploy a contract at an address
+/// derived purely from the bytecode, so `AntDrive`'s swap helper lands at
+/// a constant, pre-computable address.
+pub const CREATE2_DEPLOYER: &str = "0x4e59b44847b379578588920cA78FbF26c0B4956C";
+
 #[cfg(feature = "chain-rpc")]
 pub struct ChainClient {
     url: String,
@@ -258,6 +274,52 @@ impl ChainClient {
         );
         let out = self.eth_call(postage_contract, &data).await?;
         abi_word_last_u128_be(&out)
+    }
+
+    /// Deployed bytecode at `addr` (`eth_getCode`). Empty `Vec` means no
+    /// contract is deployed there yet — used to decide whether the swap
+    /// helper still needs its one-time CREATE2 deployment.
+    pub async fn eth_get_code(&self, addr: &str) -> Result<Vec<u8>, RpcError> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1u64,
+            "method": "eth_getCode",
+            "params": [addr, "latest"],
+        });
+        let v: RpcResp<'_> = self
+            .http
+            .post(&self.url)
+            .json(&body)
+            .send()
+            .await?
+            .json()
+            .await?;
+        if let Some(e) = v.error {
+            return Err(RpcError::Rpc(
+                e.message.unwrap_or_else(|| "unknown RPC error".to_string()),
+            ));
+        }
+        let s = v
+            .result
+            .ok_or_else(|| RpcError::Rpc("missing result".into()))?;
+        decode_hex_prefixed_bytes(s.as_ref()).map_err(|e| RpcError::Decode(e.to_string()))
+    }
+
+    /// Read a Uniswap-V3-style pool's `slot0()` and return the raw
+    /// `sqrtPriceX96` (the lower 160 bits of the first ABI word). The
+    /// spot price token1-per-token0 is `(sqrtPriceX96 / 2^96)^2`; for the
+    /// BZZ/WXDAI pool that's WXDAI-wei per BZZ-plur, which converts a
+    /// postage cost straight into the xDAI needed to buy it.
+    pub async fn pool_sqrt_price_x96(&self, pool: &str) -> Result<[u8; 32], RpcError> {
+        // slot0() selector 0x3850c7bd
+        let data = "0x3850c7bd";
+        let out = self.eth_call(pool, data).await?;
+        if out.len() < 32 {
+            return Err(RpcError::Decode("slot0 returned short word".into()));
+        }
+        let mut word = [0u8; 32];
+        word.copy_from_slice(&out[0..32]);
+        Ok(word)
     }
 }
 
