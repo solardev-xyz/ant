@@ -1042,7 +1042,17 @@ impl UploadManager {
     ) {
         for round in 0..MAX_HEAL_ROUNDS {
             tokio::time::sleep(HEAL_SETTLE_DELAY).await;
-            let missing = self.query_missing(all_addrs).await;
+            let Some(missing) = self.query_missing(all_addrs).await else {
+                // Read-back couldn't run (peers not ready / transport
+                // error). Do NOT claim the upload is healthy — just try
+                // again next round after another settle delay.
+                warn!(
+                    target: "ant_node::uploads",
+                    job_id, round, chunks = all_addrs.len(),
+                    "post-upload heal: read-back inconclusive (peers not ready?); retrying",
+                );
+                continue;
+            };
             if missing.is_empty() {
                 info!(
                     target: "ant_node::uploads",
@@ -1078,27 +1088,38 @@ impl UploadManager {
         }
         // One final read-back after the last re-push round.
         tokio::time::sleep(HEAL_SETTLE_DELAY).await;
-        let missing = self.query_missing(all_addrs).await;
-        if missing.is_empty() {
-            info!(
+        match self.query_missing(all_addrs).await {
+            Some(missing) if missing.is_empty() => info!(
                 target: "ant_node::uploads",
                 job_id, chunks = all_addrs.len(),
                 "post-upload heal: all chunks reachable after re-push",
-            );
-        } else {
-            warn!(
+            ),
+            Some(missing) => warn!(
                 target: "ant_node::uploads",
                 job_id, missing = missing.len(), total = all_addrs.len(), rounds = MAX_HEAL_ROUNDS,
                 "post-upload heal: chunks still unreachable after all rounds",
-            );
+            ),
+            None => warn!(
+                target: "ant_node::uploads",
+                job_id, total = all_addrs.len(), rounds = MAX_HEAL_ROUNDS,
+                "post-upload heal: final read-back inconclusive (peers not ready?)",
+            ),
         }
     }
 
     /// Ask the node loop which of `all_addrs` aren't retrievable from
     /// the network, batching the address list so each ack stays bounded.
-    /// Returns an empty list (i.e. "nothing to heal") on any transport
-    /// error or not-ready condition — heal is best-effort.
-    async fn query_missing(&self, all_addrs: &[[u8; 32]]) -> Vec<[u8; 32]> {
+    ///
+    /// Returns `Some(missing)` only when **every** batch was actually
+    /// verified against the network. Returns `None` when the read-back
+    /// was inconclusive — a transport error, a `NotReady` (peers not yet
+    /// handshaked), an unexpected ack, or an unparseable body. The
+    /// distinction matters: an inconclusive read-back must **not** be
+    /// mistaken for "nothing missing", or heal would silently declare an
+    /// unretrievable upload healthy (the exact failure mode that made
+    /// self-heal a no-op on a flaky/cold peer set). The caller retries
+    /// the round instead of claiming success.
+    async fn query_missing(&self, all_addrs: &[[u8; 32]]) -> Option<Vec<[u8; 32]>> {
         let mut missing = Vec::new();
         for batch in all_addrs.chunks(HEAL_VERIFY_BATCH) {
             let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
@@ -1112,20 +1133,22 @@ impl UploadManager {
                 .await
                 .is_err()
             {
-                return missing;
+                return None;
             }
             match ack_rx.await {
-                Ok(ControlAck::Ok { message }) => {
-                    if let Some(batch_missing) = parse_missing(&message) {
-                        missing.extend(batch_missing);
-                    }
-                }
-                // No peers yet, or an unexpected ack — can't verify now,
-                // so report nothing missing and let heal end this round.
-                _ => return missing,
+                Ok(ControlAck::Ok { message }) => match parse_missing(&message) {
+                    Some(batch_missing) => missing.extend(batch_missing),
+                    // A malformed body means we can't trust this batch —
+                    // treat the whole read-back as inconclusive rather
+                    // than assuming the batch was fully present.
+                    None => return None,
+                },
+                // No peers yet, an error, or an unexpected ack — can't
+                // verify now, so the read-back is inconclusive.
+                _ => return None,
             }
         }
-        missing
+        Some(missing)
     }
 
     /// Re-derive every chunk of the source file via the deterministic

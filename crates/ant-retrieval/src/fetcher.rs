@@ -444,14 +444,73 @@ impl RoutingFetcher {
     /// ceiling on otherwise-healthy uploads.
     const MAX_PUSH_ERRORS: usize = 64;
 
-    /// One transient retry on the *same* peer, on a fresh stream,
-    /// before adding it to the skip list. The dominant failure mode in
-    /// the live network is `Io("Connection is closed")` mid-pushsync —
-    /// the peer is fine, the underlying libp2p connection just got
-    /// recycled. Re-dialing on a fresh stream succeeds the vast
-    /// majority of the time and saves us from burning through the
-    /// closest 24 peers on what is essentially noise.
+    /// One transient retry on the *same* peer, on a fresh stream, before
+    /// adding it to the skip list. This fires only for a mid-exchange
+    /// `Io` error (see [`is_transient_pushsync_error`]): the stream had
+    /// negotiated, so the connection was alive and a fresh stream on it
+    /// usually goes through. An *open* failure (the dominant churn under
+    /// connection-reset load) is no longer retried here — re-opening
+    /// needs a fresh dial that can't finish in the retry window, so we
+    /// skip straight to the next-closest peer instead.
     const PER_PEER_RETRY_BUDGET: usize = 1;
+
+    /// How many distinct peers may return a *shallow* receipt before we
+    /// stop hunting for a deeper storer and accept the chunk as stored.
+    ///
+    /// A shallow receipt is **not** a failed push: the responding storer
+    /// *did* run its `store()` path (reserve-put + sign), so the chunk is
+    /// retrievable from that node and its neighbours — it just landed
+    /// shallower than the storer's own reported radius (the common cause
+    /// on mainnet today is the reserve-doubling feature, where a node
+    /// keeps a chunk that hashes into its *sister* neighbourhood). Bee's
+    /// own uploader treats this exactly as a soft outcome: its pusher
+    /// retries a shallow receipt up to `DefaultRetryCount` (6) times and
+    /// then reports the chunk `ChunkSynced` regardless (see
+    /// `bee/pkg/pusher/pusher.go::pushDeferred`, the
+    /// `pushsync.ErrShallowReceipt` arm). Rejecting shallow receipts
+    /// outright — as we did before — made uploads spuriously fail or
+    /// thrash through all 64 candidates whenever the chunk's
+    /// neighbourhood legitimately answers shallow, which a NAT'd light
+    /// node with a ~100-peer view hits routinely. Matching bee's count
+    /// keeps us interoperable: we prefer a deep storer when one is
+    /// reachable, but accept a shallow (still-retrievable) one rather
+    /// than failing the upload.
+    const MAX_SHALLOW_ATTEMPTS: u32 = 6;
+
+    /// Per-attempt "hedge" deadline applied to the early, closest
+    /// candidates. A healthy pushsync round-trip acks in well under a
+    /// second (a 129-chunk 500 KiB upload at 32-wide concurrency
+    /// finishes in ~1-2 s when nothing stalls), so a peer that opened
+    /// the stream but hasn't relayed a receipt within this window is
+    /// almost certainly wedged forwarding the chunk deeper. Abandoning
+    /// it for the next-closest peer is far cheaper than burning the full
+    /// [`crate::pushsync::DEFAULT_PUSHSYNC_TIMEOUT`] (45 s) — which,
+    /// because the upload completes only when its slowest chunk does,
+    /// otherwise pins an entire 500 KiB upload at 45 s whenever a single
+    /// chunk draws a stuck closest peer. We keep the full 45 s ceiling
+    /// for the last few candidates ([`HEDGE_RESERVE_CANDIDATES`]) so a
+    /// genuinely slow-but-correct neighbourhood is still given its full
+    /// budget before we give up.
+    const HEDGE_PUSH_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// How many of the final candidates fall back to the full
+    /// [`crate::pushsync::DEFAULT_PUSHSYNC_TIMEOUT`] ceiling instead of
+    /// the short [`HEDGE_PUSH_TIMEOUT`]. Hedging aggressively while many
+    /// closer peers remain, then patiently once we're nearly out of
+    /// candidates, gives us speed without sacrificing the last-resort
+    /// reliability the long timeout buys.
+    const HEDGE_RESERVE_CANDIDATES: usize = 4;
+
+    /// The per-attempt deadline for the `idx`-th pushsync candidate
+    /// (0-based): short while plenty of closer peers remain, the full
+    /// ceiling for the final [`HEDGE_RESERVE_CANDIDATES`].
+    const fn attempt_timeout(idx: usize) -> Duration {
+        if idx + Self::HEDGE_RESERVE_CANDIDATES >= Self::MAX_PUSH_ERRORS {
+            crate::pushsync::DEFAULT_PUSHSYNC_TIMEOUT
+        } else {
+            Self::HEDGE_PUSH_TIMEOUT
+        }
+    }
 
     /// Try pushsync against up to [`MAX_PUSH_ERRORS`] peers, closest-first.
     ///
@@ -464,11 +523,19 @@ impl RoutingFetcher {
         wire: Vec<u8>,
         stamp: [u8; ant_postage::STAMP_SIZE],
     ) -> Result<(), crate::pushsync::PushSyncError> {
-        use crate::pushsync::push_chunk_to_peer;
+        use crate::pushsync::push_chunk_to_peer_with_timeout;
         let mut control = self.control.clone();
         let mut skipped = Vec::<PeerId>::new();
         let mut last_err: Option<crate::pushsync::PushSyncError> = None;
-        for _ in 0..Self::MAX_PUSH_ERRORS {
+        // Track shallow receipts separately from hard failures. A shallow
+        // receipt means a storer *did* store the chunk; we keep it as an
+        // acceptable fallback while we try a bounded number of other peers
+        // for a deeper storer, then accept it (bee-aligned — see
+        // `MAX_SHALLOW_ATTEMPTS`).
+        let mut shallow_fallback: Option<crate::pushsync::PushSyncError> = None;
+        let mut shallow_attempts: u32 = 0;
+        for attempt_idx in 0..Self::MAX_PUSH_ERRORS {
+            let attempt_timeout = Self::attempt_timeout(attempt_idx);
             let live = self.peers_rx.borrow().clone();
             // Rank closest-first, then apply the shared per-process
             // push skip cache as a *soft* filter: if it would leave
@@ -503,6 +570,19 @@ impl RoutingFetcher {
                 }
             }
             let Some((peer, peer_overlay)) = ranked.first().copied() else {
+                // No candidates left to try. If a storer already accepted
+                // the chunk with a shallow receipt, the chunk is stored
+                // and retrievable — accept it rather than failing (e.g.
+                // the only reachable peer answered shallow). Bee-aligned.
+                if let Some(shallow) = shallow_fallback.take() {
+                    warn!(
+                        target: "ant_retrieval::fetcher",
+                        addr = %hex::encode(chunk_addr),
+                        err = %shallow,
+                        "accepting shallow receipt; no deeper candidates remain (bee-aligned)",
+                    );
+                    return Ok(());
+                }
                 return Err(crate::pushsync::PushSyncError::Remote("no peers".into()));
             };
             let chunk_price = peer_chunk_price(&peer_overlay, &chunk_addr);
@@ -521,13 +601,14 @@ impl RoutingFetcher {
                 s.note_pushsync(peer, 0).await;
             }
 
-            let mut err = match push_chunk_to_peer(
+            let mut err = match push_chunk_to_peer_with_timeout(
                 &mut control,
                 peer,
                 chunk_addr,
                 wire.as_slice(),
                 &stamp,
                 self.push_network_id,
+                attempt_timeout,
             )
             .await
             {
@@ -559,13 +640,14 @@ impl RoutingFetcher {
                     "pushsync attempt failed; retrying same peer once on a fresh stream",
                 );
                 tokio::time::sleep(Duration::from_millis(150)).await;
-                match push_chunk_to_peer(
+                match push_chunk_to_peer_with_timeout(
                     &mut control,
                     peer,
                     chunk_addr,
                     wire.as_slice(),
                     &stamp,
                     self.push_network_id,
+                    attempt_timeout,
                 )
                 .await
                 {
@@ -580,6 +662,38 @@ impl RoutingFetcher {
                     }
                     Err(e) => err = e,
                 }
+            }
+
+            // A shallow receipt is a *soft* outcome, not a failure: the
+            // responding storer stored the chunk (so it is retrievable),
+            // it just landed shallower than ideal. Mirror bee's pusher:
+            // remember it as an acceptable fallback and keep looking for a
+            // deeper storer for up to `MAX_SHALLOW_ATTEMPTS` shallow hits,
+            // then accept it rather than failing the upload. Crucially we
+            // do **not** cross-chunk-cool-down a shallow peer — it is a
+            // perfectly good storer for chunks that hash into *its*
+            // neighbourhood; only this chunk happened to be shallow for it.
+            if matches!(err, crate::pushsync::PushSyncError::ShallowReceipt { .. }) {
+                shallow_attempts += 1;
+                warn!(
+                    target: "ant_retrieval::fetcher",
+                    %peer,
+                    err=%err,
+                    shallow_attempts,
+                    "pushsync got a shallow receipt; chunk is stored but shallow — trying for a deeper storer",
+                );
+                if accept_shallow_after(shallow_attempts) {
+                    warn!(
+                        target: "ant_retrieval::fetcher",
+                        addr = %hex::encode(chunk_addr),
+                        shallow_attempts,
+                        "accepting shallow receipt after exhausting deeper-storer attempts (bee-aligned)",
+                    );
+                    return Ok(());
+                }
+                shallow_fallback = Some(err);
+                skipped.push(peer);
+                continue;
             }
 
             warn!(
@@ -600,6 +714,19 @@ impl RoutingFetcher {
             skipped.push(peer);
             last_err = Some(err);
         }
+        // Exhausted the candidate set. If at least one storer accepted the
+        // chunk with a shallow receipt, the chunk *is* stored and
+        // retrievable — accept it rather than failing the upload, exactly
+        // as bee's pusher does once it runs out of retries.
+        if let Some(shallow) = shallow_fallback {
+            warn!(
+                target: "ant_retrieval::fetcher",
+                addr = %hex::encode(chunk_addr),
+                err = %shallow,
+                "accepting shallow receipt after exhausting all candidates (bee-aligned)",
+            );
+            return Ok(());
+        }
         Err(crate::pushsync::PushSyncError::Remote(format!(
             "exhausted pushsync peers (last: {})",
             last_err.map_or_else(|| "unknown".to_string(), |e| e.to_string()),
@@ -607,17 +734,53 @@ impl RoutingFetcher {
     }
 }
 
-/// `true` for the kinds of `PushSyncError` that look like the libp2p
-/// substream got recycled out from under us. Those are worth one
-/// fast retry on a fresh stream against the same peer.
+/// `true` for the one `PushSyncError` worth a single fast retry on a
+/// fresh stream against the *same* peer: a mid-exchange `Io` error. The
+/// stream had already negotiated, so the connection was alive moments ago
+/// and a fresh stream on it often goes through — this is the
+/// "connection recycled mid-pushsync" case the retry was built for.
 ///
-/// Explicit `Remote(_)` rejections (the peer told us, on the wire,
-/// that it didn't want the chunk) and protocol-level errors
-/// (`ProstEncode`, `ProstDecode`, `ReceiptMismatch`) are *not*
-/// transient — retrying just wastes time.
+/// `OpenStream(_)` is **not** transient. An open failure means the
+/// connection itself is gone (`libp2p-stream` surfaces it as
+/// `oneshot canceled` / `receiver is gone` when the connection handler is
+/// dropped, or a dial error when there's no connection at all). Re-opening
+/// to the same peer needs a fresh *dial*, which doesn't complete inside
+/// the 150 ms retry window — so the retry just re-fails and we skip the
+/// peer anyway. A live 28-upload mainnet run made this stark: of 509
+/// same-peer retries (overwhelmingly `OpenStream`), ~0 succeeded, and each
+/// burned a 150 ms sleep *and* a doomed re-open that itself added to the
+/// connection-reset churn. Skipping straight to the next-closest
+/// (already-connected) peer is both faster and far more likely to land.
+///
+/// Explicit `Remote(_)` rejections (the peer told us, on the wire, that
+/// it didn't want the chunk) and protocol-level errors (`ProstEncode`,
+/// `ProstDecode`, `ReceiptMismatch`) are not transient — retrying just
+/// wastes time.
+///
+/// `Timeout` is not transient either: a peer that opened the stream but
+/// didn't relay a receipt within the (already generous) deadline is
+/// wedged forwarding the chunk deeper, and an immediate same-peer retry
+/// would just burn a second full deadline. The caller skips it and hedges
+/// onto the next-closest peer instead, which is both faster and more
+/// likely to succeed.
 fn is_transient_pushsync_error(err: &crate::pushsync::PushSyncError) -> bool {
     use crate::pushsync::PushSyncError as E;
-    matches!(err, E::Io(_) | E::OpenStream(_) | E::Timeout(_))
+    matches!(err, E::Io(_))
+}
+
+/// Given how many distinct peers have answered this chunk with a
+/// *shallow* receipt so far (1-based, counting the current one), decide
+/// whether to stop hunting for a deeper storer and accept the chunk as
+/// stored.
+///
+/// A shallow receipt is proof the chunk was stored (the storer ran its
+/// reserve-put + sign path), so accepting one keeps the chunk
+/// retrievable; we only spend a bounded number of attempts looking for a
+/// deeper storer first. The threshold matches bee's pusher, which retries
+/// a shallow receipt `DefaultRetryCount` (6) times before reporting the
+/// chunk synced regardless. See [`RoutingFetcher::MAX_SHALLOW_ATTEMPTS`].
+const fn accept_shallow_after(shallow_attempts: u32) -> bool {
+    shallow_attempts >= RoutingFetcher::MAX_SHALLOW_ATTEMPTS
 }
 
 #[async_trait]
@@ -1330,12 +1493,12 @@ mod tests {
             "stream-level Io is the dominant transient case; must retry the same peer once",
         );
         assert!(
-            is_transient_pushsync_error(&E::OpenStream("dial: no addresses".into())),
-            "open-stream failures often clear on a fresh dial",
+            !is_transient_pushsync_error(&E::OpenStream("dial: no addresses".into())),
+            "open-stream failure means the connection is gone; a fresh dial can't finish in the retry window, so skip to the next-closest peer instead of re-hammering this one",
         );
         assert!(
-            is_transient_pushsync_error(&E::Timeout(Duration::from_secs(20))),
-            "single timeout is worth one retry on a fresh stream",
+            !is_transient_pushsync_error(&E::Timeout(Duration::from_secs(20))),
+            "a stalled peer past its deadline is wedged; skip it and hedge to the next-closest, don't re-wait a second deadline",
         );
 
         assert!(
@@ -1346,6 +1509,75 @@ mod tests {
             !is_transient_pushsync_error(&E::ReceiptMismatch),
             "receipt mismatch is a protocol violation, not transient",
         );
+
+        // A shallow receipt must NOT be classified transient: it is a
+        // soft *success* (the chunk was stored), handled by the dedicated
+        // shallow-acceptance path, not by the same-peer fresh-stream
+        // retry. If it leaked into the transient set we'd pointlessly
+        // re-push to the same shallow storer.
+        assert!(
+            !is_transient_pushsync_error(&E::ShallowReceipt {
+                po: 3,
+                storage_radius: 5,
+            }),
+            "shallow receipt is a soft success, not a transient stream error",
+        );
+    }
+
+    /// Pin bee-aligned shallow-receipt acceptance: we hunt for a deeper
+    /// storer for a bounded number of shallow hits, then accept. The
+    /// threshold mirrors bee's pusher `DefaultRetryCount` (6) — a shallow
+    /// receipt means the chunk *is* stored, so failing the upload instead
+    /// of accepting it (the pre-fix behaviour) spuriously broke uploads
+    /// whenever a chunk's neighbourhood answered shallow (reserve
+    /// doubling, sparse neighbourhood, NAT'd light-node peer view).
+    #[test]
+    fn shallow_receipt_accepted_after_bounded_attempts() {
+        assert_eq!(
+            RoutingFetcher::MAX_SHALLOW_ATTEMPTS,
+            6,
+            "keep in lockstep with bee pusher DefaultRetryCount",
+        );
+        // Below the threshold: keep trying for a deeper storer.
+        assert!(!accept_shallow_after(1));
+        assert!(!accept_shallow_after(5));
+        // At/above the threshold: accept the shallow (stored) chunk.
+        assert!(accept_shallow_after(6));
+        assert!(accept_shallow_after(7));
+    }
+
+    /// Pin the hedge-timeout policy: the early, closest candidates get
+    /// the short [`RoutingFetcher::HEDGE_PUSH_TIMEOUT`] so a single
+    /// wedged peer can't pin a whole upload at the 45 s ceiling, while
+    /// the final [`RoutingFetcher::HEDGE_RESERVE_CANDIDATES`] fall back
+    /// to the full deadline so a genuinely slow-but-correct
+    /// neighbourhood still gets its full budget before we give up.
+    #[test]
+    fn hedge_timeout_short_early_full_at_the_end() {
+        // First candidate hedges aggressively.
+        assert_eq!(
+            RoutingFetcher::attempt_timeout(0),
+            RoutingFetcher::HEDGE_PUSH_TIMEOUT,
+        );
+        // Still hedging while plenty of closer peers remain.
+        let last_hedged =
+            RoutingFetcher::MAX_PUSH_ERRORS - RoutingFetcher::HEDGE_RESERVE_CANDIDATES;
+        assert_eq!(
+            RoutingFetcher::attempt_timeout(last_hedged - 1),
+            RoutingFetcher::HEDGE_PUSH_TIMEOUT,
+        );
+        // The final reserved candidates get the full ceiling.
+        assert_eq!(
+            RoutingFetcher::attempt_timeout(last_hedged),
+            crate::pushsync::DEFAULT_PUSHSYNC_TIMEOUT,
+        );
+        assert_eq!(
+            RoutingFetcher::attempt_timeout(RoutingFetcher::MAX_PUSH_ERRORS - 1),
+            crate::pushsync::DEFAULT_PUSHSYNC_TIMEOUT,
+        );
+        // The hedge window must be meaningfully shorter than the ceiling
+        // or it buys nothing.
+        assert!(RoutingFetcher::HEDGE_PUSH_TIMEOUT < crate::pushsync::DEFAULT_PUSHSYNC_TIMEOUT);
     }
 
     /// Pin the consumer side of the live-peers fix: every `ranked()`

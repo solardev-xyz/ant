@@ -112,8 +112,45 @@ pub async fn push_chunk_to_peer(
     stamp_binary: &[u8; ant_postage::STAMP_SIZE],
     network_id: Option<u64>,
 ) -> Result<(), PushSyncError> {
-    tokio::time::timeout(
+    push_chunk_to_peer_with_timeout(
+        control,
+        peer,
+        chunk_addr,
+        wire_span_payload,
+        stamp_binary,
+        network_id,
         PUSHSYNC_TIMEOUT,
+    )
+    .await
+}
+
+/// The default ceiling a single pushsync attempt is allowed to run for
+/// (see [`PUSHSYNC_TIMEOUT`]).
+pub const DEFAULT_PUSHSYNC_TIMEOUT: Duration = PUSHSYNC_TIMEOUT;
+
+/// Like [`push_chunk_to_peer`] but with a caller-chosen per-attempt
+/// deadline. The uploader uses a short "hedge" deadline for the early,
+/// closest candidates so a single peer that opens the stream but then
+/// stalls forwarding the chunk deeper (and never relays a receipt)
+/// doesn't pin the whole chunk — and therefore the whole upload, which
+/// waits on its slowest chunk — for the full 45 s. A healthy push acks
+/// in well under a second, so a peer that hasn't answered in the hedge
+/// window is almost certainly wedged; moving to the next-closest peer
+/// is both faster and what bee's pusher effectively does. The full
+/// [`PUSHSYNC_TIMEOUT`] is still available as the last-candidate
+/// ceiling so a genuinely slow-but-correct neighbourhood is not
+/// abandoned prematurely.
+pub async fn push_chunk_to_peer_with_timeout(
+    control: &mut Control,
+    peer: PeerId,
+    chunk_addr: [u8; 32],
+    wire_span_payload: &[u8],
+    stamp_binary: &[u8; ant_postage::STAMP_SIZE],
+    network_id: Option<u64>,
+    attempt_timeout: Duration,
+) -> Result<(), PushSyncError> {
+    tokio::time::timeout(
+        attempt_timeout,
         push_chunk_inner(
             control,
             peer,
@@ -124,7 +161,7 @@ pub async fn push_chunk_to_peer(
         ),
     )
     .await
-    .map_err(|_| PushSyncError::Timeout(PUSHSYNC_TIMEOUT))?
+    .map_err(|_| PushSyncError::Timeout(attempt_timeout))?
 }
 
 async fn push_chunk_inner(
