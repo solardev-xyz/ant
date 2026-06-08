@@ -194,7 +194,7 @@ the still-open items.
 | [`ant-chain`](crates/ant-chain) | Gnosis JSON-RPC client + ABI calldata builders + EIP-155 transaction signer; ERC-20, PostageStamp, SimpleSwap chequebook. |
 | [`ant-ffi`](crates/ant-ffi) | Hand-written `extern "C"` surface + `ant.h` for the iOS download smoke test (PLAN.md § 9). Throwaway — replaced by UniFFI in M2 Phase 4. |
 
-Current workspace version: **`0.3.4`** across all crates (the deployment
+Current workspace version: **`0.5.13`** across all crates (the deployment
 bump on each release to `vibing.at/ant`; see `AGENTS.md`).
 
 ## Requirements
