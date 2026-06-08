@@ -39,6 +39,7 @@
 #[cfg(feature = "bee-recover")]
 pub mod beestore;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use ant_crypto::{
@@ -101,7 +102,26 @@ pub struct StampIssuer {
     /// [`StampIssuer::increment`]. `None` for in-memory-only test
     /// instances.
     persist_path: Option<PathBuf>,
+    /// Per-chunk stamp cache: maps a chunk address to the stamp already
+    /// issued for it under this batch. Makes stamping **idempotent** —
+    /// re-pushing a chunk (post-upload heal, a manual retry, an
+    /// interrupted-upload resume) returns the *same* stamp instead of
+    /// burning a fresh bucket index. Without this a chunk re-pushed N
+    /// times consumes N slots in its collision bucket, so a few heal
+    /// rounds can saturate an otherwise-roomy batch. Backed by the
+    /// append-only `.stamps` sidecar (see [`append_stamp_record`]).
+    seen: HashMap<[u8; 32], [u8; STAMP_SIZE]>,
+    /// Sidecar path the issued stamps are appended to (sibling of
+    /// `persist_path`, `.stamps` extension). `None` for in-memory issuers.
+    stamps_path: Option<PathBuf>,
 }
+
+/// Magic for the per-chunk stamp sidecar (Ant `STamp` Map).
+const STAMP_STORE_MAGIC: &[u8; 4] = b"ASTM";
+/// Sidecar header: `magic(4) + version(2) + batch_id(32)`.
+const STAMP_STORE_HEADER_LEN: usize = 38;
+/// One appended record: chunk address(32) + stamp([`STAMP_SIZE`]).
+const STAMP_RECORD_LEN: usize = 32 + STAMP_SIZE;
 
 /// Snapshot of a [`StampIssuer`]'s capacity and fill, suitable for
 /// ops dashboards and pre-flight upload checks. Returned by
@@ -195,14 +215,18 @@ impl StampIssuer {
                 });
             }
             let buckets = decode_buckets(&bytes, bucket_depth)?;
-            return Ok(Self {
+            let mut issuer = Self {
                 batch_id,
                 batch_depth,
                 bucket_depth,
                 immutable,
                 buckets,
                 persist_path: Some(path),
-            });
+                seen: HashMap::new(),
+                stamps_path: None,
+            };
+            issuer.attach_stamp_store();
+            return Ok(issuer);
         }
         let issuer = Self::build(batch_id, batch_depth, bucket_depth, immutable, Some(path))?;
         issuer.persist()?;
@@ -258,14 +282,18 @@ impl StampIssuer {
             .map_err(|e| PostageError::Load(format!("{}: {e}", path.display())))?;
         let header = decode_header(&bytes)?;
         let buckets = decode_buckets(&bytes, header.bucket_depth)?;
-        Ok(Self {
+        let mut issuer = Self {
             batch_id: header.batch_id,
             batch_depth: header.batch_depth,
             bucket_depth: header.bucket_depth,
             immutable: header.immutable,
             buckets,
             persist_path: Some(path),
-        })
+            seen: HashMap::new(),
+            stamps_path: None,
+        };
+        issuer.attach_stamp_store();
+        Ok(issuer)
     }
 
     /// Raise the batch depth in place after an on-chain `increaseDepth`
@@ -308,14 +336,32 @@ impl StampIssuer {
         let n = 1usize
             .checked_shl(u32::from(bucket_depth))
             .ok_or_else(|| PostageError::Msg("bucket bitmap too large".into()))?;
-        Ok(Self {
+        let mut issuer = Self {
             batch_id,
             batch_depth,
             bucket_depth,
             immutable,
             buckets: vec![0u32; n],
             persist_path,
-        })
+            seen: HashMap::new(),
+            stamps_path: None,
+        };
+        issuer.attach_stamp_store();
+        Ok(issuer)
+    }
+
+    /// Wire the per-chunk stamp sidecar next to the counter file and
+    /// load any previously-issued stamps into [`Self::seen`]. No-op for
+    /// in-memory issuers (no `persist_path`). Best-effort: a missing or
+    /// corrupt sidecar yields an empty cache — the worst case is that a
+    /// future re-push re-stamps (the pre-fix behaviour), never a wrong
+    /// stamp.
+    fn attach_stamp_store(&mut self) {
+        if let Some(p) = &self.persist_path {
+            let sidecar = stamps_sidecar_path(p);
+            self.seen = load_stamp_store(&sidecar, &self.batch_id);
+            self.stamps_path = Some(sidecar);
+        }
     }
 
     #[must_use]
@@ -420,6 +466,39 @@ impl StampIssuer {
     pub fn is_saturated(&self) -> bool {
         let upper = self.bucket_upper_bound();
         self.buckets.iter().any(|&n| n >= upper)
+    }
+
+    /// The stamp already issued for `addr` under this batch, if any.
+    /// A `Some` means a re-push can reuse it for free; callers should
+    /// check this *before* the [`Self::bucket_is_full`] pre-flight so a
+    /// re-push of an already-stamped chunk is never blocked by a now-full
+    /// bucket (it consumes no new slot).
+    #[must_use]
+    pub fn cached_stamp(&self, addr: &[u8; 32]) -> Option<[u8; STAMP_SIZE]> {
+        self.seen.get(addr).copied()
+    }
+
+    /// Whether a stamp has already been issued for `addr`. Cheap
+    /// companion to [`Self::cached_stamp`] for guard conditions.
+    #[must_use]
+    pub fn has_stamp(&self, addr: &[u8; 32]) -> bool {
+        self.seen.contains_key(addr)
+    }
+
+    /// Remember the stamp issued for `addr` and, for persistent issuers,
+    /// append it to the `.stamps` sidecar (append + fsync) so a restart
+    /// recovers it. Append-only keeps this `O(1)` regardless of how many
+    /// chunks the batch has stamped.
+    fn record_stamp(
+        &mut self,
+        addr: [u8; 32],
+        stamp: [u8; STAMP_SIZE],
+    ) -> Result<(), PostageError> {
+        self.seen.insert(addr, stamp);
+        if let Some(path) = &self.stamps_path {
+            append_stamp_record(path, &self.batch_id, &addr, &stamp)?;
+        }
+        Ok(())
     }
 
     /// Reserve the next index in the bucket the chunk address falls in.
@@ -657,6 +736,15 @@ pub fn sign_stamp_bytes(
     issuer: &mut StampIssuer,
     chunk_address: &[u8; 32],
 ) -> Result<[u8; STAMP_SIZE], PostageError> {
+    // Idempotent per chunk: a chunk we've stamped before reuses its
+    // original stamp, so a re-push (heal / retry / resume) costs no new
+    // bucket slot. The network treats the same (chunk, batch, index, ts)
+    // stamp as a no-op replay rather than a double-spend, exactly what a
+    // re-delivery wants.
+    if let Some(stamp) = issuer.cached_stamp(chunk_address) {
+        return Ok(stamp);
+    }
+
     let (index, ts) = issuer.increment(chunk_address)?;
     let digest = postage_sign_digest(chunk_address, &issuer.batch_id, &index, &ts);
     let sig = sign_handshake_data(secret, &digest)?;
@@ -666,7 +754,86 @@ pub fn sign_stamp_bytes(
     stamp[32..40].copy_from_slice(&index);
     stamp[40..48].copy_from_slice(&ts);
     stamp[48..113].copy_from_slice(&sig);
+    issuer.record_stamp(*chunk_address, stamp)?;
     Ok(stamp)
+}
+
+/// Sidecar path for the per-chunk stamp cache: the counter file's path
+/// with its extension swapped to `.stamps` (e.g. `<batch>.bin` →
+/// `<batch>.stamps`).
+fn stamps_sidecar_path(persist: &Path) -> PathBuf {
+    persist.with_extension("stamps")
+}
+
+/// Load the per-chunk stamp sidecar into a map. Best-effort: a missing
+/// file, a bad magic/version, a batch-id mismatch, or a truncated
+/// trailing record all yield whatever clean records precede the problem
+/// (or an empty map). A stale cache only ever costs a re-stamp, never
+/// correctness, so we never hard-fail issuer construction over it.
+fn load_stamp_store(path: &Path, batch_id: &[u8; 32]) -> HashMap<[u8; 32], [u8; STAMP_SIZE]> {
+    let mut map = HashMap::new();
+    let Ok(bytes) = std::fs::read(path) else {
+        return map;
+    };
+    if bytes.len() < STAMP_STORE_HEADER_LEN
+        || &bytes[0..4] != STAMP_STORE_MAGIC
+        || u16::from_le_bytes([bytes[4], bytes[5]]) != STORE_VERSION
+        || &bytes[6..38] != batch_id.as_slice()
+    {
+        return map;
+    }
+    let mut off = STAMP_STORE_HEADER_LEN;
+    while off + STAMP_RECORD_LEN <= bytes.len() {
+        let mut addr = [0u8; 32];
+        addr.copy_from_slice(&bytes[off..off + 32]);
+        let mut stamp = [0u8; STAMP_SIZE];
+        stamp.copy_from_slice(&bytes[off + 32..off + STAMP_RECORD_LEN]);
+        map.insert(addr, stamp);
+        off += STAMP_RECORD_LEN;
+    }
+    map
+}
+
+/// Append one `(addr, stamp)` record to the sidecar, creating it with a
+/// header first if absent, and fsync before returning so a restart
+/// recovers it. Append-only: re-pushes hit the in-memory cache and never
+/// reach here, so the file only grows by genuinely-new chunks.
+fn append_stamp_record(
+    path: &Path,
+    batch_id: &[u8; 32],
+    addr: &[u8; 32],
+    stamp: &[u8; STAMP_SIZE],
+) -> Result<(), PostageError> {
+    use std::io::Write as _;
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| PostageError::Persist(format!("{}: {e}", path.display())))?;
+        }
+    }
+    let need_header = !path.exists();
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| PostageError::Persist(format!("{}: {e}", path.display())))?;
+    if need_header {
+        let mut header = Vec::with_capacity(STAMP_STORE_HEADER_LEN);
+        header.extend_from_slice(STAMP_STORE_MAGIC);
+        header.extend_from_slice(&STORE_VERSION.to_le_bytes());
+        header.extend_from_slice(batch_id);
+        f.write_all(&header)
+            .map_err(|e| PostageError::Persist(format!("{}: {e}", path.display())))?;
+    }
+    let mut rec = Vec::with_capacity(STAMP_RECORD_LEN);
+    rec.extend_from_slice(addr);
+    rec.extend_from_slice(stamp);
+    f.write_all(&rec)
+        .map_err(|e| PostageError::Persist(format!("{}: {e}", path.display())))?;
+    f.sync_all()
+        .map_err(|e| PostageError::Persist(format!("{}: {e}", path.display())))?;
+    Ok(())
 }
 
 pub fn stamp_batch_id(stamp: &[u8]) -> Result<&[u8; 32], PostageError> {
@@ -927,6 +1094,77 @@ mod tests {
             matches!(err, PostageError::Load(_)),
             "expected Load error on checksum mismatch, got {err:?}",
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Re-stamping the same chunk must be idempotent: it returns the
+    /// identical stamp and consumes **no** new bucket index. This is the
+    /// fix for self-inflicted batch saturation — a heal/retry that
+    /// re-pushes already-stamped chunks must not burn postage. We also
+    /// prove the exemption: even after the bucket has filled, an
+    /// already-stamped chunk still re-stamps (reuses) for free.
+    #[test]
+    fn restamp_is_idempotent_and_free() {
+        let secret = random_secp256k1_secret();
+        let batch_id = [0x11u8; 32];
+        // depth 17, bucket_depth 16 => 2 slots per bucket.
+        let mut issuer = StampIssuer::new(batch_id, 17, 16, true).unwrap();
+        let chunk = [0x42u8; 32];
+
+        let first = sign_stamp_bytes(&secret, &mut issuer, &chunk).unwrap();
+        let issued_after_first = issuer.issued_count();
+        assert_eq!(issued_after_first, 1);
+        assert!(issuer.has_stamp(&chunk));
+
+        // Re-stamp the same chunk several times: same bytes, no new index.
+        for _ in 0..5 {
+            let again = sign_stamp_bytes(&secret, &mut issuer, &chunk).unwrap();
+            assert_eq!(again, first, "re-stamp must reuse the original stamp");
+        }
+        assert_eq!(
+            issuer.issued_count(),
+            issued_after_first,
+            "re-stamping must not consume bucket slots",
+        );
+
+        // Fill the bucket with a *different* chunk in the same bucket so
+        // it saturates, then prove the already-stamped chunk still
+        // re-stamps for free despite the full bucket.
+        let mut sibling = chunk;
+        sibling[31] = 0x01; // same top bits => same collision bucket
+        sign_stamp_bytes(&secret, &mut issuer, &sibling).unwrap();
+        assert!(issuer.bucket_is_full(&chunk));
+        let after_full = sign_stamp_bytes(&secret, &mut issuer, &chunk).unwrap();
+        assert_eq!(after_full, first);
+    }
+
+    /// The `.stamps` sidecar must survive a restart so the startup heal
+    /// reuses stamps instead of re-issuing them.
+    #[test]
+    fn stamp_cache_persists_across_restart() {
+        let secret = random_secp256k1_secret();
+        let dir = tmpdir();
+        let path = dir.join("batch.bin");
+        let batch_id = [0x22u8; 32];
+
+        let chunk = [0x99u8; 32];
+        let original = {
+            let mut issuer =
+                StampIssuer::open_or_new(path.clone(), batch_id, 17, 16, true).unwrap();
+            let s = sign_stamp_bytes(&secret, &mut issuer, &chunk).unwrap();
+            assert_eq!(issuer.issued_count(), 1);
+            s
+        };
+        assert!(path.with_extension("stamps").exists());
+
+        // Reopen — the cache should rehydrate, so a re-stamp reuses the
+        // original and issues no new index.
+        let mut reopened = StampIssuer::open_or_new(path, batch_id, 17, 16, true).unwrap();
+        assert!(reopened.has_stamp(&chunk));
+        let reused = sign_stamp_bytes(&secret, &mut reopened, &chunk).unwrap();
+        assert_eq!(reused, original);
+        assert_eq!(reopened.issued_count(), 1);
 
         std::fs::remove_dir_all(&dir).ok();
     }

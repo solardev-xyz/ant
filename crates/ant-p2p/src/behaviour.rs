@@ -1729,31 +1729,54 @@ fn handle_control_command(
                     });
                     return;
                 };
-                // Headroom guard: refuse to stamp a chunk whose collision
-                // bucket is already full. On a mutable batch the issuer
-                // would otherwise wrap the bucket and re-issue an
-                // already-used slot, which bee resolves by evicting the
-                // older chunk — silently dropping content (often from the
-                // same upload) and making it unretrievable network-wide.
-                // Failing loudly here surfaces an under-sized batch (e.g.
-                // depth 17, only 2 slots/bucket) instead of producing a
-                // phantom "uploaded" file. Buy/dilute to a larger batch.
-                if issuer.bucket_is_full(&addr) {
+                // Headroom guard for a *full* collision bucket. Behaviour
+                // depends on the batch's mutability:
+                //
+                // * **Immutable** batch ⇒ hard-refuse. The issuer can't
+                //   evict, so a full bucket is a genuine dead end; failing
+                //   loudly surfaces an under-sized batch instead of a
+                //   phantom "uploaded" file.
+                // * **Mutable** batch ⇒ proceed and let `increment` wrap
+                //   the bucket, which is exactly bee's documented mutable
+                //   semantics (evict the oldest stamp in that one bucket).
+                //   Hard-refusing here would brick an otherwise-roomy
+                //   mutable batch over a single hot bucket — the very
+                //   failure that left 98%-empty batches unable to upload.
+                //   The real cause of premature bucket fill (re-stamping
+                //   the same chunk on every re-push) is fixed by the
+                //   per-chunk stamp cache, so a mutable wrap now only
+                //   happens when one bucket genuinely sees >capacity
+                //   *distinct* chunks — vanishingly rare on a sane depth,
+                //   and the pre-upload capacity check warns before then.
+                //
+                // A chunk we've *already* stamped is exempt either way: a
+                // re-push (heal / retry / resume) reuses its original
+                // stamp and consumes no new slot.
+                if !issuer.has_stamp(&addr) && issuer.bucket_is_full(&addr) {
+                    if issuer.immutable() {
+                        warn!(
+                            target: "ant_p2p",
+                            batch = %hex::encode(batch_id),
+                            depth = issuer.batch_depth(),
+                            addr = %hex::encode(addr),
+                            "refusing to stamp: collision bucket full on immutable batch — stamping would evict an existing chunk (buy/dilute a larger batch)",
+                        );
+                        let _ = ack.send(ControlAck::Error {
+                            message: format!(
+                                "batch 0x{} saturated: collision bucket full at depth {} on an immutable batch — stamping would evict an existing chunk; buy or dilute to a larger batch",
+                                hex::encode(batch_id),
+                                issuer.batch_depth(),
+                            ),
+                        });
+                        return;
+                    }
                     warn!(
                         target: "ant_p2p",
                         batch = %hex::encode(batch_id),
                         depth = issuer.batch_depth(),
                         addr = %hex::encode(addr),
-                        "refusing to stamp: collision bucket full — batch is saturated, stamping would evict an existing chunk (batch depth too small; buy/dilute a larger batch)",
+                        "collision bucket full on mutable batch — wrapping (evicting the oldest stamp in this bucket); consider diluting to a larger batch",
                     );
-                    let _ = ack.send(ControlAck::Error {
-                        message: format!(
-                            "batch 0x{} saturated: collision bucket full at depth {} — stamping would evict an existing chunk; buy or dilute to a larger batch",
-                            hex::encode(batch_id),
-                            issuer.batch_depth(),
-                        ),
-                    });
-                    return;
                 }
                 match ant_postage::sign_stamp_bytes(&upload.stamp_key, issuer, &addr) {
                     Ok(s) => s,

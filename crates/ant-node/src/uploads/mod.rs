@@ -795,6 +795,15 @@ impl UploadManager {
             return Err(e);
         }
 
+        // Best-effort capacity warning before we start stamping, so a
+        // tight batch is flagged up-front rather than discovered when a
+        // chunk fails to stamp (immutable) or evicts an older one
+        // (mutable) part-way through. Never fatal.
+        let est_chunks = snap
+            .chunks_total
+            .unwrap_or_else(|| estimate_chunk_count(snap.source_size, snap.raw));
+        self.capacity_preflight(&batch_id, est_chunks).await;
+
         // mmap (zero-copy). Empty files are a special case: mmap
         // on a 0-byte file is undefined on some platforms, so we
         // produce the empty leaf via the streaming splitter's
@@ -1350,6 +1359,78 @@ impl UploadManager {
     /// unretrievable upload healthy (the exact failure mode that made
     /// self-heal a no-op on a flaky/cold peer set). The caller retries
     /// the round instead of claiming success.
+    /// Best-effort pre-upload capacity check. Looks up the postage
+    /// batch this job stamps against and logs a clear warning when it's
+    /// tight, so the operator/app can dilute (or buy a larger batch)
+    /// *before* stamps start failing or evicting mid-upload. Two signals:
+    ///
+    /// * **A full collision bucket already exists** (`bucket_fill_max >=
+    ///   bucket_capacity`). Any chunk routing into a full bucket will, on
+    ///   an immutable batch, fail to stamp (and fail the upload), or on a
+    ///   mutable batch, evict the oldest stamp in that bucket. Either way
+    ///   the batch wants diluting.
+    /// * **The upload likely exceeds the conservative headroom**
+    ///   (`est_chunks > worst_case_remaining_chunks`). This is the
+    ///   pessimistic "every chunk hashes into the fullest bucket" bound,
+    ///   so it errs toward warning early.
+    ///
+    /// Never fails the job: a missing/erroring status, an unregistered
+    /// batch, or a transport error just skips the warning.
+    async fn capacity_preflight(&self, batch_id: &[u8; 32], est_chunks: u64) {
+        let want = hex::encode(batch_id);
+        let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
+        if self
+            .inner
+            .cmd_tx
+            .send(ControlCommand::PostageList { ack: ack_tx })
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let Ok(ControlAck::PostageList(views)) = ack_rx.await else {
+            return;
+        };
+        let Some(view) = views.into_iter().find(|v| {
+            v.batch_id
+                .trim_start_matches("0x")
+                .eq_ignore_ascii_case(&want)
+        }) else {
+            return;
+        };
+        if !view.enabled {
+            return;
+        }
+
+        if view.bucket_capacity > 0 && view.bucket_fill_max >= view.bucket_capacity {
+            warn!(
+                target: "ant_node::uploads",
+                batch = %want,
+                depth = view.batch_depth,
+                immutable = view.immutable,
+                fullest_bucket = view.bucket_fill_max,
+                bucket_capacity = view.bucket_capacity,
+                consequence = if view.immutable {
+                    "chunks landing there will fail to stamp (this upload may fail)"
+                } else {
+                    "chunks landing there will evict the oldest stamp in that bucket"
+                },
+                "postage pre-flight: batch has at least one full collision bucket — dilute to a larger depth to be safe",
+            );
+        } else if est_chunks > view.worst_case_remaining_chunks {
+            warn!(
+                target: "ant_node::uploads",
+                batch = %want,
+                depth = view.batch_depth,
+                est_chunks,
+                worst_case_remaining = view.worst_case_remaining_chunks,
+                issued = view.issued_chunks,
+                capacity = view.total_capacity_chunks,
+                "postage pre-flight: upload may exceed the batch's conservative headroom — if stamping starts failing, dilute to a larger depth",
+            );
+        }
+    }
+
     async fn query_missing(&self, all_addrs: &[[u8; 32]], probes: usize) -> Option<Vec<[u8; 32]>> {
         let mut missing = Vec::new();
         for batch in all_addrs.chunks(HEAL_VERIFY_BATCH) {
@@ -1887,6 +1968,12 @@ mod tests {
                             message: "PushSoc unexpected in upload tests".into(),
                         });
                     }
+                    ControlCommand::PostageList { ack } => {
+                        // The pre-upload capacity check lists batches; the
+                        // fake loop has none, so report an empty set (no
+                        // warning, no effect on dispatch-count assertions).
+                        let _ = ack.send(ControlAck::PostageList(Vec::new()));
+                    }
                     other => panic!("unexpected control command in upload tests: {other:?}"),
                 }
             }
@@ -1994,6 +2081,9 @@ mod tests {
                         let _ = ack.send(ControlAck::Error {
                             message: "PushSoc unexpected in heal test".into(),
                         });
+                    }
+                    ControlCommand::PostageList { ack } => {
+                        let _ = ack.send(ControlAck::PostageList(Vec::new()));
                     }
                     other => panic!("unexpected control command in heal test: {other:?}"),
                 }
