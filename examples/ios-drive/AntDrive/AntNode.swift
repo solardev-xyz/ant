@@ -204,14 +204,16 @@ final class AntNode: ObservableObject {
     // MARK: - Propagation verification
 
     /// Check that a completed upload actually propagated by resolving its
-    /// manifest, enumerating the file's chunk tree, and probing a sample
-    /// of the real data leaves over the network — bypassing our local
-    /// copy. Stores the result in `propagation[job.id]` for the file row.
-    /// `samples` caps how many data leaves to probe (evenly spread,
-    /// clamped 1…32); `probes` is how many distinct closest peers to ask
-    /// per chunk (route diversity / replication, clamped 1…8).
+    /// manifest, enumerating the file's chunk tree, and checking the real
+    /// data leaves over the network — bypassing our local copy. Stores the
+    /// result in `propagation[job.id]` for the file row. `samples == 0`
+    /// (the default) checks *every* leaf — the only verdict strong enough
+    /// to catch a partially-propagated file; a non-zero value spot-checks
+    /// that many evenly-spread leaves. `probes` is how many distinct
+    /// closest peers to ask per chunk (route diversity / replication,
+    /// clamped 1…8).
     @discardableResult
-    func verifyPropagation(_ job: UploadJob, samples: UInt8 = 6, probes: UInt8 = 2) async -> PropagationInfo? {
+    func verifyPropagation(_ job: UploadJob, samples: UInt8 = 0, probes: UInt8 = 2) async -> PropagationInfo? {
         guard let h = handle, let reference = job.reference, !reference.isEmpty else { return nil }
         if verifying.contains(job.id) { return propagation[job.id] }
         verifying.insert(job.id)

@@ -263,17 +263,19 @@ const HINT_DIAL_BATCH: usize = 4;
 /// memory (each entry is a `PeerId` + a few multiaddrs + 32-byte overlay).
 const KNOWN_DIALABLE_CAP: usize = 16_384;
 /// How many of the closest known peers we dial toward a chunk address on a
-/// single neighbourhood-dial request. Mirrors a small replication fan-out:
-/// enough to land at least one peer genuinely inside the chunk's
-/// neighbourhood without flooding the dial pipeline.
-const NEIGHBORHOOD_DIAL_FANOUT: usize = 4;
+/// single neighbourhood-dial request. A larger fan-out lands more peers
+/// genuinely inside the chunk's neighbourhood per request, so a light node's
+/// push reaches a deep storer (deep receipt) instead of drawing a shallow
+/// one — the dominant cause of uploads that the uploader can read back but
+/// the wider network can't.
+const NEIGHBORHOOD_DIAL_FANOUT: usize = 8;
 /// How far over `target_peers` the connection pipeline may grow to admit
 /// on-demand neighbourhood dials. Uploads need transient connections into
 /// many different chunk neighbourhoods across the keyspace; this headroom
 /// lets us reach them without the count-based `target_peers` cap (tuned for
 /// steady-state forwarding) starving the upload. Excess peers churn back
 /// out naturally once the upload is done.
-const NEIGHBORHOOD_DIAL_MARGIN: usize = 64;
+const NEIGHBORHOOD_DIAL_MARGIN: usize = 128;
 /// Minimum gap between two consecutive peer top-ups. Sustained connection
 /// churn (bee-side load shedding under pushsync pressure being the canonical
 /// trigger) drops the peer set below the floor; the top-up clears the
@@ -1608,13 +1610,19 @@ fn handle_control_command(
             ack,
         } => {
             // Deep read-back propagation check. Resolve the manifest,
-            // enumerate the file's chunk tree, and probe a sample of the
-            // *actual data leaves* across distinct closest peers — all
-            // network-only so a store-then-push local copy can't mask a
-            // failed push. The heavy lifting runs in a spawned task
-            // (`verify_propagation_deep`); here we only snapshot the peer
-            // pool synchronously so we don't borrow `state` into the task.
-            let samples = if samples == 0 { 6 } else { samples.min(32) } as usize;
+            // enumerate the file's chunk tree, and check the *actual data
+            // leaves* across distinct closest peers — all network-only so a
+            // store-then-push local copy can't mask a failed push. The heavy
+            // lifting runs in a spawned task (`verify_propagation_deep`); here
+            // we only snapshot the peer pool synchronously so we don't borrow
+            // `state` into the task.
+            //
+            // `samples == 0` is the thorough default: every data leaf for a
+            // small file, or a large evenly-spread sample (bounded by
+            // `MAX_FULL_VERIFY_LEAVES`) for a big one. A non-zero value probes
+            // only that many leaves — a weaker signal we keep for callers that
+            // explicitly want a quick spot-check.
+            let samples = samples as usize;
             let probes = if probes == 0 { 2 } else { probes.min(8) } as usize;
             let peers: Vec<(PeerId, Overlay)> = state.peers_watch.subscribe().borrow().clone();
             if peers.is_empty() {
@@ -3309,12 +3317,29 @@ async fn verify_chunks_present(
     .await
 }
 
+/// Upper bound on how many data leaves a default verification
+/// (`samples == 0`) checks network-only. Small files (≲2 MB) sit under
+/// this, so every leaf is verified and the UI shows "all N chunks"; a
+/// larger file falls back to an evenly-spread sample of this size — a
+/// "large sample" that reliably catches a partially-propagated body while
+/// keeping the check bounded in wall time (per-leaf network fetches are
+/// far slower than a pipelined download). Sampling only a handful of
+/// leaves — the old behaviour — is what let broken files show "Verified".
+const MAX_FULL_VERIFY_LEAVES: usize = 512;
+
+/// How many leaves a verification additionally probes for the
+/// informational distinct-route ("sources") floor. Bounded because each
+/// probe is a second per-leaf round-trip on top of the reachability check.
+const SOURCE_PROBE_SAMPLE: usize = 24;
+
 /// Deep propagation check: resolve the manifest at `reference` to its
 /// data root, enumerate the file's chunk tree (fetching every interior
 /// node network-only, which proves the skeleton is retrievable), then
-/// probe an evenly-spread sample of up to `samples` data leaves across
-/// up to `probes` distinct closest peers each. Returns the JSON body
-/// described on [`ControlCommand::VerifyPropagation`].
+/// check the data leaves network-only — every leaf when `samples == 0`
+/// (bounded by [`MAX_FULL_VERIFY_LEAVES`]), otherwise an evenly-spread
+/// sample of `samples` leaves — and probe a bounded subset across up to
+/// `probes` distinct closest peers for the replication floor. Returns the
+/// JSON body described on [`ControlCommand::VerifyPropagation`].
 async fn verify_propagation_deep(
     control: Control,
     peers_rx: watch::Receiver<Vec<(PeerId, Overlay)>>,
@@ -3381,31 +3406,39 @@ async fn verify_propagation_deep(
     let total_chunks = inv.total();
 
     // Every interior node (and the data root) was fetched network-only
-    // above, so the skeleton is retrievable. Now sample real leaves.
+    // above, so the skeleton is retrievable. Now check the data leaves.
+    //
+    // `samples == 0` checks *every* leaf (bounded by
+    // `MAX_FULL_VERIFY_LEAVES` so a huge file can't open an unbounded
+    // number of streams) — this is the authoritative verdict the UI
+    // shows as "Verified · all N chunks". A non-zero `samples` probes an
+    // evenly-spread subset only. Sampling a handful of leaves is what let
+    // a partially-propagated file (root + skeleton present, body chunks
+    // missing) pass as "Verified", so the default path is now full.
+    let check_idx = if samples == 0 {
+        sample_indices(leaf_chunks, leaf_chunks.min(MAX_FULL_VERIFY_LEAVES))
+    } else {
+        sample_indices(leaf_chunks, samples)
+    };
+    let sampled_leaves = check_idx.len();
+    let leaf_addrs: Vec<[u8; 32]> = check_idx.iter().map(|&i| inv.leaves[i]).collect();
+
+    // Authoritative reachability uses the *same* network path a real
+    // download takes: the cache-free `RoutingFetcher`, walked
+    // closest-first through forwarder peers, hedged, with error backfill,
+    // and run concurrently (`verify_chunks_present`) so checking every
+    // leaf of a multi-thousand-chunk file stays bounded in wall time.
+    let missing = verify_chunks_present(&fetcher, &leaf_addrs).await;
+    let leaves_retrievable = sampled_leaves - missing.len();
+
+    // Informational replication floor: how many of a chunk's own closest
+    // peers hold it directly (route diversity), separate from whether it's
+    // reachable at all. Probing this is a second round-trip per leaf, so we
+    // only sample a bounded, evenly-spread subset rather than every leaf.
     let probe_timeout = std::time::Duration::from_secs(10);
-    let sample_idx = sample_indices(leaf_chunks, samples);
-    let sampled_leaves = sample_idx.len();
-    let mut leaves_retrievable = 0usize;
     let mut min_sources = u32::MAX;
-    for idx in sample_idx {
-        let addr = inv.leaves[idx];
-        // Authoritative reachability uses the *same* network path a real
-        // download takes: the cache-free `RoutingFetcher`, which walks
-        // closest-first through forwarder peers, hedges, and backfills
-        // on error. A single direct probe to the few closest *connected*
-        // peers would falsely flag a leaf "missing" whenever its storers
-        // are only reachable via a different forwarder.
-        let reachable = matches!(
-            tokio::time::timeout(std::time::Duration::from_secs(20), fetcher.fetch(addr)).await,
-            Ok(Ok(_))
-        );
-        if reachable {
-            leaves_retrievable += 1;
-        }
-        // Informational replication floor: how many of the chunk's own
-        // closest peers hold it directly (route diversity), separate
-        // from whether it's reachable at all.
-        let s = probe_leaf_sources(&control, &peers, addr, probes, probe_timeout).await;
+    for i in sample_indices(leaf_addrs.len(), SOURCE_PROBE_SAMPLE.min(leaf_addrs.len())) {
+        let s = probe_leaf_sources(&control, &peers, leaf_addrs[i], probes, probe_timeout).await;
         min_sources = min_sources.min(s);
     }
     let min_sources = if min_sources == u32::MAX {
@@ -3417,8 +3450,8 @@ async fn verify_propagation_deep(
     let checked_chunks = intermediate_chunks + sampled_leaves;
     let retrievable_chunks = intermediate_chunks + leaves_retrievable;
     // Intermediates are retrievable by construction (enumeration fetched
-    // them); the verdict turns on whether every sampled leaf came back.
-    let retrievable = total_chunks > 0 && leaves_retrievable == sampled_leaves;
+    // them); the verdict turns on whether every checked leaf came back.
+    let retrievable = total_chunks > 0 && missing.is_empty();
 
     serde_json::json!({
         "reference": ref_hex,

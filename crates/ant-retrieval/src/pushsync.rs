@@ -275,7 +275,7 @@ fn verify_receipt(
 /// `bee/pkg/swarm/swarm.go::Proximity`: the number of leading zero bits
 /// in `a XOR b`, capped at `MAX_PO = 31` (storage radii on mainnet are
 /// far below this, so the cap never interferes with the shallow check).
-fn proximity(a: &[u8; 32], b: &[u8; 32]) -> u8 {
+pub(crate) fn proximity(a: &[u8; 32], b: &[u8; 32]) -> u8 {
     const MAX_PO: u8 = 31;
     let mut po = 0u8;
     for (x, y) in a.iter().zip(b.iter()) {

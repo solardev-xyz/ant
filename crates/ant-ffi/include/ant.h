@@ -289,20 +289,21 @@ char *ant_storage_settlement_status(const AntHandle *handle, char **out_err);
  * Deep read-back propagation check for an uploaded reference. Resolves
  * the manifest to its data root, enumerates the file's chunk tree
  * (fetching every interior node network-only, which proves the skeleton
- * is retrievable), then probes an evenly-spread sample of up to
- * `samples` real data leaves across up to `probes` distinct closest
- * peers each. All probes bypass local caches so our own store-then-push
- * copy can't mask a failed push. Returns JSON:
+ * is retrievable), then checks the real data leaves network-only. All
+ * fetches bypass local caches so our own store-then-push copy can't mask
+ * a failed push. Returns JSON:
  *   {"reference","retrievable":bool,"total_chunks":int,"leaf_chunks":int,
  *    "intermediate_chunks":int,"checked_chunks":int,
  *    "retrievable_chunks":int,"sampled_leaves":int,"sources":int,
  *    "error"?:string}
  * `retrievable` is true iff the root and every interior node were
- * fetched and every sampled leaf came back; `sources` is the minimum
- * distinct-route count across sampled leaves (a replication floor).
+ * fetched and every checked leaf came back; `sources` is the minimum
+ * distinct-route count across the probed subset (a replication floor).
  * `reference` accepts a bare/0x 64-hex address, a `bytes://` ref, or a
- * `bzz://<ref>/<path>` URL (path ignored). `samples` is clamped to
- * 1..=32 and `probes` to 1..=8; pass 0 for either to use a default.
+ * `bzz://<ref>/<path>` URL (path ignored). `samples == 0` checks *every*
+ * leaf (a full verification, internally bounded for very large files);
+ * a non-zero value spot-checks that many evenly-spread leaves. `probes`
+ * is clamped to 1..=8; pass 0 to use a default.
  */
 char *ant_storage_verify_propagation(const AntHandle *handle,
                                      const char *reference,

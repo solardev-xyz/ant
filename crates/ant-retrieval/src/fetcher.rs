@@ -503,7 +503,25 @@ impl RoutingFetcher {
     /// keeps us interoperable: we prefer a deep storer when one is
     /// reachable, but accept a shallow (still-retrievable) one rather
     /// than failing the upload.
-    const MAX_SHALLOW_ATTEMPTS: u32 = 6;
+    ///
+    /// Raised above bee's `DefaultRetryCount` because a light node, unlike a
+    /// full node, cannot lean on pull-sync to repair a shallow placement
+    /// after the fact — a chunk that lands shallow stays readable *by the
+    /// uploader* (it's connected to the shallow storer) but not by the wider
+    /// network, which routes to the proper neighbourhood. So we spend more
+    /// rounds — each preceded by an active neighbourhood dial + a bounded
+    /// wait for a deeper peer to connect (see [`SHALLOW_REDIAL_WAIT`]) —
+    /// hunting for a deep storer before falling back to accepting shallow.
+    const MAX_SHALLOW_ATTEMPTS: u32 = 12;
+
+    /// Bounded wait, after a shallow receipt triggers a neighbourhood dial,
+    /// for a peer deeper than the shallow storer to actually connect before
+    /// we retry the push. Short enough that 32 concurrent chunk pushes
+    /// (`MAX_PUSH_CONCURRENCY`) overlap their waits and the upload stays
+    /// brisk, long enough for a freshly-dialed neighbourhood peer to finish
+    /// its handshake. Chunks whose neighbourhood is already connected skip
+    /// the wait entirely.
+    const SHALLOW_REDIAL_WAIT: Duration = Duration::from_millis(800);
 
     /// Rank the live peer set closest-first to `chunk_addr` and return the
     /// next candidate not already used for this chunk. The per-process
@@ -543,6 +561,46 @@ impl RoutingFetcher {
     fn request_neighborhood_dial(&self, target: &[u8; 32]) {
         if let Some(tx) = self.neighborhood_dial.as_ref() {
             let _ = tx.try_send(*target);
+        }
+    }
+
+    /// Highest proximity order to `chunk_addr` among the peers we're
+    /// currently connected to. A higher value means we have a peer deeper in
+    /// the chunk's neighbourhood, so a push is likelier to land deep.
+    fn best_connected_po(&self, chunk_addr: &[u8; 32]) -> u8 {
+        let live = self.peers_rx.borrow();
+        live.iter()
+            .map(|(_, overlay)| crate::pushsync::proximity(chunk_addr, overlay))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Ask the swarm to dial `chunk_addr`'s neighbourhood, then wait — bounded
+    /// by [`Self::SHALLOW_REDIAL_WAIT`] — for a peer at least as deep as
+    /// `target_po` (the storer radius a shallow receipt told us about) to
+    /// connect, so the next push attempt can reach a deep storer instead of
+    /// re-drawing a shallow receipt off the same connected set. Returns early
+    /// the moment such a peer is connected; if none arrives in time we retry
+    /// anyway against the best we have (the attempt budget still bounds the
+    /// hunt). A no-op wait when a deep-enough peer is already connected.
+    async fn dial_and_await_deeper(&self, chunk_addr: &[u8; 32], target_po: u8) {
+        self.request_neighborhood_dial(chunk_addr);
+        if self.best_connected_po(chunk_addr) >= target_po {
+            return;
+        }
+        let mut rx = self.peers_rx.clone();
+        let sleep = tokio::time::sleep(Self::SHALLOW_REDIAL_WAIT);
+        tokio::pin!(sleep);
+        loop {
+            tokio::select! {
+                biased;
+                changed = rx.changed() => {
+                    if changed.is_err() || self.best_connected_po(chunk_addr) >= target_po {
+                        return;
+                    }
+                }
+                () = &mut sleep => return,
+            }
         }
     }
 
@@ -699,25 +757,21 @@ impl RoutingFetcher {
                             }
                             return Ok(());
                         }
-                        Err(e) if matches!(e, PushSyncError::ShallowReceipt { .. }) => {
+                        Err(PushSyncError::ShallowReceipt { po, storage_radius }) => {
                             // Not a failure: the storer ran its reserve-put
-                            // + sign path, so the chunk is stored and will
-                            // pull-sync through the neighbourhood. Mirror
-                            // bee's pusher: retry for a deeper storer up to
-                            // MAX_SHALLOW_ATTEMPTS, then accept. Do NOT
-                            // cool-down a shallow peer — it's a fine storer
-                            // for chunks that hash into its own
+                            // + sign path, so the chunk is stored. But a light
+                            // node can't rely on pull-sync to deepen it later,
+                            // so — unlike bee — we work hard to land a deep
+                            // receipt now. Do NOT cool-down a shallow peer;
+                            // it's a fine storer for chunks in its own
                             // neighbourhood.
                             shallow_attempts += 1;
                             shallow_seen = true;
-                            // A shallow receipt is direct evidence we lack a
-                            // connected peer in this chunk's neighbourhood —
-                            // ask the swarm loop to dial one before we retry.
-                            self.request_neighborhood_dial(&chunk_addr);
                             warn!(
                                 target: "ant_retrieval::fetcher",
                                 %peer,
-                                err=%e,
+                                po,
+                                storage_radius,
                                 shallow_attempts,
                                 "pushsync got a shallow receipt; chunk stored but shallow — trying for a deeper storer",
                             );
@@ -733,6 +787,14 @@ impl RoutingFetcher {
                                 );
                                 return Ok(());
                             }
+                            // A shallow receipt is direct evidence we lack a
+                            // connected peer in this chunk's neighbourhood.
+                            // Dial it and wait (bounded) for a peer at least as
+                            // deep as the storer radius to connect before
+                            // retrying, so the next attempt can land deep
+                            // instead of re-drawing shallow off the same set.
+                            let target_po = storage_radius.min(u32::from(u8::MAX)) as u8;
+                            self.dial_and_await_deeper(&chunk_addr, target_po).await;
                             want += 1;
                         }
                         Err(e) if is_transient_pushsync_error(&e) && !retried.contains(&peer) => {
@@ -1586,26 +1648,26 @@ mod tests {
         );
     }
 
-    /// Pin bee-aligned shallow-receipt acceptance: we hunt for a deeper
-    /// storer for a bounded number of shallow hits, then accept. The
-    /// threshold mirrors bee's pusher `DefaultRetryCount` (6) — a shallow
-    /// receipt means the chunk *is* stored, so failing the upload instead
-    /// of accepting it (the pre-fix behaviour) spuriously broke uploads
-    /// whenever a chunk's neighbourhood answered shallow (reserve
-    /// doubling, sparse neighbourhood, NAT'd light-node peer view).
+    /// Pin shallow-receipt acceptance: we hunt for a deeper storer for a
+    /// bounded number of shallow hits, then accept (a shallow receipt still
+    /// means the chunk *is* stored, so failing the upload would be wrong).
+    /// The threshold sits above bee's pusher `DefaultRetryCount` (6) because
+    /// a light node can't lean on pull-sync to deepen a shallow placement
+    /// after the fact, so it spends extra rounds — each with an active
+    /// neighbourhood dial + bounded wait — hunting for a deep storer first.
     #[test]
     fn shallow_receipt_accepted_after_bounded_attempts() {
         assert_eq!(
             RoutingFetcher::MAX_SHALLOW_ATTEMPTS,
-            6,
-            "keep in lockstep with bee pusher DefaultRetryCount",
+            12,
+            "light node hunts harder than bee's DefaultRetryCount before accepting shallow",
         );
         // Below the threshold: keep trying for a deeper storer.
         assert!(!accept_shallow_after(1));
-        assert!(!accept_shallow_after(5));
+        assert!(!accept_shallow_after(11));
         // At/above the threshold: accept the shallow (stored) chunk.
-        assert!(accept_shallow_after(6));
-        assert!(accept_shallow_after(7));
+        assert!(accept_shallow_after(12));
+        assert!(accept_shallow_after(13));
     }
 
     /// Pin the consumer side of the live-peers fix: every `ranked()`

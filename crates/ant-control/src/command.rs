@@ -277,21 +277,24 @@ pub enum ControlCommand {
     ///
     /// Every interior (intermediate) node of the tree is fetched
     /// network-only to walk it, so reaching the end proves the whole
-    /// skeleton is retrievable. A bounded, evenly-spread sample of up
-    /// to `samples` data **leaves** is then probed across up to
-    /// `probes` distinct closest BZZ peers each (closest-first, skipping
-    /// peers that already answered), again network-only so the daemon's
-    /// own store-then-push copy can't mask a failed push.
+    /// skeleton is retrievable. The data **leaves** are then checked
+    /// network-only along the same path (so the daemon's own
+    /// store-then-push copy can't mask a failed push): when `samples == 0`
+    /// *every* leaf is checked (a full verification, internally bounded so
+    /// a huge file stays tractable); a non-zero `samples` checks an
+    /// evenly-spread sample of that many leaves only. A bounded subset is
+    /// additionally probed across up to `probes` distinct closest BZZ peers
+    /// for the replication floor.
     ///
     /// The ack is a [`ControlAck::Ok`] whose `message` is a JSON
     /// document `{reference, retrievable, total_chunks, leaf_chunks,
     /// intermediate_chunks, checked_chunks, retrievable_chunks,
     /// sampled_leaves, sources, error?}`. `retrievable` is true iff the
-    /// data root and every interior node were fetched and every sampled
+    /// data root and every interior node were fetched and every checked
     /// leaf returned from at least one peer; `sources` is the minimum
-    /// distinct-route count observed across sampled leaves (a
-    /// replication floor). `samples`/`probes` of `0` fall back to
-    /// sensible defaults.
+    /// distinct-route count observed across the probed subset (a
+    /// replication floor). `samples == 0` means a full check; `probes == 0`
+    /// falls back to a sensible default.
     VerifyPropagation {
         reference: [u8; 32],
         samples: u8,

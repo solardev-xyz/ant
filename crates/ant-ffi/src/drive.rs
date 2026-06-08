@@ -37,6 +37,14 @@ use crate::AntHandle;
 /// milliseconds; the timeout only guards against a wedged node loop.
 const OP_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Upper bound for a propagation check. Unlike the other control ops this
+/// is a network operation — it fetches every interior node plus a large
+/// sample of data leaves over the live network — so it legitimately runs
+/// for many seconds on a big file. A generous ceiling keeps it from being
+/// cut short (which surfaced as a missing verdict / silent failure) while
+/// still guarding against a wedged loop.
+const VERIFY_TIMEOUT: Duration = Duration::from_mins(5);
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum DriveError {
     #[error("{0}")]
@@ -217,7 +225,7 @@ pub(crate) fn verify_propagation(
             },
         )
         .await?;
-        match recv_oneshot(ack_rx).await? {
+        match recv_oneshot_within(ack_rx, VERIFY_TIMEOUT).await? {
             ControlAck::Ok { message } => Ok(message),
             ControlAck::NotReady { message } | ControlAck::Error { message } => {
                 Err(DriveError::Op(message))
@@ -1009,7 +1017,14 @@ async fn send(
 }
 
 async fn recv_oneshot(rx: oneshot::Receiver<ControlAck>) -> Result<ControlAck, DriveError> {
-    match tokio::time::timeout(OP_TIMEOUT, rx).await {
+    recv_oneshot_within(rx, OP_TIMEOUT).await
+}
+
+async fn recv_oneshot_within(
+    rx: oneshot::Receiver<ControlAck>,
+    timeout: Duration,
+) -> Result<ControlAck, DriveError> {
+    match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(ack)) => Ok(ack),
         Ok(Err(_)) => Err(DriveError::Op("node dropped the ack channel".into())),
         Err(_) => Err(DriveError::Op("operation timed out".into())),

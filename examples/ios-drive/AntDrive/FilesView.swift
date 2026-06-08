@@ -364,10 +364,10 @@ private struct FileRow: View {
     }
 
     /// Read-back verdict for a completed file: a spinner while probing,
-    /// then a green "verified · N chunks" or an orange "chunks missing"
+    /// then a green "verified · all N chunks" or an orange "chunks missing"
     /// once the network has been asked. The check resolves the manifest,
-    /// walks the chunk tree, and probes a sample of the real data chunks
-    /// — distinct from the job's "Online" status, which only means the
+    /// walks the chunk tree, and fetches every data chunk network-only —
+    /// distinct from the job's "Online" status, which only means the
     /// upload was attempted locally.
     @ViewBuilder private var propagationBadge: some View {
         if node.verifying.contains(job.id) {
@@ -402,7 +402,7 @@ private struct FileRow: View {
             Menu {
                 Button { onShare(job) } label: { Label("Copy share link", systemImage: "link") }
                 Button {
-                    Task { await node.verifyPropagation(job, samples: 16, probes: 3) }
+                    Task { await node.verifyPropagation(job, samples: 0, probes: 3) }
                 } label: {
                     Label("Verify chunks", systemImage: "antenna.radiowaves.left.and.right")
                 }
