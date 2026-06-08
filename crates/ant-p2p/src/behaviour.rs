@@ -256,6 +256,24 @@ const HINT_CHAN_CAP: usize = 512;
 /// `ConnectionEstablished` → handshake pipeline from being drowned in parallel
 /// dials when a fresh bootnode dumps its full neighbourhood at once.
 const HINT_DIAL_BATCH: usize = 4;
+/// Maximum number of known-but-unconnected peers we retain (with dial
+/// addresses) for on-demand neighbourhood dialing. Hive gossip refreshes
+/// constantly, so a generous cap gives broad keyspace coverage for routing
+/// uploads toward arbitrary chunk neighbourhoods while staying bounded in
+/// memory (each entry is a `PeerId` + a few multiaddrs + 32-byte overlay).
+const KNOWN_DIALABLE_CAP: usize = 16_384;
+/// How many of the closest known peers we dial toward a chunk address on a
+/// single neighbourhood-dial request. Mirrors a small replication fan-out:
+/// enough to land at least one peer genuinely inside the chunk's
+/// neighbourhood without flooding the dial pipeline.
+const NEIGHBORHOOD_DIAL_FANOUT: usize = 4;
+/// How far over `target_peers` the connection pipeline may grow to admit
+/// on-demand neighbourhood dials. Uploads need transient connections into
+/// many different chunk neighbourhoods across the keyspace; this headroom
+/// lets us reach them without the count-based `target_peers` cap (tuned for
+/// steady-state forwarding) starving the upload. Excess peers churn back
+/// out naturally once the upload is done.
+const NEIGHBORHOOD_DIAL_MARGIN: usize = 64;
 /// Minimum gap between two consecutive peer top-ups. Sustained connection
 /// churn (bee-side load shedding under pushsync pressure being the canonical
 /// trigger) drops the peer set below the floor; the top-up clears the
@@ -777,6 +795,23 @@ struct SwarmState {
     /// wiring does. `None` until `run` populates it (and in tests /
     /// builds without the pseudosettle driver).
     hot_hint: Option<mpsc::Sender<ant_retrieval::accounting::HotHint>>,
+    /// Overlay-indexed dial book: every peer we've learned about via hive
+    /// gossip (or the on-disk peerstore) that we are *not* currently
+    /// connected to, retained with its dial multiaddrs + overlay. Unlike
+    /// `hint_queue` (FIFO, drained once) and `known` (overlay counts only,
+    /// no addresses), this lets us dial *toward an arbitrary target
+    /// address* on demand — the building block for reaching a chunk's deep
+    /// neighbourhood during an upload, the way a full bee node's saturated
+    /// Kademlia always has a peer close to any chunk. Bounded by
+    /// [`KNOWN_DIALABLE_CAP`]; entries are removed once the peer connects.
+    known_dialable: HashMap<PeerId, sinks::PeerHint>,
+    /// Sender half of the on-demand neighbourhood-dial channel. Cloned into
+    /// every upload-side `RoutingFetcher`; when a push can't find a
+    /// connected peer inside a chunk's neighbourhood, the fetcher sends the
+    /// chunk address here and the swarm loop dials the closest peers it
+    /// knows about (from `known_dialable`) toward that address. `None`
+    /// until `run` wires the channel (and in tests).
+    neighborhood_dial_tx: Option<mpsc::Sender<[u8; 32]>>,
 }
 
 impl SwarmState {
@@ -829,6 +864,8 @@ impl SwarmState {
             pushsync_swap: None,
             push_skip: ant_retrieval::PushSkipCache::new(),
             hot_hint: None,
+            known_dialable: HashMap::new(),
+            neighborhood_dial_tx: None,
         }
     }
 
@@ -899,6 +936,24 @@ impl SwarmState {
         // our own overlay.
         if hint.peer_id != local_peer_id {
             self.known.note(hint.overlay);
+            // Retain the full dial info (addrs + overlay) so we can dial
+            // *toward a chunk's neighbourhood* on demand later — even for
+            // peers we don't dial now (peer set full / already seen).
+            // Skip peers that carry no overlay (older hive adverts) since
+            // we can't rank those by proximity to a target.
+            if hint.overlay != [0u8; 32] && !self.bzz_peers.contains(&hint.peer_id) {
+                if self.known_dialable.len() >= KNOWN_DIALABLE_CAP
+                    && !self.known_dialable.contains_key(&hint.peer_id)
+                {
+                    // Bound the book: drop one arbitrary stale entry. The
+                    // hive stream constantly refreshes, so a dropped entry
+                    // that's still live will be re-learned shortly.
+                    if let Some(victim) = self.known_dialable.keys().next().copied() {
+                        self.known_dialable.remove(&victim);
+                    }
+                }
+                self.known_dialable.insert(hint.peer_id, hint.clone());
+            }
         }
         if hint.peer_id == local_peer_id
             || self.bzz_peers.contains(&hint.peer_id)
@@ -1342,6 +1397,14 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     // each) without blocking the resolver.
     let (bootnode_dial_tx, mut bootnode_dial_rx) = mpsc::channel::<Multiaddr>(64);
 
+    // On-demand neighbourhood dialing: upload-side fetchers send chunk
+    // addresses here when they lack a connected peer close to the chunk;
+    // the loop dials known peers toward that address. Bounded + best-effort
+    // (the fetcher drops on a full channel) so a large upload can't flood
+    // the dial pipeline.
+    let (neighborhood_dial_tx, mut neighborhood_dial_rx) = mpsc::channel::<[u8; 32]>(256);
+    state.neighborhood_dial_tx = Some(neighborhood_dial_tx);
+
     let mut backoff = MIN_BACKOFF;
     let mut last_bootstrap_at = Instant::now();
     // Last time the partial-drain top-up fired. Initialised so the very first
@@ -1420,6 +1483,9 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
             }
             Some(addr) = bootnode_dial_rx.recv() => {
                 handle_bootnode_dial(&mut swarm, &mut state, addr);
+            }
+            Some(target) = neighborhood_dial_rx.recv() => {
+                dial_toward_target(&mut swarm, &mut state, target);
             }
             Some((peer, outcome)) = result_rx.recv() => {
                 handle_drive_outcome(
@@ -1693,6 +1759,7 @@ fn handle_control_command(
             let push_skip = state.push_skip.clone();
             let disk_cache = state.disk_cache.clone();
             let mem_cache = state.chunk_cache.clone();
+            let neighborhood_dial = state.neighborhood_dial_tx.clone();
             tokio::spawn(async move {
                 // Land the chunk in our own local store *before* pushsync,
                 // mirroring bee's store-then-push upload model. Without
@@ -1719,6 +1786,9 @@ fn handle_control_command(
                 let mut fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx)
                     .with_push_skip(push_skip)
                     .with_network_id(network_id);
+                if let Some(tx) = neighborhood_dial {
+                    fetcher = fetcher.with_neighborhood_dialer(tx);
+                }
                 if let Some(svc) = pushsync_swap {
                     let s: Arc<dyn ant_retrieval::PushsyncSettlement> = svc;
                     fetcher = fetcher.with_pushsync_settlement(s);
@@ -1803,6 +1873,7 @@ fn handle_control_command(
             let push_skip = state.push_skip.clone();
             let disk_cache = state.disk_cache.clone();
             let mem_cache = state.chunk_cache.clone();
+            let neighborhood_dial = state.neighborhood_dial_tx.clone();
             tokio::spawn(async move {
                 // Keep a local copy of our own upload before pushsync, so
                 // the node can serve the SOC it just stamped without
@@ -1823,6 +1894,9 @@ fn handle_control_command(
                 let mut fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx)
                     .with_push_skip(push_skip)
                     .with_network_id(network_id);
+                if let Some(tx) = neighborhood_dial {
+                    fetcher = fetcher.with_neighborhood_dialer(tx);
+                }
                 if let Some(svc) = pushsync_swap {
                     let s: Arc<dyn ant_retrieval::PushsyncSettlement> = svc;
                     fetcher = fetcher.with_pushsync_settlement(s);
@@ -3578,6 +3652,96 @@ fn fill_pipeline_from_hints(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmSt
     }
 }
 
+/// Dial the closest known-but-unconnected peers toward `target` (a chunk
+/// address), so a subsequent pushsync lands inside the chunk's
+/// neighbourhood instead of relying on a possibly-shallow forwarding chain.
+///
+/// This is the on-demand counterpart to a full bee node's saturated
+/// Kademlia: a light node connects to ~100 roughly-random peers, so for
+/// most chunks its closest *connected* peer is shallow and pushes draw
+/// shallow receipts (the chunk lands on the wrong neighbourhood and an
+/// independent gateway can't retrieve it). When the upload path detects it
+/// has no connected peer close enough to a chunk, it asks us to dial
+/// peers we've learned about via hive whose overlay *is* close to that
+/// chunk. We only dial peers strictly deeper than our current best
+/// connected peer (so we always improve coverage), capped at
+/// [`NEIGHBORHOOD_DIAL_FANOUT`] per request, and only while the pipeline
+/// has [`NEIGHBORHOOD_DIAL_MARGIN`] headroom over `target_peers`.
+fn dial_toward_target(swarm: &mut Swarm<AntBehaviour>, state: &mut SwarmState, target: Overlay) {
+    if state.pipeline_size() >= state.target_peers + NEIGHBORHOOD_DIAL_MARGIN {
+        return;
+    }
+    // Proximity of our current best *connected* peer to the target. We only
+    // bother dialing peers that would sit strictly deeper than this.
+    let best_connected_po = state
+        .routing
+        .closest_peer(&target, &[])
+        .map_or(0, |(_, overlay)| {
+            crate::routing::proximity(&target, &overlay)
+        });
+
+    // Rank known-but-unconnected peers by proximity to the target, deepest
+    // first, keeping only those that improve on what we already have.
+    let mut candidates: Vec<(PeerId, u8)> = state
+        .known_dialable
+        .iter()
+        .filter(|(pid, _)| {
+            !state.bzz_peers.contains(*pid)
+                && !state.dialing.contains(*pid)
+                && !state.pending.contains_key(*pid)
+        })
+        .map(|(pid, hint)| (*pid, crate::routing::proximity(&target, &hint.overlay)))
+        .filter(|(_, po)| *po > best_connected_po)
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
+    debug!(
+        target: "ant_p2p",
+        target = %hex::encode(target),
+        known_dialable = state.known_dialable.len(),
+        best_connected_po,
+        candidates = candidates.len(),
+        deepest = candidates.first().map_or(0, |c| c.1),
+        "neighbourhood dial request",
+    );
+    candidates.truncate(NEIGHBORHOOD_DIAL_FANOUT);
+
+    for (peer_id, po) in candidates {
+        let Some(hint) = state.known_dialable.get(&peer_id).cloned() else {
+            continue;
+        };
+        if swarm.is_connected(&peer_id) {
+            continue;
+        }
+        let opts = DialOpts::peer_id(peer_id)
+            .addresses(hint.addrs.clone())
+            .build();
+        match swarm.dial(opts) {
+            Ok(()) => {
+                state.dialing.insert(peer_id);
+                state.dial_started.insert(peer_id, Instant::now());
+                state.failed.retain(|f| f.peer != peer_id);
+                if let Some(a) = hint.addrs.first() {
+                    state.dial_hint_addr.insert(peer_id, a.clone());
+                }
+                debug!(
+                    target: "ant_p2p",
+                    peer = %peer_id,
+                    po,
+                    target = %hex::encode(target),
+                    "dialing toward chunk neighbourhood",
+                );
+            }
+            Err(DialError::DialPeerConditionFalse(_)) => {}
+            Err(e) => {
+                debug!(target: "ant_p2p", peer = %peer_id, "neighbourhood dial error: {e}");
+            }
+        }
+    }
+}
+
 /// Re-warm the dial pipeline + re-bootstrap when sustained connection churn
 /// drops the peer set below half of `target_peers`. Without this, peers
 /// disconnected by remote-side close (bee's "load shedding" under sustained
@@ -3895,6 +4059,9 @@ fn handle_drive_outcome(
         DriveOutcome::Ok(info) => {
             let first_bzz_in_session = state.bzz_peers.is_empty();
             state.bzz_peers.insert(peer);
+            // Now connected: drop it from the dial book so neighbourhood
+            // dials don't re-target an already-connected peer.
+            state.known_dialable.remove(&peer);
             if let Some(p) = pipeline_ms.as_ref() {
                 let total = p.dial_ms.unwrap_or(0) + p.identifying_ms + p.handshake_ms;
                 state.ready_in_ms.insert(peer, total);

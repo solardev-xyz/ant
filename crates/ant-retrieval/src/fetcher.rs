@@ -202,21 +202,15 @@ pub struct RoutingFetcher {
     /// signature). The daemon sets this so a push only counts as
     /// success when a genuine neighbourhood storer signed the receipt.
     push_network_id: Option<u64>,
-    /// Whether a *shallow* pushsync receipt may count as a successful
-    /// push. A shallow receipt proves a storer ran its `store()` path,
-    /// but at a proximity *shallower* than its own reported storage
-    /// radius — i.e. the chunk did **not** reach its true neighbourhood.
-    /// Such a chunk is retrievable transiently (the shallow forwarder
-    /// still holds it, and the uploading node keeps its own copy), which
-    /// is exactly why a single-node read-back can falsely report it
-    /// "reachable" — but an independent cold node, routing to the real
-    /// neighbourhood, finds nothing and the upload is unretrievable
-    /// network-wide. Default `false`: we hunt every candidate for a
-    /// deep storer and, if none is reachable, fail the push *loudly*
-    /// rather than reporting a non-durable upload as synced. Set `true`
-    /// (via [`Self::with_accept_shallow`]) only where bee-aligned soft
-    /// acceptance is explicitly wanted.
-    accept_shallow: bool,
+    /// Optional on-demand neighbourhood-dial request channel into the swarm
+    /// loop. When [`Self::push_stamped_chunk`] is about to push a chunk for
+    /// which we have no connected peer inside the chunk's neighbourhood, it
+    /// sends the chunk address here; the swarm loop dials the closest peers
+    /// it knows about toward that address so the push can land deep (the
+    /// way a full bee node's saturated Kademlia always has a near peer).
+    /// Best-effort: a full channel drops the request rather than blocking
+    /// the push. `None` for retrieval-only fetchers and tests.
+    neighborhood_dial: Option<mpsc::Sender<[u8; 32]>>,
 }
 
 impl RoutingFetcher {
@@ -253,20 +247,18 @@ impl RoutingFetcher {
             pushsync_settlement: None,
             push_skip: None,
             push_network_id: None,
-            accept_shallow: false,
+            neighborhood_dial: None,
         }
     }
 
-    /// Opt back in to bee-aligned *soft* acceptance of shallow pushsync
-    /// receipts. When set, [`Self::push_stamped_chunk`] treats a shallow
-    /// receipt as success after exhausting the bounded deeper-storer hunt
-    /// (the pre-strict-mode behaviour). Left unset (the default), a chunk
-    /// that only ever draws shallow receipts fails the push so the upload
-    /// surfaces the non-durable placement instead of silently reporting
-    /// success. See [`Self::accept_shallow`] for the full rationale.
+    /// Attach the on-demand neighbourhood-dial request channel. When set,
+    /// [`Self::push_stamped_chunk`] asks the swarm loop to dial peers
+    /// toward a chunk's neighbourhood when our connected set has nothing
+    /// close enough, so pushes reach the deep neighbourhood instead of
+    /// drawing shallow receipts. See the `neighborhood_dial` field.
     #[must_use]
-    pub fn with_accept_shallow(mut self, accept: bool) -> Self {
-        self.accept_shallow = accept;
+    pub fn with_neighborhood_dialer(mut self, tx: mpsc::Sender<[u8; 32]>) -> Self {
+        self.neighborhood_dial = Some(tx);
         self
     }
 
@@ -467,21 +459,28 @@ impl RoutingFetcher {
             .push(peer);
     }
 
-    /// Per-chunk skip-list cap. Bumped from 24 → 64 because a
-    /// Poisson-unlucky neighborhood (a few peers all in the middle of
-    /// dropping their TCP connection at once) was hitting the old
-    /// ceiling on otherwise-healthy uploads.
-    const MAX_PUSH_ERRORS: usize = 64;
+    /// Hard-failure budget for one chunk's push, matching bee 2.8.0
+    /// `pushsync.maxPushErrors` (`pkg/pushsync/pushsync.go`). Bee's
+    /// origin `pushToClosest` seeds `sentErrorsLeft = maxPushErrors` and
+    /// decrements it on every *failed* send attempt (stream open / io /
+    /// remote-rejection), giving up with `ErrNoPush` once it hits zero. A
+    /// shallow receipt is **not** a failure and does not consume this
+    /// budget. We mirror the value exactly so a chunk is abandoned after
+    /// the same number of genuinely-bad peers bee would tolerate.
+    const MAX_PUSH_ERRORS: usize = 32;
 
-    /// One transient retry on the *same* peer, on a fresh stream, before
-    /// adding it to the skip list. This fires only for a mid-exchange
-    /// `Io` error (see [`is_transient_pushsync_error`]): the stream had
-    /// negotiated, so the connection was alive and a fresh stream on it
-    /// usually goes through. An *open* failure (the dominant churn under
-    /// connection-reset load) is no longer retried here — re-opening
-    /// needs a fresh dial that can't finish in the retry window, so we
-    /// skip straight to the next-closest peer instead.
-    const PER_PEER_RETRY_BUDGET: usize = 1;
+    /// Preemptive hedge interval, matching bee 2.8.0
+    /// `pushsync.preemptiveInterval`. Bee's origin pushToClosest arms a
+    /// ticker at this interval and, on every tick, fans the chunk out to
+    /// one additional closest peer *concurrently* with the in-flight
+    /// attempt(s) — "early replication / opportunistic receipting" from
+    /// the pushsync multiplexing design. This is what stops a single
+    /// slow-but-not-dead closest storer from pinning the whole upload
+    /// (the upload finishes only when its slowest chunk does): rather
+    /// than waiting out the full per-attempt deadline, we keep widening
+    /// the concurrent attempt set every 5 s and take the first valid
+    /// receipt.
+    const PREEMPTIVE_INTERVAL: Duration = Duration::from_secs(5);
 
     /// How many distinct peers may return a *shallow* receipt before we
     /// stop hunting for a deeper storer and accept the chunk as stored.
@@ -506,42 +505,69 @@ impl RoutingFetcher {
     /// than failing the upload.
     const MAX_SHALLOW_ATTEMPTS: u32 = 6;
 
-    /// Per-attempt "hedge" deadline applied to the early, closest
-    /// candidates. A healthy pushsync round-trip acks in well under a
-    /// second (a 129-chunk 500 KiB upload at 32-wide concurrency
-    /// finishes in ~1-2 s when nothing stalls), so a peer that opened
-    /// the stream but hasn't relayed a receipt within this window is
-    /// almost certainly wedged forwarding the chunk deeper. Abandoning
-    /// it for the next-closest peer is far cheaper than burning the full
-    /// [`crate::pushsync::DEFAULT_PUSHSYNC_TIMEOUT`] (45 s) — which,
-    /// because the upload completes only when its slowest chunk does,
-    /// otherwise pins an entire 500 KiB upload at 45 s whenever a single
-    /// chunk draws a stuck closest peer. We keep the full 45 s ceiling
-    /// for the last few candidates ([`HEDGE_RESERVE_CANDIDATES`]) so a
-    /// genuinely slow-but-correct neighbourhood is still given its full
-    /// budget before we give up.
-    const HEDGE_PUSH_TIMEOUT: Duration = Duration::from_secs(10);
+    /// Rank the live peer set closest-first to `chunk_addr` and return the
+    /// next candidate not already used for this chunk. The per-process
+    /// push-skip cache (cross-chunk cool-down) is applied as a *soft*
+    /// filter: if honouring it would leave no candidate (every closest
+    /// peer is currently cooling down), we fall through to the unfiltered
+    /// ranking so a small / flappy network can still make progress.
+    fn next_push_peer(&self, chunk_addr: &[u8; 32], used: &[PeerId]) -> Option<(PeerId, Overlay)> {
+        let live = self.peers_rx.borrow();
+        let mut ranked: Vec<(PeerId, Overlay)> = live
+            .iter()
+            .filter(|(p, _)| !used.contains(p))
+            .copied()
+            .collect();
+        drop(live);
+        ranked.sort_by(|(_, a), (_, b)| {
+            for i in 0..32 {
+                let da = a[i] ^ chunk_addr[i];
+                let db = b[i] ^ chunk_addr[i];
+                if da != db {
+                    return da.cmp(&db);
+                }
+            }
+            Ordering::Equal
+        });
+        if let Some(skip) = self.push_skip.as_ref() {
+            if let Some(hit) = ranked.iter().copied().find(|(p, _)| !skip.is_skipped(*p)) {
+                return Some(hit);
+            }
+        }
+        ranked.first().copied()
+    }
 
-    /// How many of the final candidates fall back to the full
-    /// [`crate::pushsync::DEFAULT_PUSHSYNC_TIMEOUT`] ceiling instead of
-    /// the short [`HEDGE_PUSH_TIMEOUT`]. Hedging aggressively while many
-    /// closer peers remain, then patiently once we're nearly out of
-    /// candidates, gives us speed without sacrificing the last-resort
-    /// reliability the long timeout buys.
-    const HEDGE_RESERVE_CANDIDATES: usize = 4;
-
-    /// The per-attempt deadline for the `idx`-th pushsync candidate
-    /// (0-based): short while plenty of closer peers remain, the full
-    /// ceiling for the final [`HEDGE_RESERVE_CANDIDATES`].
-    const fn attempt_timeout(idx: usize) -> Duration {
-        if idx + Self::HEDGE_RESERVE_CANDIDATES >= Self::MAX_PUSH_ERRORS {
-            crate::pushsync::DEFAULT_PUSHSYNC_TIMEOUT
-        } else {
-            Self::HEDGE_PUSH_TIMEOUT
+    /// Best-effort request to the swarm loop to dial peers toward `target`'s
+    /// neighbourhood. Dropped silently if no dialer is wired or the request
+    /// channel is full (the loop is already busy dialing).
+    fn request_neighborhood_dial(&self, target: &[u8; 32]) {
+        if let Some(tx) = self.neighborhood_dial.as_ref() {
+            let _ = tx.try_send(*target);
         }
     }
 
-    /// Try pushsync against up to [`MAX_PUSH_ERRORS`] peers, closest-first.
+    /// Push one stamped chunk into the network, porting bee 2.8.0's
+    /// origin upload path (`pkg/pushsync::pushToClosest(origin=true)`
+    /// followed by `pkg/pusher`'s shallow-receipt handling).
+    ///
+    /// Behaviour, matched to bee:
+    /// * **Closest-first, concurrent.** We push to the closest connected
+    ///   peer and, every [`PREEMPTIVE_INTERVAL`] (bee `preemptiveInterval`),
+    ///   fan out to one more closest peer *concurrently* — bee's
+    ///   "preemptive" early-replication hedge. The first valid receipt
+    ///   wins; remaining attempts are dropped.
+    /// * **Shallow receipts are not failures.** A shallow receipt proves a
+    ///   storer ran its reserve-put + sign path (so the chunk is stored
+    ///   and will be pull-synced through the neighbourhood); it just
+    ///   landed shallower than ideal. Like bee's pusher
+    ///   (`pushDeferred`/`pushDirect`, the `ErrShallowReceipt` arm) we
+    ///   retry for a deeper storer up to [`MAX_SHALLOW_ATTEMPTS`] (bee
+    ///   `DefaultRetryCount`) and then **accept** it — bee reports the
+    ///   chunk `ChunkSynced` rather than ever failing the upload on a
+    ///   shallow receipt.
+    /// * **Hard failures** (stream open / io / remote rejection) consume a
+    ///   bounded budget ([`MAX_PUSH_ERRORS`], bee `maxPushErrors`); a
+    ///   single mid-exchange `Io` gets one same-peer retry first.
     ///
     /// Does **not** mutate the retrieval blacklist; push uses its own
     /// skip list because a peer that rejects a stamped write may still
@@ -552,232 +578,218 @@ impl RoutingFetcher {
         wire: Vec<u8>,
         stamp: [u8; ant_postage::STAMP_SIZE],
     ) -> Result<(), crate::pushsync::PushSyncError> {
-        use crate::pushsync::push_chunk_to_peer_with_timeout;
-        let mut control = self.control.clone();
-        let mut skipped = Vec::<PeerId>::new();
-        let mut last_err: Option<crate::pushsync::PushSyncError> = None;
-        // Track shallow receipts separately from hard failures. A shallow
-        // receipt means a storer *did* store the chunk; we keep it as an
-        // acceptable fallback while we try a bounded number of other peers
-        // for a deeper storer, then accept it (bee-aligned — see
-        // `MAX_SHALLOW_ATTEMPTS`).
-        let mut shallow_fallback: Option<crate::pushsync::PushSyncError> = None;
+        use crate::pushsync::{
+            push_chunk_to_peer_with_timeout, PushSyncError, DEFAULT_PUSHSYNC_TIMEOUT,
+        };
+
+        // Shared across the concurrent in-flight attempts.
+        let wire = Arc::new(wire);
+        let stamp = Arc::new(stamp);
+        let net = self.push_network_id;
+
+        // Peers already dialled for this chunk (bee's per-chunk skip
+        // list): never re-pick the same peer for the same chunk.
+        let mut used = Vec::<PeerId>::new();
+        // Peers we've already granted the one-shot same-peer transient
+        // retry to (so a flapping peer can't loop forever).
+        let mut retried = Vec::<PeerId>::new();
+
+        // Hard-failure budget (bee `sentErrorsLeft = maxPushErrors`).
+        let mut errors_left: i32 = Self::MAX_PUSH_ERRORS as i32;
         let mut shallow_attempts: u32 = 0;
-        for attempt_idx in 0..Self::MAX_PUSH_ERRORS {
-            let attempt_timeout = Self::attempt_timeout(attempt_idx);
-            let live = self.peers_rx.borrow().clone();
-            // Rank closest-first, then apply the shared per-process
-            // push skip cache as a *soft* filter: if it would leave
-            // the candidate list empty (every closest peer is
-            // currently cooling down), fall through to the
-            // unfiltered list so we still attempt the push. Without
-            // this fall-through the cache could indefinitely block
-            // small networks where every BZZ peer flapped at least
-            // once during the upload.
-            let mut ranked: Vec<(PeerId, Overlay)> = live
-                .into_iter()
-                .filter(|(p, _)| !skipped.contains(p))
-                .collect();
-            ranked.sort_by(|(_, a), (_, b)| {
-                for i in 0..32 {
-                    let da = a[i] ^ chunk_addr[i];
-                    let db = b[i] ^ chunk_addr[i];
-                    if da != db {
-                        return da.cmp(&db);
-                    }
-                }
-                Ordering::Equal
-            });
-            if let Some(skip) = self.push_skip.as_ref() {
-                let filtered: Vec<(PeerId, Overlay)> = ranked
-                    .iter()
-                    .copied()
-                    .filter(|(p, _)| !skip.is_skipped(*p))
-                    .collect();
-                if !filtered.is_empty() {
-                    ranked = filtered;
-                }
-            }
-            let Some((peer, peer_overlay)) = ranked.first().copied() else {
-                // No candidates left to try. A shallow receipt means the
-                // chunk landed shallower than its storage radius, so it
-                // did not reach its true neighbourhood and is not durably
-                // retrievable network-wide. In strict mode (the default)
-                // we surface that as a failed push; only with
-                // `accept_shallow` do we treat it as bee-aligned success.
-                if let Some(shallow) = shallow_fallback.take() {
-                    if self.accept_shallow {
-                        warn!(
-                            target: "ant_retrieval::fetcher",
-                            addr = %hex::encode(chunk_addr),
-                            err = %shallow,
-                            "accepting shallow receipt; no deeper candidates remain (bee-aligned)",
-                        );
-                        return Ok(());
-                    }
-                    warn!(
-                        target: "ant_retrieval::fetcher",
-                        addr = %hex::encode(chunk_addr),
-                        err = %shallow,
-                        "no deep storer reachable; chunk only landed shallow — failing push (not durably retrievable)",
-                    );
-                    return Err(shallow);
-                }
-                return Err(crate::pushsync::PushSyncError::Remote("no peers".into()));
-            };
-            let chunk_price = peer_chunk_price(&peer_overlay, &chunk_addr);
+        let mut shallow_seen = false;
+        let mut last_err: Option<PushSyncError> = None;
 
-            // Settle before pushing if the implementation wants to. The
-            // hook is allowed to (and will) block on opening a swap
-            // stream, so this serialises pushsync against settlement
-            // for THIS peer — bee accepts the cheque, credits us, then
-            // accepts the chunk on the same connection. Without this
-            // pre-settle, the very next pushsync after a threshold
-            // crossing would land before the cheque and bee would RST
-            // it. Reporting `0` here is a no-op for the threshold check
-            // (we haven't accrued anything new) but lets the hook
-            // re-emit a pending cheque from a previous failed attempt.
-            if let Some(s) = self.pushsync_settlement.as_ref() {
-                s.note_pushsync(peer, 0).await;
-            }
+        // In-flight pushsync attempts. Each yields
+        // `(peer, overlay, chunk_price, result)`.
+        type Attempt = (PeerId, Overlay, u64, Result<(), PushSyncError>);
+        let inflight = FuturesUnordered::<
+            std::pin::Pin<Box<dyn std::future::Future<Output = Attempt> + Send>>,
+        >::new();
+        let mut inflight = inflight;
 
-            let mut err = match push_chunk_to_peer_with_timeout(
-                &mut control,
-                peer,
-                chunk_addr,
-                wire.as_slice(),
-                &stamp,
-                self.push_network_id,
-                attempt_timeout,
-            )
-            .await
-            {
-                Ok(()) => {
-                    if let Some(s) = self.pushsync_settlement.as_ref() {
-                        s.note_pushsync(peer, chunk_price).await;
+        // `want` is bee's `retryC`: how many fresh attempts to dispatch to
+        // the next-closest peers. Seed with one; the preemptive ticker and
+        // soft (shallow / failed) outcomes bump it.
+        let mut want: i32 = 1;
+
+        let mut preempt = tokio::time::interval(Self::PREEMPTIVE_INTERVAL);
+        // The first tick fires immediately; consume it so the real hedge
+        // doesn't go out until one interval has elapsed.
+        preempt.tick().await;
+
+        // Ask the swarm loop to dial peers toward this chunk's
+        // neighbourhood so the push can land deep instead of relying on a
+        // possibly-shallow forwarding chain. Best-effort and self-limiting:
+        // the loop only dials when it knows a peer closer to the chunk than
+        // anything we're already connected to, so this is a no-op once
+        // we're well-connected to the neighbourhood.
+        self.request_neighborhood_dial(&chunk_addr);
+
+        // Dispatch one attempt against `peer`, optionally after a short
+        // delay (used for the same-peer transient retry). Pushes the
+        // future onto `inflight`.
+        macro_rules! dispatch {
+            ($peer:expr, $overlay:expr, $price:expr, $delay_ms:expr) => {{
+                let peer = $peer;
+                let overlay = $overlay;
+                let price = $price;
+                let mut control = self.control.clone();
+                let wire = wire.clone();
+                let stamp = stamp.clone();
+                let delay_ms: u64 = $delay_ms;
+                inflight.push(Box::pin(async move {
+                    if delay_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     }
-                    // Clear any pre-existing cool-down: a
-                    // peer that successfully accepts a chunk is
-                    // healthy *right now*, so the next chunk's
-                    // ranking should put it back at the top
-                    // instead of waiting out the TTL.
-                    if let Some(s) = self.push_skip.as_ref() {
-                        s.clear(peer);
-                    }
-                    return Ok(());
-                }
-                Err(e) => e,
-            };
-
-            for _ in 0..Self::PER_PEER_RETRY_BUDGET {
-                if !is_transient_pushsync_error(&err) {
-                    break;
-                }
-                warn!(
-                    target: "ant_retrieval::fetcher",
-                    %peer,
-                    err=%err,
-                    "pushsync attempt failed; retrying same peer once on a fresh stream",
-                );
-                tokio::time::sleep(Duration::from_millis(150)).await;
-                match push_chunk_to_peer_with_timeout(
-                    &mut control,
-                    peer,
-                    chunk_addr,
-                    wire.as_slice(),
-                    &stamp,
-                    self.push_network_id,
-                    attempt_timeout,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        if let Some(s) = self.pushsync_settlement.as_ref() {
-                            s.note_pushsync(peer, chunk_price).await;
-                        }
-                        if let Some(s) = self.push_skip.as_ref() {
-                            s.clear(peer);
-                        }
-                        return Ok(());
-                    }
-                    Err(e) => err = e,
-                }
-            }
-
-            // A shallow receipt is a *soft* outcome, not a failure: the
-            // responding storer stored the chunk (so it is retrievable),
-            // it just landed shallower than ideal. Mirror bee's pusher:
-            // remember it as an acceptable fallback and keep looking for a
-            // deeper storer for up to `MAX_SHALLOW_ATTEMPTS` shallow hits,
-            // then accept it rather than failing the upload. Crucially we
-            // do **not** cross-chunk-cool-down a shallow peer — it is a
-            // perfectly good storer for chunks that hash into *its*
-            // neighbourhood; only this chunk happened to be shallow for it.
-            if matches!(err, crate::pushsync::PushSyncError::ShallowReceipt { .. }) {
-                shallow_attempts += 1;
-                warn!(
-                    target: "ant_retrieval::fetcher",
-                    %peer,
-                    err=%err,
-                    shallow_attempts,
-                    "pushsync got a shallow receipt; chunk is stored but shallow — trying for a deeper storer",
-                );
-                if self.accept_shallow && accept_shallow_after(shallow_attempts) {
-                    warn!(
-                        target: "ant_retrieval::fetcher",
-                        addr = %hex::encode(chunk_addr),
-                        shallow_attempts,
-                        "accepting shallow receipt after exhausting deeper-storer attempts (bee-aligned)",
-                    );
-                    return Ok(());
-                }
-                shallow_fallback = Some(err);
-                skipped.push(peer);
-                continue;
-            }
-
-            warn!(
-                target: "ant_retrieval::fetcher",
-                %peer,
-                err=%err,
-                "pushsync attempt failed; skipping peer for this chunk",
-            );
-            // Cross-chunk cool-down: keep this peer out of the
-            // candidate set for the next few seconds so the
-            // *next* chunk doesn't immediately re-pick the same
-            // broken peer. Soft (the filter falls through when
-            // every candidate is skipped) so a small network
-            // can't starve itself out.
-            if let Some(s) = self.push_skip.as_ref() {
-                s.note_failure(peer, DEFAULT_SKIP_TTL);
-            }
-            skipped.push(peer);
-            last_err = Some(err);
+                    let r = push_chunk_to_peer_with_timeout(
+                        &mut control,
+                        peer,
+                        chunk_addr,
+                        wire.as_slice(),
+                        stamp.as_ref(),
+                        net,
+                        DEFAULT_PUSHSYNC_TIMEOUT,
+                    )
+                    .await;
+                    (peer, overlay, price, r)
+                }));
+            }};
         }
-        // Exhausted the candidate set. At least one storer accepted the
-        // chunk shallow. With `accept_shallow` we follow bee's pusher and
-        // report it synced; in strict mode (the default) a shallow-only
-        // placement is *not* durably retrievable network-wide, so we fail
-        // the push and let the uploader/self-heal surface it loudly.
-        if let Some(shallow) = shallow_fallback {
-            if self.accept_shallow {
-                warn!(
-                    target: "ant_retrieval::fetcher",
-                    addr = %hex::encode(chunk_addr),
-                    err = %shallow,
-                    "accepting shallow receipt after exhausting all candidates (bee-aligned)",
-                );
-                return Ok(());
+
+        loop {
+            // Fill the requested dispatch slots with the next-closest
+            // peers we haven't dialled yet for this chunk. Pre-settle each
+            // peer first (bee accepts the cheque, credits us, then accepts
+            // the chunk on the same connection — without this the next
+            // pushsync after a settlement threshold crossing would be
+            // RST'd by bee).
+            while want > 0 {
+                let Some((peer, overlay)) = self.next_push_peer(&chunk_addr, &used) else {
+                    break;
+                };
+                used.push(peer);
+                if let Some(s) = self.pushsync_settlement.as_ref() {
+                    s.note_pushsync(peer, 0).await;
+                }
+                let price = peer_chunk_price(&overlay, &chunk_addr);
+                dispatch!(peer, overlay, price, 0u64);
+                want -= 1;
             }
+
+            if inflight.is_empty() {
+                // Nothing pending and no candidates left to dial.
+                break;
+            }
+
+            tokio::select! {
+                // Prefer draining results over firing more hedges.
+                biased;
+                Some((peer, overlay, price, res)) = inflight.next() => {
+                    match res {
+                        Ok(()) => {
+                            if let Some(s) = self.pushsync_settlement.as_ref() {
+                                s.note_pushsync(peer, price).await;
+                            }
+                            // A peer that just accepted a chunk is healthy
+                            // right now: clear any cool-down so the next
+                            // chunk ranks it at the top again.
+                            if let Some(s) = self.push_skip.as_ref() {
+                                s.clear(peer);
+                            }
+                            return Ok(());
+                        }
+                        Err(e) if matches!(e, PushSyncError::ShallowReceipt { .. }) => {
+                            // Not a failure: the storer ran its reserve-put
+                            // + sign path, so the chunk is stored and will
+                            // pull-sync through the neighbourhood. Mirror
+                            // bee's pusher: retry for a deeper storer up to
+                            // MAX_SHALLOW_ATTEMPTS, then accept. Do NOT
+                            // cool-down a shallow peer — it's a fine storer
+                            // for chunks that hash into its own
+                            // neighbourhood.
+                            shallow_attempts += 1;
+                            shallow_seen = true;
+                            // A shallow receipt is direct evidence we lack a
+                            // connected peer in this chunk's neighbourhood —
+                            // ask the swarm loop to dial one before we retry.
+                            self.request_neighborhood_dial(&chunk_addr);
+                            warn!(
+                                target: "ant_retrieval::fetcher",
+                                %peer,
+                                err=%e,
+                                shallow_attempts,
+                                "pushsync got a shallow receipt; chunk stored but shallow — trying for a deeper storer",
+                            );
+                            if accept_shallow_after(shallow_attempts) {
+                                if let Some(s) = self.pushsync_settlement.as_ref() {
+                                    s.note_pushsync(peer, price).await;
+                                }
+                                warn!(
+                                    target: "ant_retrieval::fetcher",
+                                    addr = %hex::encode(chunk_addr),
+                                    shallow_attempts,
+                                    "accepting shallow receipt after deeper-storer attempts (bee-aligned: chunk is stored)",
+                                );
+                                return Ok(());
+                            }
+                            want += 1;
+                        }
+                        Err(e) if is_transient_pushsync_error(&e) && !retried.contains(&peer) => {
+                            // One same-peer retry on a fresh stream for a
+                            // mid-exchange Io error (the connection was
+                            // alive moments ago).
+                            retried.push(peer);
+                            warn!(
+                                target: "ant_retrieval::fetcher",
+                                %peer,
+                                err=%e,
+                                "pushsync attempt failed; retrying same peer once on a fresh stream",
+                            );
+                            dispatch!(peer, overlay, price, 150u64);
+                        }
+                        Err(e) => {
+                            warn!(
+                                target: "ant_retrieval::fetcher",
+                                %peer,
+                                err=%e,
+                                "pushsync attempt failed; hedging onto the next-closest peer",
+                            );
+                            // Cross-chunk cool-down so the next chunk
+                            // doesn't immediately re-pick a broken peer.
+                            if let Some(s) = self.push_skip.as_ref() {
+                                s.note_failure(peer, DEFAULT_SKIP_TTL);
+                            }
+                            errors_left -= 1;
+                            last_err = Some(e);
+                            if errors_left <= 0 {
+                                break;
+                            }
+                            want += 1;
+                        }
+                    }
+                }
+                _ = preempt.tick() => {
+                    // Preemptive early-replication hedge: widen the
+                    // concurrent attempt set to one more closest peer.
+                    want += 1;
+                }
+            }
+        }
+
+        // Candidate set / error budget exhausted. Bee never fails an
+        // upload on a shallow receipt — its pusher reports the chunk
+        // `ChunkSynced` after the retry budget — so if any storer accepted
+        // the chunk (even shallow), treat the push as done.
+        if shallow_seen {
             warn!(
                 target: "ant_retrieval::fetcher",
                 addr = %hex::encode(chunk_addr),
-                err = %shallow,
-                "exhausted all candidates with only shallow receipts — failing push (not durably retrievable)",
+                "accepting shallow receipt after exhausting candidates (bee-aligned: chunk is stored)",
             );
-            return Err(shallow);
+            return Ok(());
         }
-        Err(crate::pushsync::PushSyncError::Remote(format!(
+        Err(PushSyncError::Remote(format!(
             "exhausted pushsync peers (last: {})",
             last_err.map_or_else(|| "unknown".to_string(), |e| e.to_string()),
         )))
@@ -1594,40 +1606,6 @@ mod tests {
         // At/above the threshold: accept the shallow (stored) chunk.
         assert!(accept_shallow_after(6));
         assert!(accept_shallow_after(7));
-    }
-
-    /// Pin the hedge-timeout policy: the early, closest candidates get
-    /// the short [`RoutingFetcher::HEDGE_PUSH_TIMEOUT`] so a single
-    /// wedged peer can't pin a whole upload at the 45 s ceiling, while
-    /// the final [`RoutingFetcher::HEDGE_RESERVE_CANDIDATES`] fall back
-    /// to the full deadline so a genuinely slow-but-correct
-    /// neighbourhood still gets its full budget before we give up.
-    #[test]
-    fn hedge_timeout_short_early_full_at_the_end() {
-        // First candidate hedges aggressively.
-        assert_eq!(
-            RoutingFetcher::attempt_timeout(0),
-            RoutingFetcher::HEDGE_PUSH_TIMEOUT,
-        );
-        // Still hedging while plenty of closer peers remain.
-        let last_hedged =
-            RoutingFetcher::MAX_PUSH_ERRORS - RoutingFetcher::HEDGE_RESERVE_CANDIDATES;
-        assert_eq!(
-            RoutingFetcher::attempt_timeout(last_hedged - 1),
-            RoutingFetcher::HEDGE_PUSH_TIMEOUT,
-        );
-        // The final reserved candidates get the full ceiling.
-        assert_eq!(
-            RoutingFetcher::attempt_timeout(last_hedged),
-            crate::pushsync::DEFAULT_PUSHSYNC_TIMEOUT,
-        );
-        assert_eq!(
-            RoutingFetcher::attempt_timeout(RoutingFetcher::MAX_PUSH_ERRORS - 1),
-            crate::pushsync::DEFAULT_PUSHSYNC_TIMEOUT,
-        );
-        // The hedge window must be meaningfully shorter than the ceiling
-        // or it buys nothing.
-        assert!(RoutingFetcher::HEDGE_PUSH_TIMEOUT < crate::pushsync::DEFAULT_PUSHSYNC_TIMEOUT);
     }
 
     /// Pin the consumer side of the live-peers fix: every `ranked()`

@@ -1094,30 +1094,26 @@ impl UploadManager {
                 job_id, chunks = all_addrs.len(),
                 "post-upload heal: all chunks reachable after re-push",
             ),
-            // A *conclusive* miss after every round means the upload is
-            // not durably retrievable — the chunks never reached their
-            // neighbourhood. Leaving the job at `Completed` would report
-            // an unretrievable upload as success (the exact symptom of
-            // "I can't verify uploads on other nodes"), so flip it to
-            // `Failed` with a descriptive error. The operator can
-            // `resume` to retry from the checkpoint; the recorded
-            // `reference` is preserved for inspection.
+            // Some chunks still aren't retrievable via a *cold* network
+            // fetch after every re-push round. This is NOT proof the
+            // upload failed: bee considers a chunk synced once a
+            // neighbourhood storer signs a receipt, and pull-sync then
+            // spreads it across the neighbourhood's branches with a short
+            // delay (see the Swarm pushsync/pullsync spec — "pull sync
+            // remedies this with a small time-delay"). A cold fetch issued
+            // seconds after upload routes to one branch and can miss a
+            // chunk that is in fact stored and about to propagate. Bee
+            // never fails an upload on this basis, so neither do we: we log
+            // loudly and leave the job `Completed` (the re-pushes above
+            // already gave every laggard chunk extra delivery attempts).
             Some(missing) => {
                 let n = missing.len();
                 let total = all_addrs.len();
                 warn!(
                     target: "ant_node::uploads",
                     job_id, missing = n, total, rounds = MAX_HEAL_ROUNDS,
-                    "post-upload heal: chunks still unreachable after all rounds — marking job failed",
+                    "post-upload heal: {n}/{total} chunks not yet retrievable via cold fetch after all rounds — leaving job completed (pull-sync should still be propagating; bee-aligned)",
                 );
-                if let Ok(handle) = self.resolve(job_id) {
-                    self.mark_failed(
-                        &handle,
-                        format!(
-                            "post-upload heal: {n}/{total} chunks not retrievable from the network after {MAX_HEAL_ROUNDS} rounds (upload is not durably stored)",
-                        ),
-                    );
-                }
             }
             None => warn!(
                 target: "ant_node::uploads",
