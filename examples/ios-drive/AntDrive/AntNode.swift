@@ -46,6 +46,20 @@ final class AntNode: ObservableObject {
     private var peerPollTask: Task<Void, Never>?
     private var refreshTask: Task<Void, Never>?
 
+    /// Disk-backed propagation verdicts, keyed by the Swarm reference
+    /// (content-addressed, so stable across restarts). Lets a verified
+    /// file stay verified across launches instead of re-probing the
+    /// network every cold start. Only *positive* verdicts are stored, so a
+    /// not-yet-propagated file is re-checked next launch rather than being
+    /// pinned to a stale "missing" result.
+    private var verdictCache: [String: CachedVerdict] = [:]
+    private static let verdictTTL: TimeInterval = 24 * 60 * 60
+
+    private struct CachedVerdict: Codable {
+        let info: PropagationInfo
+        let checkedAtUnix: UInt64
+    }
+
     // MARK: - Lifecycle
 
     func start() async {
@@ -69,6 +83,7 @@ final class AntNode: ObservableObject {
         }
         handle = raw
         status = .ready
+        loadVerdictCache()
         startPollingPeers()
         await refreshAll()
         startAutoRefresh()
@@ -222,8 +237,77 @@ final class AntNode: ObservableObject {
             reference.withCString { ant_storage_verify_propagation(h, $0, samples, probes, errPtr) }
         }) else { return nil }
         let info = DriveDecoder.propagation(from: json)
-        if let info { propagation[job.id] = info }
+        if let info {
+            propagation[job.id] = info
+            // Persist only a clean, fully-retrievable verdict. A partial or
+            // not-yet-propagated result is left out so the next launch
+            // re-probes rather than trusting a stale "missing".
+            if info.retrievable, info.error == nil {
+                verdictCache[Self.normalizedRef(reference)] =
+                    CachedVerdict(info: info, checkedAtUnix: UInt64(Date().timeIntervalSince1970))
+                saveVerdictCache()
+            }
+        }
         return info
+    }
+
+    /// Populate a completed row's verdict, preferring the disk cache: a
+    /// fresh (<24h) cached verdict is reused without touching the network;
+    /// otherwise the file is probed once. Drives the per-row auto-verify.
+    func ensureVerified(_ job: UploadJob) async {
+        guard job.isDone, let reference = job.reference, !reference.isEmpty,
+              peerCount > 0 else { return }
+        if propagation[job.id] != nil { return }
+        if let cached = freshVerdict(for: reference) {
+            propagation[job.id] = cached
+            return
+        }
+        await verifyPropagation(job)
+    }
+
+    /// A cached verdict for `reference` if one exists and is younger than
+    /// the TTL, else `nil` (missing or expired → re-probe).
+    private func freshVerdict(for reference: String) -> PropagationInfo? {
+        guard let entry = verdictCache[Self.normalizedRef(reference)] else { return nil }
+        let age = Date().timeIntervalSince1970 - Double(entry.checkedAtUnix)
+        return age < Self.verdictTTL ? entry.info : nil
+    }
+
+    /// Drop every completed file's cached + in-memory verdict and re-probe
+    /// the network, bypassing the TTL. Wired to pull-to-refresh so a manual
+    /// refresh always re-checks. Probes run concurrently in the background
+    /// so the gesture returns promptly while rows show their own spinners.
+    private func forceReverifyCompleted() {
+        let completed = jobs.filter { $0.isDone && ($0.reference?.isEmpty == false) }
+        guard !completed.isEmpty else { return }
+        for job in completed {
+            propagation[job.id] = nil
+            if let ref = job.reference { verdictCache[Self.normalizedRef(ref)] = nil }
+        }
+        saveVerdictCache()
+        for job in completed {
+            Task { _ = await verifyPropagation(job) }
+        }
+    }
+
+    private static func normalizedRef(_ r: String) -> String {
+        (r.hasPrefix("0x") ? String(r.dropFirst(2)) : r).lowercased()
+    }
+
+    private static func verdictCacheURL() -> URL {
+        resolveDataDir().appendingPathComponent("verify-cache.json")
+    }
+
+    private func loadVerdictCache() {
+        guard let data = try? Data(contentsOf: Self.verdictCacheURL()),
+              let decoded = try? JSONDecoder().decode([String: CachedVerdict].self, from: data)
+        else { return }
+        verdictCache = decoded
+    }
+
+    private func saveVerdictCache() {
+        guard let data = try? JSONEncoder().encode(verdictCache) else { return }
+        try? data.write(to: Self.verdictCacheURL(), options: .atomic)
     }
 
     // MARK: - Account
@@ -242,6 +326,13 @@ final class AntNode: ObservableObject {
         await refreshPlan()
         await refreshAccount()
         await refreshSettlement()
+    }
+
+    /// Pull-to-refresh: refresh everything, then force a fresh propagation
+    /// re-check of every completed file (ignoring the 24h cache).
+    func refreshAndReverify() async {
+        await refreshAll()
+        forceReverifyCompleted()
     }
 
     func refreshJobs() async {

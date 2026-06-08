@@ -22,6 +22,9 @@ struct GetStartedView: View {
     @State private var loadingQuotes = false
     @State private var loadingQuote = false
     @State private var error: String?
+    /// Flips true the moment a polled balance check sees the plan become
+    /// funded, so the payment step can call out that the payment landed.
+    @State private var paymentArrived = false
 
     var body: some View {
         NavigationStack {
@@ -33,7 +36,7 @@ struct GetStartedView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     if step == .payment {
-                        Button("Back") { withAnimation { step = .plan; quote = nil } }
+                        Button("Back") { withAnimation { step = .plan; quote = nil; paymentArrived = false } }
                     } else if step == .plan {
                         Button("Close") { dismiss() }
                     }
@@ -174,6 +177,12 @@ struct GetStartedView: View {
 
                     if !quote.sufficientFunds {
                         fundingCard(quote)
+                    } else if paymentArrived {
+                        Label("Payment received — ready to activate", systemImage: "checkmark.circle.fill")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.green)
+                            .frame(maxWidth: .infinity)
+                            .transition(.opacity)
                     }
 
                     Button { activate() } label: {
@@ -205,6 +214,7 @@ struct GetStartedView: View {
             }
             .padding(20)
         }
+        .task { await pollForPayment() }
     }
 
     private func fundingCard(_ quote: StorageQuote) -> some View {
@@ -346,6 +356,7 @@ struct GetStartedView: View {
     private func choose(_ tier: StoragePlanTier) {
         selected = tier
         error = nil
+        paymentArrived = false
         if rpc.trimmingCharacters(in: .whitespaces).isEmpty { rpc = defaultRpc }
         // Use the price already fetched for the picker when we have it;
         // otherwise fetch it now.
@@ -372,6 +383,32 @@ struct GetStartedView: View {
             } catch {
                 self.error = error.localizedDescription
             }
+        }
+    }
+
+    /// While the payment step is on screen and the plan is still unfunded,
+    /// re-quote every few seconds. A re-quote re-reads the account's
+    /// on-chain xDAI balance, so when an incoming transfer lands the UI
+    /// flips itself to "Ready to activate" — no manual "Refresh balance"
+    /// tap needed. The `.task` driving this is cancelled automatically when
+    /// the step changes (Back / Activate), which ends the loop.
+    private func pollForPayment() async {
+        guard let tier = selected else { return }
+        while !Task.isCancelled {
+            if quote?.sufficientFunds == true { return }
+            try? await Task.sleep(nanoseconds: 6_000_000_000)
+            if Task.isCancelled { return }
+            guard let fresh = try? await node.quoteStorage(rpc: activeRpc,
+                                                           depth: tier.depth,
+                                                           days: tier.days)
+            else { continue }
+            let justFunded = quote?.sufficientFunds == false && fresh.sufficientFunds
+            withAnimation {
+                quote = fresh
+                quotes[tier.id] = fresh
+                if justFunded { paymentArrived = true }
+            }
+            if fresh.sufficientFunds { return }
         }
     }
 

@@ -1,10 +1,11 @@
+import CoreTransferable
 import PhotosUI
 import SwiftUI
 import UniformTypeIdentifiers
 
 /// The Files tab — a Dropbox-style list of everything the user has
 /// uploaded, with an Add menu (upload a file / add from a share link)
-/// and per-file actions (share link, pause/resume/cancel, retry).
+/// and per-file actions (copy Swarm hash, pause/resume/cancel, retry).
 struct FilesView: View {
     @EnvironmentObject var node: AntNode
 
@@ -15,7 +16,7 @@ struct FilesView: View {
     @State private var photoSelection: [PhotosPickerItem] = []
     @State private var linkText = ""
     @State private var banner: String?
-    @State private var shareItem: ShareItem?
+    @State private var showAddOptions = false
 
     var body: some View {
         ZStack {
@@ -30,7 +31,7 @@ struct FilesView: View {
                         emptyState
                     } else {
                         ForEach(node.jobs) { job in
-                            FileRow(job: job, onShare: share, onPause: pause,
+                            FileRow(job: job, onCopy: copyHash, onPause: pause,
                                     onResume: resume, onCancel: cancel)
                         }
                     }
@@ -40,7 +41,7 @@ struct FilesView: View {
                 .padding(.bottom, 130)
             }
             .scrollIndicators(.hidden)
-            .refreshable { await node.refreshAll() }
+            .refreshable { await node.refreshAndReverify() }
         }
         .preferredColorScheme(.dark)
         .overlay(alignment: .top) { bannerView }
@@ -55,7 +56,6 @@ struct FilesView: View {
         .onChange(of: photoSelection) { _, items in handlePhotos(items) }
         .sheet(isPresented: $showLinkSheet) { linkSheet }
         .sheet(isPresented: $showGetStarted) { GetStartedView() }
-        .sheet(item: $shareItem) { item in ShareSheet(text: item.link) }
         .task { await node.refreshAll() }
     }
 
@@ -126,27 +126,31 @@ struct FilesView: View {
     /// The add button only appears once storage is active — uploads and
     /// link imports require a storage plan, so before that the Get
     /// Started greeter is the only call to action.
+    ///
+    /// This is a plain glass `Button` (not a `Menu`): a `Menu` whose label
+    /// carries a hand-applied `.glassEffect` flickers on iOS 26 because the
+    /// system can't morph the custom glass into the menu. The options are
+    /// presented via a `confirmationDialog` instead, which has no glass
+    /// morph and keeps the FAB rock-steady.
     @ViewBuilder private var addButton: some View {
         if node.hasStorage {
-            Menu {
-                Button { showPhotoPicker = true } label: {
-                    Label("Upload photos", systemImage: "photo")
-                }
-                Button { showImporter = true } label: {
-                    Label("Upload a file", systemImage: "arrow.up.doc")
-                }
-                Button { showLinkSheet = true } label: {
-                    Label("Add from link", systemImage: "link")
-                }
-            } label: {
+            Button { showAddOptions = true } label: {
                 Image(systemName: "plus")
                     .font(.title2.weight(.semibold))
                     .foregroundStyle(.white)
                     .frame(width: 60, height: 60)
                     .glassEffect(.regular.tint(.blue.opacity(0.5)), in: .circle)
             }
+            .buttonStyle(.plain)
             .padding(.trailing, 22)
             .padding(.bottom, 110)
+            .confirmationDialog("Add to AntDrive", isPresented: $showAddOptions,
+                                titleVisibility: .visible) {
+                Button("Upload photos") { showPhotoPicker = true }
+                Button("Upload a file") { showImporter = true }
+                Button("Add from link") { showLinkSheet = true }
+                Button("Cancel", role: .cancel) {}
+            }
         }
     }
 
@@ -188,10 +192,13 @@ struct FilesView: View {
 
     // MARK: actions
 
-    private func share(_ job: UploadJob) {
-        guard let ref = job.reference else { return }
+    /// Copy the bare Swarm hash (64-hex, no `0x`, no `bzz://`) straight to
+    /// the clipboard in a single tap — no share sheet, no submenu.
+    private func copyHash(_ job: UploadJob) {
+        guard let ref = job.reference, !ref.isEmpty else { return }
         let hex = ref.hasPrefix("0x") ? String(ref.dropFirst(2)) : ref
-        shareItem = ShareItem(link: "bzz://\(hex)")
+        UIPasteboard.general.string = hex
+        flash("Copied Swarm hash")
     }
 
     private func pause(_ job: UploadJob) { Task { await node.pauseUpload(job.jobId) } }
@@ -212,27 +219,25 @@ struct FilesView: View {
         }
     }
 
-    /// Load each picked photo/video's bytes, stage them in the sandbox,
-    /// and kick off an upload. `PhotosPickerItem` hands us out-of-process
-    /// data (no photo-library permission prompt), so we materialise a real
-    /// file the Rust uploader can mmap.
+    /// Stage each picked photo/video into the sandbox and kick off an
+    /// upload, keeping the original iOS filename. `PhotosPickerItem` hands
+    /// us out-of-process data (no photo-library permission prompt); loading
+    /// it as a file (rather than raw `Data`) lets us recover the source
+    /// file's name (e.g. `IMG_4567.HEIC`) so the row and manifest use the
+    /// real name instead of a synthetic `Photo-<stamp>` one.
     private func handlePhotos(_ items: [PhotosPickerItem]) {
         guard !items.isEmpty else { return }
         photoSelection = []
         Task {
-            for (index, item) in items.enumerated() {
+            for item in items {
                 do {
-                    guard let data = try await item.loadTransferable(type: Data.self) else {
+                    guard let picked = try await item.loadTransferable(type: PickedPhoto.self) else {
                         flash("Couldn't read selected item")
                         continue
                     }
-                    let type = item.supportedContentTypes.first
-                    let ext = type?.preferredFilenameExtension ?? "dat"
-                    let ct = type?.preferredMIMEType
-                    let stamp = Int(Date().timeIntervalSince1970)
-                    let name = "Photo-\(stamp)-\(index + 1).\(ext)"
-                    let local = try writeIntoSandbox(data: data, name: name)
-                    try await node.startUpload(path: local, name: name, contentType: ct)
+                    let name = picked.url.lastPathComponent
+                    let ct = UTType(filenameExtension: picked.url.pathExtension)?.preferredMIMEType
+                    try await node.startUpload(path: picked.url, name: name, contentType: ct)
                     flash("Uploading \(name)")
                 } catch {
                     flash(error.localizedDescription)
@@ -264,28 +269,11 @@ struct FilesView: View {
     /// give it a stable, always-readable path.
     private func copyIntoSandbox(_ url: URL) throws -> URL {
         let fm = FileManager.default
-        let base = try fm.url(for: .applicationSupportDirectory, in: .userDomainMask,
-                              appropriateFor: nil, create: true)
-            .appendingPathComponent("antdrive/imports", isDirectory: true)
-        try fm.createDirectory(at: base, withIntermediateDirectories: true)
-        let dest = base.appendingPathComponent(url.lastPathComponent)
+        let dest = try antdriveImportsDir().appendingPathComponent(url.lastPathComponent)
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
         if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
         try fm.copyItem(at: url, to: dest)
-        return dest
-    }
-
-    /// Write in-memory bytes (from the photo picker) to the same imports
-    /// directory so the uploader has a stable path to stream from.
-    private func writeIntoSandbox(data: Data, name: String) throws -> URL {
-        let fm = FileManager.default
-        let base = try fm.url(for: .applicationSupportDirectory, in: .userDomainMask,
-                              appropriateFor: nil, create: true)
-            .appendingPathComponent("antdrive/imports", isDirectory: true)
-        try fm.createDirectory(at: base, withIntermediateDirectories: true)
-        let dest = base.appendingPathComponent(name)
-        try data.write(to: dest, options: .atomic)
         return dest
     }
 
@@ -298,9 +286,35 @@ struct FilesView: View {
     }
 }
 
-private struct ShareItem: Identifiable {
-    let id = UUID()
-    let link: String
+/// A photo/video picked from the library, materialised into the app's
+/// sandbox with its original iOS filename. Loading the item as a *file*
+/// (rather than raw `Data`) is what gives us the source filename; the
+/// importing closure must copy the handed-over file synchronously because
+/// the system reclaims it once the closure returns.
+private struct PickedPhoto: Transferable {
+    let url: URL
+
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(importedContentType: .data) { received in
+            let fm = FileManager.default
+            let name = received.file.lastPathComponent
+            let dest = try antdriveImportsDir().appendingPathComponent(name)
+            if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
+            try fm.copyItem(at: received.file, to: dest)
+            return PickedPhoto(url: dest)
+        }
+    }
+}
+
+/// The sandbox directory the Rust uploader streams imports from. Shared by
+/// the file importer and the photo picker so both stage files in one place.
+func antdriveImportsDir() throws -> URL {
+    let fm = FileManager.default
+    let base = try fm.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                          appropriateFor: nil, create: true)
+        .appendingPathComponent("antdrive/imports", isDirectory: true)
+    try fm.createDirectory(at: base, withIntermediateDirectories: true)
+    return base
 }
 
 /// One file row: type icon, name, status line, and a trailing control
@@ -309,7 +323,7 @@ private struct ShareItem: Identifiable {
 private struct FileRow: View {
     @EnvironmentObject var node: AntNode
     let job: UploadJob
-    let onShare: (UploadJob) -> Void
+    let onCopy: (UploadJob) -> Void
     let onPause: (UploadJob) -> Void
     let onResume: (UploadJob) -> Void
     let onCancel: (UploadJob) -> Void
@@ -341,17 +355,12 @@ private struct FileRow: View {
                 trailing
             }
         }
-        // Auto-verify a completed file once: probe the network for its
-        // reference chunk (bypassing our local copy) so the row shows a
-        // real "retrievable" verdict instead of just the local "Online"
-        // state. Cached in `node.propagation`, so this fires at most
-        // once per file per session.
-        .task(id: autoVerifyKey) {
-            if job.isDone, job.reference?.isEmpty == false,
-               node.peerCount > 0, node.propagation[job.id] == nil {
-                await node.verifyPropagation(job)
-            }
-        }
+        // Auto-verify a completed file: reuse a fresh (<24h) disk-cached
+        // verdict if we have one, otherwise probe the network once for the
+        // real "retrievable" verdict (rather than just the local "Online"
+        // state). Verdicts persist across launches, so a verified file
+        // isn't re-probed every cold start.
+        .task(id: autoVerifyKey) { await node.ensureVerified(job) }
     }
 
     /// Re-trigger the auto-verify when the job reaches the completed
@@ -399,15 +408,8 @@ private struct FileRow: View {
                 }
             }
         } else if job.isDone {
-            Menu {
-                Button { onShare(job) } label: { Label("Copy share link", systemImage: "link") }
-                Button {
-                    Task { await node.verifyPropagation(job, samples: 0, probes: 3) }
-                } label: {
-                    Label("Verify chunks", systemImage: "antenna.radiowaves.left.and.right")
-                }
-            } label: {
-                Image(systemName: "square.and.arrow.up")
+            Button { onCopy(job) } label: {
+                Image(systemName: "doc.on.doc")
                     .font(.title3).foregroundStyle(.white.opacity(0.85))
             }
         } else if job.isFailed {
@@ -436,12 +438,3 @@ private struct FileRow: View {
     }
 }
 
-/// Thin UIActivityViewController wrapper so "Copy share link" can hand
-/// the bzz link to the system share sheet.
-struct ShareSheet: UIViewControllerRepresentable {
-    let text: String
-    func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(activityItems: [text], applicationActivities: nil)
-    }
-    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
-}
