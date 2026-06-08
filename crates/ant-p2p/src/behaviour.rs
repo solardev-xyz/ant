@@ -1642,22 +1642,33 @@ fn handle_control_command(
                 });
             });
         }
-        ControlCommand::VerifyChunksPresent { addresses, ack } => {
+        ControlCommand::VerifyChunksPresent {
+            addresses,
+            probes,
+            ack,
+        } => {
             // Read-back presence check for a specific address set (upload
-            // self-heal). Cache-free `RoutingFetcher` so each fetch takes
-            // the real network path; we report which addresses didn't
-            // come back so the caller can re-push exactly those.
-            let peers_rx = state.peers_watch.subscribe();
-            if peers_rx.borrow().is_empty() {
+            // self-heal). `probes == 0` is the any-route fetch (cache-free
+            // `RoutingFetcher`, the real download path); `probes > 0` is the
+            // deep neighbourhood check that flags shallow placements. Either
+            // way we report which addresses didn't come back so the caller
+            // can re-push exactly those.
+            let peers: Vec<(PeerId, Overlay)> = state.peers_watch.subscribe().borrow().clone();
+            if peers.is_empty() {
                 let _ = ack.send(ControlAck::NotReady {
                     message: "no peers available; wait for handshakes to complete".into(),
                 });
                 return;
             }
+            let peers_rx = state.peers_watch.subscribe();
             let control = control.clone();
             tokio::spawn(async move {
-                let fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx);
-                let missing = verify_chunks_present(&fetcher, &addresses).await;
+                let missing = if probes == 0 {
+                    let fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx);
+                    verify_chunks_present(&fetcher, &addresses).await
+                } else {
+                    verify_chunks_present_deep(&control, &peers, &addresses, probes).await
+                };
                 let body = serde_json::json!({
                     "checked": addresses.len(),
                     "missing": missing
@@ -3313,6 +3324,37 @@ async fn verify_chunks_present(
     }))
     .buffer_unordered(CONCURRENCY)
     .filter_map(|(addr, reachable)| async move { (!reachable).then_some(addr) })
+    .collect()
+    .await
+}
+
+/// Deep read-back: for each address, probe its `probes` closest known
+/// peers directly (its true neighbourhood) and report the addresses that
+/// **no** close peer holds. Unlike [`verify_chunks_present`], this does
+/// not walk forwarders, so a chunk that only landed shallow — present to
+/// the uploader because it stays linked to the far storer that signed a
+/// shallow receipt, yet absent from the neighbourhood the network routes
+/// to — is correctly reported missing. That's what lets self-heal detect
+/// and re-push shallow placements (the uploader's any-route fetch would
+/// be fooled by its own privileged link). Bounded concurrency so a large
+/// file's check doesn't open thousands of simultaneous streams.
+async fn verify_chunks_present_deep(
+    control: &Control,
+    peers: &[(PeerId, Overlay)],
+    addresses: &[[u8; 32]],
+    probes: usize,
+) -> Vec<[u8; 32]> {
+    use futures::stream::StreamExt;
+
+    const CONCURRENCY: usize = 16;
+    const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+    futures::stream::iter(addresses.iter().copied().map(|addr| async move {
+        let hits = probe_leaf_sources(control, peers, addr, probes, PROBE_TIMEOUT).await;
+        (addr, hits > 0)
+    }))
+    .buffer_unordered(CONCURRENCY)
+    .filter_map(|(addr, present)| async move { (!present).then_some(addr) })
     .collect()
     .await
 }

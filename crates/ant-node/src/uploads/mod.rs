@@ -172,6 +172,16 @@ const HEAL_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_secs(3)
 /// so each ack's JSON stays bounded on a large file.
 const HEAL_VERIFY_BATCH: usize = 512;
 
+/// Number of closest peers heal probes per chunk. Non-zero, so the
+/// read-back is the *deep* neighbourhood check (see
+/// [`ControlCommand::VerifyChunksPresent`]): a chunk counts as healthy
+/// only if its true neighbourhood holds it, not merely if the uploader
+/// can still reach a far storer that signed a shallow receipt. That's
+/// what lets heal detect and re-push shallow placements — including in
+/// files uploaded before the deep-push fix, which self-repair on the
+/// next startup heal pass.
+const HEAL_PROBES: usize = 4;
+
 /// Skip the heal pass for files above this chunk count (~200 MB at
 /// 4 KiB leaves). A full network read-back of a multi-GB file would
 /// cost as much as a re-download; the per-chunk pushsync receipts on
@@ -341,6 +351,7 @@ impl UploadManager {
             last_update_unix: now_s,
             last_error: None,
             reference: None,
+            heal_verified: false,
         };
         info.save(&UploadJobInfo::manifest_path(
             &self.inner.state_dir,
@@ -501,6 +512,7 @@ impl UploadManager {
     pub fn rehydrate_from_disk(&self, auto_resume: bool) -> std::io::Result<usize> {
         let dir = &self.inner.state_dir;
         let mut count = 0;
+        let mut startup_heals: Vec<Arc<JobHandle>> = Vec::new();
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -563,9 +575,128 @@ impl UploadManager {
                     &self.inner.state_dir,
                     &job_id,
                 ));
+            } else if auto_resume
+                && matches!(handle.snapshot().status, UploadStatus::Completed)
+                && !handle.snapshot().heal_verified
+            {
+                // A previously-completed upload that was never confirmed
+                // deep-reachable (old daemon, an inconclusive final
+                // read-back, or a file uploaded before the deep-push fix).
+                // Queue a background deep-heal so shallow chunks self-repair
+                // without the operator re-uploading. Bounded: each file
+                // heals at most once — success sets `heal_verified` and
+                // future startups skip it.
+                startup_heals.push(handle);
             }
         }
+        // Drive the startup heals *sequentially* on one background task.
+        // Healing every unverified file at once stampedes the postage
+        // batch (re-stamping thousands of chunks trips "collision bucket
+        // full") and floods the network/peer set; one-at-a-time keeps the
+        // self-repair gentle and lets each file settle before the next.
+        if !startup_heals.is_empty() {
+            let mgr = self.clone();
+            tokio::spawn(async move {
+                let total = startup_heals.len();
+                info!(
+                    target: "ant_node::uploads",
+                    jobs = total,
+                    "starting background self-heal of unverified completed uploads (sequential)",
+                );
+                for handle in startup_heals {
+                    mgr.heal_completed_job(handle).await;
+                }
+                info!(
+                    target: "ant_node::uploads",
+                    jobs = total,
+                    "background self-heal pass finished",
+                );
+            });
+        }
         Ok(count)
+    }
+
+    /// Deep-heal one rehydrated `Completed` job that isn't yet
+    /// `heal_verified`. Re-validates the source file (existence + size),
+    /// re-derives the chunk set, then runs the same
+    /// [`verify_and_heal`](Self::verify_and_heal) loop the post-upload
+    /// path uses. Best-effort: a missing/changed source or an oversized
+    /// file is logged and skipped. Awaited sequentially by the startup
+    /// heal driver so the pass doesn't stampede postage / the network.
+    async fn heal_completed_job(&self, handle: Arc<JobHandle>) {
+        let snap = handle.snapshot();
+        let job_id = snap.job_id.clone();
+        let source_path = self.resolve_source_path(&snap.source_path);
+
+        // Source must still be present and have the same content, or a
+        // re-derived chunk set wouldn't match what was uploaded. We gate
+        // on size only, not mtime: heal re-derives every chunk address
+        // straight from the bytes, and a re-anchored import (carried into
+        // a new data container) can legitimately carry a fresh mtime while
+        // its content is byte-identical.
+        match std::fs::metadata(&source_path) {
+            Ok(md) if md.len() == snap.source_size => {}
+            Ok(_) => {
+                info!(
+                    target: "ant_node::uploads",
+                    job_id = %job_id,
+                    "skipping startup heal: source file changed since upload (size mismatch)",
+                );
+                return;
+            }
+            Err(_) => {
+                info!(
+                    target: "ant_node::uploads",
+                    job_id = %job_id,
+                    "skipping startup heal: source file no longer present",
+                );
+                return;
+            }
+        }
+
+        let all_addrs = match collect_heal_addrs(
+            &source_path,
+            snap.source_size,
+            snap.raw,
+            snap.name.as_deref(),
+            snap.content_type.as_deref(),
+        ) {
+            Ok(Some(addrs)) => addrs,
+            Ok(None) => {
+                info!(
+                    target: "ant_node::uploads",
+                    job_id = %job_id,
+                    "skipping startup heal: file exceeds heal chunk cap",
+                );
+                return;
+            }
+            Err(e) => {
+                warn!(
+                    target: "ant_node::uploads",
+                    job_id = %job_id,
+                    "skipping startup heal: could not re-derive chunks: {e}",
+                );
+                return;
+            }
+        };
+
+        let batch_id = resolve_batch_id(snap.batch_id.as_deref(), self.inner.default_batch_id);
+        info!(
+            target: "ant_node::uploads",
+            job_id = %job_id, chunks = all_addrs.len(),
+            "running startup heal for previously-completed upload",
+        );
+        self.verify_and_heal(
+            &job_id,
+            &all_addrs,
+            batch_id,
+            &source_path,
+            snap.source_size,
+            snap.raw,
+            snap.name.as_deref(),
+            snap.content_type.as_deref(),
+        )
+        .await;
     }
 
     fn mint_id(&self) -> String {
@@ -632,7 +763,9 @@ impl UploadManager {
         }
 
         let snap = handle.snapshot();
-        let source_path = snap.source_path.clone();
+        // Re-anchor the source if its stored absolute path went stale
+        // across a data-container move (see `resolve_source_path`).
+        let source_path = self.resolve_source_path(&snap.source_path);
         // Resolve which postage batch stamps this job's chunks: the
         // job's own `batch_id` (hex) if set, else the manager's startup
         // default. A zeroed id means "none configured" — the node loop
@@ -1022,12 +1155,28 @@ impl UploadManager {
     }
 
     /// Post-upload self-heal loop. Reads `all_addrs` back from the
-    /// network (via [`ControlCommand::VerifyChunksPresent`]); any chunk
-    /// that didn't come back is re-derived from the source file and
-    /// re-pushed. Repeats up to [`MAX_HEAL_ROUNDS`] times, with a settle
-    /// delay before each read-back. Best-effort: a daemon-gone or
-    /// no-peers condition ends the loop quietly, and a re-push failure
-    /// is logged rather than failing the (already pushed) upload.
+    /// network with the *deep* presence check (via
+    /// [`ControlCommand::VerifyChunksPresent`] with [`HEAL_PROBES`]): a
+    /// chunk is healthy only if its true neighbourhood holds it, so a
+    /// chunk that merely landed shallow is treated as missing, re-derived
+    /// from the source file, and re-pushed (the deep-push path lands it
+    /// properly this time). Repeats up to [`MAX_HEAL_ROUNDS`] times, with
+    /// a settle delay before each read-back.
+    ///
+    /// Verdict (this is the *tight* part — no more false green):
+    /// * every chunk deep-reachable ⇒ flag the job `heal_verified` and
+    ///   leave it `Completed`;
+    /// * chunks still shallow/absent after all rounds + re-pushes ⇒ mark
+    ///   the job `Failed` with a clear message, so the operator (or the
+    ///   app) sees a real failure instead of a "Completed" that 404s
+    ///   elsewhere. A light node can't lean on pull-sync to fix this
+    ///   later, so a persistent miss really is a failed upload.
+    /// * read-back inconclusive (peers not ready / transport error) ⇒
+    ///   leave the job `Completed` but *not* `heal_verified`, so the next
+    ///   startup heal pass retries it.
+    ///
+    /// Re-derivation runs from the source file, so this also repairs
+    /// files uploaded before the deep-push fix when re-run at startup.
     #[allow(clippy::too_many_arguments)]
     async fn verify_and_heal(
         &self,
@@ -1042,7 +1191,7 @@ impl UploadManager {
     ) {
         for round in 0..MAX_HEAL_ROUNDS {
             tokio::time::sleep(HEAL_SETTLE_DELAY).await;
-            let Some(missing) = self.query_missing(all_addrs).await else {
+            let Some(missing) = self.query_missing(all_addrs, HEAL_PROBES).await else {
                 // Read-back couldn't run (peers not ready / transport
                 // error). Do NOT claim the upload is healthy — just try
                 // again next round after another settle delay.
@@ -1057,14 +1206,15 @@ impl UploadManager {
                 info!(
                     target: "ant_node::uploads",
                     job_id, round, chunks = all_addrs.len(),
-                    "post-upload heal: all chunks reachable",
+                    "post-upload heal: all chunks deep-reachable",
                 );
+                self.mark_heal_verified(job_id);
                 return;
             }
             warn!(
                 target: "ant_node::uploads",
                 job_id, round, missing = missing.len(), total = all_addrs.len(),
-                "post-upload heal: re-pushing unreachable chunks",
+                "post-upload heal: re-pushing shallow/unreachable chunks",
             );
             let missing_set: HashSet<[u8; 32]> = missing.into_iter().collect();
             if let Err(e) = self
@@ -1086,41 +1236,106 @@ impl UploadManager {
                 return;
             }
         }
-        // One final read-back after the last re-push round.
+        // One final read-back after the last re-push round decides the
+        // verdict.
         tokio::time::sleep(HEAL_SETTLE_DELAY).await;
-        match self.query_missing(all_addrs).await {
-            Some(missing) if missing.is_empty() => info!(
-                target: "ant_node::uploads",
-                job_id, chunks = all_addrs.len(),
-                "post-upload heal: all chunks reachable after re-push",
-            ),
-            // Some chunks still aren't retrievable via a *cold* network
-            // fetch after every re-push round. This is NOT proof the
-            // upload failed: bee considers a chunk synced once a
-            // neighbourhood storer signs a receipt, and pull-sync then
-            // spreads it across the neighbourhood's branches with a short
-            // delay (see the Swarm pushsync/pullsync spec — "pull sync
-            // remedies this with a small time-delay"). A cold fetch issued
-            // seconds after upload routes to one branch and can miss a
-            // chunk that is in fact stored and about to propagate. Bee
-            // never fails an upload on this basis, so neither do we: we log
-            // loudly and leave the job `Completed` (the re-pushes above
-            // already gave every laggard chunk extra delivery attempts).
+        match self.query_missing(all_addrs, HEAL_PROBES).await {
+            Some(missing) if missing.is_empty() => {
+                info!(
+                    target: "ant_node::uploads",
+                    job_id, chunks = all_addrs.len(),
+                    "post-upload heal: all chunks deep-reachable after re-push",
+                );
+                self.mark_heal_verified(job_id);
+            }
+            // Chunks are still shallow or absent after every re-push round.
+            // For a light node this is a genuine failure: it can't rely on
+            // pull-sync to spread the chunk later, and the uploader's own
+            // privileged link to a shallow storer would let it 404 for the
+            // rest of the network. Surface it rather than leaving a false
+            // "Completed". The operator/app can `resume` to retry.
             Some(missing) => {
                 let n = missing.len();
                 let total = all_addrs.len();
                 warn!(
                     target: "ant_node::uploads",
                     job_id, missing = n, total, rounds = MAX_HEAL_ROUNDS,
-                    "post-upload heal: {n}/{total} chunks not yet retrievable via cold fetch after all rounds — leaving job completed (pull-sync should still be propagating; bee-aligned)",
+                    "post-upload heal: {n}/{total} chunks not deep-reachable after all rounds — marking job failed",
                 );
+                if let Some(handle) = self.job_handle(job_id) {
+                    self.mark_failed(
+                        &handle,
+                        format!(
+                            "{n}/{total} chunks not retrievable from their neighbourhood after {MAX_HEAL_ROUNDS} heal rounds (resume to retry)"
+                        ),
+                    );
+                }
             }
             None => warn!(
                 target: "ant_node::uploads",
                 job_id, total = all_addrs.len(), rounds = MAX_HEAL_ROUNDS,
-                "post-upload heal: final read-back inconclusive (peers not ready?)",
+                "post-upload heal: final read-back inconclusive (peers not ready?) — leaving job completed, will retry on next startup",
             ),
         }
+    }
+
+    /// Resolve a job's stored source path to a file that actually exists,
+    /// re-anchoring app-managed imports across data-container moves.
+    ///
+    /// The iOS app stages picked files under `<data_dir>/imports/<name>`
+    /// but the job manifest persists an *absolute* path that embeds the
+    /// OS data-container id. When the OS reassigns that id (app reinstall
+    /// or device migration) the absolute path goes stale even though the
+    /// bytes were carried into the new container — which is exactly what
+    /// left old uploads unable to self-heal. We recover by retrying the
+    /// same filename under the *current* data dir's `imports/` folder.
+    /// Sources outside the data dir (e.g. `antctl` uploads from an
+    /// arbitrary path) simply don't match the fallback, so their
+    /// behaviour is unchanged.
+    fn resolve_source_path(&self, stored: &Path) -> PathBuf {
+        if stored.exists() {
+            return stored.to_path_buf();
+        }
+        if let (Some(name), Some(data_dir)) = (stored.file_name(), self.inner.state_dir.parent()) {
+            let candidate = data_dir.join("imports").join(name);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+        stored.to_path_buf()
+    }
+
+    /// Look up a registered job handle by id, if the manager still holds
+    /// it (it does for the lifetime of the daemon once rehydrated/started).
+    fn job_handle(&self, job_id: &str) -> Option<Arc<JobHandle>> {
+        self.inner
+            .jobs
+            .lock()
+            .expect("uploads jobs mutex poisoned")
+            .get(job_id)
+            .cloned()
+    }
+
+    /// Mark a job's chunks confirmed deep-reachable so future startup heal
+    /// passes skip it. Persists the flag; leaves status untouched.
+    fn mark_heal_verified(&self, job_id: &str) {
+        let Some(handle) = self.job_handle(job_id) else {
+            return;
+        };
+        let snap = {
+            let mut info = handle.info.lock().expect("upload mutex poisoned");
+            if info.heal_verified {
+                return;
+            }
+            info.heal_verified = true;
+            info.last_update_unix = unix_seconds();
+            info.clone()
+        };
+        let _ = handle.progress.send(snap.clone());
+        let _ = snap.save(&UploadJobInfo::manifest_path(
+            &self.inner.state_dir,
+            &snap.job_id,
+        ));
     }
 
     /// Ask the node loop which of `all_addrs` aren't retrievable from
@@ -1135,7 +1350,7 @@ impl UploadManager {
     /// unretrievable upload healthy (the exact failure mode that made
     /// self-heal a no-op on a flaky/cold peer set). The caller retries
     /// the round instead of claiming success.
-    async fn query_missing(&self, all_addrs: &[[u8; 32]]) -> Option<Vec<[u8; 32]>> {
+    async fn query_missing(&self, all_addrs: &[[u8; 32]], probes: usize) -> Option<Vec<[u8; 32]>> {
         let mut missing = Vec::new();
         for batch in all_addrs.chunks(HEAL_VERIFY_BATCH) {
             let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
@@ -1144,6 +1359,7 @@ impl UploadManager {
                 .cmd_tx
                 .send(ControlCommand::VerifyChunksPresent {
                     addresses: batch.to_vec(),
+                    probes,
                     ack: ack_tx,
                 })
                 .await
@@ -1250,6 +1466,59 @@ fn note_heal_addr(addrs: &mut Vec<[u8; 32]>, overflow: &mut bool, addr: [u8; 32]
         return;
     }
     addrs.push(addr);
+}
+
+/// Re-derive the complete chunk address set (data leaves +
+/// intermediates + manifest) for a finished upload by re-streaming its
+/// source file through the deterministic splitter — the same traversal
+/// `run_job` does, minus the pushes. Used by the startup heal pass,
+/// which doesn't have the in-memory `heal_addrs` the upload run kept.
+///
+/// Returns `Ok(None)` when the file exceeds [`HEAL_MAX_CHUNKS`] (heal is
+/// skipped for very large files, matching the post-upload path). The
+/// source file must still exist, unchanged; the caller is expected to
+/// have re-validated size/mtime before invoking.
+fn collect_heal_addrs(
+    source_path: &Path,
+    source_size: u64,
+    raw: bool,
+    name: Option<&str>,
+    content_type: Option<&str>,
+) -> std::io::Result<Option<Vec<[u8; 32]>>> {
+    let file = std::fs::File::open(source_path)?;
+    let body: Option<Mmap> = if source_size == 0 {
+        None
+    } else {
+        // SAFETY: same contract as the upload/repush paths — the file is
+        // immutable for the duration; the caller re-validates mtime first.
+        Some(unsafe { Mmap::map(&file)? })
+    };
+
+    let mut addrs: Vec<[u8; 32]> = Vec::new();
+    let mut overflow = false;
+
+    let mut splitter = StreamingSplitter::new();
+    for leaf in LeafIter::new(body.as_deref(), source_size) {
+        for chunk in splitter.push_leaf(leaf) {
+            note_heal_addr(&mut addrs, &mut overflow, chunk.address);
+        }
+    }
+    let (data_root, _bytes, tail) = splitter.finish();
+    for chunk in tail {
+        note_heal_addr(&mut addrs, &mut overflow, chunk.address);
+    }
+    if !raw {
+        let filename = name.unwrap_or("blob.bin").to_string();
+        let manifest = build_single_file_manifest(&filename, content_type, data_root)
+            .map_err(std::io::Error::other)?;
+        for chunk in &manifest.chunks {
+            note_heal_addr(&mut addrs, &mut overflow, chunk.address);
+        }
+    }
+    if overflow {
+        return Ok(None);
+    }
+    Ok(Some(addrs))
 }
 
 /// Parse the `{"checked":N,"missing":["0x..",...]}` body of a
@@ -1587,7 +1856,11 @@ mod tests {
                             reference: format!("0x{}", hex::encode(addr)),
                         });
                     }
-                    ControlCommand::VerifyChunksPresent { addresses, ack } => {
+                    ControlCommand::VerifyChunksPresent {
+                        addresses,
+                        probes: _,
+                        ack,
+                    } => {
                         // The background heal pass fires after every
                         // completed upload. Report every pushed chunk as
                         // present (nothing missing) so heal no-ops and
@@ -1686,7 +1959,11 @@ mod tests {
                             reference: format!("0x{}", hex::encode(addr)),
                         });
                     }
-                    ControlCommand::VerifyChunksPresent { addresses, ack } => {
+                    ControlCommand::VerifyChunksPresent {
+                        addresses,
+                        probes: _,
+                        ack,
+                    } => {
                         let mut missing: Vec<String> = {
                             let present = hc.present.lock().expect("present");
                             addresses
@@ -2040,6 +2317,7 @@ mod tests {
             last_update_unix: 0,
             last_error: None,
             reference: None,
+            heal_verified: false,
         };
         info.save(&UploadJobInfo::manifest_path(state_dir.path(), &job_id))
             .expect("save");

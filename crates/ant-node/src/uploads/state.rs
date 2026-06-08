@@ -135,6 +135,16 @@ pub struct UploadJobInfo {
     /// `status` flips to `Completed`.
     #[serde(default)]
     pub reference: Option<String>,
+    /// Set once the post-upload self-heal confirmed every chunk is
+    /// deep-reachable (held by its true neighbourhood, not merely
+    /// reachable from the uploader's privileged link to a shallow
+    /// storer). Startup re-runs the deep heal for any `Completed` job
+    /// where this is still `false`, so files uploaded before the
+    /// deep-push fix — or whose final read-back was inconclusive —
+    /// self-repair on the next launch. Defaults to `false` for jobs
+    /// persisted by older daemons.
+    #[serde(default)]
+    pub heal_verified: bool,
 }
 
 impl UploadJobInfo {

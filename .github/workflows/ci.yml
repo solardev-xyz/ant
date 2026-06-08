@@ -42,7 +42,7 @@ jobs:
     name: fmt + clippy + test (linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         # `dtolnay/rust-toolchain` is the de-facto stable replacement
@@ -92,7 +92,7 @@ jobs:
     name: cross-compile aarch64-linux-android
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -114,7 +114,7 @@ jobs:
         # NDK version so reproducible cross-builds don't drift when
         # Google ships a new minor — bump in lock-step with what
         # local devs install.
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
         with:
           packages: ndk;27.2.12479018
 
@@ -166,7 +166,7 @@ jobs:
     name: cross-compile aarch64-apple-ios-sim
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

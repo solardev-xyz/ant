@@ -608,7 +608,11 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
                 message: body.to_string(),
             });
         }
-        ControlCommand::VerifyChunksPresent { addresses, ack } => {
+        ControlCommand::VerifyChunksPresent {
+            addresses,
+            probes: _,
+            ack,
+        } => {
             // Stand-in: the fixture's `DirFetcher` is the source of
             // truth for "present", so report any address it can't serve
             // as missing, in the heal loop's JSON shape.

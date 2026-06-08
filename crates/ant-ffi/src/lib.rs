@@ -360,8 +360,16 @@ fn init_inner(data_dir: &Path) -> Result<AntHandle, FfiError> {
     });
     let upload_manager = UploadManager::new(data_dir.join("uploads"), cmd_tx.clone(), None)
         .map_err(|e| FfiError::Io(format!("open upload state dir: {e}")))?;
-    if let Err(e) = upload_manager.rehydrate_from_disk(true) {
-        tracing::warn!(target: "ant-ffi", "rehydrate upload jobs: {e}");
+    {
+        // `rehydrate_from_disk` may `tokio::spawn` (auto-resuming an
+        // interrupted upload, or kicking off a startup self-heal for a
+        // completed-but-unverified job), so it must run inside the
+        // runtime context — unlike `antd`'s async main, this FFI init
+        // path isn't already on a runtime thread.
+        let _enter = runtime.enter();
+        if let Err(e) = upload_manager.rehydrate_from_disk(true) {
+            tracing::warn!(target: "ant-ffi", "rehydrate upload jobs: {e}");
+        }
     }
 
     // SWAP settlement (parity with `antd`'s startup wiring).

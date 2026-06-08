@@ -302,16 +302,26 @@ pub enum ControlCommand {
         ack: oneshot::Sender<ControlAck>,
     },
     /// Read-back presence check for a specific set of chunk addresses.
-    /// Backs the upload self-heal loop: each address is fetched
-    /// network-only (cache-free, the same robust closest-first /
-    /// forwarder-walking path a real download takes), so the daemon's
-    /// own store-then-push copy can't make an un-propagated chunk look
-    /// present. The ack is a [`ControlAck::Ok`] whose `message` is JSON
-    /// `{"checked":N,"missing":["0x..",...]}` listing the addresses
-    /// that could not be retrieved from the network. Callers batch the
+    /// Backs the upload self-heal loop. The ack is a [`ControlAck::Ok`]
+    /// whose `message` is JSON `{"checked":N,"missing":["0x..",...]}`
+    /// listing the addresses that didn't come back. Callers batch the
     /// address list to keep each ack bounded.
+    ///
+    /// `probes` selects the presence test:
+    /// * `0` — *any-route* fetch (cache-free, the same robust
+    ///   closest-first / forwarder-walking path a real download takes).
+    ///   A chunk counts as present if it can be retrieved by any path.
+    /// * `>0` — *deep* check: the chunk must be held by at least one of
+    ///   its `probes` closest known peers (its true neighbourhood). A
+    ///   chunk that only landed shallow — reachable because the uploader
+    ///   stays linked to a far storer that signed a shallow receipt, but
+    ///   absent from the neighbourhood the network routes to — is
+    ///   reported missing so the caller can re-push it deep. This is what
+    ///   lets self-heal repair shallow placements instead of being fooled
+    ///   by the uploader's privileged vantage point.
     VerifyChunksPresent {
         addresses: Vec<[u8; 32]>,
+        probes: usize,
         ack: oneshot::Sender<ControlAck>,
     },
     /// Resolve a sequence feed `(owner, topic)` to its latest update.
