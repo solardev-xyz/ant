@@ -202,12 +202,12 @@ const HEAL_VERIFY_BATCH: usize = 512;
 
 /// Number of closest peers heal probes per chunk. Non-zero, so the
 /// read-back is the *deep* neighbourhood check (see
-/// [`ControlCommand::VerifyChunksPresent`]): a chunk counts as healthy
-/// only if its true neighbourhood holds it, not merely if the uploader
-/// can still reach a far storer that signed a shallow receipt. That's
-/// what lets heal detect and re-push shallow placements — including in
-/// files uploaded before the deep-push fix, which self-repair on the
-/// next startup heal pass.
+/// [`ControlCommand::VerifyChunksPresent`]): each chunk's own closest
+/// peers are probed first, and probe misses are confirmed via the
+/// routed download path before counting as missing. That's what lets
+/// heal detect and re-push shallow placements — including in files
+/// uploaded before the deep-push fix — without re-pushing hundreds of
+/// perfectly healthy chunks every launch on probe noise.
 const HEAL_PROBES: usize = 4;
 
 /// Skip the heal pass for files above this chunk count. Raised from

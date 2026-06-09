@@ -311,14 +311,15 @@ pub enum ControlCommand {
     /// * `0` — *any-route* fetch (cache-free, the same robust
     ///   closest-first / forwarder-walking path a real download takes).
     ///   A chunk counts as present if it can be retrieved by any path.
-    /// * `>0` — *deep* check: the chunk must be held by at least one of
-    ///   its `probes` closest known peers (its true neighbourhood). A
-    ///   chunk that only landed shallow — reachable because the uploader
-    ///   stays linked to a far storer that signed a shallow receipt, but
-    ///   absent from the neighbourhood the network routes to — is
-    ///   reported missing so the caller can re-push it deep. This is what
-    ///   lets self-heal repair shallow placements instead of being fooled
-    ///   by the uploader's privileged vantage point.
+    /// * `>0` — *deep* check: probe each chunk's `probes` closest known
+    ///   peers (its neighbourhood vantage) first; chunks those one-shot
+    ///   probes miss are then confirmed via the any-route fetch and
+    ///   count missing only when **both** fail. The probe stage flags
+    ///   shallow placements (a chunk reachable only because the uploader
+    ///   stays linked to a far storer that signed a shallow receipt);
+    ///   the routed confirmation clears the probes' substantial
+    ///   single-attempt false-failure rate, so "missing" tracks what a
+    ///   third party (e.g. the public gateway) can actually retrieve.
     VerifyChunksPresent {
         addresses: Vec<[u8; 32]>,
         probes: usize,

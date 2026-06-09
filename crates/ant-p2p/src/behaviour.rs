@@ -729,6 +729,16 @@ struct SwarmState {
     /// streams in the four-WAV repro), but high enough that several
     /// large gateway downloads can make progress at once.
     retrieval_inflight: Arc<Semaphore>,
+    /// One-permit gate serialising deep verification passes
+    /// (`VerifyPropagation` and the deep arm of `VerifyChunksPresent`)
+    /// process-wide. The probe stage of a verification fans out dozens
+    /// of raw `retrieve_chunk` streams; two verifications racing (the
+    /// Drive app fires one per completed file at once) saturate the
+    /// peer set and fail each other's probes — the same file that
+    /// verifies clean alone reported ~30% of its chunks missing when
+    /// checked alongside a sibling. Serialised, each verification gets
+    /// the node's full bandwidth and verdicts stay reproducible.
+    verify_gate: Arc<Semaphore>,
     /// Notification channel into the pseudosettle driver. Cloned into
     /// every `RoutingFetcher` so successful chunk fetches feed the
     /// driver's per-peer activity tracker. Set lazily by the run loop
@@ -864,6 +874,7 @@ impl SwarmState {
             chunk_record_dir,
             peers_watch: watch::channel(Vec::new()).0,
             retrieval_inflight: Arc::new(Semaphore::new(RETRIEVAL_INFLIGHT_CAP)),
+            verify_gate: Arc::new(Semaphore::new(1)),
             payment_notify: None,
             accounting: None,
             retrieval_counters: Arc::new(RetrievalCounters::new()),
@@ -1642,10 +1653,12 @@ fn handle_control_command(
             }
             let peers_rx = state.peers_watch.subscribe();
             let control = control.clone();
+            let net = VerifyNet::from_state(state);
             tokio::spawn(async move {
-                let body =
-                    verify_propagation_deep(control, peers_rx, peers, reference, samples, probes)
-                        .await;
+                let body = verify_propagation_deep(
+                    control, peers_rx, peers, reference, samples, probes, net,
+                )
+                .await;
                 let _ = ack.send(ControlAck::Ok {
                     message: body.to_string(),
                 });
@@ -1671,12 +1684,22 @@ fn handle_control_command(
             }
             let peers_rx = state.peers_watch.subscribe();
             let control = control.clone();
+            let net = VerifyNet::from_state(state);
             tokio::spawn(async move {
+                // Serialise with any other in-flight verification (see
+                // `SwarmState::verify_gate`).
+                let _gate = net
+                    .verify_gate
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("verify gate semaphore closed");
+                let fetcher = net.fetcher(control.clone(), peers_rx);
                 let missing = if probes == 0 {
-                    let fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx);
                     verify_chunks_present(&fetcher, &addresses).await
                 } else {
-                    verify_chunks_present_deep(&control, &peers, &addresses, probes).await
+                    verify_chunks_present_deep(&control, &peers, &fetcher, &addresses, probes, &net)
+                        .await
                 };
                 let body = serde_json::json!({
                     "checked": addresses.len(),
@@ -3292,13 +3315,24 @@ fn sample_indices(len: usize, max: usize) -> Vec<usize> {
 /// route-diversity / replication count). Peers are ranked by XOR
 /// distance to `addr` — the same ordering [`RoutingFetcher`] uses — so
 /// we hit the chunk's natural neighbourhood first.
+///
+/// Each probe is a real, billable retrieval on the serving peer's
+/// accounting, so it goes through the same admission control
+/// (`Accounting::try_reserve`) and pseudosettle heartbeat as the
+/// production fetch path. A peer refused by admission control counts as
+/// a non-hit for this probe — better an under-count here than piling
+/// unpaid debt onto a peer until it blocklists us (which is what turned
+/// whole verify passes into false "missing" verdicts).
 async fn probe_leaf_sources(
     control: &Control,
     peers: &[(PeerId, Overlay)],
     addr: [u8; 32],
     probes: usize,
     probe_timeout: std::time::Duration,
+    net: &VerifyNet,
 ) -> u32 {
+    use ant_retrieval::accounting::Accounting;
+
     let mut ranked: Vec<(PeerId, Overlay)> = peers.to_vec();
     ranked.sort_by(|(_, a), (_, b)| {
         for i in 0..32 {
@@ -3310,18 +3344,40 @@ async fn probe_leaf_sources(
         }
         std::cmp::Ordering::Equal
     });
-    let candidates: Vec<PeerId> = ranked.into_iter().take(probes).map(|(p, _)| p).collect();
-    let probes_iter = candidates.into_iter().map(|peer| {
+    let candidates: Vec<(PeerId, Overlay)> = ranked.into_iter().take(probes).collect();
+    let probes_iter = candidates.into_iter().map(|(peer, overlay)| {
         let mut control = control.clone();
+        let accounting = net.accounting.clone();
+        let payment_notify = net.payment_notify.clone();
         async move {
-            matches!(
+            let guard = match accounting.as_ref() {
+                Some(acc) => {
+                    let price = Accounting::peer_price(&overlay, &addr);
+                    match acc.try_reserve(peer, price) {
+                        Some(g) => Some(g),
+                        // Saturated peer: skip rather than overdraw.
+                        None => return false,
+                    }
+                }
+                None => None,
+            };
+            let hit = matches!(
                 tokio::time::timeout(
                     probe_timeout,
                     ant_retrieval::retrieve_chunk(&mut control, peer, addr),
                 )
                 .await,
                 Ok(Ok(_))
-            )
+            );
+            if hit {
+                if let Some(g) = guard {
+                    g.apply();
+                }
+                if let Some(tx) = payment_notify.as_ref() {
+                    let _ = tx.try_send(peer);
+                }
+            }
+            hit
         }
     });
     futures::future::join_all(probes_iter)
@@ -3360,35 +3416,119 @@ async fn verify_chunks_present(
     .await
 }
 
-/// Deep read-back: for each address, probe its `probes` closest known
-/// peers directly (its true neighbourhood) and report the addresses that
-/// **no** close peer holds. Unlike [`verify_chunks_present`], this does
-/// not walk forwarders, so a chunk that only landed shallow — present to
-/// the uploader because it stays linked to the far storer that signed a
-/// shallow receipt, yet absent from the neighbourhood the network routes
-/// to — is correctly reported missing. That's what lets self-heal detect
-/// and re-push shallow placements (the uploader's any-route fetch would
-/// be fooled by its own privileged link). Bounded concurrency so a large
-/// file's check doesn't open thousands of simultaneous streams.
+/// Deep read-back: for each address, first probe its `probes` closest
+/// known peers (the chunk's neighbourhood vantage), then — for every
+/// address those one-shot probes failed to find — confirm with the real
+/// routed download path before declaring it missing. An address is
+/// reported missing only when **both** passes come up empty.
+///
+/// Why two stages: the closest-peer probes are single-attempt fetches
+/// with no hedging, no retry and no error backfill, so on a light node
+/// they have a substantial per-chunk false-failure rate (peer churn, a
+/// slow forwarding hop, an overdraft skip). Run alone they flagged ~25%
+/// of a file "missing" while the public gateway streamed the very same
+/// file byte-exact — and the heal then re-pushed hundreds of perfectly
+/// healthy chunks on every launch. The routed confirmation pass
+/// ([`verify_chunks_present`], the production fetch path: closest-first
+/// through forwarder peers, hedged, with error backfill) clears those
+/// false alarms, so "missing" again means "a third party can't get it".
+///
+/// The probe stage is kept (rather than going routed-only) because it is
+/// what surfaces shallow placements: the routed pass run from the
+/// uploader can be privileged — it may still be directly linked to a far
+/// storer that signed a shallow receipt — but a chunk that *no* probe
+/// finds and only the privileged route serves is rare now that uploads
+/// dial the neighbourhood and land deep at push time; we accept that
+/// residual in exchange for verdicts that match gateway reality.
+/// Bounded concurrency so a large file's check doesn't open thousands
+/// of simultaneous streams.
 async fn verify_chunks_present_deep(
     control: &Control,
     peers: &[(PeerId, Overlay)],
+    fetcher: &ant_retrieval::RoutingFetcher,
     addresses: &[[u8; 32]],
     probes: usize,
+    net: &VerifyNet,
 ) -> Vec<[u8; 32]> {
     use futures::stream::StreamExt;
 
     const CONCURRENCY: usize = 16;
     const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-    futures::stream::iter(addresses.iter().copied().map(|addr| async move {
-        let hits = probe_leaf_sources(control, peers, addr, probes, PROBE_TIMEOUT).await;
-        (addr, hits > 0)
-    }))
-    .buffer_unordered(CONCURRENCY)
-    .filter_map(|(addr, present)| async move { (!present).then_some(addr) })
-    .collect()
-    .await
+    let flagged: Vec<[u8; 32]> =
+        futures::stream::iter(addresses.iter().copied().map(|addr| async move {
+            let hits = probe_leaf_sources(control, peers, addr, probes, PROBE_TIMEOUT, net).await;
+            (addr, hits > 0)
+        }))
+        .buffer_unordered(CONCURRENCY)
+        .filter_map(|(addr, present)| async move { (!present).then_some(addr) })
+        .collect()
+        .await;
+
+    if flagged.is_empty() {
+        return flagged;
+    }
+    debug!(
+        target: "ant_p2p",
+        flagged = flagged.len(),
+        checked = addresses.len(),
+        "deep probes missed some chunks; confirming via routed fetch before declaring missing",
+    );
+    verify_chunks_present(fetcher, &flagged).await
+}
+
+/// Settlement + admission plumbing for every network-only verification
+/// fetch (the deep neighbourhood probes and the routed confirmation
+/// pass). Verification used to run *without* this — raw `retrieve_chunk`
+/// calls with no accounting mirror and no pseudosettle heartbeat — so a
+/// few hundred probed leaves racked up unpaid debt on the serving peers
+/// (each chunk is ~240–320 k units against bee's ≈1.69 M-unit light-mode
+/// disconnect limit, i.e. ~6 free chunks per peer) and the closest peers
+/// started refusing us mid-verify. The result was mass false-"missing"
+/// verdicts on files the public gateway streamed perfectly well, and
+/// heal rounds whose missing count *grew* round-over-round as the debt
+/// piled up. Cloned out of [`SwarmState`] at command time.
+#[derive(Clone)]
+struct VerifyNet {
+    inflight: Arc<Semaphore>,
+    payment_notify: Option<mpsc::Sender<PeerId>>,
+    accounting: Option<Arc<ant_retrieval::accounting::Accounting>>,
+    /// See [`SwarmState::verify_gate`]: serialises verification passes
+    /// so concurrent per-file verifies can't fail each other's probes.
+    verify_gate: Arc<Semaphore>,
+}
+
+impl VerifyNet {
+    fn from_state(state: &SwarmState) -> Self {
+        Self {
+            inflight: state.retrieval_inflight.clone(),
+            payment_notify: state.payment_notify.clone(),
+            accounting: state.accounting.clone(),
+            verify_gate: state.verify_gate.clone(),
+        }
+    }
+
+    /// Cache-free fetcher for verification: network-only (the local
+    /// store-then-push copy must never mask a failed push) but a full
+    /// network citizen — process-wide inflight cap, overdraft admission
+    /// control, and pseudosettle heartbeat, exactly like the real
+    /// download path.
+    fn fetcher(
+        &self,
+        control: Control,
+        peers_rx: watch::Receiver<Vec<(PeerId, Overlay)>>,
+    ) -> ant_retrieval::RoutingFetcher {
+        let mut f = ant_retrieval::RoutingFetcher::new(control, peers_rx)
+            .with_inflight_limit(self.inflight.clone())
+            .with_request_inflight_limit(RETRIEVAL_REQUEST_INFLIGHT_CAP);
+        if let Some(tx) = self.payment_notify.clone() {
+            f = f.with_payment_notify(tx);
+        }
+        if let Some(acc) = self.accounting.clone() {
+            f = f.with_accounting(acc);
+        }
+        f
+    }
 }
 
 /// Upper bound on how many data leaves a default verification
@@ -3406,14 +3546,15 @@ const MAX_FULL_VERIFY_LEAVES: usize = 512;
 /// probe is a second per-leaf round-trip on top of the reachability check.
 const SOURCE_PROBE_SAMPLE: usize = 24;
 
-/// Floor on how many of a leaf's closest peers the authoritative
-/// reachability check probes (the binary "does its neighbourhood hold
-/// it" question, distinct from the `sources` route-diversity floor). A
-/// leaf counts retrievable if *any* of its closest `VERIFY_DEEP_PROBES`
-/// peers returns it. Matched to the heal's `HEAL_PROBES` so the UI verdict
-/// and the post-upload heal agree on what "reachable" means; raising it
-/// reduces false-missing when our closest *known* peer for a neighbourhood
-/// isn't actually one of the storers.
+/// Floor on how many of a leaf's closest peers the first-pass
+/// reachability probes ask (the "does its neighbourhood hold it"
+/// question, distinct from the `sources` route-diversity floor). A leaf
+/// passes the probe stage if *any* of its closest `VERIFY_DEEP_PROBES`
+/// peers returns it; probe misses are then confirmed via the routed
+/// download path before counting as missing (see
+/// [`verify_chunks_present_deep`]). Matched to the heal's `HEAL_PROBES`
+/// so the UI verdict and the post-upload heal agree on what "reachable"
+/// means.
 const VERIFY_DEEP_PROBES: usize = 4;
 
 /// Deep propagation check: resolve the manifest at `reference` to its
@@ -3431,11 +3572,21 @@ async fn verify_propagation_deep(
     reference: [u8; 32],
     samples: usize,
     probes: usize,
+    net: VerifyNet,
 ) -> serde_json::Value {
     use ant_retrieval::{
         enumerate_chunk_tree, lookup_path, ChunkFetcher, JoinOptions, ManifestError,
         DEFAULT_MAX_FILE_BYTES,
     };
+
+    // Serialise with any other in-flight verification (see
+    // `SwarmState::verify_gate`); the permit is held for the whole pass.
+    let _gate = net
+        .verify_gate
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("verify gate semaphore closed");
 
     let ref_hex = format!("0x{}", hex::encode(reference));
     let err_body = |msg: String| {
@@ -3454,8 +3605,11 @@ async fn verify_propagation_deep(
     };
 
     // Cache-free fetcher: manifest resolution and interior-node fetches
-    // must hit the network, never the daemon's local store-then-push copy.
-    let fetcher = ant_retrieval::RoutingFetcher::new(control.clone(), peers_rx);
+    // must hit the network, never the daemon's local store-then-push
+    // copy. Fully wired (inflight cap, admission control, pseudosettle
+    // heartbeat) so the verification's own traffic gets paid for instead
+    // of blocklisting us with the peers we're about to probe.
+    let fetcher = net.fetcher(control.clone(), peers_rx);
 
     // Resolve the manifest to its data root; a non-manifest reference is
     // treated as a raw `/bytes/` data root.
@@ -3507,22 +3661,19 @@ async fn verify_propagation_deep(
     let sampled_leaves = check_idx.len();
     let leaf_addrs: Vec<[u8; 32]> = check_idx.iter().map(|&i| inv.leaves[i]).collect();
 
-    // Authoritative *global* reachability uses the deep neighbourhood
-    // probe, not the forwarder-walking `RoutingFetcher`. Run from the
-    // uploader the forwarder-walk is privileged: the node is directly
-    // peered with the shallow storers it just pushed to, so it pulls
-    // every chunk back and reports "retrievable" even when no third party
-    // (the public gateway, say) can route to it. The deep probe instead
-    // asks each chunk's *own* closest peers — its true neighbourhood, the
-    // vantage a gateway reaches by routing closest-first — so a chunk that
-    // only landed shallow counts as missing here exactly as it does for a
-    // gateway. This is the same signal the post-upload heal uses, so the
-    // UI verdict and the heal can no longer disagree (the bug that let a
-    // file the gateway can't stream show as "Online / Verified"). A wider
-    // probe than the informational `sources` floor below: a chunk is
-    // reachable if any of its closest neighbourhood peers holds it.
+    // Reachability verdict: two-stage. First the deep neighbourhood
+    // probe — each chunk's *own* closest peers, the vantage a gateway
+    // reaches by routing closest-first, so a chunk that only landed
+    // shallow is flagged exactly as a gateway would experience it. Then
+    // every probe miss is confirmed via the routed download path before
+    // counting as missing, because the one-shot probes have a material
+    // false-failure rate on a light node (see
+    // [`verify_chunks_present_deep`]). Same signal as the post-upload
+    // heal, so the UI verdict and the heal can't disagree.
     let deep_probes = probes.max(VERIFY_DEEP_PROBES);
-    let missing = verify_chunks_present_deep(&control, &peers, &leaf_addrs, deep_probes).await;
+    let missing =
+        verify_chunks_present_deep(&control, &peers, &fetcher, &leaf_addrs, deep_probes, &net)
+            .await;
     let leaves_retrievable = sampled_leaves - missing.len();
 
     // Informational replication floor: how many of a chunk's own closest
@@ -3532,7 +3683,8 @@ async fn verify_propagation_deep(
     let probe_timeout = std::time::Duration::from_secs(10);
     let mut min_sources = u32::MAX;
     for i in sample_indices(leaf_addrs.len(), SOURCE_PROBE_SAMPLE.min(leaf_addrs.len())) {
-        let s = probe_leaf_sources(&control, &peers, leaf_addrs[i], probes, probe_timeout).await;
+        let s =
+            probe_leaf_sources(&control, &peers, leaf_addrs[i], probes, probe_timeout, &net).await;
         min_sources = min_sources.min(s);
     }
     let min_sources = if min_sources == u32::MAX {
