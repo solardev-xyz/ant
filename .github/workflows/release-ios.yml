@@ -1,0 +1,105 @@
+# Build + publish the interim pre-UniFFI `AntFFI.xcframework`
+# (PLAN.md § "Interim releasable iOS artifact").
+#
+# Kept separate from release.yml so Freedom's `fetch-ant.js` keyword
+# matching over the antd assets is untouched, and so a failed macOS
+# runner never blocks the antd binaries.
+#
+# Triggers:
+#   * tag push `v*`  — builds and attaches the zip + checksum to the
+#     same GitHub release the antd matrix publishes to.
+#   * workflow_dispatch — dry-run build (artifact only), or, when
+#     `release_tag` is set, attaches the assets to that existing
+#     release (lets us ship the xcframework for a tag cut before this
+#     workflow existed).
+#
+# The zip is created with `ditto -c -k --keepParent` (the only layout
+# SwiftPM accepts for a `binaryTarget` URL) and the printed checksum
+# is what consumers paste into Package.swift:
+#
+#   .binaryTarget(name: "AntFFI", url: "…/AntFFI.xcframework.zip",
+#                 checksum: "<see AntFFI.xcframework.zip.checksum>")
+#
+# Known limitations (stated in release notes): hand-written pre-UniFFI
+# surface (ABI will change), one-Rust-staticlib-per-app rule, `chain`
+# feature baked in.
+
+name: release-ios
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag to attach AntFFI.xcframework to (empty = build-only dry run)"
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build AntFFI.xcframework
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-ios
+
+      - name: Build xcframework
+        run: cargo xtask build-ios-xcframework
+
+      - name: Package + checksum
+        id: pkg
+        run: |
+          set -euo pipefail
+          cd target/ios-xcframework
+          # ditto, not zip: SwiftPM rejects archives whose entries
+          # carry leading directories other than the framework itself.
+          ditto -c -k --keepParent AntFFI.xcframework AntFFI.xcframework.zip
+          # The SPM checksum consumers must pin in Package.swift.
+          checksum="$(swift package compute-checksum AntFFI.xcframework.zip)"
+          printf '%s\n' "$checksum" > AntFFI.xcframework.zip.checksum
+          echo "=== AntFFI.xcframework.zip ==="
+          ls -la AntFFI.xcframework.zip
+          echo "spm checksum: $checksum"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: antffi-xcframework
+          path: |
+            target/ios-xcframework/AntFFI.xcframework.zip
+            target/ios-xcframework/AntFFI.xcframework.zip.checksum
+          retention-days: 7
+
+      - name: Attach to tag release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            target/ios-xcframework/AntFFI.xcframework.zip
+            target/ios-xcframework/AntFFI.xcframework.zip.checksum
+
+      - name: Attach to named release (manual dispatch)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.event.inputs.release_tag }}" \
+            target/ios-xcframework/AntFFI.xcframework.zip \
+            target/ios-xcframework/AntFFI.xcframework.zip.checksum \
+            --clobber

@@ -1900,6 +1900,8 @@ The proper M2 Phase 4 deliverable is still a UniFFI-based `.xcframework` that me
 
 ### Interim releasable iOS artifact — `AntFFI.xcframework` (pre-UniFFI)
 
+> **Status update (2026-06):** work items 1 (xtask) and 3 (release CI) landed — `cargo xtask build-ios-xcframework` builds the device + fat-simulator slices (release, `chain`, `IPHONEOS_DEPLOYMENT_TARGET=15.0`), stages `ant.h` + a `module.modulemap` (with `link framework` directives for `Security` / `SystemConfiguration` / `CoreFoundation`), and assembles `AntFFI.xcframework`; `.github/workflows/release-ios.yml` builds it on a macOS runner per `v*` tag, zips with `ditto --keepParent`, computes the SPM checksum, and attaches `AntFFI.xcframework.zip` + `.checksum` to the GitHub release (first shipped with v0.5.17). Item 4's `strip = "symbols"` was already in the workspace release profile. Still open: item 2 (the thin Swift wrapper package), item 5 (consumer-facing README trim), item 6 (codesigning), and the out-of-repo fresh-Xcode-project exit test.
+
 The hand-written `ant-ffi` surface has outgrown the original three-function smoke test: the AntDrive example exercises downloads, streaming, uploads, storage plans, and on-chain plan purchase through it. That makes an *interim* third-party release worthwhile before the UniFFI artefact lands — external apps can embed the node today without a Rust toolchain, and we learn the distribution mechanics (SPM, checksums, release CI) ahead of Phase 4 instead of during it.
 
 This is a packaging track only. It does not change the FFI shape, any milestone gate, or the Phase 4 commitment to UniFFI; it ships the existing C surface as-is, tagged pre-1.0 with an explicit "ABI will change" notice.

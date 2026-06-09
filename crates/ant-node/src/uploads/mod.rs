@@ -43,6 +43,15 @@
 //!   Multiple jobs share the daemon's process-wide retrieval /
 //!   pushsync semaphores, so two simultaneous uploads don't double
 //!   the load on neighbours.
+//!
+//! - **Retries never hold a slot.** A transiently-failed chunk parks
+//!   in a [`RetryQueue`] for its (jittered) back-off and is
+//!   re-dispatched when due, so every in-flight slot is always doing
+//!   network work (bee's pusher shape). Once the splitter is drained
+//!   and only a few stragglers remain, re-dispatches are hedged
+//!   across [`TAIL_HEDGE_WIDTH`] concurrent pushsync commands and the
+//!   first receipt wins — pushsync is idempotent, so the losers cost
+//!   wasted RTTs, not correctness.
 
 pub mod state;
 
@@ -113,8 +122,8 @@ const PUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(2);
 
 /// Per-chunk retry budget for the **bounded** push paths (post-upload
 /// heal re-push and startup heal). The *upload* path itself is
-/// unbounded — it retries a struggling chunk forever, bee-style, and
-/// never fails the job on transient peer churn (see [`PushRetry`] and
+/// unbounded — it re-queues a struggling chunk forever, bee-style, and
+/// never fails the job on transient peer churn (see [`RetryQueue`] and
 /// `run_job`). Heal keeps a bounded budget so a background heal task
 /// can't wedge forever on a dead network: it gives up the current
 /// round, and the next startup heal pass retries.
@@ -222,21 +231,240 @@ const HEAL_PROBES: usize = 4;
 /// pass too, which they previously skipped entirely. Tunable.
 const HEAL_MAX_CHUNKS: usize = 2_000_000;
 
-/// Future returned by [`UploadManager::dispatch_push`]: a chunk-emit
-/// index (so the ack log can advance the in-order cursor) plus the
-/// outcome of the pushsync round-trip.
+/// When the splitter is drained and at most this many chunks are
+/// still unacked, the driver switches to **tail hedging** (Fix 2 of
+/// the big-uploads plan): each *re-dispatched* straggler is raced as
+/// [`TAIL_HEDGE_WIDTH`] concurrent pushsync commands instead of one.
+/// pushsync is idempotent at the network level, so the duplicate
+/// pushes cost a few wasted round-trips at worst — and convert the
+/// "one straggler walks peers serially with back-off" tail (observed
+/// at ~1 chunk/min on the 1 GiB stress run) into a parallel race
+/// where the first receipt wins.
+const TAIL_HEDGE_THRESHOLD: usize = 16;
+
+/// How many concurrent pushsync commands a hedged tail re-dispatch
+/// fans out to. Each command independently walks the closest-peer
+/// list (with its own per-chunk skip list), so 3 commands race ~3
+/// different storer paths.
+const TAIL_HEDGE_WIDTH: usize = 3;
+
+/// Stagger between the hedged attempts of one chunk, so a fast first
+/// receipt cancels the rest before they hit the wire.
+const TAIL_HEDGE_STAGGER: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Add ±25 % decorrelation jitter to a retry back-off (part of Fix 4
+/// of the big-uploads plan): a connection reset that drops a whole
+/// neighbourhood's streams at once would otherwise re-queue dozens of
+/// chunks with byte-identical wake times, and the synchronized retry
+/// burst re-trips the same storers. Cheap xorshift over an atomic —
+/// no `rand` dependency, statistical quality is irrelevant here.
+fn with_jitter(d: std::time::Duration) -> std::time::Duration {
+    static STATE: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
+    let mut x = STATE
+        .fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed)
+        .wrapping_add(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |t| u64::from(t.subsec_nanos())),
+        );
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    let per_mille = 750 + (x % 501) as u32; // 0.75x ..= 1.25x
+    d * per_mille / 1000
+}
+
+/// Future returned by [`UploadManager::dispatch_push_once`]: a
+/// chunk-emit index (so the ack log can advance the in-order cursor)
+/// plus the outcome of one (possibly hedged) pushsync round-trip.
 type PushFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = (u64, PushOnceOutcome)> + Send>>;
+
+/// Future returned by [`UploadManager::dispatch_push_bounded`] (the
+/// heal re-push path, which keeps its internal bounded retry loop).
+type BoundedPushFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = (u64, Result<(), UploadError>)> + Send>>;
 
-/// Retry policy for [`UploadManager::dispatch_push`].
-enum PushRetry {
-    /// Retry transient failures indefinitely (the upload path —
-    /// bee-style "slow, never fail"). Each retry bumps the shared
-    /// observability counter.
-    Forever { requeued: Arc<AtomicU64> },
-    /// Retry transient failures up to `budget` attempts, then return
-    /// `Err` (the bounded heal re-push path).
-    Bounded { budget: u32 },
+/// Outcome of a single dispatched push (no internal retry loop — the
+/// upload driver owns retries via [`RetryQueue`], Fix 1 of the
+/// big-uploads plan).
+enum PushOnceOutcome {
+    /// A storer issued a receipt.
+    Acked,
+    /// Transient failure (busy peers, timeouts, connection resets,
+    /// "no peers"). The chunk is handed back to the driver so it can
+    /// be re-queued *without* holding an in-flight slot during the
+    /// back-off.
+    Transient {
+        chunk: SplitChunk,
+        /// Attempt counter as of the failed dispatch; the driver
+        /// re-queues with `attempt + 1`.
+        attempt: u32,
+        no_peer: bool,
+        message: String,
+    },
+    /// Genuinely unrecoverable (daemon gone / bad batch / bad wire).
+    Fatal(UploadError),
+}
+
+/// Result of one raw `PushChunk` round-trip (shared by the upload
+/// and heal dispatch paths).
+enum AttemptResult {
+    Acked,
+    Transient { no_peer: bool, message: String },
+    Fatal(UploadError),
+}
+
+/// One `PushChunk` command → ack round-trip, classified. No retries.
+async fn push_attempt(
+    cmd_tx: &mpsc::Sender<ControlCommand>,
+    wire: Vec<u8>,
+    batch_id: [u8; 32],
+) -> AttemptResult {
+    let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
+    if cmd_tx
+        .send(ControlCommand::PushChunk {
+            wire,
+            batch_id,
+            ack: ack_tx,
+        })
+        .await
+        .is_err()
+    {
+        return AttemptResult::Fatal(UploadError::DaemonGone);
+    }
+    match tokio::time::timeout(PUSH_TIMEOUT, ack_rx).await {
+        Ok(Ok(ControlAck::ChunkUploaded { .. })) => AttemptResult::Acked,
+        Ok(Ok(ControlAck::Error { message })) => {
+            // A clearly-permanent condition (bad batch / stamp /
+            // wire) is fatal even on the upload path — retrying
+            // forever would just spin.
+            if is_fatal_push_error(&message) {
+                return AttemptResult::Fatal(UploadError::PushFailed(message));
+            }
+            AttemptResult::Transient {
+                no_peer: is_no_peer_error(&message),
+                message,
+            }
+        }
+        // "Accepted but not ready" (e.g. zero peers yet) is
+        // transient — retry, don't fail.
+        Ok(Ok(ControlAck::NotReady { message })) => AttemptResult::Transient {
+            no_peer: true,
+            message,
+        },
+        Ok(Ok(other)) => AttemptResult::Fatal(UploadError::PushFailed(format!(
+            "unexpected ack: {other:?}",
+        ))),
+        Ok(Err(_)) => AttemptResult::Fatal(UploadError::DaemonGone),
+        Err(_) => AttemptResult::Transient {
+            no_peer: false,
+            message: format!("push timed out after {}s", PUSH_TIMEOUT.as_secs()),
+        },
+    }
+}
+
+/// A chunk parked between push attempts (Fix 1). It holds **no**
+/// in-flight slot while its back-off runs; the driver re-dispatches
+/// it once `due` elapses and a slot is free.
+struct RetryEntry {
+    due: tokio::time::Instant,
+    index: u64,
+    chunk: SplitChunk,
+    attempt: u32,
+}
+
+impl PartialEq for RetryEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.due == other.due && self.index == other.index
+    }
+}
+impl Eq for RetryEntry {}
+impl PartialOrd for RetryEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for RetryEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Reversed (earliest due first): `BinaryHeap` is a max-heap.
+        other
+            .due
+            .cmp(&self.due)
+            .then_with(|| other.index.cmp(&self.index))
+    }
+}
+
+/// Min-heap of parked chunks keyed by wake time. This is the delay
+/// queue at the heart of the Fix-1 scheduler: a transiently-failed
+/// chunk goes here instead of sleeping inside its own future, so all
+/// [`MAX_PUSH_CONCURRENCY`] slots keep doing network work while the
+/// back-off runs.
+#[derive(Default)]
+struct RetryQueue {
+    heap: std::collections::BinaryHeap<RetryEntry>,
+}
+
+impl RetryQueue {
+    fn push(&mut self, e: RetryEntry) {
+        self.heap.push(e);
+    }
+    /// Pop the earliest entry whose wake time has elapsed, if any.
+    fn pop_due(&mut self, now: tokio::time::Instant) -> Option<RetryEntry> {
+        if self.heap.peek().is_some_and(|e| e.due <= now) {
+            self.heap.pop()
+        } else {
+            None
+        }
+    }
+    fn next_due(&self) -> Option<tokio::time::Instant> {
+        self.heap.peek().map(|e| e.due)
+    }
+    fn len(&self) -> usize {
+        self.heap.len()
+    }
+    fn is_empty(&self) -> bool {
+        self.heap.is_empty()
+    }
+}
+
+/// Fan-out width for one dispatch: hedge a *re-dispatched* straggler
+/// across several peers when the splitter is drained and only a
+/// handful of chunks remain (Fix 2); everything else is a single
+/// command. First attempts are never hedged — they nearly always
+/// succeed, and hedging them would triple the postage/stream cost of
+/// the happy path.
+const fn hedge_width(splitter_done: bool, remaining: usize) -> usize {
+    if splitter_done && remaining <= TAIL_HEDGE_THRESHOLD {
+        TAIL_HEDGE_WIDTH
+    } else {
+        1
+    }
+}
+
+/// Driver-side liveness state: stall detection plus the periodic
+/// heartbeat tick that keeps `follow` streams alive (Fix 7 — both the
+/// daemon's streaming dispatch and the client socket treat a long
+/// gap between frames as a dead stream).
+struct Liveness {
+    last_progress: Instant,
+    stalled: bool,
+    tick: tokio::time::Interval,
+}
+
+impl Liveness {
+    fn new() -> Self {
+        let mut tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + STALL_CHECK_INTERVAL,
+            STALL_CHECK_INTERVAL,
+        );
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        Self {
+            last_progress: Instant::now(),
+            stalled: false,
+            tick,
+        }
+    }
 }
 
 /// Classify a `PushChunk` error message as genuinely unrecoverable
@@ -950,24 +1178,23 @@ impl UploadManager {
         let mut heal_addrs: Vec<[u8; 32]> = Vec::new();
         let mut heal_overflow = false;
 
-        // Shared counter the per-chunk push futures bump on every
-        // transient retry. Folded into the job snapshot on each
-        // checkpoint / stall tick for observability — never a kill
-        // switch. Seeded from the persisted value so a resumed job's
-        // counter keeps climbing rather than resetting.
+        // Shared counter bumped on every transient re-queue. Folded
+        // into the job snapshot on each checkpoint / heartbeat tick
+        // for observability — never a kill switch. Seeded from the
+        // persisted value so a resumed job's counter keeps climbing
+        // rather than resetting.
         let requeued = Arc::new(AtomicU64::new(snap.chunks_requeued));
         // Liveness tracking. The upload never fails on peer churn (a
-        // struggling chunk is re-pushed forever), so a blocking caller
+        // struggling chunk is re-queued forever), so a blocking caller
         // needs a signal that it's not progressing: if no chunk acks
         // for STALL_THRESHOLD we flip `stalled` true (and broadcast
         // it) without changing the job's terminal outcome.
-        let mut last_progress = Instant::now();
-        let mut stalled = false;
-        let mut stall_tick = tokio::time::interval_at(
-            tokio::time::Instant::now() + STALL_CHECK_INTERVAL,
-            STALL_CHECK_INTERVAL,
-        );
-        stall_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut live = Liveness::new();
+        // Fix 1 (re-queue scheduler): a chunk whose push transiently
+        // failed parks here for its back-off instead of sleeping
+        // inside its own future — so all MAX_PUSH_CONCURRENCY slots
+        // keep doing network work while it waits.
+        let mut retries = RetryQueue::default();
 
         loop {
             // Cancellation check at the top of every loop turn —
@@ -983,9 +1210,11 @@ impl UploadManager {
                 drop(in_flight);
                 return Ok(());
             }
-            // Pause check — drain in-flight, persist, park.
+            // Pause check — drain in-flight, persist, park. Parked
+            // retries are simply dropped: the contiguous cursor can't
+            // advance past them, so resume re-derives and re-pushes.
             if handle.pause_requested.load(Ordering::SeqCst) {
-                self.drain_inflight(&mut in_flight, &mut ack_log, &handle)
+                self.drain_for_pause(&mut in_flight, &mut ack_log, &handle, &requeued, &mut live)
                     .await?;
                 debug!(
                     target: "ant_node::uploads",
@@ -999,8 +1228,28 @@ impl UploadManager {
                 return Ok(());
             }
 
-            // Either: dispatch the next chunk(s), await an
-            // in-flight completion, or — if both queues are empty
+            // Re-dispatch parked chunks whose back-off has elapsed
+            // before pulling fresh chunks off the splitter, so older
+            // chunks aren't starved by new ones (bee's pusher does
+            // the same: the retry channel outranks the fresh-chunk
+            // channel).
+            let now = tokio::time::Instant::now();
+            while in_flight.len() < MAX_PUSH_CONCURRENCY {
+                let Some(entry) = retries.pop_due(now) else {
+                    break;
+                };
+                let width = hedge_width(leaf_iter.is_done(), in_flight.len() + retries.len() + 1);
+                in_flight.push(self.dispatch_push_once(
+                    entry.index,
+                    entry.chunk,
+                    entry.attempt,
+                    batch_id,
+                    width,
+                ));
+            }
+
+            // Then: dispatch the next fresh chunk(s), await an
+            // in-flight completion, or — if all queues are empty
             // and the splitter is exhausted — break to the finish
             // step.
             if in_flight.len() < MAX_PUSH_CONCURRENCY {
@@ -1020,120 +1269,49 @@ impl UploadManager {
                             // re-derived this address byte-for-byte.
                             continue;
                         }
-                        in_flight.push(self.dispatch_push(
-                            i,
-                            chunk,
-                            batch_id,
-                            PushRetry::Forever {
-                                requeued: requeued.clone(),
-                            },
-                        ));
+                        in_flight.push(self.dispatch_push_once(i, chunk, 0, batch_id, 1));
                     }
                     continue;
                 }
             }
 
-            // Nothing more to dispatch and nothing in flight — break
-            // to the finish step. Checked before the await so we never
-            // park on an empty queue.
-            if leaf_iter.is_done() && in_flight.is_empty() {
+            // Nothing more to dispatch and nothing in flight or
+            // parked — break to the finish step. Checked before the
+            // await so we never park on an empty queue.
+            if leaf_iter.is_done() && in_flight.is_empty() && retries.is_empty() {
                 break;
             }
 
-            // Either drain an in-flight completion or wake on the
-            // stall tick to refresh the liveness flag. The job never
-            // fails here: `dispatch_push(Forever)` only yields `Err`
-            // on a genuinely unrecoverable condition (daemon gone /
-            // bad batch), which we surface; transient peer churn is
-            // re-pushed inside the future forever.
+            // Drain an in-flight completion, wake when the earliest
+            // parked retry comes due (only if a slot is free for it),
+            // or refresh liveness on the heartbeat tick. The job
+            // never fails here on peer churn: only a genuinely
+            // unrecoverable condition (daemon gone / bad batch)
+            // surfaces as an error.
+            let next_due = retries.next_due();
             tokio::select! {
                 biased;
-                Some((i, res)) = in_flight.next() => {
-                    match res {
-                        Ok(()) => {
-                            ack_log.record(i);
-                            last_progress = Instant::now();
-                            let cursor = ack_log.cursor();
-                            let mut info = handle.info.lock().expect("upload mutex poisoned");
-                            let advanced = cursor > info.chunks_pushed;
-                            let mut dirty = false;
-                            if advanced {
-                                info.chunks_pushed = cursor;
-                                // bytes_pushed tracks data leaves pushed
-                                // (cursor includes intermediates, so derive
-                                // from the leaf-bytes counter we keep on
-                                // the side).
-                                info.bytes_pushed =
-                                    ack_log.bytes_pushed(snap.source_size).min(snap.source_size);
-                                dirty = true;
-                            }
-                            let rq = requeued.load(Ordering::Relaxed);
-                            if info.chunks_requeued != rq {
-                                info.chunks_requeued = rq;
-                                dirty = true;
-                            }
-                            if info.stalled {
-                                info.stalled = false;
-                                dirty = true;
-                            }
-                            stalled = false;
-                            if dirty {
-                                info.last_update_unix = unix_seconds();
-                                let snap = info.clone();
-                                drop(info);
-                                let _ = handle.progress.send(snap.clone());
-                                // Checkpoint to disk every N chunks —
-                                // pubsub watchers always see updates.
-                                if advanced && cursor.is_multiple_of(CHECKPOINT_INTERVAL_CHUNKS) {
-                                    let _ = snap.save(&UploadJobInfo::manifest_path(
-                                        &self.inner.state_dir,
-                                        &snap.job_id,
-                                    ));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            // Only genuinely unrecoverable errors reach
-                            // here (the upload path retries transient
-                            // failures forever). Surface and exit; the
-                            // operator can `resume` from the persisted
-                            // cursor.
-                            let msg = e.to_string();
-                            self.mark_failed(&handle, msg.clone());
-                            return Err(UploadError::PushFailed(msg));
-                        }
-                    }
+                Some((i, outcome)) = in_flight.next() => {
+                    self.handle_outcome(
+                        i, outcome, &mut retries, &mut ack_log, &handle,
+                        &requeued, &mut live, snap.source_size,
+                    )?;
                 }
-                _ = stall_tick.tick() => {
-                    let rq = requeued.load(Ordering::Relaxed);
-                    let now_stalled = last_progress.elapsed() >= STALL_THRESHOLD;
-                    let mut info = handle.info.lock().expect("upload mutex poisoned");
-                    let changed = info.chunks_requeued != rq || info.stalled != now_stalled;
-                    if changed {
-                        info.chunks_requeued = rq;
-                        info.stalled = now_stalled;
-                        info.last_update_unix = unix_seconds();
-                        let snap = info.clone();
-                        drop(info);
-                        let _ = handle.progress.send(snap);
-                    }
-                    if now_stalled && !stalled {
-                        warn!(
-                            target: "ant_node::uploads",
-                            job_id = %snap.job_id,
-                            requeued = rq,
-                            "upload stalled: no chunk acked for {}s — still retrying (job not failed)",
-                            STALL_THRESHOLD.as_secs(),
-                        );
-                    }
-                    stalled = now_stalled;
+                () = tokio::time::sleep_until(next_due.unwrap_or(now)),
+                    if next_due.is_some() && in_flight.len() < MAX_PUSH_CONCURRENCY => {
+                    // Loop turn re-dispatches the due retry.
+                }
+                _ = live.tick.tick() => {
+                    self.heartbeat(&handle, &requeued, &mut live, &snap.job_id);
                 }
             }
         }
         // Source fully consumed. Cancel/pause check before pushing
         // intermediates is unnecessary because they were emitted
         // inline by `push_leaf` already; only the splitter's tail
-        // (root + partial intermediates) remains.
+        // (root + partial intermediates) remains — a handful of
+        // chunks (one partial intermediate per tree level), well
+        // under MAX_PUSH_CONCURRENCY, so dispatch them all at once.
         let (data_root, _total_bytes, tail) = splitter.finish();
         for chunk in tail {
             let i = next_index;
@@ -1142,18 +1320,24 @@ impl UploadManager {
             if i < resume_cursor {
                 continue;
             }
-            in_flight.push(self.dispatch_push(
-                i,
-                chunk,
-                batch_id,
-                PushRetry::Forever {
-                    requeued: requeued.clone(),
-                },
-            ));
+            in_flight.push(self.dispatch_push_once(i, chunk, 0, batch_id, 1));
         }
-        // Drain the tail.
-        self.drain_inflight(&mut in_flight, &mut ack_log, &handle)
-            .await?;
+        // Drain the tail (with the same re-queue + tail-hedging
+        // machinery as the main loop).
+        self.drain_with_requeue(
+            &mut in_flight,
+            &mut retries,
+            &mut ack_log,
+            &handle,
+            &requeued,
+            &mut live,
+            batch_id,
+            snap.source_size,
+        )
+        .await?;
+        if handle.cancel_requested.load(Ordering::SeqCst) {
+            return Ok(());
+        }
 
         // Either wrap the data root in a single-file mantaray
         // manifest (the bzz-compatible default) or finish at the
@@ -1180,17 +1364,22 @@ impl UploadManager {
                 if i < resume_cursor {
                     continue;
                 }
-                in_flight.push(self.dispatch_push(
-                    i,
-                    chunk.clone(),
-                    batch_id,
-                    PushRetry::Forever {
-                        requeued: requeued.clone(),
-                    },
-                ));
+                in_flight.push(self.dispatch_push_once(i, chunk.clone(), 0, batch_id, 1));
             }
-            self.drain_inflight(&mut in_flight, &mut ack_log, &handle)
-                .await?;
+            self.drain_with_requeue(
+                &mut in_flight,
+                &mut retries,
+                &mut ack_log,
+                &handle,
+                &requeued,
+                &mut live,
+                batch_id,
+                snap.source_size,
+            )
+            .await?;
+            if handle.cancel_requested.load(Ordering::SeqCst) {
+                return Ok(());
+            }
             manifest.root
         };
 
@@ -1265,37 +1454,209 @@ impl UploadManager {
         Ok(())
     }
 
-    /// Wait for every in-flight push to complete (success or
-    /// failure) and update the cursor. Used at pause time, after
-    /// the splitter tail is drained, and after the manifest is
-    /// pushed.
-    async fn drain_inflight(
+    /// Record one acked chunk: advance the in-order cursor, refresh
+    /// liveness, broadcast progress, and checkpoint to disk every
+    /// [`CHECKPOINT_INTERVAL_CHUNKS`] pushes. Shared by the main
+    /// driver loop and both drain paths.
+    fn note_acked(
         &self,
-        in_flight: &mut FuturesUnordered<PushFuture>,
+        handle: &Arc<JobHandle>,
+        ack_log: &mut AckLog,
+        requeued: &Arc<AtomicU64>,
+        live: &mut Liveness,
+        i: u64,
+        source_size: u64,
+    ) {
+        ack_log.record(i);
+        live.last_progress = Instant::now();
+        live.stalled = false;
+        let cursor = ack_log.cursor();
+        let mut info = handle.info.lock().expect("upload mutex poisoned");
+        let advanced = cursor > info.chunks_pushed;
+        let mut dirty = false;
+        if advanced {
+            info.chunks_pushed = cursor;
+            // bytes_pushed tracks data leaves pushed (cursor includes
+            // intermediates, so derive from the leaf-bytes counter we
+            // keep on the side).
+            info.bytes_pushed = ack_log.bytes_pushed(source_size).min(source_size);
+            dirty = true;
+        }
+        let rq = requeued.load(Ordering::Relaxed);
+        if info.chunks_requeued != rq {
+            info.chunks_requeued = rq;
+            dirty = true;
+        }
+        if info.stalled {
+            info.stalled = false;
+            dirty = true;
+        }
+        if dirty {
+            info.last_update_unix = unix_seconds();
+            let snap = info.clone();
+            drop(info);
+            let _ = handle.progress.send(snap.clone());
+            // Checkpoint to disk every N chunks — pubsub watchers
+            // always see updates.
+            if advanced && cursor.is_multiple_of(CHECKPOINT_INTERVAL_CHUNKS) {
+                let _ = snap.save(&UploadJobInfo::manifest_path(
+                    &self.inner.state_dir,
+                    &snap.job_id,
+                ));
+            }
+        }
+    }
+
+    /// Fold one completed push outcome back into the driver state:
+    /// ack bookkeeping on success, re-queue with jittered back-off on
+    /// a transient failure (Fix 1 — the in-flight slot was already
+    /// freed when the future completed), `Err` on a genuinely
+    /// unrecoverable condition.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_outcome(
+        &self,
+        i: u64,
+        outcome: PushOnceOutcome,
+        retries: &mut RetryQueue,
         ack_log: &mut AckLog,
         handle: &Arc<JobHandle>,
+        requeued: &Arc<AtomicU64>,
+        live: &mut Liveness,
+        source_size: u64,
     ) -> Result<(), UploadError> {
-        while let Some((i, res)) = in_flight.next().await {
-            match res {
-                Ok(()) => {
-                    ack_log.record(i);
-                    let cursor = ack_log.cursor();
-                    let snap = {
-                        let mut info = handle.info.lock().expect("upload mutex poisoned");
-                        if cursor > info.chunks_pushed {
-                            info.chunks_pushed = cursor;
-                            info.bytes_pushed =
-                                ack_log.bytes_pushed(info.source_size).min(info.source_size);
-                            info.last_update_unix = unix_seconds();
-                        }
-                        info.clone()
-                    };
-                    let _ = handle.progress.send(snap.clone());
+        match outcome {
+            PushOnceOutcome::Acked => {
+                self.note_acked(handle, ack_log, requeued, live, i, source_size);
+                Ok(())
+            }
+            PushOnceOutcome::Transient {
+                chunk,
+                attempt,
+                no_peer,
+                message,
+            } => {
+                requeued.fetch_add(1, Ordering::Relaxed);
+                let base = if no_peer {
+                    NO_PEER_BACKOFF
+                } else {
+                    backoff_for_retry(attempt)
+                };
+                let delay = with_jitter(base);
+                debug!(
+                    target: "ant_node::uploads",
+                    index = i,
+                    attempt,
+                    no_peer,
+                    delay_ms = delay.as_millis() as u64,
+                    "re-queueing chunk after transient push failure: {message}",
+                );
+                retries.push(RetryEntry {
+                    due: tokio::time::Instant::now() + delay,
+                    index: i,
+                    chunk,
+                    attempt: attempt.saturating_add(1),
+                });
+                Ok(())
+            }
+            PushOnceOutcome::Fatal(e) => {
+                // Only genuinely unrecoverable errors reach here (the
+                // upload path re-queues transient failures forever).
+                // Surface and exit; the operator can `resume` from
+                // the persisted cursor.
+                let msg = e.to_string();
+                self.mark_failed(handle, msg.clone());
+                Err(UploadError::PushFailed(msg))
+            }
+        }
+    }
+
+    /// Periodic liveness + keep-alive broadcast (Fix 7). Always sends
+    /// a progress frame — even when nothing changed — because both
+    /// the daemon's streaming dispatch (60 s) and the client socket
+    /// (75 s) treat a long gap between frames as a dead stream, and a
+    /// stalled-but-alive upload must keep its `follow`ers attached.
+    #[allow(clippy::unused_self)] // driver-loop helper, kept on the manager for symmetry
+    fn heartbeat(
+        &self,
+        handle: &Arc<JobHandle>,
+        requeued: &Arc<AtomicU64>,
+        live: &mut Liveness,
+        job_id: &str,
+    ) {
+        let rq = requeued.load(Ordering::Relaxed);
+        let now_stalled = live.last_progress.elapsed() >= STALL_THRESHOLD;
+        let snap = {
+            let mut info = handle.info.lock().expect("upload mutex poisoned");
+            info.chunks_requeued = rq;
+            info.stalled = now_stalled;
+            info.last_update_unix = unix_seconds();
+            info.clone()
+        };
+        let _ = handle.progress.send(snap);
+        if now_stalled && !live.stalled {
+            warn!(
+                target: "ant_node::uploads",
+                job_id = %job_id,
+                requeued = rq,
+                "upload stalled: no chunk acked for {}s — still retrying (job not failed)",
+                STALL_THRESHOLD.as_secs(),
+            );
+        }
+        live.stalled = now_stalled;
+    }
+
+    /// Run the re-queue scheduler until every in-flight and parked
+    /// chunk has acked. Used after the splitter tail is dispatched
+    /// and after the manifest is pushed — the phases where the
+    /// remaining set is small, so re-dispatches hedge across peers
+    /// (Fix 2). Returns early (Ok) on cancel; the caller re-checks
+    /// `cancel_requested` before declaring the job complete.
+    #[allow(clippy::too_many_arguments)]
+    async fn drain_with_requeue(
+        &self,
+        in_flight: &mut FuturesUnordered<PushFuture>,
+        retries: &mut RetryQueue,
+        ack_log: &mut AckLog,
+        handle: &Arc<JobHandle>,
+        requeued: &Arc<AtomicU64>,
+        live: &mut Liveness,
+        batch_id: [u8; 32],
+        source_size: u64,
+    ) -> Result<(), UploadError> {
+        let job_id = handle.snapshot().job_id;
+        loop {
+            if handle.cancel_requested.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            let now = tokio::time::Instant::now();
+            while in_flight.len() < MAX_PUSH_CONCURRENCY {
+                let Some(entry) = retries.pop_due(now) else {
+                    break;
+                };
+                let width = hedge_width(true, in_flight.len() + retries.len() + 1);
+                in_flight.push(self.dispatch_push_once(
+                    entry.index,
+                    entry.chunk,
+                    entry.attempt,
+                    batch_id,
+                    width,
+                ));
+            }
+            if in_flight.is_empty() && retries.is_empty() {
+                break;
+            }
+            let next_due = retries.next_due();
+            tokio::select! {
+                biased;
+                Some((i, outcome)) = in_flight.next() => {
+                    self.handle_outcome(
+                        i, outcome, retries, ack_log, handle, requeued, live, source_size,
+                    )?;
                 }
-                Err(e) => {
-                    let msg = e.to_string();
-                    self.mark_failed(handle, msg.clone());
-                    return Err(UploadError::PushFailed(msg));
+                () = tokio::time::sleep_until(next_due.unwrap_or(now)),
+                    if next_due.is_some() && in_flight.len() < MAX_PUSH_CONCURRENCY => {}
+                _ = live.tick.tick() => {
+                    self.heartbeat(handle, requeued, live, &job_id);
                 }
             }
         }
@@ -1308,114 +1669,148 @@ impl UploadManager {
         Ok(())
     }
 
-    /// Build the future that pushes one chunk through the existing
-    /// `ControlCommand::PushChunk` pipeline. Boxed so the
-    /// `FuturesUnordered` queue can hold heterogeneous push types
-    /// (data leaf vs intermediate vs manifest chunk — the wire
-    /// shape is identical, but boxing keeps the type uniform).
+    /// Wait for every in-flight push to complete and update the
+    /// cursor, dropping transiently-failed chunks (the contiguous
+    /// cursor can't advance past them, so resume re-derives and
+    /// re-pushes). Used at pause time only — single-attempt futures
+    /// complete within [`PUSH_TIMEOUT`], so pause is prompt instead
+    /// of waiting out a forever-retry loop.
+    async fn drain_for_pause(
+        &self,
+        in_flight: &mut FuturesUnordered<PushFuture>,
+        ack_log: &mut AckLog,
+        handle: &Arc<JobHandle>,
+        requeued: &Arc<AtomicU64>,
+        live: &mut Liveness,
+    ) -> Result<(), UploadError> {
+        let source_size = handle.snapshot().source_size;
+        while let Some((i, outcome)) = in_flight.next().await {
+            match outcome {
+                PushOnceOutcome::Acked => {
+                    self.note_acked(handle, ack_log, requeued, live, i, source_size);
+                }
+                // Dropped on pause: re-pushed after resume.
+                PushOnceOutcome::Transient { .. } => {}
+                PushOnceOutcome::Fatal(e) => {
+                    let msg = e.to_string();
+                    self.mark_failed(handle, msg.clone());
+                    return Err(UploadError::PushFailed(msg));
+                }
+            }
+        }
+        // Final checkpoint after the drain.
+        let snap = handle.snapshot();
+        snap.save(&UploadJobInfo::manifest_path(
+            &self.inner.state_dir,
+            &snap.job_id,
+        ))?;
+        Ok(())
+    }
+
+    /// Build the future for **one** push of one chunk through the
+    /// existing `ControlCommand::PushChunk` pipeline — no internal
+    /// retry loop (the driver's [`RetryQueue`] owns retries, Fix 1).
+    /// Boxed so the `FuturesUnordered` queue can hold heterogeneous
+    /// push types (data leaf vs intermediate vs manifest chunk — the
+    /// wire shape is identical, but boxing keeps the type uniform).
     ///
-    /// Retry policy is set by `retry`:
-    /// * [`PushRetry::Forever`] — the upload path. Transient errors
-    ///   (busy peers, timeouts, connection resets, "no peers") are
-    ///   re-pushed **indefinitely** with back-off, bee-style; the job
-    ///   never fails on peer churn. Only a genuinely unrecoverable
-    ///   condition (the daemon channel closing, or a clearly-permanent
-    ///   stamp/batch misconfiguration — see [`is_fatal_push_error`])
-    ///   returns `Err`. The shared `requeued` counter is bumped on
-    ///   every retry for observability.
-    /// * [`PushRetry::Bounded`] — the heal re-push path. The same
-    ///   transient errors are retried only up to a fixed budget, then
-    ///   the future returns `Err` so a background heal task can give
-    ///   up the round (and the next startup pass retries) rather than
-    ///   wedging forever.
-    fn dispatch_push(
+    /// `width > 1` enables tail hedging (Fix 2): the chunk is raced
+    /// as `width` concurrent pushsync commands, staggered by
+    /// [`TAIL_HEDGE_STAGGER`], and the first receipt wins (pushsync
+    /// is idempotent, so the losers are wasted RTTs, not bugs). The
+    /// outcome is `Transient` only if *every* lane failed
+    /// transiently; any fatal lane fails the dispatch.
+    fn dispatch_push_once(
+        &self,
+        index: u64,
+        chunk: SplitChunk,
+        attempt: u32,
+        batch_id: [u8; 32],
+        width: usize,
+    ) -> PushFuture {
+        let cmd_tx = self.inner.cmd_tx.clone();
+        Box::pin(async move {
+            let mut lanes: FuturesUnordered<_> = (0..width.max(1))
+                .map(|k| {
+                    let cmd_tx = cmd_tx.clone();
+                    let wire = chunk.wire.clone();
+                    async move {
+                        if k > 0 {
+                            tokio::time::sleep(TAIL_HEDGE_STAGGER * k as u32).await;
+                        }
+                        push_attempt(&cmd_tx, wire, batch_id).await
+                    }
+                })
+                .collect();
+            // `no_peer` only if every lane reported it: one lane
+            // finding candidates means the neighbourhood isn't empty,
+            // so the shorter busy-storer back-off applies.
+            let mut no_peer = true;
+            let mut last_msg = String::new();
+            while let Some(res) = lanes.next().await {
+                match res {
+                    AttemptResult::Acked => return (index, PushOnceOutcome::Acked),
+                    AttemptResult::Fatal(e) => return (index, PushOnceOutcome::Fatal(e)),
+                    AttemptResult::Transient {
+                        no_peer: np,
+                        message,
+                    } => {
+                        no_peer &= np;
+                        last_msg = message;
+                    }
+                }
+            }
+            drop(lanes);
+            (
+                index,
+                PushOnceOutcome::Transient {
+                    chunk,
+                    attempt,
+                    no_peer,
+                    message: last_msg,
+                },
+            )
+        })
+    }
+
+    /// Build the future that pushes one chunk with an **internal**
+    /// bounded retry loop — the heal re-push path. Transient errors
+    /// are retried up to `budget` attempts with jittered back-off,
+    /// then the future returns `Err` so a background heal task can
+    /// give up the round (and the next startup pass retries) rather
+    /// than wedging forever.
+    fn dispatch_push_bounded(
         &self,
         index: u64,
         chunk: SplitChunk,
         batch_id: [u8; 32],
-        retry: PushRetry,
-    ) -> PushFuture {
+        budget: u32,
+    ) -> BoundedPushFuture {
         let cmd_tx = self.inner.cmd_tx.clone();
         Box::pin(async move {
-            // Set fresh on every transient failure; only read by the
-            // `Bounded` budget-exhaustion message. The initial value is
-            // overwritten before any read, hence the narrow allow.
-            #[allow(unused_assignments)]
-            let mut last_err: Option<String> = None;
             let mut attempt: u32 = 0;
             loop {
-                let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
-                if cmd_tx
-                    .send(ControlCommand::PushChunk {
-                        wire: chunk.wire.clone(),
-                        batch_id,
-                        ack: ack_tx,
-                    })
-                    .await
-                    .is_err()
-                {
-                    return (index, Err(UploadError::DaemonGone));
-                }
-                let mut no_peer = false;
-                match tokio::time::timeout(PUSH_TIMEOUT, ack_rx).await {
-                    Ok(Ok(ControlAck::ChunkUploaded { .. })) => {
-                        return (index, Ok(()));
-                    }
-                    Ok(Ok(ControlAck::Error { message })) => {
-                        // A clearly-permanent condition (bad batch /
-                        // stamp / wire) is fatal even on the upload
-                        // path — retrying forever would just spin.
-                        if is_fatal_push_error(&message) {
-                            return (index, Err(UploadError::PushFailed(message)));
+                match push_attempt(&cmd_tx, chunk.wire.clone(), batch_id).await {
+                    AttemptResult::Acked => return (index, Ok(())),
+                    AttemptResult::Fatal(e) => return (index, Err(e)),
+                    AttemptResult::Transient { no_peer, message } => {
+                        if attempt + 1 >= budget {
+                            return (
+                                index,
+                                Err(UploadError::PushFailed(format!(
+                                    "exhausted {budget} retries: {message}",
+                                ))),
+                            );
                         }
-                        no_peer = is_no_peer_error(&message);
-                        last_err = Some(message);
-                    }
-                    // "Accepted but not ready" (e.g. zero peers yet) is
-                    // transient — retry, don't fail.
-                    Ok(Ok(ControlAck::NotReady { message })) => {
-                        no_peer = true;
-                        last_err = Some(message);
-                    }
-                    Ok(Ok(other)) => {
-                        return (
-                            index,
-                            Err(UploadError::PushFailed(format!(
-                                "unexpected ack: {other:?}",
-                            ))),
-                        );
-                    }
-                    Ok(Err(_)) => {
-                        return (index, Err(UploadError::DaemonGone));
-                    }
-                    Err(_) => {
-                        last_err =
-                            Some(format!("push timed out after {}s", PUSH_TIMEOUT.as_secs()));
+                        let delay = if no_peer {
+                            NO_PEER_BACKOFF
+                        } else {
+                            backoff_for_retry(attempt)
+                        };
+                        tokio::time::sleep(with_jitter(delay)).await;
+                        attempt = attempt.saturating_add(1);
                     }
                 }
-
-                // Transient failure: decide whether to keep retrying.
-                if let PushRetry::Bounded { budget } = retry {
-                    if attempt + 1 >= budget {
-                        return (
-                            index,
-                            Err(UploadError::PushFailed(format!(
-                                "exhausted {budget} retries: {}",
-                                last_err.unwrap_or_else(|| "unknown".to_string()),
-                            ))),
-                        );
-                    }
-                }
-                if let PushRetry::Forever { ref requeued } = retry {
-                    requeued.fetch_add(1, Ordering::Relaxed);
-                }
-                let delay = if no_peer {
-                    NO_PEER_BACKOFF
-                } else {
-                    backoff_for_retry(attempt)
-                };
-                tokio::time::sleep(delay).await;
-                attempt = attempt.saturating_add(1);
             }
         })
     }
@@ -1750,7 +2145,7 @@ impl UploadManager {
         name: Option<&str>,
         content_type: Option<&str>,
     ) -> Result<(), UploadError> {
-        let mut in_flight: FuturesUnordered<PushFuture> = FuturesUnordered::new();
+        let mut in_flight: FuturesUnordered<BoundedPushFuture> = FuturesUnordered::new();
         // Addresses still needing a re-push after the disk-cache pass.
         // Anything left is re-derived from the source file in pass 2.
         let mut remaining: HashSet<[u8; 32]> = missing.clone();
@@ -1766,16 +2161,14 @@ impl UploadManager {
                                 res?;
                             }
                         }
-                        in_flight.push(self.dispatch_push(
+                        in_flight.push(self.dispatch_push_bounded(
                             0,
                             SplitChunk {
                                 address: addr,
                                 wire,
                             },
                             batch_id,
-                            PushRetry::Bounded {
-                                budget: PER_CHUNK_RETRY_BUDGET,
-                            },
+                            PER_CHUNK_RETRY_BUDGET,
                         ));
                         remaining.remove(&addr);
                     }
@@ -1818,13 +2211,11 @@ impl UploadManager {
                                         res?;
                                     }
                                 }
-                                in_flight.push(self.dispatch_push(
+                                in_flight.push(self.dispatch_push_bounded(
                                     0,
                                     chunk,
                                     batch_id,
-                                    PushRetry::Bounded {
-                                        budget: PER_CHUNK_RETRY_BUDGET,
-                                    },
+                                    PER_CHUNK_RETRY_BUDGET,
                                 ));
                             }
                         }};
@@ -2650,15 +3041,173 @@ mod tests {
             final_snap.chunks_pushed, total,
             "every chunk must be acked once the flaky one recovers",
         );
+        // `chunks_requeued` counts re-queues, not attempts: once the
+        // splitter drains, each re-dispatch hedges TAIL_HEDGE_WIDTH
+        // parallel attempts, so `fail_until` attempt-failures are
+        // absorbed by ~fail_until / TAIL_HEDGE_WIDTH re-queues.
+        let min_requeues = (fail_until as u64).div_ceil(TAIL_HEDGE_WIDTH as u64);
         assert!(
-            final_snap.chunks_requeued >= fail_until as u64,
-            "requeue counter should reflect the {fail_until} retries, got {}",
+            final_snap.chunks_requeued >= min_requeues,
+            "requeue counter should reflect ≥ {min_requeues} re-queues for {fail_until} failed attempts, got {}",
             final_snap.chunks_requeued,
         );
         assert!(
             !final_snap.stalled,
             "a recovered job must not report stalled"
         );
+    }
+
+    /// Harness for the tail-hedging test: the first chunk address it
+    /// sees becomes the "straggler". Its first push fails transiently
+    /// (so it enters the retry queue); every later push of it is
+    /// *held* (the ack sender is parked, no reply) so the test can
+    /// observe how many parallel pushsync lanes the driver opened for
+    /// it. All other chunks ack instantly.
+    struct HedgeHarness {
+        target: Mutex<Option<[u8; 32]>>,
+        held: Mutex<Vec<oneshot::Sender<ControlAck>>>,
+        target_attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    fn spawn_fake_pushsync_hedge() -> (mpsc::Sender<ControlCommand>, Arc<HedgeHarness>) {
+        let (tx, mut rx) = mpsc::channel::<ControlCommand>(64);
+        let h = Arc::new(HedgeHarness {
+            target: Mutex::new(None),
+            held: Mutex::new(Vec::new()),
+            target_attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let hc = h.clone();
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                match cmd {
+                    ControlCommand::PushChunk { wire, ack, .. } => {
+                        let mut span = [0u8; 8];
+                        span.copy_from_slice(&wire[..8]);
+                        let addr =
+                            ant_crypto::bmt::bmt_hash_with_span(&span, &wire[8..]).expect("BMT");
+                        let is_target = {
+                            let mut t = hc.target.lock().expect("target");
+                            if t.is_none() {
+                                *t = Some(addr);
+                            }
+                            *t == Some(addr)
+                        };
+                        if is_target {
+                            let n = hc
+                                .target_attempts
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            if n == 0 {
+                                // First attempt: transient failure → the
+                                // chunk parks in the retry queue and its
+                                // re-dispatch is hedged once the splitter
+                                // is drained.
+                                let _ = ack.send(ControlAck::Error {
+                                    message: "connection reset by peer (transient)".into(),
+                                });
+                            } else {
+                                // Hedged re-dispatch lanes: hold the ack so
+                                // the test can count the parallel lanes
+                                // before releasing one.
+                                hc.held.lock().expect("held").push(ack);
+                            }
+                            continue;
+                        }
+                        let _ = ack.send(ControlAck::ChunkUploaded {
+                            reference: format!("0x{}", hex::encode(addr)),
+                        });
+                    }
+                    ControlCommand::VerifyChunksPresent { addresses, ack, .. } => {
+                        let body = serde_json::json!({
+                            "checked": addresses.len(),
+                            "missing": Vec::<String>::new(),
+                        });
+                        let _ = ack.send(ControlAck::Ok {
+                            message: body.to_string(),
+                        });
+                    }
+                    ControlCommand::PostageList { ack } => {
+                        let _ = ack.send(ControlAck::PostageList(Vec::new()));
+                    }
+                    other => panic!("unexpected control command in hedge test: {other:?}"),
+                }
+            }
+        });
+        (tx, h)
+    }
+
+    /// Fix 2 (tail hedging): once the splitter is drained and a lone
+    /// straggler is being retried, its re-dispatch must fan out to
+    /// [`TAIL_HEDGE_WIDTH`] *concurrent* pushsync commands — the
+    /// serial peer-walk tail observed on the 1 GiB stress run — and
+    /// the first receipt completes the chunk.
+    #[tokio::test(start_paused = true)]
+    async fn tail_straggler_is_hedged_across_parallel_pushes() {
+        let len = 20_000usize;
+        let payload: Vec<u8> = (0..len).map(|i| ((i * 19) % 251) as u8).collect();
+        let f = write_temp_file(&payload);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let (tx, harness) = spawn_fake_pushsync_hedge();
+        let mgr = UploadManager::new(state_dir.path().to_path_buf(), tx, None).expect("manager");
+
+        let id = mgr
+            .start(f.path().to_path_buf(), None, None, None, true)
+            .expect("start");
+
+        // Wait (in auto-advanced logical time) for the straggler's
+        // re-dispatch to open all hedge lanes.
+        let mut lanes = 0;
+        for _ in 0..2_000 {
+            lanes = harness.held.lock().expect("held").len();
+            if lanes >= TAIL_HEDGE_WIDTH {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            lanes, TAIL_HEDGE_WIDTH,
+            "tail straggler should race TAIL_HEDGE_WIDTH parallel pushes",
+        );
+
+        // Release one lane — the first receipt must win and the job
+        // must complete (the other lanes' acks are simply dropped).
+        let ack = harness.held.lock().expect("held").pop().expect("lane");
+        let addr = harness.target.lock().expect("target").expect("target");
+        let _ = ack.send(ControlAck::ChunkUploaded {
+            reference: format!("0x{}", hex::encode(addr)),
+        });
+
+        let mut rx = mgr.subscribe(&id).expect("subscribe");
+        let final_snap = loop {
+            let snap = rx.borrow().clone();
+            if snap.status.is_terminal() {
+                break snap;
+            }
+            rx.changed().await.expect("watch");
+        };
+        assert_eq!(final_snap.status, UploadStatus::Completed);
+        assert_eq!(
+            final_snap.chunks_pushed,
+            estimate_chunk_count(len as u64, true),
+        );
+    }
+
+    /// Fix 4 (jitter): the retry back-off must stay inside the
+    /// documented ±25 % band and actually vary between calls, so a
+    /// reset storm that re-queues a whole window of chunks at once
+    /// doesn't wake them all in the same instant.
+    #[test]
+    fn jitter_stays_within_band_and_varies() {
+        let base = Duration::from_secs(4);
+        let mut distinct = HashSet::new();
+        for _ in 0..200 {
+            let j = with_jitter(base);
+            assert!(
+                j >= base * 750 / 1000 && j <= base * 1250 / 1000,
+                "jitter {j:?} outside ±25% of {base:?}",
+            );
+            distinct.insert(j.as_nanos());
+        }
+        assert!(distinct.len() > 1, "jitter should vary across calls");
     }
 
     /// Fake node loop that mirrors the real `PushChunk` handler's

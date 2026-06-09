@@ -305,8 +305,14 @@ deliberately C-shaped, no codegen, header maintained by hand next to
 UniFFI-generated `.xcframework`; until then, this is the supported way
 to embed ant in an iOS app.
 
-An interim third-party release of this surface as a zipped
-`AntFFI.xcframework` (SPM `binaryTarget` + Swift wrapper package) is
-planned — see PLAN.md § "Interim releasable iOS artifact —
-`AntFFI.xcframework` (pre-UniFFI)" for the work items and known
-limitations.
+An interim third-party release of this surface ships as a zipped
+`AntFFI.xcframework` on the GitHub releases page (per `v*` tag, built
+by `.github/workflows/release-ios.yml` via
+`cargo xtask build-ios-xcframework`): device + fat-simulator static
+libraries, `ant.h`, and a `module.modulemap` so consumers `import
+AntFFI` — consumable as an SPM `binaryTarget` using the published
+`AntFFI.xcframework.zip.checksum`. Min iOS 15.0; the `chain` feature
+is baked in; the ABI is pre-1.0 and will change when the UniFFI
+artefact lands. See PLAN.md § "Interim releasable iOS artifact —
+`AntFFI.xcframework` (pre-UniFFI)" for remaining work items (Swift
+wrapper package, codesigning) and known limitations.

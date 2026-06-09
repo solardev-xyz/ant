@@ -13,6 +13,7 @@
 //!     cargo xtask build-ios-sim --profile debug
 //!     cargo xtask build-ios-device                 # aarch64-apple-ios (real iPhone / iPad)
 //!     cargo xtask build-ios-device --profile debug
+//!     cargo xtask build-ios-xcframework            # releasable AntFFI.xcframework (macOS only)
 //!
 //!     cargo xtask build-android-arm64              # aarch64-linux-android
 //!     cargo xtask build-android-armv7              # armv7-linux-androideabi
@@ -43,6 +44,13 @@ const DEFAULT_SIM_TARGET: &str = "aarch64-apple-ios-sim";
 const X86_SIM_TARGET: &str = "x86_64-apple-ios";
 const DEVICE_TARGET: &str = "aarch64-apple-ios";
 
+/// Minimum iOS the released `AntFFI.xcframework` supports. Pinned
+/// explicitly (instead of inheriting rustc's per-target default) so
+/// the artifact has a documented, predictable floor. iOS 15 covers
+/// every device back to the iPhone 6s; the in-repo example apps use a
+/// much newer target, but they are demos, not the shipped artifact.
+const IOS_DEPLOYMENT_TARGET: &str = "15.0";
+
 const ANDROID_ARM64_TARGET: &str = "aarch64-linux-android";
 const ANDROID_ARMV7_TARGET: &str = "armv7-linux-androideabi";
 const ANDROID_X86_64_TARGET: &str = "x86_64-linux-android";
@@ -67,14 +75,15 @@ fn run() -> Result<()> {
     let sub = args.next().ok_or_else(|| {
         anyhow!(
             "missing subcommand (try `build-ios-sim`, `build-ios-device`, \
-             `build-android-arm64`, `build-android-armv7`, `build-android-x86_64`, \
-             or `build-android-all`)"
+             `build-ios-xcframework`, `build-android-arm64`, `build-android-armv7`, \
+             `build-android-x86_64`, or `build-android-all`)"
         )
     })?;
     let rest: Vec<OsString> = args.collect();
     match sub.to_string_lossy().as_ref() {
         "build-ios-sim" => build_ios(rest, IosFlavor::Simulator),
         "build-ios-device" => build_ios(rest, IosFlavor::Device),
+        "build-ios-xcframework" => build_ios_xcframework(&rest),
         "build-android-arm64" => build_android_one(&rest, ANDROID_ARM64_TARGET),
         "build-android-armv7" => build_android_one(&rest, ANDROID_ARMV7_TARGET),
         "build-android-x86_64" => build_android_one(&rest, ANDROID_X86_64_TARGET),
@@ -98,6 +107,10 @@ fn print_help() {
              build-ios-device [--profile debug|release]\n\
                  Cross-compile crates/ant-ffi for a real iPhone / iPad\n\
                  (aarch64-apple-ios). Default: --profile release.\n\
+             build-ios-xcframework\n\
+                 Build the releasable AntFFI.xcframework (device +\n\
+                 fat-simulator slices, header + module map). Always\n\
+                 release + `chain`; requires macOS (lipo, xcodebuild).\n\
              build-android-arm64 [--profile debug|release]\n\
                  Cross-compile crates/ant-ffi for arm64 Android phones\n\
                  (aarch64-linux-android). Default: --profile release.\n\
@@ -245,6 +258,135 @@ fn parse_build_opts(args: Vec<OsString>, flavor: IosFlavor) -> Result<BuildOpts>
         profile,
         features,
     })
+}
+
+// ---------------------------------------------------------------------------
+// AntFFI.xcframework (the interim pre-UniFFI release artifact;
+// PLAN.md § "Interim releasable iOS artifact")
+// ---------------------------------------------------------------------------
+
+/// Build the releasable `AntFFI.xcframework`: device + fat-simulator
+/// static libraries, the hand-written C header, and a module map so
+/// Swift consumers write `import AntFFI` with no bridging header.
+///
+/// Always `--release --features chain` — features are baked into a
+/// staticlib, and one variant beats a 2× artifact matrix (non-chain
+/// callers pay only size). Must run on macOS (`lipo` + `xcodebuild`).
+fn build_ios_xcframework(args: &[OsString]) -> Result<()> {
+    if !args.is_empty() {
+        bail!("build-ios-xcframework takes no arguments (always release + chain)");
+    }
+    let workspace_root = workspace_root()?;
+
+    // 1. Cross-compile the three slices, pinning the deployment
+    //    target so the artifact has a documented min-iOS floor.
+    for target in [DEVICE_TARGET, DEFAULT_SIM_TARGET, X86_SIM_TARGET] {
+        ensure_rust_target(target)?;
+        let mut cmd = Command::new(cargo_bin());
+        cmd.arg("build")
+            .arg("-p")
+            .arg("ant-ffi")
+            .arg("--release")
+            .arg("--features")
+            .arg("chain")
+            .arg("--target")
+            .arg(target)
+            .env("IPHONEOS_DEPLOYMENT_TARGET", IOS_DEPLOYMENT_TARGET)
+            .current_dir(&workspace_root);
+        let status = cmd
+            .status()
+            .with_context(|| format!("spawn `cargo build --target {target}`"))?;
+        if !status.success() {
+            bail!("cargo build --target {target} failed");
+        }
+    }
+
+    let slice = |target: &str| {
+        workspace_root
+            .join("target")
+            .join(target)
+            .join("release")
+            .join("libant_ffi.a")
+    };
+    let device_lib = slice(DEVICE_TARGET);
+    let sim_arm = slice(DEFAULT_SIM_TARGET);
+    let sim_x86 = slice(X86_SIM_TARGET);
+    for lib in [&device_lib, &sim_arm, &sim_x86] {
+        if !lib.exists() {
+            bail!("expected {} after build, but it is missing", lib.display());
+        }
+    }
+
+    // 2. Staging area. Recreated from scratch every run so a stale
+    //    header or library can't leak into the artifact.
+    let stage = workspace_root.join("target").join("ios-xcframework");
+    if stage.exists() {
+        std::fs::remove_dir_all(&stage)
+            .with_context(|| format!("clear staging dir {}", stage.display()))?;
+    }
+    std::fs::create_dir_all(&stage)?;
+
+    // 3. `lipo` the two simulator slices into one fat library:
+    //    `-create-xcframework` accepts only one library per
+    //    platform-variant (here: ios-simulator).
+    let sim_fat_dir = stage.join("sim-fat");
+    std::fs::create_dir_all(&sim_fat_dir)?;
+    let sim_fat = sim_fat_dir.join("libant_ffi.a");
+    let status = Command::new("lipo")
+        .arg("-create")
+        .arg(&sim_arm)
+        .arg(&sim_x86)
+        .arg("-output")
+        .arg(&sim_fat)
+        .status()
+        .context("spawn `lipo` (this subcommand must run on macOS)")?;
+    if !status.success() {
+        bail!("lipo -create failed");
+    }
+
+    // 4. Stage the header + module map. The `link` directives carry
+    //    the mandatory system-framework dependencies into consumers
+    //    via autolinking, so an SPM `binaryTarget` user doesn't
+    //    rediscover the linker errors by hand.
+    let headers = stage.join("Headers");
+    std::fs::create_dir_all(&headers)?;
+    std::fs::copy(
+        workspace_root
+            .join("crates")
+            .join("ant-ffi")
+            .join("include")
+            .join("ant.h"),
+        headers.join("ant.h"),
+    )
+    .context("stage ant.h")?;
+    std::fs::write(
+        headers.join("module.modulemap"),
+        "module AntFFI {\n    header \"ant.h\"\n    link framework \"Security\"\n    link framework \"SystemConfiguration\"\n    link framework \"CoreFoundation\"\n    export *\n}\n",
+    )
+    .context("write module.modulemap")?;
+
+    // 5. Assemble the xcframework.
+    let out = stage.join("AntFFI.xcframework");
+    let status = Command::new("xcodebuild")
+        .arg("-create-xcframework")
+        .arg("-library")
+        .arg(&device_lib)
+        .arg("-headers")
+        .arg(&headers)
+        .arg("-library")
+        .arg(&sim_fat)
+        .arg("-headers")
+        .arg(&headers)
+        .arg("-output")
+        .arg(&out)
+        .status()
+        .context("spawn `xcodebuild -create-xcframework`")?;
+    if !status.success() {
+        bail!("xcodebuild -create-xcframework failed");
+    }
+
+    println!("{}", out.display());
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
