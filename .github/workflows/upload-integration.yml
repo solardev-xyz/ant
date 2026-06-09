@@ -91,7 +91,9 @@ jobs:
         if: steps.guard.outputs.ok == 'true'
         run: |
           cargo build --release -p antd -p antctl
-          cargo build --release -p ant-ffi --features chain --example upload_smoke
+          # `--lib` emits the staticlib (libant_ffi.a) for the C-ABI symbol
+          # smoke; `--example` alone does not produce the staticlib artifact.
+          cargo build --release -p ant-ffi --features chain --lib --example upload_smoke
 
       - name: ant-ffi C-ABI upload symbol smoke
         if: steps.guard.outputs.ok == 'true'
