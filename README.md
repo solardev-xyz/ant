@@ -97,19 +97,25 @@ the still-open items.
 
 ## What's not here yet
 
-- **Mobile artefact.** A hand-written `extern "C"` slice of
-  `ant-ffi` exists, and an iOS download smoke-test app in
-  [`examples/ios-download/`](examples/ios-download/) links it to
-  shake out iOS-side transport edges (PLAN.md § 9). The UniFFI
-  `.xcframework` / Kotlin `.aar` that meets the Phase-4 size budget
-  and API surface is still not built.
-- **Automatic SWAP settlement triggers.** The cheque issuance + emit
-  primitives are in place and the wire protocol is registered; the
-  hook that decides "outbound debt for peer P just crossed the
-  payment threshold, sign + emit a cheque" is not wired into
-  `ant-retrieval::accounting` yet. Operators today can issue cheques
-  programmatically through `ant_p2p::swap::issue_and_emit`, but
-  routine pay-as-you-fetch is still on the to-do list.
+- **Mobile artefact.** The hand-written `extern "C"` / JNI surface in
+  [`ant-ffi`](crates/ant-ffi) has grown well past the original smoke
+  test — downloads, streaming, uploads, storage plans, account info —
+  and is exercised by three example apps
+  ([`examples/ios-download/`](examples/ios-download/),
+  [`examples/ios-drive/`](examples/ios-drive/),
+  [`examples/android-download/`](examples/android-download/)). But
+  there is no *releasable* artefact yet: the UniFFI `.xcframework` /
+  Kotlin `.aar` that meets the Phase-4 size budget is not built, and
+  the interim `AntFFI.xcframework` packaging track (PLAN.md § "Interim
+  releasable iOS artifact") is planned but not started.
+- **Retrieval-side SWAP settlement.** Upload-side settlement is
+  done: the pushsync dialer signs + emits cheques when outbound debt
+  crosses the payment threshold and drives bee's pseudosettle
+  refreshments alongside (PLAN.md Phases 7b/7d — proven by a
+  sustained 256 MiB / 66 K-chunk mainnet upload). The *retrieval*
+  path still relies on pseudosettle alone (fine in light mode); a
+  cheque-emitting hook in `ant-retrieval::accounting` for routine
+  pay-as-you-fetch remains on the to-do list.
 - **Live `cheque_smoke` re-run with the corrected EIP-712 digest.**
   Tier-1 (`antctl chequebook cash-self --submit`, see above) caught a
   real bug in our EIP-712 implementation — bee's chequebook domain is
@@ -192,9 +198,9 @@ the still-open items.
 | [`ant-crypto`](crates/ant-crypto) | secp256k1, keccak256, BMT, CAC/SOC validation, overlay derivation. |
 | [`ant-postage`](crates/ant-postage) | EIP-191 stamp issuer with crash-safe bucket-counter persistence. |
 | [`ant-chain`](crates/ant-chain) | Gnosis JSON-RPC client + ABI calldata builders + EIP-155 transaction signer; ERC-20, PostageStamp, SimpleSwap chequebook. |
-| [`ant-ffi`](crates/ant-ffi) | Hand-written `extern "C"` surface + `ant.h` for the iOS download smoke test (PLAN.md § 9). Throwaway — replaced by UniFFI in M2 Phase 4. |
+| [`ant-ffi`](crates/ant-ffi) | Hand-written `extern "C"` + JNI surface (`ant.h`) embedding the full light-node in mobile apps: downloads, streaming, uploads, storage plans, account (see its [README](crates/ant-ffi/README.md)). Pre-UniFFI — superseded by the Phase-4 artefact when it lands. |
 
-Current workspace version: **`0.5.15`** across all crates (the deployment
+Current workspace version: **`0.5.16`** across all crates (the deployment
 bump on each release to `vibing.at/ant`; see `AGENTS.md`).
 
 ## Requirements
@@ -428,7 +434,12 @@ open examples/ios-download/AntDownload.xcodeproj
 
 Pick an iPhone simulator and ⌘R. See
 [`examples/ios-download/README.md`](examples/ios-download/README.md)
-for troubleshooting and the ant / app responsibility split.
+for troubleshooting and the ant / app responsibility split. The
+bigger sibling, [`examples/ios-drive/`](examples/ios-drive/)
+(AntDrive), exercises the full `ant-ffi` surface: uploads, storage
+plans, and on-chain plan purchase. For embedding `ant-ffi` in your
+own iOS app, start with
+[`crates/ant-ffi/README.md`](crates/ant-ffi/README.md).
 
 ## Further reading
 
