@@ -18,13 +18,12 @@ struct GetStartedView: View {
     @State private var selected: StoragePlanTier?
     @State private var quote: StorageQuote?
     @State private var quotes: [String: StorageQuote] = [:]
-    @State private var usdRate: Double?
     @State private var loadingQuotes = false
     @State private var loadingQuote = false
     @State private var error: String?
-    /// Flips true the moment a polled balance check sees the plan become
-    /// funded, so the payment step can call out that the payment landed.
-    @State private var paymentArrived = false
+    /// One-shot guard so funds-detected auto-activation fires only once per
+    /// payment session (a failed activation must not re-trigger a loop).
+    @State private var didAutoActivate = false
 
     var body: some View {
         NavigationStack {
@@ -36,7 +35,7 @@ struct GetStartedView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     if step == .payment {
-                        Button("Back") { withAnimation { step = .plan; quote = nil; paymentArrived = false } }
+                        Button("Back") { withAnimation { step = .plan; quote = nil; didAutoActivate = false } }
                     } else if step == .plan {
                         Button("Close") { dismiss() }
                     }
@@ -108,6 +107,10 @@ struct GetStartedView: View {
                     priceColumn(for: tier)
                 }
             }
+            // Make the whole card (incl. the empty spacer gap) tappable,
+            // not just the text/price — the default hit area is only the
+            // laid-out subviews.
+            .contentShape(.rect(cornerRadius: 28))
         }
         .buttonStyle(.plain)
         .disabled(loadingQuote)
@@ -115,16 +118,12 @@ struct GetStartedView: View {
 
     @ViewBuilder private func priceColumn(for tier: StoragePlanTier) -> some View {
         if let q = quotes[tier.id] {
-            VStack(alignment: .trailing, spacing: 2) {
-                Text(usdString(forBzz: q.totalCostBzz) ?? "\(q.totalCostBzz) xBZZ")
-                    .font(.headline.weight(.bold))
-                    .foregroundStyle(.white)
-                if usdRate != nil {
-                    Text("\(q.totalCostBzz) xBZZ")
-                        .font(.caption2)
-                        .foregroundStyle(.white.opacity(0.6))
-                }
-            }
+            // USD only here; the payment page shows the same figure in xDAI
+            // (both derived from the rounded-up xDAI-to-send, so they agree).
+            let price = roundedUpXdai(q.xdaiToSendDisplay)
+            Text(usdFromXdai(price) ?? "$\(price)")
+                .font(.headline.weight(.bold))
+                .foregroundStyle(.white)
         } else if loadingQuotes {
             ProgressView().tint(.white)
         } else {
@@ -134,150 +133,88 @@ struct GetStartedView: View {
 
     // MARK: Step 2 — payment information
 
+    /// Stripped to the essentials: how much xDAI to send, where to send it,
+    /// a live waiting/received status (driven by the balance poll), and
+    /// Activate. No price breakdown, no manual refresh, no prose.
     @ViewBuilder private var paymentStep: some View {
-        ScrollView {
-            VStack(spacing: 18) {
-                if let tier = selected, let quote {
-                    VStack(spacing: 6) {
-                        Text(tier.title)
-                            .font(.system(.title2, design: .rounded).weight(.bold))
-                            .foregroundStyle(.white)
-                        Text("Up to \(formatBytes(tier.safeLimitBytes)) for \(tier.durationLabel)")
+        if let quote {
+            VStack(spacing: 22) {
+                Spacer(minLength: 0)
+
+                if quote.sufficientFunds {
+                    Label("Payment received", systemImage: "checkmark.circle.fill")
+                        .font(.title3.weight(.semibold))
+                        .foregroundStyle(.green)
+                } else {
+                    sendCard(quote)
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small).tint(.white)
+                        Text("Waiting for payment…")
                             .font(.subheadline)
                             .foregroundStyle(.white.opacity(0.7))
                     }
-                    .padding(.top, 8)
+                }
 
-                    GlassCard {
-                        VStack(spacing: 14) {
-                            HStack(alignment: .firstTextBaseline) {
-                                Text("Price")
-                                    .font(.subheadline)
-                                    .foregroundStyle(.white.opacity(0.7))
-                                Spacer()
-                                VStack(alignment: .trailing, spacing: 2) {
-                                    Text(usdString(forBzz: quote.totalCostBzz) ?? "\(quote.totalCostBzz) xBZZ")
-                                        .font(.title3.weight(.bold))
-                                        .foregroundStyle(.white)
-                                    if usdRate != nil {
-                                        Text("\(quote.totalCostBzz) xBZZ")
-                                            .font(.caption)
-                                            .foregroundStyle(.white.opacity(0.6))
-                                    }
-                                }
-                            }
-                            Divider().overlay(.white.opacity(0.2))
-                            payRow("Pay with", "\(quote.xdaiRequiredDisplay) xDAI")
-                            payRow("Your xDAI", "\(quote.accountXdaiDisplay) xDAI",
-                                   tint: quote.sufficientFunds ? .white : .orange)
-                            payRow("Status", quote.sufficientFunds ? "Ready to activate" : "Needs funds",
-                                   tint: quote.sufficientFunds ? .green : .orange)
-                        }
-                    }
+                Spacer(minLength: 0)
 
-                    if !quote.sufficientFunds {
-                        fundingCard(quote)
-                    } else if paymentArrived {
-                        Label("Payment received — ready to activate", systemImage: "checkmark.circle.fill")
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(.green)
-                            .frame(maxWidth: .infinity)
-                            .transition(.opacity)
-                    }
+                Button { activate() } label: {
+                    Text("Activate")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .glassEffect(.regular.tint(.blue.opacity(quote.sufficientFunds ? 0.6 : 0.2)),
+                                     in: .capsule)
+                        .foregroundStyle(.white.opacity(quote.sufficientFunds ? 1 : 0.5))
+                }
+                .buttonStyle(.plain)
+                .disabled(!quote.sufficientFunds)
 
-                    Button { activate() } label: {
-                        Text(quote.sufficientFunds ? "Activate storage" : "I've sent xDAI — Activate")
-                            .font(.headline)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 14)
-                            .glassEffect(.regular.tint(.blue.opacity(0.6)), in: .capsule)
-                            .foregroundStyle(.white)
-                    }
-                    .buttonStyle(.plain)
-
-                    Button("Refresh balance") { reprice() }
-                        .font(.subheadline)
-                        .foregroundStyle(.white.opacity(0.8))
-
-                    Text("Activating swaps your xDAI to storage credit and registers your plan on the Gnosis network. This can take a minute.")
-                        .font(.caption)
-                        .foregroundStyle(.white.opacity(0.55))
+                if let error {
+                    Text(error)
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
                         .multilineTextAlignment(.center)
-
-                    if let error {
-                        Text(error)
-                            .font(.footnote)
-                            .foregroundStyle(.orange)
-                            .multilineTextAlignment(.center)
-                    }
                 }
             }
-            .padding(20)
+            .padding(24)
+            .task { await pollForPayment() }
         }
-        .task { await pollForPayment() }
     }
 
-    private func fundingCard(_ quote: StorageQuote) -> some View {
-        GlassCard {
-            VStack(alignment: .leading, spacing: 12) {
-                Label("Add funds to activate", systemImage: "creditcard")
-                    .font(.headline)
-                    .foregroundStyle(.white)
-                Text("Send this much xDAI to your account address on the Gnosis network. AntDrive converts it to storage credit and activates your plan — no other tokens needed.")
-                    .font(.subheadline)
-                    .foregroundStyle(.white.opacity(0.7))
-
-                sendRow(amount: "\(quote.xdaiToSendDisplay) xDAI",
-                        usd: usdFromXdai(quote.xdaiToSendDisplay),
-                        note: "covers the swap to xBZZ + network fees")
-
-                if let addr = node.account?.ethAddress {
-                    Text("Send to your account address")
+    /// The single instruction: send this much xDAI to this address (tap to
+    /// copy). Everything else the user needs is already on the plan picker.
+    private func sendCard(_ quote: StorageQuote) -> some View {
+        let send = roundedUpXdai(quote.xdaiToSendDisplay)
+        return GlassCard {
+            VStack(spacing: 16) {
+                VStack(spacing: 2) {
+                    Text("Send")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.white.opacity(0.6))
-                        .padding(.top, 2)
-                    HStack {
-                        Text(addr)
-                            .font(.caption.monospaced())
-                            .foregroundStyle(.white)
-                            .lineLimit(1).truncationMode(.middle)
-                        Spacer()
-                        Button {
-                            UIPasteboard.general.string = addr
-                        } label: {
-                            Image(systemName: "doc.on.doc").foregroundStyle(.white.opacity(0.85))
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// One "send X — for Y" line in the funding instructions.
-    private func sendRow(amount: String, usd: String?, note: String) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Image(systemName: "arrow.up.circle.fill")
-                .foregroundStyle(.blue)
-            VStack(alignment: .leading, spacing: 1) {
-                HStack(spacing: 6) {
-                    Text(amount)
-                        .font(.subheadline.weight(.bold))
+                    Text("\(send) xDAI")
+                        .font(.system(.largeTitle, design: .rounded).weight(.bold))
                         .foregroundStyle(.white)
-                    if let usd {
-                        Text("(≈\(usd))")
-                            .font(.caption)
-                            .foregroundStyle(.white.opacity(0.6))
-                    }
                 }
-                Text(note)
-                    .font(.caption)
-                    .foregroundStyle(.white.opacity(0.6))
+                if let addr = node.account?.ethAddress {
+                    Button {
+                        UIPasteboard.general.string = addr
+                    } label: {
+                        HStack {
+                            Text(addr)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.white)
+                                .lineLimit(1).truncationMode(.middle)
+                            Spacer()
+                            Image(systemName: "doc.on.doc")
+                                .foregroundStyle(.white.opacity(0.85))
+                        }
+                        .padding(12)
+                        .background(.white.opacity(0.06), in: .rect(cornerRadius: 12))
+                    }
+                    .buttonStyle(.plain)
+                }
             }
-            Spacer()
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(10)
-        .background(.white.opacity(0.06), in: .rect(cornerRadius: 12))
     }
 
     /// xDAI is a USD stablecoin (~$1), so its USD value is ~1:1.
@@ -286,16 +223,14 @@ struct GetStartedView: View {
         return PriceOracle.formatUsd(amount)
     }
 
-    private func payRow(_ label: String, _ value: String, strong: Bool = false, tint: Color = .white) -> some View {
-        HStack {
-            Text(label)
-                .font(.subheadline)
-                .foregroundStyle(.white.opacity(0.7))
-            Spacer()
-            Text(value)
-                .font(strong ? .title3.weight(.bold) : .subheadline.weight(.semibold))
-                .foregroundStyle(tint)
-        }
+    /// Round the funding amount up to the next whole cent (0.01 xDAI) so
+    /// the user sends a clean figure with a hair of headroom — never less
+    /// than the quote requires. The small epsilon keeps a value already on
+    /// a cent boundary from being bumped a cent by float error.
+    private func roundedUpXdai(_ xdai: String) -> String {
+        guard let amount = Double(xdai) else { return xdai }
+        let cents = (amount * 100 - 1e-6).rounded(.up)
+        return String(format: "%.2f", max(0, cents) / 100)
     }
 
     // MARK: Step 3 — activating
@@ -321,15 +256,14 @@ struct GetStartedView: View {
         return r.isEmpty ? defaultRpc : r
     }
 
-    /// Fetch the USD rate + a quote for every plan so the picker can show
-    /// each plan's price up front. Best-effort per plan.
+    /// Fetch a quote for every plan so the picker can show each plan's
+    /// all-in price (xDAI to send) up front. Best-effort per plan.
     private func loadPlans() async {
         if rpc.trimmingCharacters(in: .whitespaces).isEmpty { rpc = defaultRpc }
         loadingQuotes = true
         defer { loadingQuotes = false }
         let rpcURL = activeRpc
         let drive = node
-        async let rate = PriceOracle.bzzUsd()
         await withTaskGroup(of: (String, StorageQuote?).self) { group in
             for tier in StoragePlanTier.all {
                 group.addTask {
@@ -341,22 +275,15 @@ struct GetStartedView: View {
                 if let q { quotes[id] = q }
             }
         }
-        usdRate = await rate
         if quotes.isEmpty {
             error = "Couldn't reach the network to price plans. Pull to retry."
         }
     }
 
-    /// USD string for an xBZZ decimal string, or nil if no rate yet.
-    private func usdString(forBzz bzz: String) -> String? {
-        guard let rate = usdRate, let amount = Double(bzz) else { return nil }
-        return PriceOracle.formatUsd(amount * rate)
-    }
-
     private func choose(_ tier: StoragePlanTier) {
         selected = tier
         error = nil
-        paymentArrived = false
+        didAutoActivate = false
         if rpc.trimmingCharacters(in: .whitespaces).isEmpty { rpc = defaultRpc }
         // Use the price already fetched for the picker when we have it;
         // otherwise fetch it now.
@@ -378,7 +305,6 @@ struct GetStartedView: View {
                 let q = try await node.quoteStorage(rpc: activeRpc, depth: tier.depth, days: tier.days)
                 quote = q
                 quotes[tier.id] = q
-                if usdRate == nil { usdRate = await PriceOracle.bzzUsd() }
                 withAnimation { step = .payment }
             } catch {
                 self.error = error.localizedDescription
@@ -388,28 +314,35 @@ struct GetStartedView: View {
 
     /// While the payment step is on screen and the plan is still unfunded,
     /// re-quote every few seconds. A re-quote re-reads the account's
-    /// on-chain xDAI balance, so when an incoming transfer lands the UI
-    /// flips itself to "Ready to activate" — no manual "Refresh balance"
-    /// tap needed. The `.task` driving this is cancelled automatically when
-    /// the step changes (Back / Activate), which ends the loop.
+    /// on-chain xDAI balance, so when an incoming transfer lands we activate
+    /// the plan automatically — no tap needed. The `.task` driving this is
+    /// cancelled when the step changes (Back / Activate), ending the loop.
     private func pollForPayment() async {
         guard let tier = selected else { return }
         while !Task.isCancelled {
-            if quote?.sufficientFunds == true { return }
+            if quote?.sufficientFunds == true { autoActivateIfFunded(); return }
             try? await Task.sleep(nanoseconds: 6_000_000_000)
             if Task.isCancelled { return }
             guard let fresh = try? await node.quoteStorage(rpc: activeRpc,
                                                            depth: tier.depth,
                                                            days: tier.days)
             else { continue }
-            let justFunded = quote?.sufficientFunds == false && fresh.sufficientFunds
             withAnimation {
                 quote = fresh
                 quotes[tier.id] = fresh
-                if justFunded { paymentArrived = true }
             }
-            if fresh.sufficientFunds { return }
+            if fresh.sufficientFunds { autoActivateIfFunded(); return }
         }
+    }
+
+    /// Kick off activation the instant funds are detected, but only once per
+    /// payment session — so a failed activation (which drops back to the
+    /// payment step) doesn't immediately re-trigger an infinite loop. The
+    /// Activate button remains as a manual retry.
+    private func autoActivateIfFunded() {
+        guard !didAutoActivate else { return }
+        didAutoActivate = true
+        activate()
     }
 
     private func activate() {

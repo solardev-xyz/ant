@@ -45,7 +45,6 @@ struct FilesView: View {
         }
         .preferredColorScheme(.dark)
         .overlay(alignment: .top) { bannerView }
-        .overlay(alignment: .bottomTrailing) { addButton }
         .fileImporter(isPresented: $showImporter,
                       allowedContentTypes: [.item],
                       allowsMultipleSelection: true) { handleImport($0) }
@@ -72,6 +71,7 @@ struct FilesView: View {
                     .foregroundStyle(.white.opacity(0.65))
             }
             Spacer()
+            addButton
         }
         .padding(.horizontal, 6)
     }
@@ -125,25 +125,24 @@ struct FilesView: View {
 
     /// The add button only appears once storage is active — uploads and
     /// link imports require a storage plan, so before that the Get
-    /// Started greeter is the only call to action.
+    /// Started greeter is the only call to action. It lives in the header
+    /// row, top-right, aligned with the "Files" headline.
     ///
     /// This is a plain glass `Button` (not a `Menu`): a `Menu` whose label
     /// carries a hand-applied `.glassEffect` flickers on iOS 26 because the
     /// system can't morph the custom glass into the menu. The options are
     /// presented via a `confirmationDialog` instead, which has no glass
-    /// morph and keeps the FAB rock-steady.
+    /// morph and keeps the button rock-steady.
     @ViewBuilder private var addButton: some View {
         if node.hasStorage {
             Button { showAddOptions = true } label: {
                 Image(systemName: "plus")
                     .font(.title2.weight(.semibold))
                     .foregroundStyle(.white)
-                    .frame(width: 60, height: 60)
+                    .frame(width: 48, height: 48)
                     .glassEffect(.regular.tint(.blue.opacity(0.5)), in: .circle)
             }
             .buttonStyle(.plain)
-            .padding(.trailing, 22)
-            .padding(.bottom, 110)
             .confirmationDialog("Add to AntDrive", isPresented: $showAddOptions,
                                 titleVisibility: .visible) {
                 Button("Upload photos") { showPhotoPicker = true }
