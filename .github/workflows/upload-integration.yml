@@ -2,8 +2,8 @@
 #
 # This is NOT part of the per-PR gate (see ci.yml): it dials mainnet, spends
 # real BZZ on a postage batch, and needs wallet secrets — so it runs only on
-# a nightly schedule and on manual dispatch, and it no-ops (succeeds) when the
-# wallet secrets aren't configured (e.g. on forks).
+# manual dispatch, and it no-ops (succeeds) when the wallet secrets aren't
+# configured (e.g. on forks).
 #
 # It builds antd + antctl + ant-ffi, smoke-checks the ant-ffi C-ABI upload
 # symbols, then uploads 1 MB / 10 MB files through a freshly started isolated
@@ -36,9 +36,6 @@ on:
         description: "Also run the FFI-driven upload smoke (needs ANT_FFI_IDENTITY + ANT_FFI_BATCH)"
         type: boolean
         default: false
-  schedule:
-    # Nightly at 04:27 UTC (off the hour to dodge the scheduler stampede).
-    - cron: "27 4 * * *"
 
 # Never run two of these at once — concurrent runs would race the same wallet
 # nonce / postage batch. Queue, don't cancel.
