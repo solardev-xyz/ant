@@ -57,7 +57,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch, Notify};
 use tracing::{debug, info, warn};
@@ -111,8 +111,15 @@ const CHECKPOINT_INTERVAL_CHUNKS: u64 = 256;
 /// re-dispatches that all queue against the same hot storer set.
 const PUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(2);
 
-/// Per-chunk retry budget before the job moves to `Failed`. Pushsync
-/// against a freshly-handshaked peer set occasionally fires a
+/// Per-chunk retry budget for the **bounded** push paths (post-upload
+/// heal re-push and startup heal). The *upload* path itself is
+/// unbounded — it retries a struggling chunk forever, bee-style, and
+/// never fails the job on transient peer churn (see [`PushRetry`] and
+/// `run_job`). Heal keeps a bounded budget so a background heal task
+/// can't wedge forever on a dead network: it gives up the current
+/// round, and the next startup heal pass retries.
+///
+/// Pushsync against a freshly-handshaked peer set occasionally fires a
 /// transient "no peers available" or "stamp signature rejected"
 /// error; a small fixed retry hides those from the operator without
 /// wallpapering over a real protocol failure.
@@ -149,9 +156,30 @@ const PER_CHUNK_RETRY_BUDGET: u32 = 8;
 /// this fix tried) avoids stretching the happy-path P95 by tens
 /// of seconds on busy uploads.
 fn backoff_for_retry(attempt: u32) -> std::time::Duration {
-    let ms = 250u64.saturating_mul(1u64 << attempt).min(4_000);
+    let ms = 250u64.saturating_mul(1u64 << attempt.min(20)).min(4_000);
     std::time::Duration::from_millis(ms)
 }
+
+/// Longer pause inserted between re-pushes when the failure looks like
+/// "no peer found for this chunk's neighbourhood" rather than a busy
+/// storer. Mirrors bee's `time.After(5 * time.Second)` on
+/// `topology.ErrNotFound` in `pushDeferred`: hammering instantly when
+/// the candidate set is empty just feeds the churn (a reset storm
+/// drops ~all candidates at once), so we back off and let topology
+/// re-converge before the next attempt.
+const NO_PEER_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How often the upload driver wakes (when otherwise blocked draining
+/// in-flight pushes) to fold the live re-queue counter into the job
+/// snapshot and re-evaluate the `stalled` liveness flag.
+const STALL_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// No chunk has acked for this long ⇒ surface `stalled = true` to
+/// watchers. The job is *not* failed — the daemon keeps retrying
+/// forever — but a blocking caller (`antctl upload` without
+/// `--detach`, the iOS follow stream) learns the upload isn't
+/// progressing instead of hanging silently against a dead network.
+const STALL_THRESHOLD: std::time::Duration = std::time::Duration::from_mins(3);
 
 /// Post-upload self-heal: after every chunk has been pushed, read the
 /// whole file back from the network and re-push any chunk that didn't
@@ -182,17 +210,69 @@ const HEAL_VERIFY_BATCH: usize = 512;
 /// next startup heal pass.
 const HEAL_PROBES: usize = 4;
 
-/// Skip the heal pass for files above this chunk count (~200 MB at
-/// 4 KiB leaves). A full network read-back of a multi-GB file would
-/// cost as much as a re-download; the per-chunk pushsync receipts on
-/// the way up are the reliability mechanism for those. Tunable.
-const HEAL_MAX_CHUNKS: usize = 50_000;
+/// Skip the heal pass for files above this chunk count. Raised from
+/// 50 000 (~200 MB) to 2 000 000 (~8 GB) now that heal re-pushes from
+/// the local chunk store (see [`UploadManager::repush_missing`])
+/// instead of re-reading + re-splitting the source file: the missing
+/// set is verified and re-pushed in bounded batches
+/// ([`HEAL_VERIFY_BATCH`] / [`MAX_PUSH_CONCURRENCY`]), so memory stays
+/// flat regardless of file size. The cap only bounds the address Vec
+/// the read-back walks (32 B/chunk ⇒ ~64 MB at the ceiling) and the
+/// total read-back cost; large multi-GB uploads now get a durability
+/// pass too, which they previously skipped entirely. Tunable.
+const HEAL_MAX_CHUNKS: usize = 2_000_000;
 
 /// Future returned by [`UploadManager::dispatch_push`]: a chunk-emit
 /// index (so the ack log can advance the in-order cursor) plus the
 /// outcome of the pushsync round-trip.
 type PushFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = (u64, Result<(), UploadError>)> + Send>>;
+
+/// Retry policy for [`UploadManager::dispatch_push`].
+enum PushRetry {
+    /// Retry transient failures indefinitely (the upload path —
+    /// bee-style "slow, never fail"). Each retry bumps the shared
+    /// observability counter.
+    Forever { requeued: Arc<AtomicU64> },
+    /// Retry transient failures up to `budget` attempts, then return
+    /// `Err` (the bounded heal re-push path).
+    Bounded { budget: u32 },
+}
+
+/// Classify a `PushChunk` error message as genuinely unrecoverable
+/// (so the upload path fails fast instead of retrying forever).
+///
+/// These are misconfiguration / capacity dead-ends, not peer churn:
+/// an unregistered or saturated immutable batch, a stamp-issuer
+/// failure, or a malformed chunk. Everything else (no peers,
+/// timeouts, connection resets, shallow placement, generic
+/// `pushsync:` transport errors) is treated as transient and
+/// re-pushed.
+fn is_fatal_push_error(message: &str) -> bool {
+    const FATAL_MARKERS: &[&str] = &[
+        "not usable",         // batch id not registered
+        "saturated",          // immutable batch collision bucket full
+        "stamp issue failed", // postage signing dead-end
+        "wire size out of range",
+        "failed to BMT-hash",
+        "uploads not configured",
+    ];
+    let m = message.to_ascii_lowercase();
+    FATAL_MARKERS.iter().any(|marker| m.contains(marker))
+}
+
+/// Whether a transient error looks like "no peer found for this
+/// chunk's neighbourhood" (vs a busy/slow storer). Such failures get
+/// the longer [`NO_PEER_BACKOFF`] pause, matching bee's `pushDeferred`
+/// 5 s wait on `topology.ErrNotFound`.
+fn is_no_peer_error(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("no peers")
+        || m.contains("no peer")
+        || m.contains("not found")
+        || m.contains("exhausted")
+        || m.contains("no closest")
+}
 
 #[derive(Debug, Error)]
 pub enum UploadError {
@@ -264,6 +344,14 @@ struct UploadManagerInner {
     /// `--postage-batch`. `None` → jobs must name a batch or the push
     /// is rejected by the node loop with "batch … not usable".
     default_batch_id: Option<[u8; 32]>,
+    /// The daemon's persistent chunk store. The `PushChunk` handler
+    /// writes every stamped chunk's wire bytes here (keyed by address)
+    /// *before* pushsync, so heal can re-push a missing chunk by
+    /// reading its payload straight from disk — no dependency on the
+    /// source file (which an app may have deleted) and surviving a
+    /// node restart. `None` in tests / `--no-disk-cache`, where heal
+    /// falls back to re-deriving chunks from the source file.
+    disk_cache: Option<Arc<ant_retrieval::DiskChunkCache>>,
 }
 
 impl UploadManager {
@@ -286,8 +374,28 @@ impl UploadManager {
                 jobs: Mutex::new(HashMap::new()),
                 id_counter: AtomicU64::new(0),
                 default_batch_id,
+                disk_cache: None,
             }),
         })
+    }
+
+    /// Attach the daemon's persistent chunk store so heal can re-push
+    /// missing chunks from local disk instead of re-reading the source
+    /// file. The `PushChunk` handler already populates this store on
+    /// every push, so a freshly-uploaded job's chunks are present even
+    /// after the source file is deleted, and persist across restarts.
+    #[must_use]
+    pub fn with_disk_cache(
+        mut self,
+        disk_cache: Option<Arc<ant_retrieval::DiskChunkCache>>,
+    ) -> Self {
+        // `Arc::get_mut` succeeds here because the manager is
+        // configured before it's cloned into the node loop / driver
+        // tasks (same lifecycle as the gateway's builder methods).
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.disk_cache = disk_cache;
+        }
+        self
     }
 
     /// State-dir path so the daemon can log it / surface it in
@@ -352,6 +460,8 @@ impl UploadManager {
             last_error: None,
             reference: None,
             heal_verified: false,
+            chunks_requeued: 0,
+            stalled: false,
         };
         info.save(&UploadJobInfo::manifest_path(
             &self.inner.state_dir,
@@ -840,6 +950,25 @@ impl UploadManager {
         let mut heal_addrs: Vec<[u8; 32]> = Vec::new();
         let mut heal_overflow = false;
 
+        // Shared counter the per-chunk push futures bump on every
+        // transient retry. Folded into the job snapshot on each
+        // checkpoint / stall tick for observability — never a kill
+        // switch. Seeded from the persisted value so a resumed job's
+        // counter keeps climbing rather than resetting.
+        let requeued = Arc::new(AtomicU64::new(snap.chunks_requeued));
+        // Liveness tracking. The upload never fails on peer churn (a
+        // struggling chunk is re-pushed forever), so a blocking caller
+        // needs a signal that it's not progressing: if no chunk acks
+        // for STALL_THRESHOLD we flip `stalled` true (and broadcast
+        // it) without changing the job's terminal outcome.
+        let mut last_progress = Instant::now();
+        let mut stalled = false;
+        let mut stall_tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + STALL_CHECK_INTERVAL,
+            STALL_CHECK_INTERVAL,
+        );
+        stall_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             // Cancellation check at the top of every loop turn —
             // no chunk dispatch can sneak in after a `cancel` call.
@@ -891,57 +1020,114 @@ impl UploadManager {
                             // re-derived this address byte-for-byte.
                             continue;
                         }
-                        in_flight.push(self.dispatch_push(i, chunk, batch_id));
+                        in_flight.push(self.dispatch_push(
+                            i,
+                            chunk,
+                            batch_id,
+                            PushRetry::Forever {
+                                requeued: requeued.clone(),
+                            },
+                        ));
                     }
                     continue;
                 }
             }
 
-            if let Some((i, res)) = in_flight.next().await {
-                match res {
-                    Ok(()) => {
-                        ack_log.record(i);
-                        let cursor = ack_log.cursor();
-                        let mut info = handle.info.lock().expect("upload mutex poisoned");
-                        if cursor > info.chunks_pushed {
-                            info.chunks_pushed = cursor;
-                            // bytes_pushed tracks data leaves
-                            // pushed (cursor includes intermediates,
-                            // so derive from the leaf-bytes
-                            // counter we keep on the side).
-                            info.bytes_pushed =
-                                ack_log.bytes_pushed(snap.source_size).min(snap.source_size);
-                            info.last_update_unix = unix_seconds();
-                            // Checkpoint to disk every N chunks —
-                            // pubsub watchers always see updates.
-                            let snap = info.clone();
-                            drop(info);
-                            let _ = handle.progress.send(snap.clone());
-                            if cursor.is_multiple_of(CHECKPOINT_INTERVAL_CHUNKS) {
-                                let _ = snap.save(&UploadJobInfo::manifest_path(
-                                    &self.inner.state_dir,
-                                    &snap.job_id,
-                                ));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        // Best-effort: surface the failure and exit.
-                        // The job stays in `Failed` and the operator
-                        // can `resume` to retry from the persisted
-                        // cursor.
-                        let msg = e.to_string();
-                        self.mark_failed(&handle, msg.clone());
-                        return Err(UploadError::PushFailed(msg));
-                    }
-                }
-                continue;
-            }
-
-            // Nothing in flight, nothing more to dispatch — break
-            // to the finish step.
+            // Nothing more to dispatch and nothing in flight — break
+            // to the finish step. Checked before the await so we never
+            // park on an empty queue.
             if leaf_iter.is_done() && in_flight.is_empty() {
                 break;
+            }
+
+            // Either drain an in-flight completion or wake on the
+            // stall tick to refresh the liveness flag. The job never
+            // fails here: `dispatch_push(Forever)` only yields `Err`
+            // on a genuinely unrecoverable condition (daemon gone /
+            // bad batch), which we surface; transient peer churn is
+            // re-pushed inside the future forever.
+            tokio::select! {
+                biased;
+                Some((i, res)) = in_flight.next() => {
+                    match res {
+                        Ok(()) => {
+                            ack_log.record(i);
+                            last_progress = Instant::now();
+                            let cursor = ack_log.cursor();
+                            let mut info = handle.info.lock().expect("upload mutex poisoned");
+                            let advanced = cursor > info.chunks_pushed;
+                            let mut dirty = false;
+                            if advanced {
+                                info.chunks_pushed = cursor;
+                                // bytes_pushed tracks data leaves pushed
+                                // (cursor includes intermediates, so derive
+                                // from the leaf-bytes counter we keep on
+                                // the side).
+                                info.bytes_pushed =
+                                    ack_log.bytes_pushed(snap.source_size).min(snap.source_size);
+                                dirty = true;
+                            }
+                            let rq = requeued.load(Ordering::Relaxed);
+                            if info.chunks_requeued != rq {
+                                info.chunks_requeued = rq;
+                                dirty = true;
+                            }
+                            if info.stalled {
+                                info.stalled = false;
+                                dirty = true;
+                            }
+                            stalled = false;
+                            if dirty {
+                                info.last_update_unix = unix_seconds();
+                                let snap = info.clone();
+                                drop(info);
+                                let _ = handle.progress.send(snap.clone());
+                                // Checkpoint to disk every N chunks —
+                                // pubsub watchers always see updates.
+                                if advanced && cursor.is_multiple_of(CHECKPOINT_INTERVAL_CHUNKS) {
+                                    let _ = snap.save(&UploadJobInfo::manifest_path(
+                                        &self.inner.state_dir,
+                                        &snap.job_id,
+                                    ));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            // Only genuinely unrecoverable errors reach
+                            // here (the upload path retries transient
+                            // failures forever). Surface and exit; the
+                            // operator can `resume` from the persisted
+                            // cursor.
+                            let msg = e.to_string();
+                            self.mark_failed(&handle, msg.clone());
+                            return Err(UploadError::PushFailed(msg));
+                        }
+                    }
+                }
+                _ = stall_tick.tick() => {
+                    let rq = requeued.load(Ordering::Relaxed);
+                    let now_stalled = last_progress.elapsed() >= STALL_THRESHOLD;
+                    let mut info = handle.info.lock().expect("upload mutex poisoned");
+                    let changed = info.chunks_requeued != rq || info.stalled != now_stalled;
+                    if changed {
+                        info.chunks_requeued = rq;
+                        info.stalled = now_stalled;
+                        info.last_update_unix = unix_seconds();
+                        let snap = info.clone();
+                        drop(info);
+                        let _ = handle.progress.send(snap);
+                    }
+                    if now_stalled && !stalled {
+                        warn!(
+                            target: "ant_node::uploads",
+                            job_id = %snap.job_id,
+                            requeued = rq,
+                            "upload stalled: no chunk acked for {}s — still retrying (job not failed)",
+                            STALL_THRESHOLD.as_secs(),
+                        );
+                    }
+                    stalled = now_stalled;
+                }
             }
         }
         // Source fully consumed. Cancel/pause check before pushing
@@ -956,7 +1142,14 @@ impl UploadManager {
             if i < resume_cursor {
                 continue;
             }
-            in_flight.push(self.dispatch_push(i, chunk, batch_id));
+            in_flight.push(self.dispatch_push(
+                i,
+                chunk,
+                batch_id,
+                PushRetry::Forever {
+                    requeued: requeued.clone(),
+                },
+            ));
         }
         // Drain the tail.
         self.drain_inflight(&mut in_flight, &mut ack_log, &handle)
@@ -987,7 +1180,14 @@ impl UploadManager {
                 if i < resume_cursor {
                     continue;
                 }
-                in_flight.push(self.dispatch_push(i, chunk.clone(), batch_id));
+                in_flight.push(self.dispatch_push(
+                    i,
+                    chunk.clone(),
+                    batch_id,
+                    PushRetry::Forever {
+                        requeued: requeued.clone(),
+                    },
+                ));
             }
             self.drain_inflight(&mut in_flight, &mut ack_log, &handle)
                 .await?;
@@ -1004,6 +1204,8 @@ impl UploadManager {
             info.bytes_pushed = info.source_size;
             info.chunks_pushed = next_index;
             info.reference = Some(format!("0x{}", hex::encode(final_root)));
+            info.chunks_requeued = requeued.load(Ordering::Relaxed);
+            info.stalled = false;
             info.last_update_unix = unix_seconds();
             info.clone()
         };
@@ -1111,11 +1313,37 @@ impl UploadManager {
     /// `FuturesUnordered` queue can hold heterogeneous push types
     /// (data leaf vs intermediate vs manifest chunk — the wire
     /// shape is identical, but boxing keeps the type uniform).
-    fn dispatch_push(&self, index: u64, chunk: SplitChunk, batch_id: [u8; 32]) -> PushFuture {
+    ///
+    /// Retry policy is set by `retry`:
+    /// * [`PushRetry::Forever`] — the upload path. Transient errors
+    ///   (busy peers, timeouts, connection resets, "no peers") are
+    ///   re-pushed **indefinitely** with back-off, bee-style; the job
+    ///   never fails on peer churn. Only a genuinely unrecoverable
+    ///   condition (the daemon channel closing, or a clearly-permanent
+    ///   stamp/batch misconfiguration — see [`is_fatal_push_error`])
+    ///   returns `Err`. The shared `requeued` counter is bumped on
+    ///   every retry for observability.
+    /// * [`PushRetry::Bounded`] — the heal re-push path. The same
+    ///   transient errors are retried only up to a fixed budget, then
+    ///   the future returns `Err` so a background heal task can give
+    ///   up the round (and the next startup pass retries) rather than
+    ///   wedging forever.
+    fn dispatch_push(
+        &self,
+        index: u64,
+        chunk: SplitChunk,
+        batch_id: [u8; 32],
+        retry: PushRetry,
+    ) -> PushFuture {
         let cmd_tx = self.inner.cmd_tx.clone();
         Box::pin(async move {
+            // Set fresh on every transient failure; only read by the
+            // `Bounded` budget-exhaustion message. The initial value is
+            // overwritten before any read, hence the narrow allow.
+            #[allow(unused_assignments)]
             let mut last_err: Option<String> = None;
-            for attempt in 0..PER_CHUNK_RETRY_BUDGET {
+            let mut attempt: u32 = 0;
+            loop {
                 let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
                 if cmd_tx
                     .send(ControlCommand::PushChunk {
@@ -1128,11 +1356,25 @@ impl UploadManager {
                 {
                     return (index, Err(UploadError::DaemonGone));
                 }
+                let mut no_peer = false;
                 match tokio::time::timeout(PUSH_TIMEOUT, ack_rx).await {
                     Ok(Ok(ControlAck::ChunkUploaded { .. })) => {
                         return (index, Ok(()));
                     }
                     Ok(Ok(ControlAck::Error { message })) => {
+                        // A clearly-permanent condition (bad batch /
+                        // stamp / wire) is fatal even on the upload
+                        // path — retrying forever would just spin.
+                        if is_fatal_push_error(&message) {
+                            return (index, Err(UploadError::PushFailed(message)));
+                        }
+                        no_peer = is_no_peer_error(&message);
+                        last_err = Some(message);
+                    }
+                    // "Accepted but not ready" (e.g. zero peers yet) is
+                    // transient — retry, don't fail.
+                    Ok(Ok(ControlAck::NotReady { message })) => {
+                        no_peer = true;
                         last_err = Some(message);
                     }
                     Ok(Ok(other)) => {
@@ -1151,15 +1393,30 @@ impl UploadManager {
                             Some(format!("push timed out after {}s", PUSH_TIMEOUT.as_secs()));
                     }
                 }
-                tokio::time::sleep(backoff_for_retry(attempt)).await;
+
+                // Transient failure: decide whether to keep retrying.
+                if let PushRetry::Bounded { budget } = retry {
+                    if attempt + 1 >= budget {
+                        return (
+                            index,
+                            Err(UploadError::PushFailed(format!(
+                                "exhausted {budget} retries: {}",
+                                last_err.unwrap_or_else(|| "unknown".to_string()),
+                            ))),
+                        );
+                    }
+                }
+                if let PushRetry::Forever { ref requeued } = retry {
+                    requeued.fetch_add(1, Ordering::Relaxed);
+                }
+                let delay = if no_peer {
+                    NO_PEER_BACKOFF
+                } else {
+                    backoff_for_retry(attempt)
+                };
+                tokio::time::sleep(delay).await;
+                attempt = attempt.saturating_add(1);
             }
-            (
-                index,
-                Err(UploadError::PushFailed(format!(
-                    "exhausted {PER_CHUNK_RETRY_BUDGET} retries: {}",
-                    last_err.unwrap_or_else(|| "unknown".to_string()),
-                ))),
-            )
         })
     }
 
@@ -1172,20 +1429,26 @@ impl UploadManager {
     /// properly this time). Repeats up to [`MAX_HEAL_ROUNDS`] times, with
     /// a settle delay before each read-back.
     ///
-    /// Verdict (this is the *tight* part — no more false green):
+    /// Verdict:
     /// * every chunk deep-reachable ⇒ flag the job `heal_verified` and
     ///   leave it `Completed`;
-    /// * chunks still shallow/absent after all rounds + re-pushes ⇒ mark
-    ///   the job `Failed` with a clear message, so the operator (or the
-    ///   app) sees a real failure instead of a "Completed" that 404s
-    ///   elsewhere. A light node can't lean on pull-sync to fix this
-    ///   later, so a persistent miss really is a failed upload.
+    /// * chunks still shallow/absent after all rounds + re-pushes ⇒
+    ///   leave the job `Completed` but **not** `heal_verified` (a
+    ///   "degraded" sub-state) and let the next startup heal pass try
+    ///   again. We deliberately do **not** flip a fully-pushed,
+    ///   already-retrievable upload to `Failed` just because some chunks
+    ///   are still only *shallow*: the data is reachable, heal keeps
+    ///   re-pushing to deepen it, and a false `Failed` on a retrievable
+    ///   file is worse than a slow convergence;
     /// * read-back inconclusive (peers not ready / transport error) ⇒
-    ///   leave the job `Completed` but *not* `heal_verified`, so the next
+    ///   also leave it `Completed` but not `heal_verified`, so the next
     ///   startup heal pass retries it.
     ///
-    /// Re-derivation runs from the source file, so this also repairs
-    /// files uploaded before the deep-push fix when re-run at startup.
+    /// Re-pushes pull payloads from the local chunk store first (see
+    /// [`repush_missing`](Self::repush_missing)), falling back to the
+    /// source file, so heal works even when the source was deleted and
+    /// repairs files uploaded before the deep-push fix when re-run at
+    /// startup.
     #[allow(clippy::too_many_arguments)]
     async fn verify_and_heal(
         &self,
@@ -1257,28 +1520,22 @@ impl UploadManager {
                 );
                 self.mark_heal_verified(job_id);
             }
-            // Chunks are still shallow or absent after every re-push round.
-            // For a light node this is a genuine failure: it can't rely on
-            // pull-sync to spread the chunk later, and the uploader's own
-            // privileged link to a shallow storer would let it 404 for the
-            // rest of the network. Surface it rather than leaving a false
-            // "Completed". The operator/app can `resume` to retry.
+            // Chunks are still shallow or absent after every re-push
+            // round. The upload itself is `Completed` and the data is
+            // retrievable (we pushed every chunk, and re-pushed the
+            // shallow ones); it's just not *deeply* placed yet. Leave
+            // the job `Completed` but un-`heal_verified` so the next
+            // startup heal pass re-pushes again — never flip a
+            // retrievable upload to `Failed`. The chunk payloads live
+            // in the local store, so the retry doesn't need the source.
             Some(missing) => {
                 let n = missing.len();
                 let total = all_addrs.len();
                 warn!(
                     target: "ant_node::uploads",
                     job_id, missing = n, total, rounds = MAX_HEAL_ROUNDS,
-                    "post-upload heal: {n}/{total} chunks not deep-reachable after all rounds — marking job failed",
+                    "post-upload heal: {n}/{total} chunks not deep-reachable after all rounds — leaving job completed (degraded), will re-push on next startup",
                 );
-                if let Some(handle) = self.job_handle(job_id) {
-                    self.mark_failed(
-                        &handle,
-                        format!(
-                            "{n}/{total} chunks not retrievable from their neighbourhood after {MAX_HEAL_ROUNDS} heal rounds (resume to retry)"
-                        ),
-                    );
-                }
             }
             None => warn!(
                 target: "ant_node::uploads",
@@ -1464,11 +1721,24 @@ impl UploadManager {
         Some(missing)
     }
 
-    /// Re-derive every chunk of the source file via the deterministic
-    /// streaming splitter and re-push the ones whose address is in
-    /// `missing`. Re-streaming keeps memory flat (we never hold the
-    /// whole file's wire bytes at once) at the cost of re-walking the
-    /// tree; heal runs rarely and on bounded files, so that's fine.
+    /// Re-push every chunk whose address is in `missing`, preferring the
+    /// node's **local chunk store** over the source file (Fix 2).
+    ///
+    /// Pass 1 reads each missing chunk's wire bytes from
+    /// [`DiskChunkCache`] — the `PushChunk` handler wrote them there on
+    /// the way up, so a just-completed job's chunks are present even if
+    /// the app already deleted the source file, and they survive a node
+    /// restart (resume re-push from disk). Pass 2 is a last resort: for
+    /// any chunk *not* found in the store (evicted, or
+    /// `--no-disk-cache`), re-derive it by re-streaming the source file
+    /// through the deterministic splitter — but only if the file is
+    /// still there. A deleted source with a populated cache heals fine;
+    /// a deleted source with a cache miss simply can't re-push *those*
+    /// chunks this round (logged, retried on the next startup pass)
+    /// rather than failing the whole upload.
+    ///
+    /// Re-pushes use a bounded retry budget so a background heal task
+    /// can't wedge forever on a dead network.
     #[allow(clippy::too_many_arguments)]
     async fn repush_missing(
         &self,
@@ -1480,52 +1750,119 @@ impl UploadManager {
         name: Option<&str>,
         content_type: Option<&str>,
     ) -> Result<(), UploadError> {
-        let file = std::fs::File::open(source_path)?;
-        let body: Option<Mmap> = if source_size == 0 {
-            None
-        } else {
-            // SAFETY: same contract as the upload path — the file is
-            // immutable for the duration; resume already refused on
-            // mtime change before we got here.
-            Some(unsafe { Mmap::map(&file)? })
-        };
-
-        let mut splitter = StreamingSplitter::new();
-        let leaf_iter = LeafIter::new(body.as_deref(), source_size);
         let mut in_flight: FuturesUnordered<PushFuture> = FuturesUnordered::new();
+        // Addresses still needing a re-push after the disk-cache pass.
+        // Anything left is re-derived from the source file in pass 2.
+        let mut remaining: HashSet<[u8; 32]> = missing.clone();
 
-        // Dispatch `chunk` if it's one of the missing ones, holding the
-        // in-flight window at `MAX_PUSH_CONCURRENCY`.
-        macro_rules! maybe_push {
-            ($chunk:expr) => {{
-                let chunk = $chunk;
-                if missing.contains(&chunk.address) {
-                    if in_flight.len() >= MAX_PUSH_CONCURRENCY {
-                        if let Some((_, res)) = in_flight.next().await {
-                            res?;
+        // --- Pass 1: re-push from the local chunk store. ---
+        if let Some(cache) = self.inner.disk_cache.clone() {
+            let addrs: Vec<[u8; 32]> = remaining.iter().copied().collect();
+            for addr in addrs {
+                match cache.get(addr).await {
+                    Ok(Some(wire)) => {
+                        if in_flight.len() >= MAX_PUSH_CONCURRENCY {
+                            if let Some((_, res)) = in_flight.next().await {
+                                res?;
+                            }
+                        }
+                        in_flight.push(self.dispatch_push(
+                            0,
+                            SplitChunk {
+                                address: addr,
+                                wire,
+                            },
+                            batch_id,
+                            PushRetry::Bounded {
+                                budget: PER_CHUNK_RETRY_BUDGET,
+                            },
+                        ));
+                        remaining.remove(&addr);
+                    }
+                    // Not cached → fall through to the source-file pass.
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(
+                            target: "ant_node::uploads",
+                            addr = %hex::encode(addr),
+                            "heal: local chunk-store read failed: {e}; will try source file",
+                        );
+                    }
+                }
+            }
+        }
+
+        // --- Pass 2: re-derive remaining chunks from the source file. ---
+        if !remaining.is_empty() {
+            match std::fs::File::open(source_path) {
+                Ok(file) => {
+                    let body: Option<Mmap> = if source_size == 0 {
+                        None
+                    } else {
+                        // SAFETY: same contract as the upload path — the
+                        // file is immutable for the duration; resume
+                        // already refused on mtime change before here.
+                        Some(unsafe { Mmap::map(&file)? })
+                    };
+                    let mut splitter = StreamingSplitter::new();
+                    let leaf_iter = LeafIter::new(body.as_deref(), source_size);
+
+                    // Dispatch `chunk` if still needed, holding the
+                    // in-flight window at `MAX_PUSH_CONCURRENCY`.
+                    macro_rules! maybe_push {
+                        ($chunk:expr) => {{
+                            let chunk = $chunk;
+                            if remaining.contains(&chunk.address) {
+                                if in_flight.len() >= MAX_PUSH_CONCURRENCY {
+                                    if let Some((_, res)) = in_flight.next().await {
+                                        res?;
+                                    }
+                                }
+                                in_flight.push(self.dispatch_push(
+                                    0,
+                                    chunk,
+                                    batch_id,
+                                    PushRetry::Bounded {
+                                        budget: PER_CHUNK_RETRY_BUDGET,
+                                    },
+                                ));
+                            }
+                        }};
+                    }
+
+                    for leaf in leaf_iter {
+                        for chunk in splitter.push_leaf(leaf) {
+                            maybe_push!(chunk);
                         }
                     }
-                    in_flight.push(self.dispatch_push(0, chunk, batch_id));
+                    let (data_root, _bytes, tail) = splitter.finish();
+                    for chunk in tail {
+                        maybe_push!(chunk);
+                    }
+                    if !raw {
+                        let filename = name.unwrap_or("blob.bin").to_string();
+                        let manifest =
+                            build_single_file_manifest(&filename, content_type, data_root)?;
+                        for chunk in &manifest.chunks {
+                            maybe_push!(chunk.clone());
+                        }
+                    }
                 }
-            }};
+                Err(e) => {
+                    // Source gone and the cache didn't cover every
+                    // missing chunk. Don't fail the upload: the cache
+                    // pass may have re-pushed most of them. Log the
+                    // shortfall; the next startup heal pass retries.
+                    warn!(
+                        target: "ant_node::uploads",
+                        remaining = remaining.len(),
+                        "heal: {} chunk(s) absent from local store and source file unavailable ({e}); cannot re-push this round",
+                        remaining.len(),
+                    );
+                }
+            }
         }
 
-        for leaf in leaf_iter {
-            for chunk in splitter.push_leaf(leaf) {
-                maybe_push!(chunk);
-            }
-        }
-        let (data_root, _bytes, tail) = splitter.finish();
-        for chunk in tail {
-            maybe_push!(chunk);
-        }
-        if !raw {
-            let filename = name.unwrap_or("blob.bin").to_string();
-            let manifest = build_single_file_manifest(&filename, content_type, data_root)?;
-            for chunk in &manifest.chunks {
-                maybe_push!(chunk.clone());
-            }
-        }
         while let Some((_, res)) = in_flight.next().await {
             res?;
         }
@@ -1798,6 +2135,8 @@ pub fn to_view(info: UploadJobInfo) -> UploadJobView {
         last_update_unix: info.last_update_unix,
         last_error: info.last_error,
         reference: info.reference,
+        chunks_requeued: info.chunks_requeued,
+        stalled: info.stalled,
     }
 }
 
@@ -2198,6 +2537,265 @@ mod tests {
         );
     }
 
+    /// Fake node loop for the re-queue test: the first chunk address it
+    /// ever sees is made "flaky" — its first `fail_until` pushes ack
+    /// with a transient error, after which it (and every other chunk)
+    /// acks success. `fail_until` is set well above the bounded retry
+    /// budget so the test proves the upload path re-pushes **forever**
+    /// (never fails) rather than giving up after a fixed count.
+    struct RequeueHarness {
+        target: Mutex<Option<[u8; 32]>>,
+        target_attempts: std::sync::atomic::AtomicUsize,
+        fail_until: usize,
+    }
+
+    fn spawn_fake_pushsync_flaky(fail_until: usize) -> mpsc::Sender<ControlCommand> {
+        let (tx, mut rx) = mpsc::channel::<ControlCommand>(64);
+        let h = Arc::new(RequeueHarness {
+            target: Mutex::new(None),
+            target_attempts: std::sync::atomic::AtomicUsize::new(0),
+            fail_until,
+        });
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                match cmd {
+                    ControlCommand::PushChunk { wire, ack, .. } => {
+                        let mut span = [0u8; 8];
+                        span.copy_from_slice(&wire[..8]);
+                        let addr =
+                            ant_crypto::bmt::bmt_hash_with_span(&span, &wire[8..]).expect("BMT");
+                        let is_target = {
+                            let mut t = h.target.lock().expect("target");
+                            if t.is_none() {
+                                *t = Some(addr);
+                            }
+                            *t == Some(addr)
+                        };
+                        if is_target {
+                            let n = h
+                                .target_attempts
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            if n < h.fail_until {
+                                let _ = ack.send(ControlAck::Error {
+                                    message: "connection reset by peer (transient)".into(),
+                                });
+                                continue;
+                            }
+                        }
+                        let _ = ack.send(ControlAck::ChunkUploaded {
+                            reference: format!("0x{}", hex::encode(addr)),
+                        });
+                    }
+                    ControlCommand::VerifyChunksPresent { addresses, ack, .. } => {
+                        // Report nothing missing so the background heal
+                        // no-ops; this test only checks the upload path.
+                        let body = serde_json::json!({
+                            "checked": addresses.len(),
+                            "missing": Vec::<String>::new(),
+                        });
+                        let _ = ack.send(ControlAck::Ok {
+                            message: body.to_string(),
+                        });
+                    }
+                    ControlCommand::PostageList { ack } => {
+                        let _ = ack.send(ControlAck::PostageList(Vec::new()));
+                    }
+                    other => panic!("unexpected control command in requeue test: {other:?}"),
+                }
+            }
+        });
+        tx
+    }
+
+    /// Fix 1: a chunk that fails its push far more times than the old
+    /// fixed retry budget (8) must **not** fail the job. The upload
+    /// path re-pushes it indefinitely; once it finally acks, the job
+    /// reaches `Completed` with `chunks_pushed == total`, and the
+    /// observability `chunks_requeued` counter reflects the retries.
+    ///
+    /// `start_paused` auto-advances tokio's clock so the back-off
+    /// sleeps resolve in logical time — the test runs in milliseconds.
+    #[tokio::test(start_paused = true)]
+    async fn upload_never_fails_on_exhausted_retries() {
+        let len = 20_000usize;
+        let payload: Vec<u8> = (0..len).map(|i| ((i * 29) % 251) as u8).collect();
+        let f = write_temp_file(&payload);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        // 12 failures > PER_CHUNK_RETRY_BUDGET (8): a fixed budget would
+        // have failed the job here.
+        let fail_until = 12usize;
+        let tx = spawn_fake_pushsync_flaky(fail_until);
+        let mgr = UploadManager::new(state_dir.path().to_path_buf(), tx, None).expect("manager");
+
+        let id = mgr
+            .start(f.path().to_path_buf(), None, None, None, true)
+            .expect("start");
+
+        let mut rx = mgr.subscribe(&id).expect("subscribe");
+        let final_snap = loop {
+            let snap = rx.borrow().clone();
+            if snap.status.is_terminal() {
+                break snap;
+            }
+            rx.changed().await.expect("watch");
+        };
+        assert_eq!(
+            final_snap.status,
+            UploadStatus::Completed,
+            "job must complete despite a chunk failing {fail_until}× (last_error: {:?})",
+            final_snap.last_error,
+        );
+        let total = estimate_chunk_count(len as u64, true);
+        assert_eq!(
+            final_snap.chunks_pushed, total,
+            "every chunk must be acked once the flaky one recovers",
+        );
+        assert!(
+            final_snap.chunks_requeued >= fail_until as u64,
+            "requeue counter should reflect the {fail_until} retries, got {}",
+            final_snap.chunks_requeued,
+        );
+        assert!(
+            !final_snap.stalled,
+            "a recovered job must not report stalled"
+        );
+    }
+
+    /// Fake node loop that mirrors the real `PushChunk` handler's
+    /// store-then-push behaviour: every pushed chunk is written into the
+    /// supplied [`DiskChunkCache`] before acking. On the first read-back
+    /// it forces the first queried address to look missing, so heal must
+    /// re-push it — and, crucially, must re-push it **from the cache**
+    /// (the test deletes the source file), proving Fix 2.
+    fn spawn_fake_pushsync_with_cache(
+        cache: Arc<ant_retrieval::DiskChunkCache>,
+    ) -> (mpsc::Sender<ControlCommand>, Arc<HealHarness>) {
+        let (tx, mut rx) = mpsc::channel::<ControlCommand>(64);
+        let h = Arc::new(HealHarness {
+            present: Mutex::new(HashSet::new()),
+            dispatches: Mutex::new(HashMap::new()),
+            forced_target: Mutex::new(None),
+            verify_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let hc = h.clone();
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                match cmd {
+                    ControlCommand::PushChunk { wire, ack, .. } => {
+                        let mut span = [0u8; 8];
+                        span.copy_from_slice(&wire[..8]);
+                        let addr =
+                            ant_crypto::bmt::bmt_hash_with_span(&span, &wire[8..]).expect("BMT");
+                        // Store-then-push, like the real node loop.
+                        let _ = cache.put(addr, wire.clone()).await;
+                        {
+                            hc.present.lock().expect("present").insert(addr);
+                            *hc.dispatches
+                                .lock()
+                                .expect("dispatch")
+                                .entry(addr)
+                                .or_insert(0) += 1;
+                        }
+                        let _ = ack.send(ControlAck::ChunkUploaded {
+                            reference: format!("0x{}", hex::encode(addr)),
+                        });
+                    }
+                    ControlCommand::VerifyChunksPresent { addresses, ack, .. } => {
+                        let mut missing: Vec<String> = {
+                            let present = hc.present.lock().expect("present");
+                            addresses
+                                .iter()
+                                .filter(|a| !present.contains(*a))
+                                .map(|a| format!("0x{}", hex::encode(a)))
+                                .collect()
+                        };
+                        let n = hc.verify_calls.fetch_add(1, Ordering::SeqCst);
+                        if n == 0 {
+                            if let Some(first) = addresses.first().copied() {
+                                *hc.forced_target.lock().expect("target") = Some(first);
+                                let hexs = format!("0x{}", hex::encode(first));
+                                if !missing.contains(&hexs) {
+                                    missing.push(hexs);
+                                }
+                            }
+                        }
+                        let body = serde_json::json!({
+                            "checked": addresses.len(),
+                            "missing": missing,
+                        });
+                        let _ = ack.send(ControlAck::Ok {
+                            message: body.to_string(),
+                        });
+                    }
+                    ControlCommand::PostageList { ack } => {
+                        let _ = ack.send(ControlAck::PostageList(Vec::new()));
+                    }
+                    other => panic!("unexpected control command in cache-heal test: {other:?}"),
+                }
+            }
+        });
+        (tx, h)
+    }
+
+    /// Fix 2: heal re-pushes a missing chunk from the local chunk store
+    /// even after the source file is deleted. We upload with a real
+    /// `DiskChunkCache` wired in, `rm` the source the moment the job
+    /// completes, then force one chunk missing on the first read-back.
+    /// Heal must re-push it (dispatch count → 2) by reading its wire
+    /// bytes from the cache — no `No such file or directory`.
+    #[tokio::test]
+    async fn heal_repushes_from_cache_after_source_deleted() {
+        let len = 20_000usize;
+        let payload: Vec<u8> = (0..len).map(|i| ((i * 23) % 251) as u8).collect();
+        let f = write_temp_file(&payload);
+        let source = f.path().to_path_buf();
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let cache_dir = tempfile::tempdir().expect("cachedir");
+        let cache = Arc::new(
+            ant_retrieval::DiskChunkCache::open(cache_dir.path().join("c.sqlite"), 1 << 30)
+                .expect("cache"),
+        );
+        let (tx, harness) = spawn_fake_pushsync_with_cache(cache.clone());
+        let mgr = UploadManager::new(state_dir.path().to_path_buf(), tx, None)
+            .expect("manager")
+            .with_disk_cache(Some(cache));
+
+        let id = mgr
+            .start(source.clone(), None, None, None, false)
+            .expect("start");
+
+        let mut rx = mgr.subscribe(&id).expect("subscribe");
+        loop {
+            let snap = rx.borrow().clone();
+            if snap.status.is_terminal() {
+                assert_eq!(snap.status, UploadStatus::Completed);
+                break;
+            }
+            rx.changed().await.expect("watch");
+        }
+
+        // Delete the source the moment the upload completes — heal must
+        // not depend on it.
+        drop(f);
+        std::fs::remove_file(&source).ok();
+        assert!(!source.exists(), "source should be gone before heal runs");
+
+        let mut healed = false;
+        for _ in 0..80 {
+            if let Some(t) = harness.target() {
+                if harness.dispatch_count(t) >= 2 {
+                    healed = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        assert!(
+            healed,
+            "heal should have re-pushed the forced-missing chunk from the local cache despite the deleted source",
+        );
+    }
+
     /// `raw = true` skips the trailing single-file mantaray
     /// manifest. The completed job's `reference` is the data root
     /// chunk address (deterministic from the splitter), and the
@@ -2408,6 +3006,8 @@ mod tests {
             last_error: None,
             reference: None,
             heal_verified: false,
+            chunks_requeued: 0,
+            stalled: false,
         };
         info.save(&UploadJobInfo::manifest_path(state_dir.path(), &job_id))
             .expect("save");

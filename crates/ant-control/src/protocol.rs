@@ -305,6 +305,16 @@ pub struct UploadJobView {
     pub last_error: Option<String>,
     #[serde(default)]
     pub reference: Option<String>,
+    /// Cumulative chunk-push retries (observability only; see
+    /// `UploadJobInfo::chunks_requeued`). Defaults to `0` so older
+    /// daemons / clients keep deserializing.
+    #[serde(default)]
+    pub chunks_requeued: u64,
+    /// `true` while the driver is retrying but making no progress
+    /// (sustained transient failure). The job is still alive — this
+    /// is a liveness hint, not a terminal status. Defaults to `false`.
+    #[serde(default)]
+    pub stalled: bool,
 }
 
 /// Snapshot of the daemon's local postage stamp issuer.
@@ -797,6 +807,8 @@ mod tests {
             last_update_unix: 0,
             last_error: None,
             reference: None,
+            chunks_requeued: 0,
+            stalled: false,
         };
         for jobs in [Vec::new(), vec![view]] {
             let resp = Response::UploadList { jobs: jobs.clone() };

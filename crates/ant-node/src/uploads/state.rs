@@ -145,6 +145,22 @@ pub struct UploadJobInfo {
     /// persisted by older daemons.
     #[serde(default)]
     pub heal_verified: bool,
+    /// Cumulative count of chunk-push retries this job has issued
+    /// (observability only — never a kill switch). Bee-style "slow,
+    /// never fail" means a chunk is re-pushed indefinitely under
+    /// transient peer churn; this counter lets an operator see *how
+    /// hard* a job is fighting the network without changing its
+    /// terminal outcome. Defaults to `0` for older persisted jobs.
+    #[serde(default)]
+    pub chunks_requeued: u64,
+    /// Liveness sub-state surfaced to watchers (CLI / iOS follow
+    /// stream) while the driver keeps retrying a struggling upload.
+    /// `true` means no chunk has acked for a sustained window (the
+    /// network is effectively down for us) — the job is *not* failed,
+    /// just not progressing. Cleared the moment a chunk acks again.
+    /// Never persisted as a terminal state; defaults to `false`.
+    #[serde(default)]
+    pub stalled: bool,
 }
 
 impl UploadJobInfo {

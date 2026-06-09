@@ -65,7 +65,10 @@ pub fn request_sync(socket_path: &Path, request: &Request) -> Result<Response, C
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     Progress(GetProgress),
-    Final(Response),
+    // Boxed: `Response`'s largest variant dwarfs `GetProgress`, so an
+    // un-boxed `Final` would make every `StreamEvent` pay the full
+    // `Response` size (clippy `large_enum_variant`).
+    Final(Box<Response>),
 }
 
 /// Round-trip one request, calling `on_progress` for every streaming

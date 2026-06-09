@@ -583,7 +583,12 @@ async fn main() -> Result<()> {
             "open upload state dir at {}",
             data_dir.join("uploads").display()
         )
-    })?;
+    })?
+    // Let heal re-push missing chunks from the local chunk store
+    // (where the PushChunk handler already persisted them) instead of
+    // re-reading the source file — so heal survives a deleted source
+    // and a node restart.
+    .with_disk_cache(disk_cache.clone());
     let restored_jobs = upload_manager
         .rehydrate_from_disk(!opt.no_resume_uploads)
         .with_context(|| {
@@ -1736,6 +1741,64 @@ async fn verify_then_build_swap(
                 error = %e,
                 "factory.deployedContracts call failed; skipping startup factory check",
             ),
+        }
+
+        // Issuer-match check (Fix 4). bee accepts a cheque only when its
+        // signer matches the chequebook's on-chain `issuer()`; a node
+        // whose cheque-signing key differs emits cheques every peer
+        // silently drops, leaving uploads on pseudosettle credit only.
+        // Verify it before enabling outbound SWAP rather than discover
+        // it as a settlement stall under load.
+        let swap_eoa = match SigningKey::from_bytes((&swap_secret).into()) {
+            Ok(sk) => Some(ethereum_address_from_public_key(sk.verifying_key())),
+            Err(e) => {
+                tracing::warn!(
+                    target: "antd",
+                    error = %e,
+                    "could not derive cheque-signing EOA from swap key; skipping issuer-match check",
+                );
+                None
+            }
+        };
+        if let Some(swap_eoa) = swap_eoa {
+            match ant_chain::chequebook_store::read_chequebook_issuer(&client, &chequebook).await {
+                Ok(issuer) if issuer == swap_eoa => tracing::info!(
+                    target: "antd",
+                    chequebook = %format!("0x{}", hex::encode(chequebook)),
+                    issuer = %format!("0x{}", hex::encode(issuer)),
+                    "issuer check passed — chequebook issuer() matches the cheque-signing key",
+                ),
+                Ok(issuer) if allow_unverified => tracing::warn!(
+                    target: "antd",
+                    chequebook = %format!("0x{}", hex::encode(chequebook)),
+                    issuer = %format!("0x{}", hex::encode(issuer)),
+                    swap_eoa = %format!("0x{}", hex::encode(swap_eoa)),
+                    "chequebook issuer() does NOT match the cheque-signing key, but --chequebook-allow-unverified was set; bee peers will reject every cheque we emit",
+                ),
+                Ok(issuer) => {
+                    tracing::error!(
+                        target: "antd",
+                        chequebook = %format!("0x{}", hex::encode(chequebook)),
+                        issuer = %format!("0x{}", hex::encode(issuer)),
+                        swap_eoa = %format!("0x{}", hex::encode(swap_eoa)),
+                        "chequebook issuer() ({}) does not match the cheque-signing key ({}); \
+                         bee peers silently reject every cheque drawn on this chequebook, so \
+                         uploads would run on pseudosettle credit only. Disabling outbound SWAP \
+                         settlement. Use a chequebook whose issuer() equals the swap key's EOA \
+                         (deploy one with `antctl chequebook deploy`), or pass \
+                         --chequebook-allow-unverified to override (devnet only).",
+                        format!("0x{}", hex::encode(issuer)),
+                        format!("0x{}", hex::encode(swap_eoa)),
+                    );
+                    return None;
+                }
+                Err(e) => tracing::warn!(
+                    target: "antd",
+                    chequebook = %format!("0x{}", hex::encode(chequebook)),
+                    error = %e,
+                    "chequebook.issuer() call failed; skipping issuer-match check",
+                ),
+            }
         }
     }
     // Placeholder `PeerEthMap`; `ant-node::run_node` overwrites the

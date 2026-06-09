@@ -1,6 +1,6 @@
 [package]
 name = "ant-node"
-version = "0.5.15"
+version = "0.5.16"
 edition.workspace = true
 
 [dependencies]
@@ -25,6 +25,9 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# `test-util` enables `#[tokio::test(start_paused = true)]`, used to
+# auto-advance the clock through push back-off in the re-queue test.
+tokio = { workspace = true, features = ["test-util"] }
 
 [features]
 default = ["chain-rpc"]

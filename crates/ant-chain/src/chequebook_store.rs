@@ -160,6 +160,40 @@ pub async fn verify_chequebook_with_factory(
     Ok(last_word.iter().any(|&b| b != 0))
 }
 
+/// One `eth_call` to `chequebook.issuer()` returning the 20-byte EOA
+/// the contract recognises as its issuer. Cheques are only accepted by
+/// bee peers when signed by this exact key (bee recovers the signer in
+/// `cashChequeBeneficiary` and the chequebook's `issuer()` must match),
+/// so a node whose cheque-signing key differs from `issuer()` emits
+/// cheques every peer silently drops. Callers compare the result to the
+/// EOA derived from their signing key before enabling outbound SWAP.
+#[cfg(feature = "chain-rpc")]
+pub async fn read_chequebook_issuer(
+    client: &crate::ChainClient,
+    chequebook: &[u8; 20],
+) -> Result<[u8; 20], ChequebookError> {
+    use crate::chequebook::chequebook_issuer_selector;
+
+    let v = client
+        .eth_call(
+            &format!("0x{}", hex::encode(chequebook)),
+            &format!("0x{}", hex::encode(chequebook_issuer_selector())),
+        )
+        .await
+        .map_err(|e| ChequebookError::Chain(format!("chequebook.issuer eth_call: {e}")))?;
+    if v.len() < 32 {
+        return Err(ChequebookError::Chain(format!(
+            "chequebook.issuer returned <32 bytes (got {} bytes)",
+            v.len()
+        )));
+    }
+    // Address is the low 20 bytes of the right-aligned 32-byte word.
+    let word = &v[v.len() - 32..];
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&word[12..32]);
+    Ok(out)
+}
+
 /// Deploy a fresh factory-registered chequebook (issuer = `node_eth`,
 /// gas paid by `wallet`), persist the association at `persist_path`,
 /// then optionally fund it with up to `deposit_plur` xBZZ (capped to
