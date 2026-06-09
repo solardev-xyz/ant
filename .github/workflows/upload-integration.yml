@@ -1,0 +1,161 @@
+# Live upload-reliability integration test against Swarm mainnet.
+#
+# This is NOT part of the per-PR gate (see ci.yml): it dials mainnet, spends
+# real BZZ on a postage batch, and needs wallet secrets — so it runs only on
+# a nightly schedule and on manual dispatch, and it no-ops (succeeds) when the
+# wallet secrets aren't configured (e.g. on forks).
+#
+# It builds antd + antctl + ant-ffi, smoke-checks the ant-ffi C-ABI upload
+# symbols, then uploads 1 MB / 10 MB files through a freshly started isolated
+# node and verifies each is byte-for-byte retrievable through the public
+# vibing.at/ant gateway (an independent node — proving real network
+# availability, not local cache).
+#
+# Required repo secrets to actually run the upload matrix:
+#   GNOSIS_RPC_URL        Gnosis RPC endpoint.
+#   WALLET_PRIVATE_KEY    funds the postage batch (+ signs cheques if SWAP on).
+# Optional secrets:
+#   ANT_BATCH             reuse a long-lived batch instead of creating one.
+#   ANT_CHEQUEBOOK        chequebook addr → enables SWAP (needed for ~100 MB+).
+#   ANT_FFI_IDENTITY      identity.json (JSON) for the FFI-driven upload smoke;
+#                         its EOA must own ANT_FFI_BATCH.
+#   ANT_FFI_BATCH         batch the ANT_FFI_IDENTITY EOA owns.
+
+name: upload-integration
+
+on:
+  workflow_dispatch:
+    inputs:
+      sizes_mb:
+        description: "Comma-separated upload sizes in MiB"
+        default: "1,10"
+      peer_threshold:
+        description: "BZZ peers to wait for before testing"
+        default: "50"
+      run_ffi_smoke:
+        description: "Also run the FFI-driven upload smoke (needs ANT_FFI_IDENTITY + ANT_FFI_BATCH)"
+        type: boolean
+        default: false
+  schedule:
+    # Nightly at 04:27 UTC (off the hour to dodge the scheduler stampede).
+    - cron: "27 4 * * *"
+
+# Never run two of these at once — concurrent runs would race the same wallet
+# nonce / postage batch. Queue, don't cancel.
+concurrency:
+  group: upload-integration
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+  GNOSIS_RPC_URL: ${{ secrets.GNOSIS_RPC_URL }}
+  WALLET_PRIVATE_KEY: ${{ secrets.WALLET_PRIVATE_KEY }}
+  ANT_BATCH: ${{ secrets.ANT_BATCH }}
+  ANT_CHEQUEBOOK: ${{ secrets.ANT_CHEQUEBOOK }}
+  ANT_FFI_IDENTITY: ${{ secrets.ANT_FFI_IDENTITY }}
+  ANT_FFI_BATCH: ${{ secrets.ANT_FFI_BATCH }}
+
+jobs:
+  upload-integration:
+    name: build + upload round-trip (mainnet)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check wallet secrets
+        # Live test needs a funded wallet. Without it (forks, unconfigured
+        # repos) we skip the heavy steps but let the job succeed, so the
+        # nightly schedule doesn't spam red.
+        id: guard
+        run: |
+          if [ -z "$GNOSIS_RPC_URL" ] || [ -z "$WALLET_PRIVATE_KEY" ]; then
+            echo "wallet secrets not configured — skipping live upload test."
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Rust toolchain
+        if: steps.guard.outputs.ok == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        if: steps.guard.outputs.ok == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: upload-integration
+
+      - name: Build antd + antctl + ant-ffi
+        if: steps.guard.outputs.ok == 'true'
+        run: |
+          cargo build --release -p antd -p antctl
+          cargo build --release -p ant-ffi --features chain --example upload_smoke
+
+      - name: ant-ffi C-ABI upload symbol smoke
+        if: steps.guard.outputs.ok == 'true'
+        # The hand-written C header (crates/ant-ffi/include/ant.h) promises
+        # these symbols; confirm #[no_mangle] actually exported them into the
+        # staticlib a C/Swift host would link. Dump nm once to a file (grep -q
+        # on the ~100 MB stream SIGPIPEs nm) then assert each symbol.
+        run: |
+          set -euo pipefail
+          AR="target/release/libant_ffi.a"
+          test -f "$AR"
+          nm "$AR" > /tmp/ffi-syms.txt 2>/dev/null || true
+          missing=0
+          for sym in ant_init ant_peer_count ant_storage_connect_batch \
+                     ant_upload_start ant_upload_status ant_free_string ant_shutdown; do
+            if grep -qE " T _?${sym}\$" /tmp/ffi-syms.txt; then
+              echo "  ok: $sym"
+            else
+              echo "  MISSING: $sym" >&2
+              missing=1
+            fi
+          done
+          test "$missing" -eq 0
+
+      - name: Upload round-trip (1/10 MB via antctl, gateway-verified)
+        if: steps.guard.outputs.ok == 'true'
+        env:
+          ANT_BIN_DIR: target/release
+          ANT_SIZES_MB: ${{ github.event.inputs.sizes_mb || '1,10' }}
+          ANT_PEER_THRESHOLD: ${{ github.event.inputs.peer_threshold || '50' }}
+          ANT_GATEWAY: https://vibing.at/ant
+        run: scripts/run_upload_integration.sh
+
+      - name: FFI-driven upload smoke (optional)
+        # Only when explicitly requested and the FFI identity/batch secrets
+        # are present. Drives a real upload through the ant-ffi C-ABI entry
+        # points and verifies the reference through the gateway.
+        if: >-
+          steps.guard.outputs.ok == 'true' &&
+          github.event.inputs.run_ffi_smoke == 'true' &&
+          env.ANT_FFI_IDENTITY != '' && env.ANT_FFI_BATCH != ''
+        env:
+          ANT_GATEWAY: https://vibing.at/ant
+          ANT_PEER_THRESHOLD: ${{ github.event.inputs.peer_threshold || '50' }}
+        run: |
+          set -euo pipefail
+          DATA_DIR="$(mktemp -d)"
+          printf '%s' "$ANT_FFI_IDENTITY" > "$DATA_DIR/identity.json"
+          FILE="$(mktemp)"
+          head -c 1048576 /dev/urandom > "$FILE"
+          SRC_SHA="$(sha256sum "$FILE" | cut -d' ' -f1)"
+          set +e
+          OUT="$(ANT_FFI_DATA_DIR="$DATA_DIR" ANT_BATCH="$ANT_FFI_BATCH" ANT_FFI_FILE="$FILE" \
+            cargo run --release -p ant-ffi --features chain --example upload_smoke 2>&1)"
+          RC=$?
+          set -e
+          echo "$OUT"
+          test "$RC" -eq 0
+          REF="$(printf '%s\n' "$OUT" | sed -n 's/^REF=//p' | tail -1)"
+          test -n "$REF"
+          echo "FFI upload reference: $REF"
+          DL="$(mktemp)"
+          curl -fsS -m 600 "$ANT_GATEWAY/bzz/${REF#0x}" -o "$DL"
+          DL_SHA="$(sha256sum "$DL" | cut -d' ' -f1)"
+          echo "src=$SRC_SHA dl=$DL_SHA"
+          test "$SRC_SHA" = "$DL_SHA"
+          echo "FFI-driven upload round-trip OK"
