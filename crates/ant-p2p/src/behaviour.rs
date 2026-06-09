@@ -268,7 +268,16 @@ const KNOWN_DIALABLE_CAP: usize = 16_384;
 /// push reaches a deep storer (deep receipt) instead of drawing a shallow
 /// one — the dominant cause of uploads that the uploader can read back but
 /// the wider network can't.
-const NEIGHBORHOOD_DIAL_FANOUT: usize = 8;
+///
+/// Raised from 8: each newly-connected near-target peer broadcasts its own
+/// neighbourhood over hive, so dialing several per round both improves
+/// immediate coverage *and* multiplies the inbound gossip that seeds the
+/// next, deeper round of the gossip-deepening cycle (a light node's only
+/// route to an arbitrary neighbourhood — hive has no `pull`/`FIND_NODE` path).
+/// Bounded by [`NEIGHBORHOOD_DIAL_MARGIN`] headroom, and `dial_toward_target`
+/// only dials peers strictly deeper than our current best, so this can't
+/// balloon the steady-state peer set.
+const NEIGHBORHOOD_DIAL_FANOUT: usize = 24;
 /// How far over `target_peers` the connection pipeline may grow to admit
 /// on-demand neighbourhood dials. Uploads need transient connections into
 /// many different chunk neighbourhoods across the keyspace; this headroom
@@ -3397,6 +3406,16 @@ const MAX_FULL_VERIFY_LEAVES: usize = 512;
 /// probe is a second per-leaf round-trip on top of the reachability check.
 const SOURCE_PROBE_SAMPLE: usize = 24;
 
+/// Floor on how many of a leaf's closest peers the authoritative
+/// reachability check probes (the binary "does its neighbourhood hold
+/// it" question, distinct from the `sources` route-diversity floor). A
+/// leaf counts retrievable if *any* of its closest `VERIFY_DEEP_PROBES`
+/// peers returns it. Matched to the heal's `HEAL_PROBES` so the UI verdict
+/// and the post-upload heal agree on what "reachable" means; raising it
+/// reduces false-missing when our closest *known* peer for a neighbourhood
+/// isn't actually one of the storers.
+const VERIFY_DEEP_PROBES: usize = 4;
+
 /// Deep propagation check: resolve the manifest at `reference` to its
 /// data root, enumerate the file's chunk tree (fetching every interior
 /// node network-only, which proves the skeleton is retrievable), then
@@ -3488,12 +3507,22 @@ async fn verify_propagation_deep(
     let sampled_leaves = check_idx.len();
     let leaf_addrs: Vec<[u8; 32]> = check_idx.iter().map(|&i| inv.leaves[i]).collect();
 
-    // Authoritative reachability uses the *same* network path a real
-    // download takes: the cache-free `RoutingFetcher`, walked
-    // closest-first through forwarder peers, hedged, with error backfill,
-    // and run concurrently (`verify_chunks_present`) so checking every
-    // leaf of a multi-thousand-chunk file stays bounded in wall time.
-    let missing = verify_chunks_present(&fetcher, &leaf_addrs).await;
+    // Authoritative *global* reachability uses the deep neighbourhood
+    // probe, not the forwarder-walking `RoutingFetcher`. Run from the
+    // uploader the forwarder-walk is privileged: the node is directly
+    // peered with the shallow storers it just pushed to, so it pulls
+    // every chunk back and reports "retrievable" even when no third party
+    // (the public gateway, say) can route to it. The deep probe instead
+    // asks each chunk's *own* closest peers — its true neighbourhood, the
+    // vantage a gateway reaches by routing closest-first — so a chunk that
+    // only landed shallow counts as missing here exactly as it does for a
+    // gateway. This is the same signal the post-upload heal uses, so the
+    // UI verdict and the heal can no longer disagree (the bug that let a
+    // file the gateway can't stream show as "Online / Verified"). A wider
+    // probe than the informational `sources` floor below: a chunk is
+    // reachable if any of its closest neighbourhood peers holds it.
+    let deep_probes = probes.max(VERIFY_DEEP_PROBES);
+    let missing = verify_chunks_present_deep(&control, &peers, &leaf_addrs, deep_probes).await;
     let leaves_retrievable = sampled_leaves - missing.len();
 
     // Informational replication floor: how many of a chunk's own closest

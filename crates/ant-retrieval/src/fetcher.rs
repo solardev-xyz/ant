@@ -516,12 +516,27 @@ impl RoutingFetcher {
 
     /// Bounded wait, after a shallow receipt triggers a neighbourhood dial,
     /// for a peer deeper than the shallow storer to actually connect before
-    /// we retry the push. Short enough that 32 concurrent chunk pushes
-    /// (`MAX_PUSH_CONCURRENCY`) overlap their waits and the upload stays
-    /// brisk, long enough for a freshly-dialed neighbourhood peer to finish
-    /// its handshake. Chunks whose neighbourhood is already connected skip
-    /// the wait entirely.
-    const SHALLOW_REDIAL_WAIT: Duration = Duration::from_millis(800);
+    /// we retry the push. This is one round of the *gossip-deepening cycle*
+    /// — the only way a light node (which can't pull-discover peers: bee's
+    /// hive is push-only gossip) reaches an arbitrary neighbourhood:
+    ///
+    /// 1. dial the closest peer we currently *know* toward the chunk,
+    /// 2. once it handshakes it broadcasts its own neighbourhood to us over
+    ///    hive (a node gossips the peers closest to itself, i.e. even
+    ///    closer to our chunk),
+    /// 3. those land in `known_dialable`, so the next dial reaches deeper,
+    /// 4. repeat until a peer inside the chunk's neighbourhood is connected.
+    ///
+    /// The previous 800 ms was too short for even step 1: a fresh dial +
+    /// BZZ handshake routinely takes 1–2 s, so `best_connected_po` never
+    /// improved inside the window and the retry just re-drew the same
+    /// shallow set — which is why ~27% of a 10 MB file's chunks stayed
+    /// shallow and the public gateway couldn't stream them. 2.5 s lets the
+    /// dial complete and the first gossip batch arrive; [`dial_and_await_deeper`]
+    /// re-issues the dial on every peer-set change within the window so the
+    /// deepening cycle advances across rounds. Chunks whose neighbourhood is
+    /// already connected skip the wait entirely.
+    const SHALLOW_REDIAL_WAIT: Duration = Duration::from_millis(2500);
 
     /// Rank the live peer set closest-first to `chunk_addr` and return the
     /// next candidate not already used for this chunk. The per-process
@@ -598,6 +613,15 @@ impl RoutingFetcher {
                     if changed.is_err() || self.best_connected_po(chunk_addr) >= target_po {
                         return;
                     }
+                    // The peer set moved — a neighbourhood dial connected
+                    // and/or fresh hive gossip arrived. Re-issue the dial so
+                    // any peer we *now* know that's deeper than our current
+                    // best gets pulled in: this is what advances the
+                    // gossip-deepening cycle (each nearer peer we connect
+                    // advertises even-closer peers). Without re-issuing, the
+                    // swarm only ever acts on the peers we knew at the first
+                    // request and the cycle stalls one hop short.
+                    self.request_neighborhood_dial(chunk_addr);
                 }
                 () = &mut sleep => return,
             }
