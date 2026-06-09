@@ -172,18 +172,17 @@ struct PropagationInfo: Codable, Equatable {
         case error
     }
 
-    /// Short, friendly verdict for a file row badge.
+    /// Short, friendly verdict for a file row badge. Deliberately free
+    /// of chunk counts: the check probes a bounded sample of a large
+    /// file's chunks, so figures like "533/2537" read as if most of the
+    /// file went unchecked (and a raw missing count overstates a
+    /// transient probe shortfall). The binary verdict is the honest
+    /// signal.
     var label: String {
         if !retrievable {
-            if totalChunks == 0 { return "Not found on network" }
-            let missing = checkedChunks - retrievableChunks
-            return "\(missing) of \(checkedChunks) chunks missing"
+            return totalChunks == 0 ? "Not found on network" : "Not fully available yet"
         }
-        let suffix = sources > 1 ? " · \(sources)×" : ""
-        if checkedChunks >= totalChunks {
-            return "Verified · all \(totalChunks) chunks\(suffix)"
-        }
-        return "Verified · \(checkedChunks)/\(totalChunks) chunks\(suffix)"
+        return "Verified"
     }
 }
 

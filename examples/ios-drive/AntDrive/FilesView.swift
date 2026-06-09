@@ -363,16 +363,17 @@ private struct FileRow: View {
     }
 
     /// Re-trigger the auto-verify when the job reaches the completed
-    /// state *and* once peers are actually connected — a probe issued
-    /// before the node has any peers just comes back "not ready" and
-    /// would otherwise never retry. The status + has-peers flag are
-    /// part of the key so the task re-runs on those transitions.
+    /// state *and* once the peer set is healthy enough for the verdict
+    /// to mean something — a probe issued against a still-ramping peer
+    /// set reports false "missing" and would pin an orange badge for
+    /// the session. The status + peer-floor flag are part of the key so
+    /// the task re-runs on those transitions.
     private var autoVerifyKey: String {
-        "\(job.id)#\(job.status)#\(node.peerCount > 0 ? "peers" : "none")"
+        "\(job.id)#\(job.status)#\(node.peerCount >= AntNode.verifyPeerFloor ? "peers" : "none")"
     }
 
     /// Read-back verdict for a completed file: a spinner while probing,
-    /// then a green "verified · all N chunks" or an orange "chunks missing"
+    /// then a green "Verified" or an orange "Not fully available yet"
     /// once the network has been asked. The check resolves the manifest,
     /// walks the chunk tree, and fetches every data chunk network-only —
     /// distinct from the job's "Online" status, which only means the

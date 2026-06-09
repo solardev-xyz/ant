@@ -24,7 +24,6 @@ struct StorageView: View {
                     header
                     meterCard
                     if node.plan?.enabled == true {
-                        planCard
                         if node.settlement?.enabled == false {
                             settlementWarningCard
                         }
@@ -114,34 +113,6 @@ struct StorageView: View {
         .frame(height: 12)
     }
 
-    // MARK: plan
-
-    private var planCard: some View {
-        GlassCard {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack {
-                    Label(planStatusText, systemImage: planStatusIcon)
-                        .font(.headline)
-                        .foregroundStyle(.white)
-                    Spacer()
-                }
-                if let plan = node.plan {
-                    Text(plan.immutable ? "Permanent storage" : "Renewable storage")
-                        .font(.caption)
-                        .foregroundStyle(.white.opacity(0.6))
-                }
-                HStack(spacing: 12) {
-                    pillButton("Add space", icon: "plus.circle") {
-                        flash("Adding space needs an on-chain top-up — coming soon")
-                    }
-                    pillButton("Renew", icon: "arrow.clockwise") {
-                        flash("Renew needs an on-chain top-up — coming soon")
-                    }
-                }
-            }
-        }
-    }
-
     // MARK: settlement warning
 
     /// Shown when a plan is connected but outbound settlement is off:
@@ -166,14 +137,6 @@ struct StorageView: View {
                 }
             }
         }
-    }
-
-    private var planStatusText: String {
-        guard let plan = node.plan else { return "Active" }
-        return plan.isLow ? "Running low" : "Active"
-    }
-    private var planStatusIcon: String {
-        (node.plan?.isLow ?? false) ? "exclamationmark.triangle.fill" : "checkmark.seal.fill"
     }
 
     // MARK: connect (no plan)
@@ -219,10 +182,6 @@ struct StorageView: View {
                             Image(systemName: "doc.on.doc").foregroundStyle(.white.opacity(0.85))
                         }
                     }
-                }
-                pillButton("Add funds", icon: "plus") {
-                    if let addr = node.account?.ethAddress { copy(addr) }
-                    flash("Send xDAI + xBZZ to your account address (copied)")
                 }
             }
         }

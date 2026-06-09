@@ -251,12 +251,20 @@ final class AntNode: ObservableObject {
         return info
     }
 
+    /// Minimum connected peers before an auto-verify is worth running.
+    /// A probe fired while the peer set is still ramping (the first
+    /// handshakes land within a second of launch) checks chunks against
+    /// a near-empty routing view, comes back "missing", and pins an
+    /// orange badge for the whole session. The set climbs to ~100 within
+    /// ~20 s, so waiting for a healthy floor costs little.
+    static let verifyPeerFloor = 30
+
     /// Populate a completed row's verdict, preferring the disk cache: a
     /// fresh (<24h) cached verdict is reused without touching the network;
     /// otherwise the file is probed once. Drives the per-row auto-verify.
     func ensureVerified(_ job: UploadJob) async {
         guard job.isDone, let reference = job.reference, !reference.isEmpty,
-              peerCount > 0 else { return }
+              peerCount >= Self.verifyPeerFloor else { return }
         if propagation[job.id] != nil { return }
         if let cached = freshVerdict(for: reference) {
             propagation[job.id] = cached
