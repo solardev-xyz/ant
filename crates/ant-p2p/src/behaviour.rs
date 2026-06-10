@@ -305,6 +305,28 @@ pub const DEFAULT_TARGET_PEERS: usize = 100;
 /// peer churn. 30 s strikes a balance: a fresh restart still warms within
 /// seconds even if the last 30 s of additions are gone.
 const PEERSTORE_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
+/// Shallow bins `0..BIN_BALANCE_MAX_BIN` are kept populated by the periodic
+/// bin-balance pass. Bin `b` covers a `2^-(b+1)` slice of the keyspace, so
+/// the first 8 bins together cover all chunks outside our own `/256`
+/// neighbourhood — exactly the part of the address space a collapsed peer
+/// set can no longer route retrievals into. Deeper bins fill themselves:
+/// hive gossip is biased toward the receiver's own neighbourhood.
+const BIN_BALANCE_MAX_BIN: usize = 8;
+/// Minimum connected peers per shallow bin before the balance pass starts
+/// dialing replacements. Matches bee's kademlia `saturationPeers = 4` —
+/// enough fan-out for retrieval forwarding with a candidate to spare when
+/// one peer flaps, without inflating the steady-state connection count.
+const BIN_BALANCE_MIN_PEERS: usize = 4;
+/// Cadence of the bin-balance pass. Collapse is a slow process (hours of
+/// churn replacing far peers with gossip-biased near ones), so a 30 s
+/// re-check is more than fast enough while keeping the pass — a scan of
+/// `known_dialable` — off the hot path.
+const BIN_BALANCE_INTERVAL: Duration = Duration::from_secs(30);
+/// Cap on dials a single balance pass may fire. A node that just lost a
+/// whole region (e.g. resumed from sleep) can be short in every shallow
+/// bin at once; bounding the fan-out keeps the handshake pipeline from
+/// being drowned, and the next pass (30 s later) finishes the job.
+const BIN_BALANCE_DIAL_CAP: usize = 16;
 
 /// Build the [`sinks::SwapWiring`] from `RunConfig::swap` (if set).
 /// Returns `None` when SWAP is unconfigured — `sinks::spawn` then
@@ -1435,6 +1457,10 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     let mut last_top_up_at = Instant::now()
         .checked_sub(PEER_TOP_UP_INTERVAL)
         .unwrap_or_else(Instant::now);
+    // First bin-balance pass only after a full interval: at startup the
+    // bootstrap wave is still handshaking, so the bins are legitimately
+    // empty and an immediate pass would burn dial slots on noise.
+    let mut last_bin_balance_at = Instant::now();
     spawn_bootstrap_dial(&cfg.bootnodes, bootnode_dial_tx.clone());
 
     let mut flush_timer = tokio::time::interval(PEERSTORE_FLUSH_INTERVAL);
@@ -1475,6 +1501,7 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
             &mut last_bootstrap_at,
             &bootnode_dial_tx,
         );
+        maybe_balance_bins(&mut swarm, &mut state, &mut last_bin_balance_at);
         if last_pipeline_sync.elapsed() >= PIPELINE_SYNC_INTERVAL {
             sync_peer_pipeline(cfg.status.as_ref(), &mut state);
             last_pipeline_sync = Instant::now();
@@ -4076,6 +4103,122 @@ fn maybe_top_up_peers(
     }
 }
 
+/// Pick known-but-unconnected peers to dial into under-populated shallow
+/// bins. Pure selection (no swarm access) so the policy is unit-testable:
+/// for each bin `0..BIN_BALANCE_MAX_BIN` whose *connected* count is below
+/// [`BIN_BALANCE_MIN_PEERS`], pick up to the deficit from `known_dialable`
+/// entries that land in that bin relative to `base`, skipping anything
+/// `exclude` rejects (connected / mid-pipeline / recently failed). Total
+/// output is capped at [`BIN_BALANCE_DIAL_CAP`].
+fn bin_balance_candidates(
+    base: &Overlay,
+    bin_counts: &[u8; crate::routing::NUM_BINS],
+    known_dialable: &HashMap<PeerId, sinks::PeerHint>,
+    exclude: impl Fn(&PeerId) -> bool,
+) -> Vec<(PeerId, u8)> {
+    let mut deficits = [0usize; BIN_BALANCE_MAX_BIN];
+    let mut total_deficit = 0usize;
+    for (bin, deficit) in deficits.iter_mut().enumerate() {
+        *deficit = BIN_BALANCE_MIN_PEERS.saturating_sub(bin_counts[bin] as usize);
+        total_deficit += *deficit;
+    }
+    if total_deficit == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<(PeerId, u8)> = Vec::new();
+    for (peer_id, hint) in known_dialable {
+        if out.len() >= BIN_BALANCE_DIAL_CAP {
+            break;
+        }
+        let po = crate::routing::proximity(base, &hint.overlay) as usize;
+        if po >= BIN_BALANCE_MAX_BIN || deficits[po] == 0 || exclude(peer_id) {
+            continue;
+        }
+        deficits[po] -= 1;
+        out.push((*peer_id, po as u8));
+    }
+    out
+}
+
+/// Periodic bin-balance pass: keep every shallow Kademlia bin minimally
+/// populated so retrieval can route into *any* neighbourhood.
+///
+/// Without this, a long-running node's peer set slowly collapses into its
+/// own neighbourhood: bee's hive gossip advertises peers close to the
+/// *receiver*, so every churn-driven replacement dial is drawn from a
+/// near-biased pool, and far peers that disconnect are never re-dialed.
+/// Observable end state (vibing.at gateway after days of uptime): all ~180
+/// connected overlays shared the node's own first nibble, retrieval of any
+/// chunk outside that /16 fast-failed, and the public gateway 404'd content
+/// that the rest of the network served fine. Count-based maintenance
+/// ([`maybe_top_up_peers`]) can't see this — the peer *count* stays healthy
+/// while the *distribution* degenerates.
+fn maybe_balance_bins(
+    swarm: &mut Swarm<AntBehaviour>,
+    state: &mut SwarmState,
+    last_balance_at: &mut Instant,
+) {
+    if last_balance_at.elapsed() < BIN_BALANCE_INTERVAL {
+        return;
+    }
+    // Below the floor the count-based top-up + re-bootstrap own recovery;
+    // balancing a near-empty table would just race them for dial slots.
+    if state.peer_set_size() < state.target_peers / 2 {
+        return;
+    }
+    if state.pipeline_size() >= state.target_peers + NEIGHBORHOOD_DIAL_MARGIN {
+        return;
+    }
+    *last_balance_at = Instant::now();
+    let bin_counts = state.routing.bin_counts();
+    let candidates = bin_balance_candidates(
+        state.routing.base(),
+        &bin_counts,
+        &state.known_dialable,
+        |peer_id| {
+            state.bzz_peers.contains(peer_id)
+                || state.pending.contains_key(peer_id)
+                || state.dialing.contains(peer_id)
+                || state.closing.contains(peer_id)
+                || state.failed.iter().any(|f| f.peer == *peer_id)
+        },
+    );
+    if candidates.is_empty() {
+        return;
+    }
+    info!(
+        target: "ant_p2p",
+        dials = candidates.len(),
+        bins = ?candidates.iter().map(|(_, b)| *b).collect::<Vec<_>>(),
+        "bin balance: dialing peers into under-populated shallow bins",
+    );
+    for (peer_id, bin) in candidates {
+        let Some(hint) = state.known_dialable.get(&peer_id).cloned() else {
+            continue;
+        };
+        if swarm.is_connected(&peer_id) {
+            continue;
+        }
+        let opts = DialOpts::peer_id(peer_id)
+            .addresses(hint.addrs.clone())
+            .build();
+        match swarm.dial(opts) {
+            Ok(()) => {
+                state.dialing.insert(peer_id);
+                state.dial_started.insert(peer_id, Instant::now());
+                if let Some(a) = hint.addrs.first() {
+                    state.dial_hint_addr.insert(peer_id, a.clone());
+                }
+                debug!(target: "ant_p2p", peer = %peer_id, bin, "dialing for bin balance");
+            }
+            Err(DialError::DialPeerConditionFalse(_)) => {}
+            Err(e) => {
+                debug!(target: "ant_p2p", peer = %peer_id, "bin-balance dial error: {e}");
+            }
+        }
+    }
+}
+
 /// Fire a fresh bootstrap dial when we've fully drained: no BZZ-handshaked
 /// peers, nothing mid-pipeline, nothing queued. Uses exponential backoff so a
 /// cold DNS + dead bootnode region doesn't turn into a tight retry loop.
@@ -4929,6 +5072,87 @@ mod tests {
 
     fn pid() -> PeerId {
         Keypair::generate_ed25519().public().to_peer_id()
+    }
+
+    /// Build a hive hint whose overlay's first byte is `first` (zeros
+    /// elsewhere, except a discriminator in the last byte so distinct
+    /// peers in the same bin stay distinct overlays). Against a zero
+    /// base overlay, `first = 0x80 >> bin` puts the hint in `bin`.
+    fn hint_in_bin(peer_id: PeerId, first: u8, discriminator: u8) -> sinks::PeerHint {
+        let mut overlay = [0u8; 32];
+        overlay[0] = first;
+        overlay[31] = discriminator;
+        sinks::PeerHint {
+            peer_id,
+            addrs: Vec::new(),
+            overlay,
+        }
+    }
+
+    /// The balance pass must dial only into bins below the minimum, take
+    /// no more than each bin's deficit, skip excluded peers, and ignore
+    /// bins at or beyond [`BIN_BALANCE_MAX_BIN`] (those fill themselves
+    /// via gossip bias). This is the policy that stops a long-running
+    /// node's peer set from collapsing into its own neighbourhood.
+    #[test]
+    fn bin_balance_candidates_fill_deficient_bins_only() {
+        let base = [0u8; 32];
+        // Bin 0 is empty, bin 1 needs one more peer, bin 2 is saturated.
+        let mut bin_counts = [0u8; crate::routing::NUM_BINS];
+        bin_counts[1] = (BIN_BALANCE_MIN_PEERS - 1) as u8;
+        bin_counts[2] = BIN_BALANCE_MIN_PEERS as u8;
+
+        let mut known = HashMap::new();
+        // More bin-0 candidates than the deficit (4) — selection must cap.
+        for i in 0..6u8 {
+            let p = pid();
+            known.insert(p, hint_in_bin(p, 0x80, i));
+        }
+        // Two bin-1 candidates for a deficit of one.
+        let b1a = pid();
+        let b1b = pid();
+        known.insert(b1a, hint_in_bin(b1a, 0x40, 0));
+        known.insert(b1b, hint_in_bin(b1b, 0x40, 1));
+        // A bin-2 candidate (saturated) and a deep-bin candidate (>= max).
+        let b2 = pid();
+        known.insert(b2, hint_in_bin(b2, 0x20, 0));
+        let deep = pid();
+        known.insert(deep, hint_in_bin(deep, 0x00, 1));
+
+        let picked = bin_balance_candidates(&base, &bin_counts, &known, |_| false);
+        let bin0 = picked.iter().filter(|(_, b)| *b == 0).count();
+        let bin1 = picked.iter().filter(|(_, b)| *b == 1).count();
+        assert_eq!(
+            bin0, BIN_BALANCE_MIN_PEERS,
+            "bin 0 fills exactly its deficit"
+        );
+        assert_eq!(bin1, 1, "bin 1 takes one peer, not both candidates");
+        assert_eq!(picked.len(), bin0 + bin1, "saturated / deep bins untouched");
+        assert!(picked.iter().all(|(p, _)| *p != b2 && *p != deep));
+    }
+
+    /// Excluded peers (connected, mid-pipeline, recently failed) must not
+    /// be selected, and a fully-balanced table yields no candidates at all
+    /// — the pass is a no-op in steady state.
+    #[test]
+    fn bin_balance_candidates_respect_exclusion_and_saturation() {
+        let base = [0u8; 32];
+        let bin_counts = [0u8; crate::routing::NUM_BINS];
+        let excluded = pid();
+        let allowed = pid();
+        let mut known = HashMap::new();
+        known.insert(excluded, hint_in_bin(excluded, 0x80, 0));
+        known.insert(allowed, hint_in_bin(allowed, 0x80, 1));
+
+        let picked = bin_balance_candidates(&base, &bin_counts, &known, |p| *p == excluded);
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].0, allowed);
+
+        let saturated = [BIN_BALANCE_MIN_PEERS as u8; crate::routing::NUM_BINS];
+        assert!(
+            bin_balance_candidates(&base, &saturated, &known, |_| false).is_empty(),
+            "balanced table must produce no dials",
+        );
     }
 
     /// Pin the contract that `publish_peers` actually republishes the
