@@ -30,6 +30,66 @@ sits next to the `.a`, Apple's linker prefers it and bakes an absolute
 build-host path into the app's load commands, which then fails to load
 on the simulator or device.
 
+## 0. No-toolchain path: the released `AntFFI.xcframework`
+
+If you don't want a Rust toolchain in your build, use the prebuilt
+artifact instead of §1–2. Every `v*` tag on the
+[releases page](https://github.com/solardev-xyz/ant/releases) carries
+`AntFFI.xcframework.zip` (device `ios-arm64` + fat
+`ios-arm64_x86_64-simulator` static libraries, `ant.h`, module map)
+and `AntFFI.xcframework.zip.checksum` (the SwiftPM checksum of the
+zip).
+
+**Swift Package Manager** — add a `binaryTarget` pinned to the
+release URL and checksum:
+
+```swift
+// Package.swift
+targets: [
+    .binaryTarget(
+        name: "AntFFI",
+        url: "https://github.com/solardev-xyz/ant/releases/download/v0.5.17/AntFFI.xcframework.zip",
+        checksum: "<paste the contents of AntFFI.xcframework.zip.checksum>"
+    ),
+    // your target:
+    .target(name: "MyApp", dependencies: ["AntFFI"]),
+]
+```
+
+**Or plain Xcode** — unzip and drag `AntFFI.xcframework` into the
+target's *Frameworks, Libraries, and Embedded Content* (embed setting
+*Do Not Embed* — it's a static library; Xcode picks the right slice
+per destination automatically).
+
+Either way, the bundled module map makes the C surface available as
+
+```swift
+import AntFFI
+```
+
+— no bridging header, no header search paths, and no manual
+`OTHER_LDFLAGS`: the module map carries `link framework` directives
+for `Security` / `SystemConfiguration` / `CoreFoundation`, so they
+autolink.
+
+What the prebuilt artifact bakes in:
+
+- **`chain` feature on** (on-chain storage-plan calls work; you carry
+  reqwest + rustls even if you never use them; expect ~10–14 MB added
+  to the app binary, ~5–7 MB to the thinned App Store download).
+- **Min iOS 15.0** (`IPHONEOS_DEPLOYMENT_TARGET` pinned by the xtask).
+- **Pre-1.0 ABI** — this is the hand-written pre-UniFFI surface; pin
+  an exact release and expect breaking changes between tags.
+- **One Rust staticlib per app** — a second Rust-based static library
+  in the same app collides at symbol level.
+
+The **ATS exception** from §2 (*Info.plist — App Transport Security*)
+is still required — the prebuilt node speaks the same Noise-over-TCP —
+and everything from §3 onward (writable data dir, lifecycle, memory
+and threading rules) applies to the prebuilt artifact exactly as it
+does to a from-source build. To reproduce the artifact locally:
+`cargo xtask build-ios-xcframework` (macOS only).
+
 ## 1. Build the static library
 
 One-time setup — install the Rust targets you need:
