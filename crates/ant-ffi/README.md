@@ -81,7 +81,53 @@ What the prebuilt artifact bakes in:
 - **Pre-1.0 ABI** — this is the hand-written pre-UniFFI surface; pin
   an exact release and expect breaking changes between tags.
 - **One Rust staticlib per app** — a second Rust-based static library
-  in the same app collides at symbol level.
+  in the same app collides at symbol level (see below).
+
+### Combining with other Rust libraries in the same app
+
+Every Rust `staticlib` embeds its own full copy of the Rust runtime —
+`std`, `core`, `alloc`, the allocator shims, the panic machinery — so
+linking the prebuilt `AntFFI.xcframework` *plus* a second,
+separately-built Rust `.a` fails with duplicate-symbol errors (and
+two interleaved std/allocator copies would be unsound even if it
+linked). The fix is to compile both into **one** staticlib instead of
+linking two: `ant-ffi` also builds as an `rlib` for exactly this.
+Make a small aggregator crate that depends on both and emits the
+single `.a`:
+
+```toml
+# myapp-ffi/Cargo.toml
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+ant-ffi = { git = "https://github.com/solardev-xyz/ant", tag = "v0.5.17", features = ["chain"] }
+my-other-lib = { path = "../my-other-lib" }
+```
+
+```rust
+// myapp-ffi/src/lib.rs — re-export so both C surfaces are kept
+pub use ant_ffi::*;
+pub use my_other_lib::*;
+```
+
+One compilation graph means one copy of std and one allocator — and
+cargo unifies shared dependencies, so if both stacks use tokio or
+libp2p you ship *one* copy instead of two (a substantial size win
+over any two-library setup). Cross-compile and package it with the
+same recipe as `cargo xtask build-ios-xcframework`, pointed at your
+aggregator crate. The trade-off: you build from source rather than
+consuming the prebuilt zip — but if you have your own Rust library,
+you have the toolchain anyway.
+
+The alternatives are worse: dylib-style xcframeworks coexist (Apple's
+two-level namespace keeps each dylib's std private) but bring
+codesigning/embedding obligations and duplicate every shared
+dependency, and `ant-ffi` deliberately ships no Apple dylib (see the
+note above § 1); prelinking with `ld -r -exported_symbols_list` to
+internalize the runtime symbols works but leaves you maintaining
+export lists against linker behaviour — a last resort when neither
+library can be rebuilt from source.
 
 The **ATS exception** from §2 (*Info.plist — App Transport Security*)
 is still required — the prebuilt node speaks the same Noise-over-TCP —
