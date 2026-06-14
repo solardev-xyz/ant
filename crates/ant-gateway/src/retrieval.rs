@@ -2361,12 +2361,13 @@ pub async fn download_feed(
         }
     };
 
-    let (reference, index, signature) = match ack {
+    let (reference, index, signature, v2) = match ack {
         ControlAck::FeedResolved {
             reference,
             index,
             signature,
-        } => (reference, index, signature),
+            v2,
+        } => (reference, index, signature, v2),
         ControlAck::FeedNotFound => {
             return json_error(StatusCode::NOT_FOUND, "no feed updates found");
         }
@@ -2441,7 +2442,7 @@ pub async fn download_feed(
         let _ = resp
             .headers_mut()
             .insert(header::CONTENT_LENGTH, HeaderValue::from(len));
-        apply_feed_headers(&mut resp, reference, index, &signature);
+        apply_feed_headers(&mut resp, reference, index, &signature, v2);
         return resp;
     }
 
@@ -2508,7 +2509,7 @@ pub async fn download_feed(
             "application/octet-stream",
             None,
         );
-        apply_feed_headers(&mut resp, reference, index, &signature);
+        apply_feed_headers(&mut resp, reference, index, &signature, v2);
         return resp;
     }
 
@@ -2544,7 +2545,7 @@ pub async fn download_feed(
         "application/octet-stream",
         None,
     );
-    apply_feed_headers(&mut resp, reference, index, &signature);
+    apply_feed_headers(&mut resp, reference, index, &signature, v2);
     resp
 }
 
@@ -2552,12 +2553,18 @@ pub async fn download_feed(
 /// the shared byte-streaming helpers. Sets `swarm-feed-index` /
 /// `swarm-feed-index-next` (8-byte big-endian hex of `index` and
 /// `index + 1`), `swarm-soc-signature` (hex of the 65-byte signature),
-/// `swarm-feed-resolved-version` (`v1`), an `ETag` of the resolved
-/// content reference, and exposes the feed headers via
+/// `swarm-feed-resolved-version` (`v1` or `v2` per `v2`), an `ETag` of
+/// the resolved content reference, and exposes the feed headers via
 /// `Access-Control-Expose-Headers`. Forces `Cache-Control: no-cache`
 /// because feed contents are mutable (overriding the immutable cache the
 /// byte-stream helpers stamp).
-fn apply_feed_headers(resp: &mut Response, reference: [u8; 32], index: u64, signature: &[u8; 65]) {
+fn apply_feed_headers(
+    resp: &mut Response,
+    reference: [u8; 32],
+    index: u64,
+    signature: &[u8; 65],
+    v2: bool,
+) {
     let h = resp.headers_mut();
     if let Ok(v) = HeaderValue::from_str(&hex::encode(index.to_be_bytes())) {
         h.insert(SWARM_FEED_INDEX, v);
@@ -2568,7 +2575,10 @@ fn apply_feed_headers(resp: &mut Response, reference: [u8; 32], index: u64, sign
     if let Ok(v) = HeaderValue::from_str(&hex::encode(signature)) {
         h.insert(SWARM_SOC_SIGNATURE, v);
     }
-    h.insert(SWARM_FEED_RESOLVED_VERSION, HeaderValue::from_static("v1"));
+    h.insert(
+        SWARM_FEED_RESOLVED_VERSION,
+        HeaderValue::from_static(if v2 { "v2" } else { "v1" }),
+    );
     if let Ok(v) = HeaderValue::from_str(&format!("\"{}\"", hex::encode(reference))) {
         h.insert(header::ETAG, v);
     }

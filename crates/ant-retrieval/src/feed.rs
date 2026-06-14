@@ -52,14 +52,24 @@
 //!
 //! ## Wrapped CAC payload (v1 vs v2)
 //!
-//! - **v1 (legacy)**: `payload` is exactly `ts(8) ‖ ref(32 or 64)`, so
-//!   `len(cac_data) - span_size = 16 + ref_size = 40 or 56`. The
-//!   reference is the bytes after the timestamp.
-//! - **v2**: `payload` is arbitrary; the wrapped CAC is itself a stored
-//!   chunk that *contains* a v1-style payload (or a manifest). v1 is
-//!   distinguished from v2 purely by length: v1 lengths are exactly 48
-//!   (40 + span) for unencrypted refs or 80 (56 + span) for encrypted
-//!   refs. Anything else is v2 and is fetched directly.
+//! - **v1 (legacy)**: the wrapped CAC's data is `span(8) ‖ ts(8) ‖
+//!   ref(32 or 64)`, i.e. total length 48 (unencrypted ref) or 80
+//!   (encrypted ref). The reference the feed points at is the bytes
+//!   after the timestamp (`cac_data[16..]`).
+//! - **v2**: the wrapped CAC *is itself* the content root chunk; the
+//!   reference the feed points at is simply the wrapped CAC's own
+//!   address. No `ts ‖ ref` indirection.
+//!
+//! A wrapped CAC of length 48 or 80 is **ambiguous** — it could be a v1
+//! payload or a v2 content chunk that happens to be that size. Bee's
+//! `resolveFeed` (`bee/pkg/api/bzz.go`) races both interpretations and
+//! returns whichever wrapped address is actually retrievable. We mirror
+//! that deterministically: for an ambiguous length we probe the v1
+//! reference, classify as v1 if it resolves, and otherwise fall back to
+//! v2 (the wrapped CAC's own address). Any other length is unambiguously
+//! v2. Encrypted (64-byte) v1 references can't be *served* yet — the
+//! joiner has no chunk decryption — but the v2 interpretation of an
+//! 80-byte wrapped CAC is still followed when its own address resolves.
 
 use crate::ChunkFetcher;
 use ant_crypto::{
@@ -102,16 +112,6 @@ pub enum FeedError {
     /// Wrapped CAC inside the SOC failed BMT validation.
     #[error("wrapped chunk failed CAC validation")]
     InvalidWrappedChunk,
-    /// We expected a v1-style payload (ts ‖ ref) but the CAC payload
-    /// length doesn't fit either the unencrypted (48) or encrypted (80)
-    /// layout, and we have no recourse for v2 yet.
-    #[error("v1 payload expected, got {0} bytes (cac with span)")]
-    NotV1Payload(usize),
-    /// Encrypted feed payloads (`ref_size = 64`) aren't supported yet.
-    /// Same restriction as the rest of the read-path; matches our
-    /// `ManifestError::UnsupportedEncryption`.
-    #[error("encrypted feed payloads not supported")]
-    EncryptedPayloadNotSupported,
     /// Walked the entire allowed range without finding a single update.
     /// Either the feed has never been published or the chunks aren't
     /// reachable from this antd's neighbourhood right now.
@@ -211,20 +211,24 @@ pub fn sequence_update_id(topic: &[u8; 32], index: u64) -> [u8; 32] {
 /// Resolved feed update: the reference the latest update points at,
 /// the sequence index that update was found at, the timestamp embedded
 /// in its v1 payload (big-endian unix seconds, exactly as bee writes;
-/// see `bee/pkg/feeds/feed.go::Update`), and the SOC signature of the
-/// resolved update chunk.
+/// see `bee/pkg/feeds/feed.go::Update`; `0` for v2 updates), the SOC
+/// signature of the resolved update chunk, and whether the update was
+/// resolved as v2 (the wrapped CAC is the content root) rather than v1
+/// (`ts ‖ ref`).
 ///
 /// Callers that only want the reference can use [`resolve_sequence_feed`];
 /// callers that need to render bee-shaped feed responses (e.g. the
 /// gateway's `GET /feeds/{owner}/{topic}` handler) need the index for
-/// the `swarm-feed-index` / `swarm-feed-index-next` headers and the
-/// signature for `swarm-soc-signature`.
+/// the `swarm-feed-index` / `swarm-feed-index-next` headers, the
+/// signature for `swarm-soc-signature`, and `v2` for
+/// `swarm-feed-resolved-version`.
 #[derive(Debug, Clone, Copy)]
 pub struct FeedResolution {
     pub reference: [u8; 32],
     pub index: u64,
     pub ts: u64,
     pub signature: [u8; 65],
+    pub v2: bool,
 }
 
 /// Resolve a feed to its current content root.
@@ -263,26 +267,21 @@ pub async fn resolve_sequence_feed_full(
     fetcher: &dyn ChunkFetcher,
     feed: &Feed,
 ) -> Result<FeedResolution, FeedError> {
-    let mut last: Option<FeedResolution> = None;
+    let mut last: Option<(u64, DecodedUpdate)> = None;
     let mut index: u64 = 0;
 
     loop {
         let addr = sequence_update_address(feed, index);
         match fetcher.fetch(addr).await {
             Ok(chunk_wire) => {
-                let (ts, reference, signature) = decode_sequence_update(&chunk_wire, addr, feed)?;
+                let decoded = decode_sequence_update(&chunk_wire, addr, feed)?;
                 trace!(
                     target: "ant_retrieval::feed",
                     index,
                     addr = %hex::encode(addr),
                     "feed update fetched and verified",
                 );
-                last = Some(FeedResolution {
-                    reference,
-                    index,
-                    ts,
-                    signature,
-                });
+                last = Some((index, decoded));
                 index += 1;
             }
             Err(e) => {
@@ -303,19 +302,56 @@ pub async fn resolve_sequence_feed_full(
     }
 
     match last {
-        Some(resolution) => {
+        Some((latest_index, decoded)) => {
+            // Disambiguate v1 vs v2 only for the latest update — the
+            // intermediate updates' references are never served.
+            let (reference, v2) = classify_payload(fetcher, &decoded).await;
             debug!(
                 target: "ant_retrieval::feed",
-                latest_index = resolution.index,
-                reference = %hex::encode(resolution.reference),
+                latest_index,
+                reference = %hex::encode(reference),
+                v2,
                 probed = index + 1,
                 "feed resolved",
             );
-            Ok(resolution)
+            Ok(FeedResolution {
+                reference,
+                index: latest_index,
+                ts: decoded.ts,
+                signature: decoded.signature,
+                v2,
+            })
         }
         // `index` is the first not-found index; we probed `index + 1`
         // addresses (0..=index) before giving up.
         None => Err(FeedError::NoUpdates { probed: index + 1 }),
+    }
+}
+
+/// Resolve the reference a verified update points at, distinguishing v1
+/// (`ts ‖ ref`) from v2 (the wrapped CAC is the content root). Returns
+/// `(reference, is_v2)`.
+///
+/// Mirrors bee's `resolveFeed` race (`bee/pkg/api/bzz.go`): a wrapped
+/// CAC of v1 length (48 unencrypted, 80 encrypted) is ambiguous, so we
+/// probe the v1 reference and classify as v1 when it resolves, falling
+/// back to v2 (the wrapped CAC's own address) on a definitive miss. A
+/// non-v1 length is unambiguously v2 and needs no probe.
+async fn classify_payload(fetcher: &dyn ChunkFetcher, decoded: &DecodedUpdate) -> ([u8; 32], bool) {
+    match decoded.v1_ref {
+        // Unambiguous v2: the wrapped CAC is the content root chunk.
+        None => (decoded.inner_cac_addr, true),
+        // Ambiguous v1-length: probe the v1 reference. Bee returns
+        // whichever wrapped address is retrievable; we prefer v1 when it
+        // resolves and otherwise fall back to v2 only on a definitive
+        // miss. A non-miss fetch error (flaky peer) keeps the v1
+        // classification — the gateway re-fetches when it streams, and
+        // misclassifying a transient v1 as v2 would be worse than an
+        // honest retry.
+        Some(v1_ref) => match fetcher.fetch(v1_ref).await {
+            Err(e) if is_chunk_not_found(e.as_ref()) => (decoded.inner_cac_addr, true),
+            _ => (v1_ref, false),
+        },
     }
 }
 
@@ -349,8 +385,24 @@ fn is_chunk_not_found(e: &(dyn StdError + 'static)) -> bool {
     msg.contains("not found") || msg.contains("no peer found")
 }
 
-/// Parse + verify a SOC chunk delivered for a sequence feed update,
-/// then extract the reference it points at.
+/// A verified feed-update SOC, decoded but not yet classified as v1/v2.
+/// `classify_payload` turns this into the final reference + version.
+struct DecodedUpdate {
+    /// The wrapped CAC's own address (the v2 reference).
+    inner_cac_addr: [u8; 32],
+    /// The candidate v1 reference (`inner_cac[16..48]`), present only
+    /// when the wrapped CAC is exactly 48 bytes — the one ambiguous
+    /// length we can actually serve. `None` means "unambiguously v2"
+    /// (any other length, including the 80-byte encrypted-v1 layout we
+    /// can't decrypt).
+    v1_ref: Option<[u8; 32]>,
+    /// v1 timestamp (big-endian unix seconds), or `0` when not v1.
+    ts: u64,
+    /// The SOC signature, surfaced in the `swarm-soc-signature` header.
+    signature: [u8; 65],
+}
+
+/// Parse + verify a SOC chunk delivered for a sequence feed update.
 ///
 /// `chunk_wire` is exactly what bee's `swarm.Chunk.Data()` would
 /// return for a SOC chunk: `id(32) ‖ sig(65) ‖ inner_cac` where
@@ -358,11 +410,14 @@ fn is_chunk_not_found(e: &(dyn StdError + 'static)) -> bool {
 /// SOC chunks only carry the wrapped CAC's own span. CAC chunks, by
 /// contrast, have a span at the front of their `Data()`. See
 /// `bee/pkg/soc/soc.go::toBytes`.
+///
+/// Returns the decoded-but-unclassified update; `classify_payload`
+/// resolves the v1/v2 ambiguity once the latest update is known.
 fn decode_sequence_update(
     chunk_wire: &[u8],
     expected_soc_addr: [u8; 32],
     feed: &Feed,
-) -> Result<(u64, [u8; 32], [u8; 65]), FeedError> {
+) -> Result<DecodedUpdate, FeedError> {
     if chunk_wire.len() < SOC_MIN_CHUNK_SIZE {
         return Err(FeedError::SocTooShort(chunk_wire.len()));
     }
@@ -415,34 +470,28 @@ fn decode_sequence_update(
         return Err(FeedError::OwnerMismatch);
     }
 
-    // Now extract the reference from the inner CAC's payload.
-    // `inner_cac = span(8) ‖ payload(N)`. v1 layouts:
-    //   span(8) ‖ ts(8) ‖ ref(32)  → total 48
-    //   span(8) ‖ ts(8) ‖ ref(64)  → total 56  (encrypted)
-    let cac_total = inner_cac.len();
-    match cac_total {
-        48 => {
-            // Unencrypted v1: ts(8 BE) at offset SPAN_SIZE..SPAN_SIZE+8;
-            // reference is the next 32 bytes. Bee writes ts as
-            // big-endian unix seconds; see
-            // `bee/pkg/feeds/feed.go::Update`.
-            let mut ts_bytes = [0u8; 8];
-            ts_bytes.copy_from_slice(&inner_cac[SPAN_SIZE..SPAN_SIZE + 8]);
-            let ts = u64::from_be_bytes(ts_bytes);
-            let mut reference = [0u8; 32];
-            reference.copy_from_slice(&inner_cac[SPAN_SIZE + 8..SPAN_SIZE + 8 + 32]);
-            Ok((ts, reference, signature))
-        }
-        56 => Err(FeedError::EncryptedPayloadNotSupported),
-        _ => {
-            // Not v1. Bee's `resolveFeed` would race v2 here; for v2
-            // the SOC's wrapped CAC payload *is* the reference target
-            // and we'd recurse one more `fetcher.fetch(inner_cac_addr)`.
-            // Until any feed in our live corpus actually uses v2,
-            // surface a clear error so we know to extend this code.
-            Err(FeedError::NotV1Payload(cac_total))
-        }
-    }
+    // Extract the v1 candidate reference. `inner_cac = span(8) ‖
+    // payload`; the v1 layout is `span(8) ‖ ts(8) ‖ ref(32)` (total 48,
+    // unencrypted) or `span(8) ‖ ts(8) ‖ ref(64)` (total 80, encrypted).
+    // We can only serve the unencrypted form, so a v1 reference is
+    // offered only for length 48; every other length is treated as v2
+    // by `classify_payload`.
+    let (v1_ref, ts) = if inner_cac.len() == 48 {
+        let mut ts_bytes = [0u8; 8];
+        ts_bytes.copy_from_slice(&inner_cac[SPAN_SIZE..SPAN_SIZE + 8]);
+        let mut reference = [0u8; 32];
+        reference.copy_from_slice(&inner_cac[SPAN_SIZE + 8..SPAN_SIZE + 8 + 32]);
+        (Some(reference), u64::from_be_bytes(ts_bytes))
+    } else {
+        (None, 0)
+    };
+
+    Ok(DecodedUpdate {
+        inner_cac_addr,
+        v1_ref,
+        ts,
+        signature,
+    })
 }
 
 #[cfg(test)]
@@ -565,9 +614,13 @@ mod tests {
 
         let mut fetcher = MapFetcher::new();
         fetcher.insert(soc_addr, soc_wire);
+        // Stage a chunk at the v1 reference so the v1/v2 disambiguation
+        // probe resolves it as v1 (its content is irrelevant here).
+        fetcher.insert(target_ref, cac_new(b"v1 target content").unwrap().1);
 
-        let resolved = resolve_sequence_feed(&fetcher, &feed).await.unwrap();
-        assert_eq!(resolved, target_ref);
+        let resolution = resolve_sequence_feed_full(&fetcher, &feed).await.unwrap();
+        assert_eq!(resolution.reference, target_ref);
+        assert!(!resolution.v2, "retrievable v1 ref must classify as v1");
     }
 
     /// Multiple updates: the resolver returns the *latest* one, not the
@@ -590,10 +643,90 @@ mod tests {
         for (i, r) in refs.iter().enumerate() {
             let (addr, wire) = make_sequence_update_v1(&secret, &owner, &topic, i as u64, r);
             fetcher.insert(addr, wire);
+            // Stage each v1 reference so the latest one classifies as v1.
+            fetcher.insert(*r, cac_new(b"v1 target content").unwrap().1);
         }
 
         let resolved = resolve_sequence_feed(&fetcher, &feed).await.unwrap();
         assert_eq!(resolved, refs[2], "should return last update's ref");
+    }
+
+    /// A v2 update: the SOC wraps a CAC that *is* the content root
+    /// chunk (no `ts ‖ ref` indirection). The v1 reference parsed from
+    /// the wrapped CAC's bytes is not retrievable, so resolution falls
+    /// back to v2 and returns the wrapped CAC's own address.
+    #[tokio::test]
+    async fn resolve_v2_update_returns_wrapped_cac_address() {
+        let secret: [u8; 32] = [0x44u8; 32];
+        let owner = deterministic_eth_address(&secret);
+        let topic: [u8; 32] = [0x55u8; 32];
+        let feed = Feed {
+            owner,
+            topic,
+            kind: FeedType::Sequence,
+        };
+
+        // The content the v2 feed points at: an arbitrary blob whose CAC
+        // is wrapped directly by the SOC. Pick content longer than 40
+        // bytes so the wrapped CAC is unambiguously non-v1-length.
+        let content = b"this is the v2 content root chunk payload, well over 40 bytes long";
+        let (content_addr, content_wire) = cac_new(content).unwrap();
+
+        // Build the SOC over the content CAC directly.
+        let mut id_input = Vec::with_capacity(40);
+        id_input.extend_from_slice(&topic);
+        id_input.extend_from_slice(&0u64.to_be_bytes());
+        let id = keccak256(&id_input);
+        let mut sig_input = Vec::with_capacity(64);
+        sig_input.extend_from_slice(&id);
+        sig_input.extend_from_slice(&content_addr);
+        let prehash = keccak256(&sig_input);
+        let sig = sign_handshake_data(&secret, &prehash).unwrap();
+        let mut wire = Vec::with_capacity(SOC_HEADER_SIZE + content_wire.len());
+        wire.extend_from_slice(&id);
+        wire.extend_from_slice(&sig);
+        wire.extend_from_slice(&content_wire);
+
+        let soc_addr = sequence_update_address(&feed, 0);
+        let mut fetcher = MapFetcher::new();
+        fetcher.insert(soc_addr, wire);
+        // The content CAC is independently retrievable (bee uploads it
+        // via POST /bytes before wrapping it in the feed update).
+        fetcher.insert(content_addr, content_wire);
+
+        let resolution = resolve_sequence_feed_full(&fetcher, &feed).await.unwrap();
+        assert_eq!(
+            resolution.reference, content_addr,
+            "v2 resolves to the wrapped CAC's own address",
+        );
+        assert!(resolution.v2, "non-v1-length payload must classify as v2");
+    }
+
+    /// An ambiguous 48-byte wrapped CAC whose v1 reference is *not*
+    /// retrievable falls back to v2 — matching bee's resolveFeed, which
+    /// returns whichever wrapped address actually resolves.
+    #[tokio::test]
+    async fn resolve_v1_length_but_unretrievable_ref_falls_back_to_v2() {
+        let secret: [u8; 32] = [0x66u8; 32];
+        let owner = deterministic_eth_address(&secret);
+        let topic: [u8; 32] = [0x77u8; 32];
+        let feed = Feed {
+            owner,
+            topic,
+            kind: FeedType::Sequence,
+        };
+        let unretrievable_ref: [u8; 32] = [0x99u8; 32];
+
+        let (soc_addr, soc_wire) =
+            make_sequence_update_v1(&secret, &owner, &topic, 0, &unretrievable_ref);
+        let mut fetcher = MapFetcher::new();
+        fetcher.insert(soc_addr, soc_wire);
+        // Deliberately do NOT stage `unretrievable_ref`: the v1 probe
+        // misses, so resolution falls back to the wrapped CAC address.
+
+        let resolution = resolve_sequence_feed_full(&fetcher, &feed).await.unwrap();
+        assert_ne!(resolution.reference, unretrievable_ref);
+        assert!(resolution.v2, "unretrievable v1 ref must fall back to v2");
     }
 
     /// An update signed by a *different* owner must be rejected: SOC

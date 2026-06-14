@@ -412,18 +412,22 @@ pub enum ControlAck {
     /// Snapshot of every registered postage batch. Terminal ack on
     /// `PostageList`.
     PostageList(Vec<PostageStatusView>),
-    /// Successful feed resolution: the reference the latest update's CAC
-    /// payload points at, the sequence index it lived at, and the SOC
-    /// signature of that update chunk. Bee's `GET /feeds/{owner}/{topic}`
-    /// surfaces the index (big-endian 8-byte) in the `swarm-feed-index`
-    /// header, `index + 1` in `swarm-feed-index-next`, and the signature
-    /// (hex) in `swarm-soc-signature`; the response body is the
+    /// Successful feed resolution: the reference the latest update points
+    /// at, the sequence index it lived at, the SOC signature of that
+    /// update chunk, and whether it resolved as v2 (the wrapped CAC is
+    /// the content root) rather than v1 (`ts ‖ ref`). Bee's
+    /// `GET /feeds/{owner}/{topic}` surfaces the index (big-endian
+    /// 8-byte) in the `swarm-feed-index` header, `index + 1` in
+    /// `swarm-feed-index-next`, the signature (hex) in
+    /// `swarm-soc-signature`, and `v1`/`v2` in
+    /// `swarm-feed-resolved-version`; the response body is the
     /// dereferenced content at `reference`. Carrying these through the
     /// ack lets the gateway build those headers without recomputing.
     FeedResolved {
         reference: [u8; 32],
         index: u64,
         signature: [u8; 65],
+        v2: bool,
     },
     /// Empty-feed signal from `GetFeed`. Distinct from
     /// [`Self::Error`] so the gateway can map it to `404 Not Found`

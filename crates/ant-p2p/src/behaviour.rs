@@ -2550,6 +2550,7 @@ fn handle_control_command(
                         reference: resolution.reference,
                         index: resolution.index,
                         signature: resolution.signature,
+                        v2: resolution.v2,
                     },
                     Err(ant_retrieval::FeedError::NoUpdates { .. }) => ControlAck::FeedNotFound,
                     Err(e) => ControlAck::Error {

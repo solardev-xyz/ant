@@ -1309,6 +1309,42 @@ fn make_feed_update(
     (soc_addr, wire)
 }
 
+/// Build a **v2** sequence-feed update SOC: the SOC wraps `content`'s
+/// CAC directly (no `ts || ref` indirection), so the feed resolves to
+/// the content CAC's own address. Returns `(soc_addr, soc_wire,
+/// content_addr, content_wire)`. Mirrors bee's v2 feed updates.
+fn make_feed_update_v2(
+    secret: &[u8; 32],
+    owner: &[u8; 20],
+    topic: &[u8; 32],
+    index: u64,
+    content: &[u8],
+) -> ([u8; 32], Vec<u8>, [u8; 32], Vec<u8>) {
+    let mut id_input = Vec::with_capacity(40);
+    id_input.extend_from_slice(topic);
+    id_input.extend_from_slice(&index.to_be_bytes());
+    let id = ant_crypto::keccak256(&id_input);
+
+    let (content_addr, content_wire) = ant_crypto::cac_new(content).expect("content cac");
+
+    let mut sig_input = Vec::with_capacity(64);
+    sig_input.extend_from_slice(&id);
+    sig_input.extend_from_slice(&content_addr);
+    let prehash = ant_crypto::keccak256(&sig_input);
+    let sig = ant_crypto::sign_handshake_data(secret, &prehash).expect("sign");
+
+    let mut soc_addr_input = Vec::with_capacity(52);
+    soc_addr_input.extend_from_slice(&id);
+    soc_addr_input.extend_from_slice(owner);
+    let soc_addr = ant_crypto::keccak256(&soc_addr_input);
+
+    let mut wire = Vec::with_capacity(32 + 65 + content_wire.len());
+    wire.extend_from_slice(&id);
+    wire.extend_from_slice(&sig);
+    wire.extend_from_slice(&content_wire);
+    (soc_addr, wire, content_addr, content_wire)
+}
+
 fn deterministic_owner(secret: &[u8; 32]) -> [u8; 20] {
     use k256::ecdsa::{SigningKey, VerifyingKey};
     let sk = SigningKey::from_bytes(secret.into()).expect("valid secret");
@@ -1371,6 +1407,28 @@ impl FeedScenario {
             }
         })
     }
+
+    /// Stage a single **v2** update at `index`: the SOC wraps the
+    /// content CAC directly, so the feed resolves to the content's own
+    /// address. The content CAC is also staged standalone (bee uploads
+    /// it via POST /bytes before wrapping it).
+    fn router_v2(&self, index: u64, content: &[u8]) -> axum::Router {
+        let mut chunks: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
+        let (soc_addr, soc_wire, content_addr, content_wire) =
+            make_feed_update_v2(&self.secret, &self.owner, &self.topic, index, content);
+        chunks.insert(soc_addr, soc_wire);
+        chunks.insert(content_addr, content_wire);
+        let owner = self.owner;
+        let topic = self.topic;
+        router_with_dispatcher(move |cmd| {
+            let chunks = chunks.clone();
+            let owner = owner;
+            let topic = topic;
+            async move {
+                handle_feed_test_command(&chunks, owner, topic, cmd).await;
+            }
+        })
+    }
 }
 
 async fn handle_feed_test_command(
@@ -1409,6 +1467,7 @@ async fn handle_feed_test_command(
                     reference: r.reference,
                     index: r.index,
                     signature: r.signature,
+                    v2: r.v2,
                 },
                 Err(ant_retrieval::FeedError::NoUpdates { .. }) => ControlAck::FeedNotFound,
                 Err(e) => ControlAck::Error {
@@ -1559,6 +1618,41 @@ async fn get_feed_dereferences_to_latest_content_with_bee_headers() {
 
     let body = body_bytes(resp).await;
     assert_eq!(body.as_slice(), latest, "body is the dereferenced content");
+}
+
+#[tokio::test]
+async fn get_feed_v2_dereferences_wrapped_cac_with_v2_version_header() {
+    // A v2 update wraps the content root chunk directly. The feed
+    // resolves to the wrapped CAC's own address, the body is that
+    // content, and `swarm-feed-resolved-version` is `v2`. Content is
+    // > 40 bytes so the wrapped CAC is unambiguously non-v1-length.
+    let scenario = FeedScenario::new(0x2a, 0xba);
+    let content = b"v2 feed content that is comfortably longer than forty bytes long";
+    let router = scenario.router_v2(0, content.as_slice());
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::GET)
+            .uri(feed_uri(&scenario.owner, &scenario.topic))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("swarm-feed-resolved-version").unwrap(),
+        "v2",
+    );
+    assert_eq!(
+        resp.headers().get("swarm-feed-index").unwrap(),
+        index_hex(0).as_str(),
+    );
+    let body = body_bytes(resp).await;
+    assert_eq!(
+        body.as_slice(),
+        content,
+        "v2 body is the wrapped CAC's content",
+    );
 }
 
 #[tokio::test]
