@@ -25,6 +25,11 @@
  lets us correlate behaviour to a specific build. Use the same patch
  number across all crates; we ship them as one unit. Bump minor or
  major only when the user asks for it explicitly.
+- **Always put version bumps in their own commit**, separate from any
+ fix/feature work, so the diff for a change stays clean and easy to
+ review/revert. Never fold the `Cargo.toml` patch-version bumps into a
+ commit that also contains code changes — commit the bump on its own
+ (e.g. `chore: bump workspace crates to x.y.Z`).
 
 ## Driving the iOS Drive app on the simulator (idb + log capture)
 
