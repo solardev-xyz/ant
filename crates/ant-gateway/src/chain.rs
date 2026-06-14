@@ -132,17 +132,30 @@ struct WalletBody {
     native_token_balance: String,
     #[serde(rename = "chainID")]
     chain_id: u64,
+    /// Node wallet (EOA) address. bee-js's `WalletBalance` parser requires
+    /// this as a string — omitting it makes `getWalletBalance()` throw
+    /// (issue #5).
+    #[serde(rename = "walletAddress")]
+    wallet_address: String,
+    /// Deployed chequebook contract address, or the all-zero sentinel when
+    /// none is configured. Also required-as-string by bee-js.
+    #[serde(rename = "chequebookContractAddress")]
+    chequebook_contract_address: String,
 }
 
 /// `GET /wallet`. Real `bzzBalance` (xBZZ ERC-20) + `nativeTokenBalance`
 /// (xDAI) for the node's wallet when a chain is configured; bee's
-/// zero-stub with `chainID:100` otherwise (PLAN.md D1).
+/// zero-stub with `chainID:100` otherwise (PLAN.md D1). Includes
+/// `walletAddress` + `chequebookContractAddress` so bee-js's
+/// `getWalletBalance()` parser is satisfied (issue #5).
 pub async fn wallet(State(handle): State<GatewayHandle>) -> Response {
     let Some(chain) = handle.chain.clone() else {
         return Json(WalletBody {
             bzz_balance: "0".into(),
             native_token_balance: "0".into(),
             chain_id: 100,
+            wallet_address: ZERO_ADDRESS.into(),
+            chequebook_contract_address: ZERO_ADDRESS.into(),
         })
         .into_response();
     };
@@ -158,6 +171,11 @@ pub async fn wallet(State(handle): State<GatewayHandle>) -> Response {
         bzz_balance: bzz.to_string(),
         native_token_balance: native.to_string(),
         chain_id: chain.chain_id,
+        wallet_address: format!("0x{}", hex::encode(chain.wallet_eth)),
+        chequebook_contract_address: chain.chequebook.map_or_else(
+            || ZERO_ADDRESS.to_string(),
+            |a| format!("0x{}", hex::encode(a)),
+        ),
     })
     .into_response()
 }
@@ -455,14 +473,42 @@ pub async fn buy_stamp(
     Path((amount, depth)): Path<(String, u8)>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let w = match writer(&handle) {
-        Ok(w) => w,
-        Err(r) => return r,
+    let Some(chain) = handle.chain.clone() else {
+        return json_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "on-chain writes require a configured wallet key + RPC endpoint",
+        );
+    };
+    let Some(w) = chain.writer.clone() else {
+        return json_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "on-chain writes require a configured wallet key + RPC endpoint",
+        );
     };
     let amount: u128 = match amount.parse() {
         Ok(a) => a,
         Err(_) => return json_error(StatusCode::BAD_REQUEST, "amount must be a decimal integer"),
     };
+    // Mirror bee's `CreateBatch` pre-submit guards so an obviously-bad buy
+    // fails the bee way (a `400`) instead of falling through to a reverted
+    // transaction surfaced as `502` (issue #5). bee requires `depth` to
+    // exceed the bucket depth and the wallet's xBZZ balance to cover the
+    // total cost `amount × 2^depth`.
+    if depth <= POSTAGE_BUCKET_DEPTH {
+        return json_error(StatusCode::BAD_REQUEST, "invalid depth");
+    }
+    let total_cost = 1u128
+        .checked_shl(u32::from(depth))
+        .and_then(|factor| amount.checked_mul(factor));
+    let balance = match guarded(chain.reader.bzz_balance(chain.wallet_eth)).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    // `total_cost == None` means it overflowed `u128`, i.e. it dwarfs any
+    // realistic balance → treat as unaffordable.
+    if total_cost.is_none_or(|cost| balance < cost) {
+        return json_error(StatusCode::BAD_REQUEST, "out of funds");
+    }
     let immutable = q
         .get("immutable")
         .is_some_and(|v| v.eq_ignore_ascii_case("true") || v == "1");

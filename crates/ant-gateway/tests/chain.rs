@@ -119,12 +119,22 @@ async fn get(router: axum::Router, uri: &str) -> (StatusCode, Value) {
 
 #[tokio::test]
 async fn wallet_reports_real_balances_when_chain_configured() {
-    let router = status_router_with_chain(snapshot_with_one_peer(), chain_ctx(None));
+    let cb = [0xAB; 20];
+    let router = status_router_with_chain(snapshot_with_one_peer(), chain_ctx(Some(cb)));
     let (status, json) = get(router, "/wallet").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["bzzBalance"], "1500000000000000000");
     assert_eq!(json["nativeTokenBalance"], "250000000000000000");
     assert_eq!(json["chainID"], 100);
+    // bee-js's WalletBalance parser requires these as strings (issue #5).
+    assert_eq!(
+        json["walletAddress"],
+        format!("0x{}", hex::encode([0x11; 20]))
+    );
+    assert_eq!(
+        json["chequebookContractAddress"],
+        format!("0x{}", hex::encode(cb)),
+    );
 }
 
 #[tokio::test]
@@ -134,6 +144,22 @@ async fn wallet_zero_stub_without_chain() {
     assert_eq!(json["bzzBalance"], "0");
     assert_eq!(json["nativeTokenBalance"], "0");
     assert_eq!(json["chainID"], 100);
+    // Even the no-chain stub emits the address fields as strings so bee-js
+    // doesn't throw on `undefined` (issue #5).
+    let zero = "0x0000000000000000000000000000000000000000";
+    assert_eq!(json["walletAddress"], zero);
+    assert_eq!(json["chequebookContractAddress"], zero);
+}
+
+#[tokio::test]
+async fn wallet_chequebook_zero_when_not_deployed() {
+    let router = status_router_with_chain(snapshot_with_one_peer(), chain_ctx(None));
+    let (status, json) = get(router, "/wallet").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json["chequebookContractAddress"],
+        "0x0000000000000000000000000000000000000000",
+    );
 }
 
 #[tokio::test]
@@ -245,6 +271,29 @@ async fn buy_stamp_rejects_bad_amount() {
     let router = status_router_with_chain(snapshot_with_one_peer(), chain_ctx_rw(None));
     let (status, _) = req(router, Method::POST, "/stamps/notanumber/20").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn buy_stamp_insufficient_funds_is_bee_400_out_of_funds() {
+    // The FakeChain wallet holds 1.5 xBZZ; this buy costs
+    // 15355000000000000 × 2^17 ≈ 2013 xBZZ — far more than the balance,
+    // so it must fail up front like bee (400 "out of funds") rather than
+    // fall through to a reverted tx surfaced as 502 (issue #5).
+    let router = status_router_with_chain(snapshot_with_one_peer(), chain_ctx_rw(None));
+    let (status, json) = req(router, Method::POST, "/stamps/15355000000000000/17").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["code"], 400);
+    assert_eq!(json["message"], "out of funds");
+}
+
+#[tokio::test]
+async fn buy_stamp_rejects_depth_at_or_below_bucket_depth() {
+    // bee requires depth > bucketDepth (16); a too-shallow batch would
+    // revert on-chain, so reject it with bee's "invalid depth" (issue #5).
+    let router = status_router_with_chain(snapshot_with_one_peer(), chain_ctx_rw(None));
+    let (status, json) = req(router, Method::POST, "/stamps/1000/16").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["message"], "invalid depth");
 }
 
 #[tokio::test]

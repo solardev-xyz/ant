@@ -2583,7 +2583,7 @@ These exist solely so bee consumers don't see undefined fields. Field names verb
 
 | Endpoint | Body |
 |---|---|
-| `GET /wallet` | `{bzzBalance:"0", nativeTokenBalance:"0", chainID:100}` |
+| `GET /wallet` | `{bzzBalance:"0", nativeTokenBalance:"0", chainID:100, walletAddress:"0x00…", chequebookContractAddress:"0x00…"}` (all five fields are required-as-string by bee-js's `WalletBalance` parser) |
 | `GET /stamps` | `{stamps:[]}` |
 | `GET /chequebook/address` | `{chequebookAddress:"0x0000000000000000000000000000000000000000"}` |
 | `GET /chequebook/balance` | `{totalBalance:"0", availableBalance:"0"}` |
