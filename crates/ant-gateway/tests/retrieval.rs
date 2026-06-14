@@ -1340,18 +1340,25 @@ impl FeedScenario {
         }
     }
 
-    fn router(&self, updates: &[(u64, [u8; 32], u64)]) -> axum::Router {
+    /// Stage `updates` (index → content bytes → ts). The wrapped
+    /// reference of each update is the CAC address of its content, so
+    /// `GetFeed` resolves to that address and the gateway's dereference
+    /// (`StreamBytes`) serves the staged content back. Content blobs in
+    /// these tests are single-chunk (≤ 4096 bytes).
+    fn router(&self, updates: &[(u64, &[u8], u64)]) -> axum::Router {
         let mut chunks: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
-        for (index, reference, ts) in updates {
+        for (index, content, ts) in updates {
+            let (content_addr, content_wire) = ant_crypto::cac_new(content).expect("content cac");
             let (addr, wire) = make_feed_update(
                 &self.secret,
                 &self.owner,
                 &self.topic,
                 *index,
                 *ts,
-                reference,
+                &content_addr,
             );
             chunks.insert(addr, wire);
+            chunks.insert(content_addr, content_wire);
         }
         let owner = self.owner;
         let topic = self.topic;
@@ -1399,10 +1406,9 @@ async fn handle_feed_test_command(
             };
             let reply = match ant_retrieval::resolve_sequence_feed_full(&fetcher, &feed).await {
                 Ok(r) => ControlAck::FeedResolved {
-                    id: ant_retrieval::sequence_update_id(&topic, r.index),
                     reference: r.reference,
                     index: r.index,
-                    ts: r.ts,
+                    signature: r.signature,
                 },
                 Err(ant_retrieval::FeedError::NoUpdates { .. }) => ControlAck::FeedNotFound,
                 Err(e) => ControlAck::Error {
@@ -1411,8 +1417,63 @@ async fn handle_feed_test_command(
             };
             let _ = ack.send(reply);
         }
+        ControlCommand::StreamBytes {
+            reference,
+            range,
+            head_only,
+            ack,
+            ..
+        } => {
+            serve_single_chunk_stream(chunks, reference, range, head_only, ack).await;
+        }
         other => panic!("unexpected command in feed test: {other:?}"),
     }
+}
+
+/// Serve the staged single-chunk content at `reference` over the
+/// streaming-ack protocol the gateway's `download_feed` dereference
+/// path consumes: a `BytesStreamStart` prologue, then (unless this is a
+/// `HEAD`) one `BytesChunk` carrying the requested byte slice, then
+/// `StreamDone`. The CAC wire is `span(8 LE) || payload`; tests stage
+/// payloads that fit in a single chunk so we never have to join a tree.
+async fn serve_single_chunk_stream(
+    chunks: &HashMap<[u8; 32], Vec<u8>>,
+    reference: [u8; 32],
+    range: Option<ant_control::StreamRange>,
+    head_only: bool,
+    ack: tokio::sync::mpsc::Sender<ControlAck>,
+) {
+    let Some(wire) = chunks.get(&reference) else {
+        let _ = ack
+            .send(ControlAck::Error {
+                message: format!("not found: {}", hex::encode(reference)),
+            })
+            .await;
+        return;
+    };
+    let payload = &wire[8..];
+    let total = payload.len() as u64;
+    if ack
+        .send(ControlAck::BytesStreamStart { total_bytes: total })
+        .await
+        .is_err()
+    {
+        return;
+    }
+    if head_only {
+        let _ = ack.send(ControlAck::StreamDone).await;
+        return;
+    }
+    let slice: Vec<u8> = match range {
+        Some(r) if total > 0 => {
+            let start = r.start.min(total - 1) as usize;
+            let end = r.end_inclusive.min(total - 1) as usize;
+            payload[start..=end].to_vec()
+        }
+        _ => payload.to_vec(),
+    };
+    let _ = ack.send(ControlAck::BytesChunk { data: slice }).await;
+    let _ = ack.send(ControlAck::StreamDone).await;
 }
 
 /// Tiny `ChunkFetcher` over an owned `HashMap<addr, wire>` so the feed
@@ -1440,11 +1501,27 @@ fn feed_uri(owner: &[u8; 20], topic: &[u8; 32]) -> String {
     format!("/feeds/{}/{}", hex::encode(owner), hex::encode(topic))
 }
 
+/// 8-byte big-endian hex encoding of a sequence index, the exact shape
+/// bee's `swarm-feed-index` / `swarm-feed-index-next` headers carry
+/// (`index::MarshalBinary`).
+fn index_hex(index: u64) -> String {
+    hex::encode(index.to_be_bytes())
+}
+
 #[tokio::test]
-async fn get_feed_returns_latest_reference() {
+async fn get_feed_dereferences_to_latest_content_with_bee_headers() {
+    // Bee's `GET /feeds` resolves the latest update and streams the
+    // *content* the update points at, with the index / next-index /
+    // signature / resolved-version headers. Three updates: the body
+    // must be the content of update 2, and the headers must reflect
+    // index 2 (and next index 3) in bee's 8-byte big-endian shape.
     let scenario = FeedScenario::new(0x21, 0xb1);
-    let target = [0xddu8; 32];
-    let router = scenario.router(&[(0, [0x10; 32], 100), (1, [0x20; 32], 200), (2, target, 300)]);
+    let latest = b"the-latest-feed-content";
+    let router = scenario.router(&[
+        (0, b"first".as_slice(), 100),
+        (1, b"second".as_slice(), 200),
+        (2, latest.as_slice(), 300),
+    ]);
     let resp = send(
         router,
         Request::builder()
@@ -1459,96 +1536,90 @@ async fn get_feed_returns_latest_reference() {
         resp.headers().get(header::CONTENT_TYPE).unwrap(),
         "application/octet-stream",
     );
-
-    let expected_id = ant_retrieval::sequence_update_id(&scenario.topic, 2);
     assert_eq!(
         resp.headers().get("swarm-feed-index").unwrap(),
-        hex::encode(expected_id).as_str(),
-        "swarm-feed-index must be the SOC id (bee shape), not the zero-padded u64 index",
+        index_hex(2).as_str(),
+        "swarm-feed-index must be the 8-byte big-endian sequence index, like bee",
     );
+    assert_eq!(
+        resp.headers().get("swarm-feed-index-next").unwrap(),
+        index_hex(3).as_str(),
+    );
+    assert_eq!(
+        resp.headers().get("swarm-feed-resolved-version").unwrap(),
+        "v1",
+    );
+    let sig = resp
+        .headers()
+        .get("swarm-soc-signature")
+        .expect("swarm-soc-signature header present")
+        .to_str()
+        .unwrap();
+    assert_eq!(sig.len(), 130, "65-byte signature is 130 hex chars");
 
     let body = body_bytes(resp).await;
-    assert_eq!(body.len(), 40);
-    assert_eq!(&body[..8], &300u64.to_be_bytes());
-    assert_eq!(&body[8..], &target);
+    assert_eq!(body.as_slice(), latest, "body is the dereferenced content");
 }
 
 #[tokio::test]
-async fn get_feed_accept_json_returns_json_body() {
+async fn get_feed_only_root_chunk_returns_raw_chunk() {
+    // `Swarm-Only-Root-Chunk: true` returns the resolved reference's
+    // root chunk verbatim (`span(8 LE) || payload`) instead of the
+    // joined content, matching bee's only-root-chunk branch.
     let scenario = FeedScenario::new(0x22, 0xb2);
-    let target = [0xeeu8; 32];
-    let router = scenario.router(&[(0, target, 1234)]);
+    let content = b"root-chunk-bytes";
+    let router = scenario.router(&[(0, content.as_slice(), 7)]);
     let resp = send(
         router,
         Request::builder()
             .method(Method::GET)
             .uri(feed_uri(&scenario.owner, &scenario.topic))
-            .header(header::ACCEPT, "application/json")
+            .header("swarm-only-root-chunk", "true")
             .body(Body::empty())
             .unwrap(),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
-        resp.headers().get(header::CONTENT_TYPE).unwrap(),
-        "application/json",
+        resp.headers().get("swarm-feed-index").unwrap(),
+        index_hex(0).as_str(),
     );
-    let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(json["reference"].as_str().unwrap(), hex::encode(target));
-    assert_eq!(json["ts"].as_u64().unwrap(), 1234);
+    let (_addr, expected_wire) = ant_crypto::cac_new(content).unwrap();
+    let body = body_bytes(resp).await;
     assert_eq!(
-        json["index"].as_u64().unwrap(),
-        0,
-        "feed JSON index is a number, not a hex string",
+        body.as_slice(),
+        expected_wire.as_slice(),
+        "only-root-chunk body is span(8 LE) || payload of the content chunk",
     );
 }
 
 #[tokio::test]
-async fn get_feed_accept_xml_returns_xml_body() {
+async fn get_feed_range_returns_partial_content() {
     let scenario = FeedScenario::new(0x23, 0xb3);
-    let target = [0xffu8; 32];
-    let router = scenario.router(&[(0, target, 7)]);
+    let content = b"0123456789abcdef";
+    let router = scenario.router(&[(0, content.as_slice(), 1)]);
     let resp = send(
         router,
         Request::builder()
             .method(Method::GET)
             .uri(feed_uri(&scenario.owner, &scenario.topic))
-            .header(header::ACCEPT, "application/xml")
+            .header(header::RANGE, "bytes=2-5")
             .body(Body::empty())
             .unwrap(),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(
-        resp.headers().get(header::CONTENT_TYPE).unwrap(),
-        "application/xml",
+        resp.headers().get(header::CONTENT_RANGE).unwrap(),
+        "bytes 2-5/16",
     );
-    let body = String::from_utf8(body_bytes(resp).await).unwrap();
-    assert!(body.contains(&format!("<reference>{}</reference>", hex::encode(target))));
-    assert!(body.contains("<ts>7</ts>"));
-    assert!(body.contains("<index>0</index>"));
-}
-
-#[tokio::test]
-async fn get_feed_unknown_accept_falls_back_to_octet_stream() {
-    let scenario = FeedScenario::new(0x24, 0xb4);
-    let target = [0xaau8; 32];
-    let router = scenario.router(&[(0, target, 5)]);
-    let resp = send(
-        router,
-        Request::builder()
-            .method(Method::GET)
-            .uri(feed_uri(&scenario.owner, &scenario.topic))
-            .header(header::ACCEPT, "text/csv")
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
+    // Range responses still carry the feed headers.
     assert_eq!(
-        resp.headers().get(header::CONTENT_TYPE).unwrap(),
-        "application/octet-stream",
+        resp.headers().get("swarm-feed-index").unwrap(),
+        index_hex(0).as_str(),
     );
+    let body = body_bytes(resp).await;
+    assert_eq!(body.as_slice(), b"2345");
 }
 
 #[tokio::test]
@@ -1556,7 +1627,7 @@ async fn get_feed_defaults_to_sequence_type() {
     // No `?type=` parameter; should default to Sequence (the only
     // implemented variant) and resolve.
     let scenario = FeedScenario::new(0x25, 0xb5);
-    let router = scenario.router(&[(0, [0x55; 32], 1)]);
+    let router = scenario.router(&[(0, b"x".as_slice(), 1)]);
     let resp = send(
         router,
         Request::builder()
@@ -1572,7 +1643,7 @@ async fn get_feed_defaults_to_sequence_type() {
 #[tokio::test]
 async fn get_feed_explicit_type_sequence_accepted() {
     let scenario = FeedScenario::new(0x26, 0xb6);
-    let router = scenario.router(&[(0, [0x66; 32], 1)]);
+    let router = scenario.router(&[(0, b"x".as_slice(), 1)]);
     let uri = format!(
         "/feeds/{}/{}?type=sequence",
         hex::encode(scenario.owner),
@@ -1635,8 +1706,7 @@ async fn get_feed_unknown_type_returns_400() {
 #[tokio::test]
 async fn get_feed_accepts_0x_prefixed_hex() {
     let scenario = FeedScenario::new(0x29, 0xb9);
-    let target = [0x77u8; 32];
-    let router = scenario.router(&[(0, target, 2)]);
+    let router = scenario.router(&[(0, b"x".as_slice(), 2)]);
     let uri = format!(
         "/feeds/0x{}/0X{}",
         hex::encode(scenario.owner),
@@ -1711,7 +1781,7 @@ async fn get_feed_returns_404_for_empty_feed() {
 #[tokio::test]
 async fn get_feed_does_not_set_immutable_cache_control() {
     let scenario = FeedScenario::new(0x2d, 0xbd);
-    let router = scenario.router(&[(0, [0x99; 32], 1)]);
+    let router = scenario.router(&[(0, b"x".as_slice(), 1)]);
     let resp = send(
         router,
         Request::builder()
@@ -1738,114 +1808,13 @@ async fn get_feed_does_not_set_immutable_cache_control() {
 }
 
 #[tokio::test]
-async fn get_feed_qvalue_picks_best_match() {
-    let scenario = FeedScenario::new(0x2e, 0xbe);
-    let target = [0xab; 32];
-    let router = scenario.router(&[(0, target, 9)]);
-    let resp = send(
-        router,
-        Request::builder()
-            .method(Method::GET)
-            .uri(feed_uri(&scenario.owner, &scenario.topic))
-            // text/html is preferred but unsupported; json is the only
-            // recognised format and wins despite a lower q-value.
-            .header(header::ACCEPT, "text/html;q=0.9, application/json;q=0.5")
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        resp.headers().get(header::CONTENT_TYPE).unwrap(),
-        "application/json",
-    );
-}
-
-#[tokio::test]
-async fn get_feed_malformed_qvalue_discards_entry() {
-    // RFC 7231 §5.3.1: a malformed q-value disqualifies the entry, so a
-    // bogus `application/json;q=abc` must not outrank the well-formed
-    // `application/xml`. Pin this so future refactors of
-    // `parse_q_thousandths` can't silently regress to "treat malformed
-    // as default 1.0", which would invert the client's preference.
-    let scenario = FeedScenario::new(0x2f, 0xbe);
-    let router = scenario.router(&[(0, [0xcd; 32], 7)]);
-    let resp = send(
-        router,
-        Request::builder()
-            .method(Method::GET)
-            .uri(feed_uri(&scenario.owner, &scenario.topic))
-            .header(header::ACCEPT, "application/json;q=abc, application/xml")
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        resp.headers().get(header::CONTENT_TYPE).unwrap(),
-        "application/xml",
-    );
-}
-
-#[tokio::test]
-async fn get_feed_uppercase_qvalue_param_is_recognised() {
-    // RFC 7231 §3.1.1.1: parameter names are case-insensitive. A client
-    // sending `Q=` must be honoured the same as `q=`; otherwise the
-    // picker would silently treat the entry as "no q-value seen" and
-    // give it the default 1.0, inverting the client's preference.
-    let scenario = FeedScenario::new(0x31, 0xbf);
-    let router = scenario.router(&[(0, [0xee; 32], 3)]);
-    let resp = send(
-        router,
-        Request::builder()
-            .method(Method::GET)
-            .uri(feed_uri(&scenario.owner, &scenario.topic))
-            .header(
-                header::ACCEPT,
-                "application/json;Q=0.1, application/xml;Q=0.9",
-            )
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        resp.headers().get(header::CONTENT_TYPE).unwrap(),
-        "application/xml",
-    );
-}
-
-#[tokio::test]
-async fn get_feed_accept_wildcard_falls_back_to_octet_stream() {
-    // `Accept: */*` carries no preference; mirror bee and serve the
-    // octet-stream body so existing browser clients keep working.
-    let scenario = FeedScenario::new(0x2f, 0xbf);
-    let router = scenario.router(&[(0, [0x42; 32], 1)]);
-    let resp = send(
-        router,
-        Request::builder()
-            .method(Method::GET)
-            .uri(feed_uri(&scenario.owner, &scenario.topic))
-            .header(header::ACCEPT, "*/*")
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        resp.headers().get(header::CONTENT_TYPE).unwrap(),
-        "application/octet-stream",
-    );
-}
-
-#[tokio::test]
 async fn head_feed_returns_headers_no_body() {
-    // `HEAD /feeds/...` runs the full lookup so existence-probe
-    // clients can read `swarm-feed-index` and `Content-Length` without
-    // paying for the 40-byte body transfer.
+    // `HEAD /feeds/...` runs the full lookup so existence-probe clients
+    // can read the feed headers and `Content-Length` without paying for
+    // the body transfer.
     let scenario = FeedScenario::new(0x30, 0xc0);
-    let target = [0x77u8; 32];
-    let router = scenario.router(&[(0, target, 5)]);
+    let content = b"head-content-blob";
+    let router = scenario.router(&[(0, content.as_slice(), 5)]);
     let resp = send(
         router,
         Request::builder()
@@ -1858,13 +1827,12 @@ async fn head_feed_returns_headers_no_body() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
         resp.headers().get(header::CONTENT_LENGTH).unwrap(),
-        "40",
-        "HEAD must echo the GET body length",
+        content.len().to_string().as_str(),
+        "HEAD must echo the GET body length (the dereferenced content)",
     );
-    let expected_id = ant_retrieval::sequence_update_id(&scenario.topic, 0);
     assert_eq!(
         resp.headers().get("swarm-feed-index").unwrap(),
-        hex::encode(expected_id).as_str(),
+        index_hex(0).as_str(),
     );
     let body = body_bytes(resp).await;
     assert!(body.is_empty(), "HEAD body must be empty");

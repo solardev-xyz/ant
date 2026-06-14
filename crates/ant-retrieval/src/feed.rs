@@ -82,19 +82,6 @@ pub const FEED_TOPIC_KEY: &str = "swarm-feed-topic";
 /// ("Sequence" or "Epoch"). We only handle "Sequence".
 pub const FEED_TYPE_KEY: &str = "swarm-feed-type";
 
-/// Hard cap on how many sequential indices we'll probe before giving up.
-/// Bee's async finder probes exponentially up to `2^DefaultLevels = 256`
-/// at the first level, then narrows; in practice every feed in our
-/// corpus is updated dozens to hundreds of times. 4096 is well past
-/// that and below any conceivable adversarial cap.
-const SEQUENCE_LOOKUP_MAX_INDEX: u64 = 4096;
-/// Number of consecutive misses before we declare the linear scan done.
-/// Bee's `sequence.finder.At` walks until the first miss; we tolerate a
-/// short window because individual chunk fetches over the live network
-/// are flaky and we'd rather risk a few wasted lookups than declare a
-/// healthy feed empty.
-const SEQUENCE_LOOKUP_MISS_TOLERANCE: u64 = 1;
-
 #[derive(Debug, Error)]
 pub enum FeedError {
     /// The metadata claimed feed semantics but a key was missing or
@@ -222,18 +209,22 @@ pub fn sequence_update_id(topic: &[u8; 32], index: u64) -> [u8; 32] {
 }
 
 /// Resolved feed update: the reference the latest update points at,
-/// the sequence index that update was found at, and the timestamp
-/// embedded in its v1 payload (big-endian unix seconds, exactly as
-/// bee writes; see `bee/pkg/feeds/feed.go::Update`).
+/// the sequence index that update was found at, the timestamp embedded
+/// in its v1 payload (big-endian unix seconds, exactly as bee writes;
+/// see `bee/pkg/feeds/feed.go::Update`), and the SOC signature of the
+/// resolved update chunk.
 ///
 /// Callers that only want the reference can use [`resolve_sequence_feed`];
 /// callers that need to render bee-shaped feed responses (e.g. the
-/// gateway's `GET /feeds/{owner}/{topic}` handler) need all three fields.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// gateway's `GET /feeds/{owner}/{topic}` handler) need the index for
+/// the `swarm-feed-index` / `swarm-feed-index-next` headers and the
+/// signature for `swarm-soc-signature`.
+#[derive(Debug, Clone, Copy)]
 pub struct FeedResolution {
     pub reference: [u8; 32],
     pub index: u64,
     pub ts: u64,
+    pub signature: [u8; 65],
 }
 
 /// Resolve a feed to its current content root.
@@ -246,9 +237,8 @@ pub struct FeedResolution {
 ///
 /// This is the linear-scan equivalent of `bee/pkg/feeds/sequence/finder.At`.
 /// Bee's async finder is faster on highly-updated feeds but more
-/// involved; the linear scan is correct, deterministic, and adequate
-/// for the live corpus we care about (largest feed in the corpus has
-/// ~150 updates).
+/// involved; the linear scan returns the identical result for a
+/// well-formed sequence feed.
 pub async fn resolve_sequence_feed(
     fetcher: &dyn ChunkFetcher,
     feed: &Feed,
@@ -257,24 +247,30 @@ pub async fn resolve_sequence_feed(
 }
 
 /// Same scan as [`resolve_sequence_feed`] but returns the full update
-/// metadata (index + ts) alongside the reference. Used by the gateway
-/// to render bee-shaped feed responses with `swarm-feed-index` headers
-/// and JSON / XML bodies that include the embedded timestamp.
+/// metadata (index + signature) alongside the reference. Used by the
+/// gateway to render bee-shaped feed responses with the
+/// `swarm-feed-index`, `swarm-feed-index-next`, and `swarm-soc-signature`
+/// headers.
+///
+/// The walk stops at the **first** missing index, exactly like bee's
+/// `sequence.finder.At`: the last contiguously-present update is the
+/// latest one. There is no miss tolerance and no upper bound on the
+/// index — a sequence feed has a finite number of updates and every
+/// probe past the last one is a genuine miss (a peer cannot forge a
+/// valid owner-signed SOC at an unused index), so the loop always
+/// terminates at the end gap.
 pub async fn resolve_sequence_feed_full(
     fetcher: &dyn ChunkFetcher,
     feed: &Feed,
 ) -> Result<FeedResolution, FeedError> {
     let mut last: Option<FeedResolution> = None;
-    let mut consecutive_misses: u64 = 0;
-    let mut probed: u64 = 0;
+    let mut index: u64 = 0;
 
-    for index in 0..SEQUENCE_LOOKUP_MAX_INDEX {
-        probed = index + 1;
+    loop {
         let addr = sequence_update_address(feed, index);
         match fetcher.fetch(addr).await {
             Ok(chunk_wire) => {
-                consecutive_misses = 0;
-                let (ts, reference) = decode_sequence_update(&chunk_wire, addr, feed)?;
+                let (ts, reference, signature) = decode_sequence_update(&chunk_wire, addr, feed)?;
                 trace!(
                     target: "ant_retrieval::feed",
                     index,
@@ -285,23 +281,21 @@ pub async fn resolve_sequence_feed_full(
                     reference,
                     index,
                     ts,
+                    signature,
                 });
+                index += 1;
             }
             Err(e) => {
-                // Distinguish "chunk not present in network" (a normal
+                // Distinguish "chunk not present in network" (the normal
                 // sentinel that the feed scan has reached its end) from
                 // a real I/O / protocol failure that the caller should
                 // know about. Bee's finder treats `storage.ErrNotFound`
-                // as "no update at this index" and keeps walking; we
+                // as the end of the feed and stops at the first miss; we
                 // do the same by inspecting the error string for the
                 // shape `RoutingFetcher` and `RetrievalError::Remote`
                 // produce.
                 if is_chunk_not_found(e.as_ref()) {
-                    consecutive_misses += 1;
-                    if consecutive_misses > SEQUENCE_LOOKUP_MISS_TOLERANCE {
-                        break;
-                    }
-                    continue;
+                    break;
                 }
                 return Err(FeedError::Fetch(e));
             }
@@ -314,12 +308,14 @@ pub async fn resolve_sequence_feed_full(
                 target: "ant_retrieval::feed",
                 latest_index = resolution.index,
                 reference = %hex::encode(resolution.reference),
-                probed,
+                probed = index + 1,
                 "feed resolved",
             );
             Ok(resolution)
         }
-        None => Err(FeedError::NoUpdates { probed }),
+        // `index` is the first not-found index; we probed `index + 1`
+        // addresses (0..=index) before giving up.
+        None => Err(FeedError::NoUpdates { probed: index + 1 }),
     }
 }
 
@@ -366,7 +362,7 @@ fn decode_sequence_update(
     chunk_wire: &[u8],
     expected_soc_addr: [u8; 32],
     feed: &Feed,
-) -> Result<(u64, [u8; 32]), FeedError> {
+) -> Result<(u64, [u8; 32], [u8; 65]), FeedError> {
     if chunk_wire.len() < SOC_MIN_CHUNK_SIZE {
         return Err(FeedError::SocTooShort(chunk_wire.len()));
     }
@@ -435,7 +431,7 @@ fn decode_sequence_update(
             let ts = u64::from_be_bytes(ts_bytes);
             let mut reference = [0u8; 32];
             reference.copy_from_slice(&inner_cac[SPAN_SIZE + 8..SPAN_SIZE + 8 + 32]);
-            Ok((ts, reference))
+            Ok((ts, reference, signature))
         }
         56 => Err(FeedError::EncryptedPayloadNotSupported),
         _ => {
@@ -670,10 +666,9 @@ mod tests {
         let fetcher = MapFetcher::new();
         match resolve_sequence_feed(&fetcher, &feed).await {
             Err(FeedError::NoUpdates { probed }) => {
-                // We probe at most miss-tolerance + 1 indices before
-                // giving up, so this should be small and finite.
-                assert!(probed >= 1);
-                assert!(probed <= SEQUENCE_LOOKUP_MISS_TOLERANCE + 2);
+                // Stop-at-first-miss: index 0 is absent, so we probe
+                // exactly one address before declaring the feed empty.
+                assert_eq!(probed, 1);
             }
             other => panic!("expected NoUpdates, got {other:?}"),
         }

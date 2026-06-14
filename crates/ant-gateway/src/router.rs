@@ -75,10 +75,11 @@ pub fn build(handle: GatewayHandle) -> Router {
         // `(owner, id)` pair can avoid computing it client-side.
         .route("/soc/{owner}/{id}", get_or_head(retrieval::download_soc))
         // Sequence-feed lookup (GET/HEAD) + feed-manifest creation
-        // (POST, PLAN.md J.2.5 / C2) share the one path. GET returns the
-        // latest update's `ts(8 BE) || ref(32)` body by default
-        // (matching bee), or structured JSON / XML when the client opts
-        // in via `Accept`; POST builds and pushes the feed manifest.
+        // (POST, PLAN.md J.2.5 / C2) share the one path. GET resolves
+        // the latest update and streams the content it points at,
+        // byte-for-byte like bee (with `Swarm-Only-Root-Chunk`, Range,
+        // and the `swarm-feed-index{,-next}` / `swarm-soc-signature`
+        // headers); POST builds and pushes the feed manifest.
         .route(
             "/feeds/{owner}/{topic}",
             get_or_head(retrieval::download_feed).post(retrieval::create_feed),

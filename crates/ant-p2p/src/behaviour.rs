@@ -2547,10 +2547,9 @@ fn handle_control_command(
                 };
                 let reply = match ant_retrieval::resolve_sequence_feed_full(&fetcher, &feed).await {
                     Ok(resolution) => ControlAck::FeedResolved {
-                        id: ant_retrieval::sequence_update_id(&topic, resolution.index),
                         reference: resolution.reference,
                         index: resolution.index,
-                        ts: resolution.ts,
+                        signature: resolution.signature,
                     },
                     Err(ant_retrieval::FeedError::NoUpdates { .. }) => ControlAck::FeedNotFound,
                     Err(e) => ControlAck::Error {
