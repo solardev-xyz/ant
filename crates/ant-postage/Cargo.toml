@@ -2,6 +2,7 @@
 name = "ant-postage"
 version = "0.5.19"
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 ant-crypto = { path = "../ant-crypto" }

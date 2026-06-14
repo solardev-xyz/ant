@@ -2,6 +2,7 @@
 name = "ant-chain"
 version = "0.5.19"
 edition.workspace = true
+license.workspace = true
 
 [[example]]
 name = "dry_run_wallet"

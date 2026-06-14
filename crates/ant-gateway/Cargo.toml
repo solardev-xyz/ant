@@ -2,6 +2,7 @@
 name = "ant-gateway"
 version = "0.5.19"
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 ant-control = { path = "../ant-control" }
