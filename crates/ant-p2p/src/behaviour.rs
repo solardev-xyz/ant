@@ -1613,37 +1613,48 @@ fn handle_control_command(
             let _ = ack.send(ControlAck::Ok { message: msg });
         }
         ControlCommand::GetChunk { reference, ack } => {
-            // Pick the best peer up-front (synchronously, no allocations
-            // beyond the existing routing entries) and hand the actual
-            // libp2p round-trip off to a spawned task. Keeps the swarm
-            // event loop free for new connections / hive gossip while the
-            // retrieve is in flight.
-            let candidate = state.routing.closest_peer(&reference, &[]);
-            let Some((peer, _overlay)) = candidate else {
-                let _ = ack.send(ControlAck::Error {
-                    message: "no peers available; wait for handshakes to complete".to_string(),
-                });
-                return;
-            };
-            let mut control = control.clone();
+            // Serve from the node's local caches first, then fall back to a
+            // hedged network retrieve. The upload path stashes every
+            // chunk/SOC into the mem + disk cache *before* pushsync (see the
+            // `PushChunk`/`PushSoc` handlers) precisely so the node can read
+            // back its own writes without waiting for network propagation —
+            // but only if the read path consults those caches. Routing the
+            // fetch through a cache-aware `RoutingFetcher` makes a local hit
+            // short-circuit before any peer round-trip, so we deliberately
+            // do *not* early-return on an empty peer set: a cached copy must
+            // still be returned. The fetcher subscribes to the live peer
+            // snapshot so network fallback tracks the current BZZ set.
+            let peers_rx = state.peers_watch.subscribe();
+            let cache = state.cache_for_request(false);
+            let disk_cache = state.disk_cache_for_request(false);
+            let control = control.clone();
             tokio::spawn(async move {
-                let res = ant_retrieval::retrieve_chunk(&mut control, peer, reference).await;
-                let reply = match res {
-                    Ok(chunk) => {
+                use ant_retrieval::ChunkFetcher;
+                let mut builder =
+                    ant_retrieval::RoutingFetcher::new(control, peers_rx).with_cache(cache);
+                if let Some(disk) = disk_cache {
+                    builder = builder.with_disk_cache(disk);
+                }
+                let fetcher = builder;
+                let reply = match fetcher.fetch(reference).await {
+                    Ok(wire) if wire.len() >= ant_crypto::SPAN_SIZE => {
+                        // `fetch` returns the chunk's wire bytes
+                        // (`span || payload`); `GetChunk` acks the payload.
+                        let payload = wire[ant_crypto::SPAN_SIZE..].to_vec();
                         debug!(
                             target: "ant_p2p",
-                            %peer,
-                            payload_bytes = chunk.payload().len(),
+                            payload_bytes = payload.len(),
                             "retrieval ok",
                         );
-                        ControlAck::Bytes {
-                            data: chunk.payload().to_vec(),
-                        }
+                        ControlAck::Bytes { data: payload }
                     }
+                    Ok(wire) => ControlAck::Error {
+                        message: format!("retrieval: short chunk ({} bytes)", wire.len()),
+                    },
                     Err(e) => {
-                        debug!(target: "ant_p2p", %peer, "retrieval failed: {e}");
+                        debug!(target: "ant_p2p", "retrieval failed: {e}");
                         ControlAck::Error {
-                            message: format!("retrieval from {peer}: {e}"),
+                            message: format!("retrieval: {e}"),
                         }
                     }
                 };
@@ -2014,33 +2025,39 @@ fn handle_control_command(
             });
         }
         ControlCommand::GetChunkRaw { reference, ack } => {
-            // Same routing / fetch path as `GetChunk`, but ack carries
-            // the wire bytes (`span || payload`) so `ant-gateway` can
-            // serve `/chunks/{addr}` byte-for-byte the way bee does.
-            let candidate = state.routing.closest_peer(&reference, &[]);
-            let Some((peer, _overlay)) = candidate else {
-                let _ = ack.send(ControlAck::NotReady {
-                    message: "no peers available; wait for handshakes to complete".to_string(),
-                });
-                return;
-            };
-            let mut control = control.clone();
+            // Same cache-then-network fetch path as `GetChunk`, but the ack
+            // carries the full wire bytes (`span || payload` for a CAC, or
+            // `id || sig || span || payload` for a SOC) so `ant-gateway` can
+            // serve `/chunks/{addr}` byte-for-byte the way bee does. This is
+            // the read path behind SOC-read-by-address and exact-index feed
+            // reads, so it must consult the local upload cache to satisfy
+            // read-after-own-write; a cached hit short-circuits before any
+            // peer round-trip, hence no early-return on an empty peer set.
+            let peers_rx = state.peers_watch.subscribe();
+            let cache = state.cache_for_request(false);
+            let disk_cache = state.disk_cache_for_request(false);
+            let control = control.clone();
             tokio::spawn(async move {
-                let res = ant_retrieval::retrieve_chunk(&mut control, peer, reference).await;
-                let reply = match res {
-                    Ok(chunk) => {
+                use ant_retrieval::ChunkFetcher;
+                let mut builder =
+                    ant_retrieval::RoutingFetcher::new(control, peers_rx).with_cache(cache);
+                if let Some(disk) = disk_cache {
+                    builder = builder.with_disk_cache(disk);
+                }
+                let fetcher = builder;
+                let reply = match fetcher.fetch(reference).await {
+                    Ok(wire) => {
                         debug!(
                             target: "ant_p2p",
-                            %peer,
-                            wire_bytes = chunk.data.len(),
+                            wire_bytes = wire.len(),
                             "retrieval ok (raw)",
                         );
-                        ControlAck::Bytes { data: chunk.data }
+                        ControlAck::Bytes { data: wire }
                     }
                     Err(e) => {
-                        debug!(target: "ant_p2p", %peer, "retrieval failed: {e}");
+                        debug!(target: "ant_p2p", "retrieval failed: {e}");
                         ControlAck::Error {
-                            message: format!("retrieval from {peer}: {e}"),
+                            message: format!("retrieval: {e}"),
                         }
                     }
                 };
@@ -2577,20 +2594,24 @@ fn handle_control_command(
             // Feed reads share their fetch path with `GetBytes`: spin up a
             // routing-aware fetcher backed by the live peer-snapshot
             // watch and let `resolve_sequence_feed_full` walk the
-            // sequence indices. The handler does not consult the disk
-            // cache because feed updates rarely repeat — every probe
-            // hits a unique SOC address — so the cache lookup would
-            // pay for itself only on retries.
+            // sequence indices. Wire in the node's mem + disk caches so a
+            // just-signed update we stashed before pushsync (see `PushSoc`)
+            // is visible to "latest" resolution immediately — without the
+            // cache, read-after-own-write on a feed returns `feed_empty`
+            // until pushsync propagates. A local hit on index 0 also lets
+            // the latest resolve with an empty peer set, so we no longer
+            // early-return on no peers.
             let peers_rx = state.peers_watch.subscribe();
-            if peers_rx.borrow().is_empty() {
-                let _ = ack.send(ControlAck::NotReady {
-                    message: "no peers available; wait for handshakes to complete".to_string(),
-                });
-                return;
-            }
+            let cache = state.cache_for_request(false);
+            let disk_cache = state.disk_cache_for_request(false);
             let control = control.clone();
             tokio::spawn(async move {
-                let fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx);
+                let mut builder =
+                    ant_retrieval::RoutingFetcher::new(control, peers_rx).with_cache(cache);
+                if let Some(disk) = disk_cache {
+                    builder = builder.with_disk_cache(disk);
+                }
+                let fetcher = builder;
                 let feed = ant_retrieval::Feed {
                     owner,
                     topic,
@@ -5584,5 +5605,176 @@ mod tests {
             "slow identify means our side, not bee's peerstore — don't \
              nag the operator about --external-address",
         );
+    }
+
+    /// Build a `SwarmState` whose disk cache holds the planted chunks but
+    /// whose peer set is empty — the read-after-own-write fixture. The
+    /// upload path stashes uploads into this same disk cache before
+    /// pushsync, so a read served from here without any peers proves the
+    /// handler consults the local cache rather than going straight to the
+    /// (here, non-existent) network.
+    fn state_with_disk_cache(disk: Arc<ant_retrieval::DiskChunkCache>) -> SwarmState {
+        SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            Some(disk),
+            crate::PeerEthMap::new(),
+        )
+    }
+
+    /// A bare libp2p stream control, good enough to construct the fetcher
+    /// in the spawned read tasks. With an empty peer set no stream is ever
+    /// opened on it, so the cache hit must answer first.
+    fn test_control() -> Control {
+        libp2p_stream::Behaviour::default().new_control()
+    }
+
+    /// Read-after-own-write for `GetChunkRaw`: a chunk present only in the
+    /// node's local disk cache (where the upload path stashes it before
+    /// pushsync) must be served verbatim with no peers available. This is
+    /// the path behind SOC-read-by-address and exact-index feed reads
+    /// (#6 / #7).
+    #[tokio::test]
+    async fn get_chunk_raw_serves_local_cache_without_peers() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Arc::new(
+            ant_retrieval::DiskChunkCache::open(dir.path().join("disk.sqlite"), 1 << 20).unwrap(),
+        );
+        let (addr, wire) = ant_crypto::cac_new(b"read-after-own-write raw").unwrap();
+        disk.put(addr, wire.clone()).await.unwrap();
+
+        let mut state = state_with_disk_cache(disk);
+        let mut peerstore = PeerStore::disabled();
+        let control = test_control();
+        let (ack_tx, ack_rx) = oneshot::channel();
+        handle_control_command(
+            &mut state,
+            &mut peerstore,
+            &control,
+            None,
+            0,
+            ControlCommand::GetChunkRaw {
+                reference: addr,
+                ack: ack_tx,
+            },
+        );
+        match ack_rx.await.unwrap() {
+            ControlAck::Bytes { data } => {
+                assert_eq!(data, wire, "GetChunkRaw must return the full wire bytes");
+            }
+            other => panic!("expected cached wire bytes, got {other:?}"),
+        }
+    }
+
+    /// Read-after-own-write for `GetChunk`: the same local-cache hit, but
+    /// this handler acks the payload (wire minus the 8-byte span).
+    #[tokio::test]
+    async fn get_chunk_serves_local_cache_payload_without_peers() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Arc::new(
+            ant_retrieval::DiskChunkCache::open(dir.path().join("disk.sqlite"), 1 << 20).unwrap(),
+        );
+        let payload = b"read-after-own-write payload";
+        let (addr, wire) = ant_crypto::cac_new(payload).unwrap();
+        disk.put(addr, wire.clone()).await.unwrap();
+
+        let mut state = state_with_disk_cache(disk);
+        let mut peerstore = PeerStore::disabled();
+        let control = test_control();
+        let (ack_tx, ack_rx) = oneshot::channel();
+        handle_control_command(
+            &mut state,
+            &mut peerstore,
+            &control,
+            None,
+            0,
+            ControlCommand::GetChunk {
+                reference: addr,
+                ack: ack_tx,
+            },
+        );
+        match ack_rx.await.unwrap() {
+            ControlAck::Bytes { data } => {
+                assert_eq!(
+                    data, payload,
+                    "GetChunk must return the span-stripped payload"
+                );
+            }
+            other => panic!("expected cached payload bytes, got {other:?}"),
+        }
+    }
+
+    /// Read-after-own-write for `GetFeed`: a freshly-signed sequence
+    /// update at index 0 stashed in the local disk cache must let "latest"
+    /// resolution find it with no peers — the exact case the old "feed
+    /// updates rarely repeat" opt-out broke (#6 / #7).
+    #[tokio::test]
+    async fn get_feed_resolves_latest_from_local_cache_without_peers() {
+        use k256::ecdsa::{SigningKey, VerifyingKey};
+
+        let secret: [u8; 32] = [7u8; 32];
+        let sk = SigningKey::from_bytes((&secret).into()).unwrap();
+        let owner = ant_crypto::ethereum_address_from_public_key(&VerifyingKey::from(&sk));
+        let topic: [u8; 32] = [0xaau8; 32];
+
+        // v1 sequence update at index 0: id = keccak256(topic ‖ index_be8),
+        // SOC address = keccak256(id ‖ owner), wire = id ‖ sig ‖ inner_cac.
+        let mut id_input = Vec::with_capacity(40);
+        id_input.extend_from_slice(&topic);
+        id_input.extend_from_slice(&0u64.to_be_bytes());
+        let id = ant_crypto::keccak256(&id_input);
+
+        let mut update_payload = Vec::with_capacity(40);
+        update_payload.extend_from_slice(&[0u8; 8]);
+        update_payload.extend_from_slice(&[0xbbu8; 32]);
+        let (inner_cac_addr, inner_cac_wire) = ant_crypto::cac_new(&update_payload).unwrap();
+
+        let mut sig_input = Vec::with_capacity(64);
+        sig_input.extend_from_slice(&id);
+        sig_input.extend_from_slice(&inner_cac_addr);
+        let prehash = ant_crypto::keccak256(&sig_input);
+        let sig = ant_crypto::sign_handshake_data(&secret, &prehash).unwrap();
+
+        let mut soc_addr_input = Vec::with_capacity(52);
+        soc_addr_input.extend_from_slice(&id);
+        soc_addr_input.extend_from_slice(&owner);
+        let soc_addr = ant_crypto::keccak256(&soc_addr_input);
+
+        let mut wire = Vec::with_capacity(ant_crypto::SOC_HEADER_SIZE + inner_cac_wire.len());
+        wire.extend_from_slice(&id);
+        wire.extend_from_slice(&sig);
+        wire.extend_from_slice(&inner_cac_wire);
+
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Arc::new(
+            ant_retrieval::DiskChunkCache::open(dir.path().join("disk.sqlite"), 1 << 20).unwrap(),
+        );
+        disk.put(soc_addr, wire).await.unwrap();
+
+        let mut state = state_with_disk_cache(disk);
+        let mut peerstore = PeerStore::disabled();
+        let control = test_control();
+        let (ack_tx, ack_rx) = oneshot::channel();
+        handle_control_command(
+            &mut state,
+            &mut peerstore,
+            &control,
+            None,
+            0,
+            ControlCommand::GetFeed {
+                owner,
+                topic,
+                ack: ack_tx,
+            },
+        );
+        match ack_rx.await.unwrap() {
+            ControlAck::FeedResolved { index, .. } => {
+                assert_eq!(index, 0, "the cached index-0 update must resolve as latest");
+            }
+            other => panic!("expected the cached feed update to resolve, got {other:?}"),
+        }
     }
 }
