@@ -79,6 +79,7 @@ use ant_crypto::{
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::hash::BuildHasher;
+use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, trace};
 
@@ -250,82 +251,235 @@ pub async fn resolve_sequence_feed(
     Ok(resolve_sequence_feed_full(fetcher, feed).await?.reference)
 }
 
-/// Same scan as [`resolve_sequence_feed`] but returns the full update
-/// metadata (index + signature) alongside the reference. Used by the
-/// gateway to render bee-shaped feed responses with the
-/// `swarm-feed-index`, `swarm-feed-index-next`, and `swarm-soc-signature`
-/// headers.
+/// Lookahead window, in powers of two, used both to bracket the latest
+/// update (phase 1) and to *confirm* the end of the feed (phase 3).
+/// Mirrors bee's `sequence.DefaultLevels = 8`: bee's async finder probes
+/// offsets `2^l - 1` for `l in 1..=8` (up to 255 indices ahead) before
+/// concluding a base index is the latest. We probe offsets `2^k` for
+/// `k in 0..=8` (up to 256 ahead), so a transient miss at a present index
+/// cannot truncate the walk to a stale update unless an entire 256-wide
+/// window is simultaneously unreachable.
+const LOOKAHEAD_LEVELS: u32 = 8;
+
+/// How many times a single index probe is retried when the underlying
+/// fetch fails with a *transient* (non-"not found") error before the
+/// probe gives up and reports the index absent. Bee's async finder
+/// re-probes inconsistent intervals on a per-attempt timeout budget; we
+/// retry the individual fetch a few times so a momentarily-flaky closest
+/// peer isn't mistaken for the end of the feed.
+const PROBE_RETRIES: u32 = 3;
+
+/// Backoff between transient-error retries of a single index probe.
+const PROBE_RETRY_DELAY: Duration = Duration::from_millis(200);
+
+/// Outcome of probing one sequence index.
+enum ProbeOutcome {
+    /// SOC fetched and verified at this index.
+    Present(DecodedUpdate),
+    /// Chunk is confidently not in the network (a "not found" / "no peer
+    /// found" miss), or a transient error persisted across
+    /// [`PROBE_RETRIES`] retries (at which point we cannot tell it apart
+    /// from a genuine gap and must not let it stall the walk — bee's
+    /// finder likewise folds any non-delivery into a nil chunk).
+    Absent,
+    /// A transient (non-miss) error that survived every retry. The search
+    /// folds this into "absent" for indices *past* a known update, but
+    /// the very first probe (index 0) propagates it as
+    /// [`FeedError::Fetch`] so the manifest-walk retry loop
+    /// (`ant-p2p::is_manifest_transient`) can refresh the peer set and
+    /// try the whole feed again rather than reporting a reachable feed as
+    /// empty.
+    Transient(Box<dyn StdError + Send + Sync>),
+}
+
+/// Probe a single sequence index, retrying transient fetch failures.
 ///
-/// The walk stops at the **first** missing index, exactly like bee's
-/// `sequence.finder.At`: the last contiguously-present update is the
-/// latest one. There is no miss tolerance and no upper bound on the
-/// index — a sequence feed has a finite number of updates and every
-/// probe past the last one is a genuine miss (a peer cannot forge a
-/// valid owner-signed SOC at an unused index), so the loop always
-/// terminates at the end gap.
-pub async fn resolve_sequence_feed_full(
+/// `*probed` is incremented once per call so the caller can report how
+/// many indices were touched. Verification failures (owner mismatch, bad
+/// SOC framing) are protocol violations, not "no update here", so they
+/// propagate immediately as `Err`.
+async fn probe(
     fetcher: &dyn ChunkFetcher,
     feed: &Feed,
-) -> Result<FeedResolution, FeedError> {
-    let mut last: Option<(u64, DecodedUpdate)> = None;
-    let mut index: u64 = 0;
-
+    index: u64,
+    probed: &mut u64,
+) -> Result<ProbeOutcome, FeedError> {
+    *probed += 1;
+    let addr = sequence_update_address(feed, index);
+    let mut attempt: u32 = 0;
     loop {
-        let addr = sequence_update_address(feed, index);
         match fetcher.fetch(addr).await {
-            Ok(chunk_wire) => {
-                let decoded = decode_sequence_update(&chunk_wire, addr, feed)?;
+            Ok(wire) => {
+                let decoded = decode_sequence_update(&wire, addr, feed)?;
                 trace!(
                     target: "ant_retrieval::feed",
                     index,
                     addr = %hex::encode(addr),
                     "feed update fetched and verified",
                 );
-                last = Some((index, decoded));
-                index += 1;
+                return Ok(ProbeOutcome::Present(decoded));
             }
             Err(e) => {
-                // Distinguish "chunk not present in network" (the normal
-                // sentinel that the feed scan has reached its end) from
-                // a real I/O / protocol failure that the caller should
-                // know about. Bee's finder treats `storage.ErrNotFound`
-                // as the end of the feed and stops at the first miss; we
-                // do the same by inspecting the error string for the
-                // shape `RoutingFetcher` and `RetrievalError::Remote`
-                // produce.
                 if is_chunk_not_found(e.as_ref()) {
-                    break;
+                    return Ok(ProbeOutcome::Absent);
                 }
-                return Err(FeedError::Fetch(e));
+                if attempt >= PROBE_RETRIES {
+                    debug!(
+                        target: "ant_retrieval::feed",
+                        index,
+                        attempts = attempt + 1,
+                        "probe exhausted retries on a transient error: {e}",
+                    );
+                    return Ok(ProbeOutcome::Transient(e));
+                }
+                attempt += 1;
+                trace!(
+                    target: "ant_retrieval::feed",
+                    index,
+                    attempt,
+                    "transient probe error, retrying: {e}",
+                );
+                tokio::time::sleep(PROBE_RETRY_DELAY).await;
             }
+        }
+    }
+}
+
+/// Same lookup as [`resolve_sequence_feed`] but returns the full update
+/// metadata (index + signature) alongside the reference. Used by the
+/// gateway to render bee-shaped feed responses with the
+/// `swarm-feed-index`, `swarm-feed-index-next`, and `swarm-soc-signature`
+/// headers.
+///
+/// # Why this isn't a linear stop-at-first-miss scan
+///
+/// A naive `0, 1, 2, …` walk that stops at the first missing index is
+/// only correct on a perfectly-retrievable feed. On the live network a
+/// fetch for a present update chunk can fail transiently (the closest
+/// peer to that SOC address times out, drops the stream, or is briefly
+/// unreachable). A linear scan that treats the first such miss as the end
+/// of the feed then either returns a **stale** earlier update (silent
+/// wrong answer) or — when the terminating probe's error isn't
+/// "not found"-shaped — fails the whole lookup. Both are intermittent and
+/// scale with the number of updates, which is exactly the
+/// "feeds sometimes don't work" symptom. Bee never hits this because its
+/// `sequence.asyncFinder` probes ahead and *retries inconsistent
+/// intervals*, so a transient miss at a present index is recovered.
+///
+/// This finder reproduces bee's resilience (and its `O(log n)` probe
+/// count) without the channel-based concurrency:
+///
+/// 1. **Anchor.** Index 0 must resolve. Absent ⇒ [`FeedError::NoUpdates`];
+///    a persistent transient ⇒ [`FeedError::Fetch`] so the caller retries.
+/// 2. **Bracket (exponential).** Double the offset from the last known
+///    present index until a probe is absent, yielding a present `lo` and
+///    an absent `hi`.
+/// 3. **Boundary (binary search).** Bisect `(lo, hi)` for the
+///    present→absent edge.
+/// 4. **Confirm (lookahead).** Probe `lo + 2^k` for `k in 0..=`
+///    [`LOOKAHEAD_LEVELS`]. If any is present, a transient miss hid a
+///    later update — adopt it and repeat from step 2. Only when the whole
+///    window is absent is `lo` accepted as the latest, mirroring bee's
+///    "inconsistent feed, retry".
+///
+/// For a well-formed, fully-retrievable feed this returns the identical
+/// update bee's finder would, and a sequence feed's contiguous indexing
+/// guarantees termination (a peer cannot forge a valid owner-signed SOC
+/// at an unused index).
+pub async fn resolve_sequence_feed_full(
+    fetcher: &dyn ChunkFetcher,
+    feed: &Feed,
+) -> Result<FeedResolution, FeedError> {
+    let mut probed: u64 = 0;
+
+    // Phase 0 — anchor on index 0.
+    let (mut latest_index, mut latest) = match probe(fetcher, feed, 0, &mut probed).await? {
+        ProbeOutcome::Present(u) => (0u64, u),
+        ProbeOutcome::Absent => return Err(FeedError::NoUpdates { probed }),
+        ProbeOutcome::Transient(e) => return Err(FeedError::Fetch(e)),
+    };
+
+    loop {
+        // Phase 1 — exponential bracket. `lo` is known present, `hi` is
+        // known absent (a transient that survived retries counts as
+        // absent here; phase 3 re-checks the boundary).
+        let mut lo = latest_index;
+        let mut lo_update = latest;
+        let mut hi: u64;
+        let mut step: u64 = 1;
+        loop {
+            let candidate = lo.saturating_add(step);
+            if candidate <= lo {
+                // Saturated at u64::MAX — treat as the absent upper bound.
+                hi = u64::MAX;
+                break;
+            }
+            if let ProbeOutcome::Present(u) = probe(fetcher, feed, candidate, &mut probed).await? {
+                lo = candidate;
+                lo_update = u;
+                step = step.saturating_mul(2);
+            } else {
+                // Absent, or a transient that outlived its retries — either
+                // way an upper bound; phase 3 re-checks if it was transient.
+                hi = candidate;
+                break;
+            }
+        }
+
+        // Phase 2 — binary search the boundary in (lo, hi).
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if let ProbeOutcome::Present(u) = probe(fetcher, feed, mid, &mut probed).await? {
+                lo = mid;
+                lo_update = u;
+            } else {
+                hi = mid;
+            }
+        }
+
+        latest_index = lo;
+        latest = lo_update;
+
+        // Phase 3 — confirm the end. If the bracket/boundary was pulled
+        // down by a transient miss, a probe ahead will reveal the hidden
+        // update; adopt it and loop. Otherwise `latest_index` is final.
+        let mut higher: Option<(u64, DecodedUpdate)> = None;
+        for k in 0..=LOOKAHEAD_LEVELS {
+            let Some(i) = latest_index.checked_add(1u64 << k) else {
+                break;
+            };
+            if let ProbeOutcome::Present(u) = probe(fetcher, feed, i, &mut probed).await? {
+                higher = Some((i, u));
+                break;
+            }
+        }
+        match higher {
+            Some((i, u)) => {
+                latest_index = i;
+                latest = u;
+            }
+            None => break,
         }
     }
 
-    match last {
-        Some((latest_index, decoded)) => {
-            // Disambiguate v1 vs v2 only for the latest update — the
-            // intermediate updates' references are never served.
-            let (reference, v2) = classify_payload(fetcher, &decoded).await;
-            debug!(
-                target: "ant_retrieval::feed",
-                latest_index,
-                reference = %hex::encode(reference),
-                v2,
-                probed = index + 1,
-                "feed resolved",
-            );
-            Ok(FeedResolution {
-                reference,
-                index: latest_index,
-                ts: decoded.ts,
-                signature: decoded.signature,
-                v2,
-            })
-        }
-        // `index` is the first not-found index; we probed `index + 1`
-        // addresses (0..=index) before giving up.
-        None => Err(FeedError::NoUpdates { probed: index + 1 }),
-    }
+    // Disambiguate v1 vs v2 only for the latest update — the intermediate
+    // updates' references are never served.
+    let (reference, v2) = classify_payload(fetcher, &latest).await;
+    debug!(
+        target: "ant_retrieval::feed",
+        latest_index,
+        reference = %hex::encode(reference),
+        v2,
+        probed,
+        "feed resolved",
+    );
+    Ok(FeedResolution {
+        reference,
+        index: latest_index,
+        ts: latest.ts,
+        signature: latest.signature,
+        v2,
+    })
 }
 
 /// Resolve the reference a verified update points at, distinguishing v1
@@ -387,6 +541,11 @@ fn is_chunk_not_found(e: &(dyn StdError + 'static)) -> bool {
 
 /// A verified feed-update SOC, decoded but not yet classified as v1/v2.
 /// `classify_payload` turns this into the final reference + version.
+///
+/// `Copy` so the finder can carry the latest candidate update around
+/// across search phases without re-fetching or cloning — every field is
+/// a fixed-size array / integer.
+#[derive(Clone, Copy)]
 struct DecodedUpdate {
     /// The wrapped CAC's own address (the v2 reference).
     inner_cac_addr: [u8; 32],
@@ -523,6 +682,51 @@ mod tests {
     #[async_trait]
     impl ChunkFetcher for MapFetcher {
         async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
+            self.chunks
+                .get(&addr)
+                .cloned()
+                .ok_or_else(|| -> Box<dyn StdError + Send + Sync> {
+                    format!("not found: {}", hex::encode(addr)).into()
+                })
+        }
+    }
+
+    /// Fetcher that models the live-network failure modes the resilient
+    /// finder exists to survive: some addresses always fail with a
+    /// *transient* (non-"not found") error — the shape a flaky / saturated
+    /// peer set produces (`"no BZZ peers available"`, a timeout tail,
+    /// etc.) — while everything else behaves like [`MapFetcher`].
+    struct FlakyFetcher {
+        chunks: HashMap<[u8; 32], Vec<u8>>,
+        /// Addresses that always fail with a transient error, simulating an
+        /// update chunk that *exists* but whose peer is unreachable right
+        /// now (the very thing that made the old stop-at-first-miss scan
+        /// return stale data or error out).
+        transient: std::collections::HashSet<[u8; 32]>,
+    }
+    impl FlakyFetcher {
+        fn new() -> Self {
+            Self {
+                chunks: HashMap::new(),
+                transient: std::collections::HashSet::new(),
+            }
+        }
+        fn insert(&mut self, addr: [u8; 32], wire: Vec<u8>) {
+            self.chunks.insert(addr, wire);
+        }
+        fn mark_transient(&mut self, addr: [u8; 32]) {
+            self.transient.insert(addr);
+        }
+    }
+    #[async_trait]
+    impl ChunkFetcher for FlakyFetcher {
+        async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
+            if self.transient.contains(&addr) {
+                // Deliberately *not* a "not found" / "no peer found" string:
+                // `is_chunk_not_found` must classify this as a transient
+                // failure, not the end of the feed.
+                return Err("no BZZ peers available".into());
+            }
             self.chunks
                 .get(&addr)
                 .cloned()
@@ -799,11 +1003,111 @@ mod tests {
         let fetcher = MapFetcher::new();
         match resolve_sequence_feed(&fetcher, &feed).await {
             Err(FeedError::NoUpdates { probed }) => {
-                // Stop-at-first-miss: index 0 is absent, so we probe
-                // exactly one address before declaring the feed empty.
+                // Index 0 is absent, so we probe exactly one address
+                // before declaring the feed empty.
                 assert_eq!(probed, 1);
             }
             other => panic!("expected NoUpdates, got {other:?}"),
+        }
+    }
+
+    /// Regression for "feeds sometimes don't work": a transient failure at
+    /// a *present* update index must not truncate the walk to a stale
+    /// earlier update. Here the feed has updates 0, 2 and 3 reachable while
+    /// index 1's chunk fails with a transient (non-"not found") error — the
+    /// exact intermittent shape a flaky peer set produces. The old
+    /// stop-at-first-miss scan returned index 0 (stale); the resilient
+    /// finder must look past the hole and return the true latest, index 3.
+    ///
+    /// Runs on a paused clock so the probe-retry backoff resolves in
+    /// virtual time (no real sleeping).
+    #[tokio::test(start_paused = true)]
+    async fn transient_hole_does_not_return_stale_update() {
+        let secret: [u8; 32] = [13u8; 32];
+        let owner = deterministic_eth_address(&secret);
+        let topic: [u8; 32] = [0x21u8; 32];
+        let feed = Feed {
+            owner,
+            topic,
+            kind: FeedType::Sequence,
+        };
+        let refs = [[0x10u8; 32], [0x11u8; 32], [0x12u8; 32], [0x13u8; 32]];
+
+        let mut fetcher = FlakyFetcher::new();
+        for (i, r) in refs.iter().enumerate() {
+            let (addr, wire) = make_sequence_update_v1(&secret, &owner, &topic, i as u64, r);
+            if i == 1 {
+                // Update 1 exists but its peer is unreachable this round.
+                fetcher.mark_transient(addr);
+            } else {
+                fetcher.insert(addr, wire);
+            }
+        }
+
+        let resolution = resolve_sequence_feed_full(&fetcher, &feed).await.unwrap();
+        assert_eq!(
+            resolution.index, 3,
+            "must look past a transient hole and return the latest update, not a stale one",
+        );
+    }
+
+    /// Regression for the "`BAD_GATEWAY` on a healthy feed" failure mode:
+    /// once at least one update is confirmed, a transient failure on the
+    /// *terminating* probe (the index past the real latest) must not fail
+    /// the whole lookup. The old scan propagated any non-"not found" error
+    /// from the end probe as `FeedError::Fetch`; the finder must instead
+    /// accept the confirmed latest update.
+    #[tokio::test(start_paused = true)]
+    async fn transient_terminating_probe_still_resolves() {
+        let secret: [u8; 32] = [14u8; 32];
+        let owner = deterministic_eth_address(&secret);
+        let topic: [u8; 32] = [0x22u8; 32];
+        let feed = Feed {
+            owner,
+            topic,
+            kind: FeedType::Sequence,
+        };
+        let target_ref = [0x20u8; 32];
+
+        let mut fetcher = FlakyFetcher::new();
+        let (addr0, wire0) = make_sequence_update_v1(&secret, &owner, &topic, 0, &target_ref);
+        fetcher.insert(addr0, wire0);
+        // The next index (1) — past the latest — fails transiently rather
+        // than with a clean "not found". Every further lookahead index is a
+        // genuine miss.
+        let (addr1, _) = make_sequence_update_v1(&secret, &owner, &topic, 1, &target_ref);
+        fetcher.mark_transient(addr1);
+
+        let resolution = resolve_sequence_feed_full(&fetcher, &feed).await.unwrap();
+        assert_eq!(
+            resolution.index, 0,
+            "single-update feed must resolve to index 0"
+        );
+    }
+
+    /// The escape hatch the manifest-walk retry loop relies on: if even
+    /// index 0 is unreachable with a transient error (not a clean miss),
+    /// surface `FeedError::Fetch` — not `NoUpdates` — so
+    /// `ant-p2p::is_manifest_transient` refreshes the peer set and retries
+    /// the whole feed rather than reporting a reachable feed as empty.
+    #[tokio::test(start_paused = true)]
+    async fn transient_index_zero_propagates_as_fetch_error() {
+        let secret: [u8; 32] = [15u8; 32];
+        let owner = deterministic_eth_address(&secret);
+        let topic: [u8; 32] = [0x23u8; 32];
+        let feed = Feed {
+            owner,
+            topic,
+            kind: FeedType::Sequence,
+        };
+
+        let mut fetcher = FlakyFetcher::new();
+        let (addr0, _) = make_sequence_update_v1(&secret, &owner, &topic, 0, &[0x30u8; 32]);
+        fetcher.mark_transient(addr0);
+
+        match resolve_sequence_feed_full(&fetcher, &feed).await {
+            Err(FeedError::Fetch(_)) => {}
+            other => panic!("expected Fetch error, got {other:?}"),
         }
     }
 
