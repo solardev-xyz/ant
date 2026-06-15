@@ -97,6 +97,20 @@ pub enum ControlCommand {
         max_bytes: Option<u64>,
         ack: mpsc::Sender<ControlAck>,
     },
+    /// Gateway-only: join the **encrypted** chunk tree rooted at the
+    /// encrypted reference `reference ‖ key` and ack with the decrypted
+    /// file bytes ([`ControlAck::Bytes`]). Backs encrypted feed content
+    /// (bee's 80-byte v1 payload), which ant resolves but does not stream:
+    /// the body is buffered (bounded by `max_bytes`) and the gateway
+    /// applies any HTTP Range by slicing the buffer. Not exposed on the
+    /// JSON control socket.
+    GetBytesEncrypted {
+        reference: [u8; 32],
+        key: [u8; 32],
+        bypass_cache: bool,
+        max_bytes: Option<u64>,
+        ack: mpsc::Sender<ControlAck>,
+    },
     /// Gateway-only streaming `/bytes/{ref}` path. Sends
     /// [`ControlAck::BytesStreamStart`], zero or more
     /// [`ControlAck::BytesChunk`] messages, then [`ControlAck::StreamDone`]
@@ -428,6 +442,11 @@ pub enum ControlAck {
         index: u64,
         signature: [u8; 65],
         v2: bool,
+        /// `Some(key)` when `reference` is an encrypted chunk address and
+        /// the content must be decrypted with `key` (bee's 80-byte v1
+        /// payload). The gateway joins `reference ‖ key` via the
+        /// decrypting joiner. `None` for unencrypted content.
+        decrypt_key: Option<[u8; 32]>,
     },
     /// Empty-feed signal from `GetFeed`. Distinct from
     /// [`Self::Error`] so the gateway can map it to `404 Not Found`

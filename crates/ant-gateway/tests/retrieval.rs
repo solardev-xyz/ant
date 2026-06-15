@@ -1468,6 +1468,7 @@ async fn handle_feed_test_command(
                     index: r.index,
                     signature: r.signature,
                     v2: r.v2,
+                    decrypt_key: r.decrypt_key,
                 },
                 Err(ant_retrieval::FeedError::NoUpdates { .. }) => ControlAck::FeedNotFound,
                 Err(e) => ControlAck::Error {

@@ -2116,6 +2116,57 @@ fn handle_control_command(
                 let _ = ack.send(reply).await;
             });
         }
+        ControlCommand::GetBytesEncrypted {
+            reference,
+            key,
+            bypass_cache,
+            max_bytes,
+            ack,
+        } => {
+            // Encrypted content (feed v1 80-byte payload): same routing /
+            // retry machinery as `GetBytes`, but the joiner decrypts each
+            // chunk with the per-chunk keys carried in the 64-byte
+            // references. Buffered, no progress stream — the volume is a
+            // feed payload, and the gateway slices the result for Range.
+            let peers_rx = state.peers_watch.subscribe();
+            if peers_rx.borrow().is_empty() {
+                send_terminal_ack(
+                    &ack,
+                    ControlAck::Error {
+                        message: "no peers available; wait for handshakes to complete".to_string(),
+                    },
+                );
+                return;
+            }
+            let control = control.clone();
+            let cache = state.cache_for_request(bypass_cache);
+            let disk_cache = state.disk_cache_for_request(bypass_cache);
+            let record_dir = state.chunk_record_dir.clone();
+            let inflight_limit = state.retrieval_inflight.clone();
+            let payment_notify = state.payment_notify.clone();
+            let accounting = state.accounting.clone();
+            let counters = state.retrieval_counters.clone();
+            let tracker = Arc::new(ProgressTracker::new(bypass_cache));
+            tokio::spawn(async move {
+                let reply = run_get_bytes_encrypted(
+                    control,
+                    peers_rx,
+                    cache,
+                    disk_cache,
+                    record_dir,
+                    inflight_limit,
+                    payment_notify,
+                    accounting,
+                    counters,
+                    tracker,
+                    reference,
+                    key,
+                    max_bytes,
+                )
+                .await;
+                let _ = ack.send(reply).await;
+            });
+        }
         ControlCommand::StreamBytes {
             reference,
             bypass_cache,
@@ -2551,6 +2602,7 @@ fn handle_control_command(
                         index: resolution.index,
                         signature: resolution.signature,
                         v2: resolution.v2,
+                        decrypt_key: resolution.decrypt_key,
                     },
                     Err(ant_retrieval::FeedError::NoUpdates { .. }) => ControlAck::FeedNotFound,
                     Err(e) => ControlAck::Error {
@@ -3220,6 +3272,103 @@ async fn try_get_bytes(
     let cap = clamp_max_bytes(max_bytes);
     join(fetcher, &root, cap).await.map_err(|e| {
         let message = format!("join {}: {e}", hex::encode(reference));
+        if is_join_transient(&e) {
+            AttemptError::Transient(message)
+        } else {
+            AttemptError::Permanent(message)
+        }
+    })
+}
+
+/// Encrypted counterpart of [`run_get_bytes`]: same per-attempt
+/// `RoutingFetcher` + retry loop, but the decrypting joiner
+/// ([`ant_retrieval::join_encrypted`]) walks the 64-byte encrypted
+/// reference `reference ‖ key`. Returns [`ControlAck::Bytes`] with the
+/// decrypted file on success.
+#[allow(clippy::too_many_arguments)]
+async fn run_get_bytes_encrypted(
+    control: Control,
+    peers_rx: watch::Receiver<Vec<(libp2p::PeerId, [u8; 32])>>,
+    cache: Arc<ant_retrieval::InMemoryChunkCache>,
+    disk_cache: Option<Arc<ant_retrieval::DiskChunkCache>>,
+    record_dir: Option<PathBuf>,
+    inflight_limit: Arc<Semaphore>,
+    payment_notify: Option<mpsc::Sender<PeerId>>,
+    accounting: Option<Arc<ant_retrieval::accounting::Accounting>>,
+    counters: Arc<RetrievalCounters>,
+    tracker: Arc<ProgressTracker>,
+    reference: [u8; 32],
+    key: [u8; 32],
+    max_bytes: Option<u64>,
+) -> ControlAck {
+    for attempt in 1..=MAX_FETCH_ATTEMPTS {
+        if peers_rx.borrow().is_empty() {
+            return ControlAck::Error {
+                message: "no peers available; wait for handshakes to complete".to_string(),
+            };
+        }
+        let mut builder = ant_retrieval::RoutingFetcher::new(control.clone(), peers_rx.clone())
+            .with_cache(cache.clone())
+            .with_record_dir(record_dir.clone())
+            .with_progress(tracker.clone())
+            .with_inflight_limit(inflight_limit.clone())
+            .with_counters(counters.clone())
+            .with_request_inflight_limit(RETRIEVAL_REQUEST_INFLIGHT_CAP);
+        if let Some(disk) = disk_cache.clone() {
+            builder = builder.with_disk_cache(disk);
+        }
+        if let Some(tx) = payment_notify.clone() {
+            builder = builder.with_payment_notify(tx);
+        }
+        if let Some(acc) = accounting.clone() {
+            builder = builder.with_accounting(acc);
+        }
+        let fetcher = builder;
+        match try_get_bytes_encrypted(&fetcher, reference, key, max_bytes).await {
+            Ok(data) => {
+                debug!(
+                    target: "ant_p2p",
+                    root = %hex::encode(reference),
+                    bytes = data.len(),
+                    attempt,
+                    "encrypted joiner produced file",
+                );
+                return ControlAck::Bytes { data };
+            }
+            Err(AttemptError::Transient(message)) if attempt < MAX_FETCH_ATTEMPTS => {
+                let backoff = RETRY_BACKOFF_BASE * attempt as u32;
+                warn!(
+                    target: "ant_p2p",
+                    attempt,
+                    next_in_ms = backoff.as_millis() as u64,
+                    "get_bytes_encrypted failed, retrying: {message}",
+                );
+                tokio::time::sleep(backoff).await;
+            }
+            Err(AttemptError::Permanent(message) | AttemptError::Transient(message)) => {
+                return ControlAck::Error { message };
+            }
+        }
+    }
+    unreachable!("retry loop exits via return on the final attempt");
+}
+
+/// One attempt at the encrypted get-bytes pipeline.
+async fn try_get_bytes_encrypted(
+    fetcher: &ant_retrieval::RoutingFetcher,
+    reference: [u8; 32],
+    key: [u8; 32],
+    max_bytes: Option<u64>,
+) -> Result<Vec<u8>, AttemptError> {
+    use ant_retrieval::{join_encrypted, ENCRYPTED_REF_SIZE};
+
+    let mut root_ref = [0u8; ENCRYPTED_REF_SIZE];
+    root_ref[..32].copy_from_slice(&reference);
+    root_ref[32..].copy_from_slice(&key);
+
+    let cap = clamp_max_bytes(max_bytes);
+    join_encrypted(fetcher, root_ref, cap).await.map_err(|e| {
+        let message = format!("join encrypted {}: {e}", hex::encode(reference));
         if is_join_transient(&e) {
             AttemptError::Transient(message)
         } else {

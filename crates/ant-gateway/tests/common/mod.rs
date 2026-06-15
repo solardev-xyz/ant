@@ -357,6 +357,27 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
             };
             let _ = ack.send(reply).await;
         }
+        ControlCommand::GetBytesEncrypted {
+            reference,
+            key,
+            bypass_cache: _,
+            max_bytes,
+            ack,
+        } => {
+            let mut root_ref = [0u8; ant_retrieval::ENCRYPTED_REF_SIZE];
+            root_ref[..32].copy_from_slice(&reference);
+            root_ref[32..].copy_from_slice(&key);
+            let cap = max_bytes.map_or(DEFAULT_MAX_FILE_BYTES, |n| {
+                usize::try_from(n).unwrap_or(usize::MAX)
+            });
+            let reply = match ant_retrieval::join_encrypted(fetcher, root_ref, cap).await {
+                Ok(data) => ControlAck::Bytes { data },
+                Err(e) => ControlAck::Error {
+                    message: e.to_string(),
+                },
+            };
+            let _ = ack.send(reply).await;
+        }
         ControlCommand::StreamBytes {
             reference,
             bypass_cache: _,

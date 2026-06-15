@@ -2361,13 +2361,14 @@ pub async fn download_feed(
         }
     };
 
-    let (reference, index, signature, v2) = match ack {
+    let (reference, index, signature, v2, decrypt_key) = match ack {
         ControlAck::FeedResolved {
             reference,
             index,
             signature,
             v2,
-        } => (reference, index, signature, v2),
+            decrypt_key,
+        } => (reference, index, signature, v2, decrypt_key),
         ControlAck::FeedNotFound => {
             return json_error(StatusCode::NOT_FOUND, "no feed updates found");
         }
@@ -2389,6 +2390,128 @@ pub async fn download_feed(
     };
 
     let head_only = method == Method::HEAD;
+
+    // Encrypted feed content (bee's 80-byte v1 payload): the node joins
+    // and decrypts `reference ‖ key` into a buffer (the payload is small).
+    // We serve it in one shot — applying any Range by slicing — rather
+    // than through the streaming joiner, which only handles plaintext.
+    if let Some(key) = decrypt_key {
+        let (ack_tx, mut ack_rx) = mpsc::channel::<ControlAck>(1);
+        let cmd = ControlCommand::GetBytesEncrypted {
+            reference,
+            key,
+            bypass_cache: false,
+            max_bytes: None,
+            ack: ack_tx,
+        };
+        if handle.commands.send(cmd).await.is_err() {
+            return node_unavailable();
+        }
+        let ack = match tokio::time::timeout(timeout, ack_rx.recv()).await {
+            Ok(Some(ack)) => ack,
+            Ok(None) => return node_unavailable(),
+            Err(_) => {
+                return json_error(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    format!("retrieval timed out after {}s", timeout.as_secs()),
+                );
+            }
+        };
+        let data = match ack {
+            ControlAck::Bytes { data } => data,
+            ControlAck::NotReady { message } => {
+                return json_error(StatusCode::SERVICE_UNAVAILABLE, message);
+            }
+            ControlAck::Error { message } => {
+                warn!(target: "ant_gateway", %message, "encrypted feed content fetch failed");
+                return json_error(StatusCode::BAD_GATEWAY, "feed content cannot be retrieved");
+            }
+            other => {
+                warn!(target: "ant_gateway", ?other, "unexpected ack from GetBytesEncrypted");
+                return json_error(StatusCode::INTERNAL_SERVER_ERROR, "unexpected node ack");
+            }
+        };
+        let total = data.len() as u64;
+        guard.update(1, 1, 0, total);
+
+        let raw_range = headers
+            .get(header::RANGE)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        let parsed_range = match raw_range.as_deref() {
+            None => None,
+            Some(raw) => match parse_single_range(raw, total) {
+                Ok(r) => r,
+                Err(RangeError::Multi) => {
+                    return json_error(
+                        StatusCode::RANGE_NOT_SATISFIABLE,
+                        "multi-range requests not supported",
+                    );
+                }
+                Err(RangeError::Unsatisfiable) => {
+                    let mut resp = json_error(
+                        StatusCode::RANGE_NOT_SATISFIABLE,
+                        "range not satisfiable for this resource",
+                    );
+                    if let Ok(v) = HeaderValue::from_str(&format!("bytes */{total}")) {
+                        resp.headers_mut().insert(header::CONTENT_RANGE, v);
+                    }
+                    return resp;
+                }
+                Err(RangeError::Malformed) => {
+                    return json_error(StatusCode::BAD_REQUEST, "malformed Range header");
+                }
+            },
+        };
+
+        let mut resp = match parsed_range {
+            None => {
+                let len = data.len();
+                let body = if head_only {
+                    Body::empty()
+                } else {
+                    Body::from(data)
+                };
+                let mut resp = Response::new(body);
+                let _ = resp.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/octet-stream"),
+                );
+                let _ = resp
+                    .headers_mut()
+                    .insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+                resp
+            }
+            Some((start, end)) => {
+                let slice = if head_only {
+                    Vec::new()
+                } else {
+                    data[start as usize..=end as usize].to_vec()
+                };
+                let body_len = end - start + 1;
+                let body = if head_only {
+                    Body::empty()
+                } else {
+                    Body::from(slice)
+                };
+                let mut resp = Response::new(body);
+                *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+                let _ = resp.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/octet-stream"),
+                );
+                let _ = resp
+                    .headers_mut()
+                    .insert(header::CONTENT_LENGTH, HeaderValue::from(body_len));
+                if let Ok(v) = HeaderValue::from_str(&format!("bytes {start}-{end}/{total}")) {
+                    resp.headers_mut().insert(header::CONTENT_RANGE, v);
+                }
+                resp
+            }
+        };
+        apply_feed_headers(&mut resp, reference, index, &signature, v2);
+        return resp;
+    }
 
     // `Swarm-Only-Root-Chunk: true` — return the resolved reference's
     // root chunk verbatim (`span(8 LE) || payload`) without joining the

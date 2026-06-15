@@ -69,8 +69,9 @@ pub use feed::{
 };
 pub use fetcher::{Overlay, RoutingFetcher};
 pub use joiner::{
-    enumerate_chunk_tree, join, join_to_sender, join_to_sender_range, join_with_options, ByteRange,
-    ChunkInventory, JoinError, JoinOptions, DEFAULT_MAX_FILE_BYTES,
+    enumerate_chunk_tree, join, join_encrypted, join_to_sender, join_to_sender_range,
+    join_with_options, ByteRange, ChunkInventory, JoinError, JoinOptions, DEFAULT_MAX_FILE_BYTES,
+    ENCRYPTED_REF_SIZE,
 };
 pub use manifest_writer::{
     build_collection_manifest, build_feed_manifest, build_single_file_manifest, ManifestFile,

@@ -26,22 +26,30 @@
 //! - **Erasure-coded / Reed-Solomon redundancy** on intermediate chunks
 //!   (`redundancy.Level != NONE`). Detected via the high bits of the span;
 //!   we reject the file with a clear error rather than silently mis-decoding.
-//! - **Encrypted chunks** (`refLength == 64`). Same: we reject; the
-//!   reference would decode in a recognisable way (entry on root manifest
-//!   would be 64 bytes, not 32) so the caller can route to a friendlier
-//!   "not yet supported" message.
+//!   This is uncommon for a plain `swarm-cli upload` of a small text file
+//!   or site, which is the main read-path target.
 //!
-//! Both are uncommon for plain `swarm-cli upload` of a small text file or
-//! site, which is the only thing the read-path currently targets.
+//! **Encrypted chunks** (`refLength == 64`) are handled by a separate
+//! entry point, [`join_encrypted`], which fetches each chunk by its
+//! 32-byte address and decrypts it with the per-chunk key carried in the
+//! 64-byte reference that pointed to it. The plaintext [`join`] family
+//! still rejects a 64-byte root via [`JoinError::UnsupportedEncryption`].
 
 use crate::ChunkFetcher;
 use ant_crypto::CHUNK_SIZE;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::trace;
+
+/// Size of an encrypted reference: `address(32) ‖ key(32)`. Re-exported
+/// from `ant-crypto` so feed / gateway callers don't depend on the crypto
+/// crate directly.
+pub const ENCRYPTED_REF_SIZE: usize = ant_crypto::REFERENCE_SIZE;
 
 /// Default cap on a joined file's total size, in bytes. Sized to comfortably
 /// hold a small website or text file while making it impossible for a
@@ -1002,6 +1010,142 @@ const fn subtrie_section(refs: usize, subtree_span: u64) -> u64 {
     }
 }
 
+/// Encrypted-tree variant of [`subtrie_section`]. Identical formula, but
+/// the branching factor is `ChunkSize / 64 = 64` because each child
+/// reference in an encrypted intermediate chunk is 64 bytes
+/// (`address ‖ key`) rather than 32. Mirrors bee's joiner, which sizes
+/// subtries off `swarm.EncryptedBranches` when the reference length is 64.
+const fn subtrie_section_enc(refs: usize, subtree_span: u64) -> u64 {
+    let refs = refs as u64;
+    let branching = (CHUNK_SIZE / ENCRYPTED_REF_SIZE) as u64;
+    let mut branch_size = CHUNK_SIZE as u64;
+    loop {
+        let whats_left = subtree_span.saturating_sub(branch_size * refs.saturating_sub(1));
+        if whats_left <= branch_size {
+            return branch_size;
+        }
+        if branch_size > u64::MAX / branching {
+            return branch_size;
+        }
+        branch_size *= branching;
+    }
+}
+
+/// Reconstruct a file from a 64-byte **encrypted** root reference
+/// (`address(32) ‖ key(32)`) into a single buffer.
+///
+/// This is the read-path mirror of bee's decrypting joiner
+/// (`pkg/encryption/store` wrapping `pkg/file/joiner`): every chunk is
+/// fetched by its 32-byte address, decrypted with the key carried in the
+/// reference that pointed to it, then either appended as leaf data or
+/// expanded into its list of 64-byte child references. Child decryption
+/// keys come from those child references, so the whole subtree is
+/// self-describing once the root key is known.
+///
+/// Unlike [`join`] this is a buffered, in-order full download — no range
+/// or streaming. It exists to serve **encrypted feed content**, the only
+/// encrypted path ant resolves today; the volume is small (a feed payload)
+/// and `max_bytes` bounds it. Range requests over encrypted content fall
+/// back to a full fetch at the gateway.
+pub async fn join_encrypted(
+    fetcher: &dyn ChunkFetcher,
+    root_ref: [u8; ENCRYPTED_REF_SIZE],
+    max_bytes: usize,
+) -> Result<Vec<u8>, JoinError> {
+    let mut out = Vec::new();
+    join_encrypted_into(fetcher, root_ref, max_bytes, &mut out).await?;
+    Ok(out)
+}
+
+/// Recursive worker for [`join_encrypted`]. Boxed because the recursion is
+/// async (a node expands into child nodes of the same future type).
+fn join_encrypted_into<'a>(
+    fetcher: &'a dyn ChunkFetcher,
+    node_ref: [u8; ENCRYPTED_REF_SIZE],
+    max_bytes: usize,
+    out: &'a mut Vec<u8>,
+) -> Pin<Box<dyn Future<Output = Result<(), JoinError>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut addr = [0u8; 32];
+        addr.copy_from_slice(&node_ref[..32]);
+        let mut key = [0u8; ant_crypto::KEY_LENGTH];
+        key.copy_from_slice(&node_ref[32..]);
+
+        let stored = fetcher
+            .fetch(addr)
+            .await
+            .map_err(|source| JoinError::FetchChunk {
+                addr: hex::encode(addr),
+                source,
+            })?;
+        let decrypted =
+            ant_crypto::decrypt_chunk(&stored, &key).map_err(|e| JoinError::MalformedChunk {
+                offset: out.len() as u64,
+                detail: format!("decrypt chunk {}: {e}", hex::encode(addr)),
+            })?;
+
+        // decrypted = span(8 LE) ‖ payload. `decrypt_chunk` only returns
+        // level-NONE chunks, so the span is the plain byte count.
+        let mut span_bytes = [0u8; 8];
+        span_bytes.copy_from_slice(&decrypted[..8]);
+        let span = u64::from_le_bytes(span_bytes);
+        if span > max_bytes as u64 {
+            return Err(JoinError::TooLarge {
+                span,
+                cap: max_bytes,
+            });
+        }
+        let payload = &decrypted[8..];
+
+        // Leaf: any subtree of at most one chunk is stored as a single
+        // data chunk whose payload is exactly the file bytes.
+        if span <= CHUNK_SIZE as u64 {
+            let n = span as usize;
+            if n > payload.len() {
+                return Err(JoinError::MalformedChunk {
+                    offset: out.len() as u64,
+                    detail: format!("leaf span {n} exceeds payload {}", payload.len()),
+                });
+            }
+            if out.len().saturating_add(n) > max_bytes {
+                return Err(JoinError::TooLarge {
+                    span: out.len().saturating_add(n) as u64,
+                    cap: max_bytes,
+                });
+            }
+            out.extend_from_slice(&payload[..n]);
+            return Ok(());
+        }
+
+        // Intermediate: payload is a list of 64-byte child references.
+        if payload.is_empty() || payload.len() % ENCRYPTED_REF_SIZE != 0 {
+            return Err(JoinError::MalformedChunk {
+                offset: out.len() as u64,
+                detail: format!(
+                    "intermediate payload {} not a multiple of {ENCRYPTED_REF_SIZE}",
+                    payload.len()
+                ),
+            });
+        }
+        let refs = payload.len() / ENCRYPTED_REF_SIZE;
+        let branch_size = subtrie_section_enc(refs, span);
+        let mut remaining = span;
+        for i in 0..refs {
+            // Trailing zero-padded references (a partially-filled
+            // intermediate chunk) carry no more subtree once the span is
+            // exhausted — stop rather than fetching the zero address.
+            if remaining == 0 {
+                break;
+            }
+            let mut child = [0u8; ENCRYPTED_REF_SIZE];
+            child.copy_from_slice(&payload[i * ENCRYPTED_REF_SIZE..(i + 1) * ENCRYPTED_REF_SIZE]);
+            join_encrypted_into(fetcher, child, max_bytes, out).await?;
+            remaining = remaining.saturating_sub(branch_size.min(remaining));
+        }
+        Ok(())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1689,5 +1833,113 @@ mod tests {
         join.await.unwrap().expect("range fetch must succeed");
         assert_eq!(body.len(), 1024);
         assert!(body.iter().all(|&b| b == 0u8), "leaf 0 is all zeros");
+    }
+
+    // --- encrypted joiner ---------------------------------------------
+
+    /// Independent re-derivation of bee's chunk encryption keystream, used
+    /// only to *build* encrypted test fixtures (the production code only
+    /// decrypts). Reusing `ant_crypto::keccak256` keeps it honest while
+    /// proving the joiner walks a genuine encrypted tree.
+    fn enc_segment_key(key: &[u8; 32], ctr: u32) -> [u8; 32] {
+        let mut input = [0u8; 36];
+        input[..32].copy_from_slice(key);
+        input[32..].copy_from_slice(&ctr.to_le_bytes());
+        ant_crypto::keccak256(&ant_crypto::keccak256(&input))
+    }
+    fn enc_transcrypt(data: &mut [u8], key: &[u8; 32], init: u32) {
+        for (i, seg) in data.chunks_mut(32).enumerate() {
+            let ks = enc_segment_key(key, init.wrapping_add(i as u32));
+            for (b, k) in seg.iter_mut().zip(ks.iter()) {
+                *b ^= *k;
+            }
+        }
+    }
+
+    /// Build one encrypted chunk from its plaintext payload + total span,
+    /// returning `(stored_wire, encrypted_ref)` where the ref is
+    /// `address(32) ‖ key(32)` and the address is the BMT hash of the
+    /// *encrypted* span ‖ data — exactly what the network stores.
+    fn build_enc_chunk(plain_payload: &[u8], span: u64, key: &[u8; 32]) -> (Vec<u8>, [u8; 64]) {
+        let mut enc_span = span.to_le_bytes();
+        enc_transcrypt(&mut enc_span, key, (CHUNK_SIZE / 32) as u32);
+        let mut data = vec![0u8; CHUNK_SIZE];
+        data[..plain_payload.len()].copy_from_slice(plain_payload);
+        enc_transcrypt(&mut data, key, 0);
+
+        let mut wire = Vec::with_capacity(8 + CHUNK_SIZE);
+        wire.extend_from_slice(&enc_span);
+        wire.extend_from_slice(&data);
+        let addr = ant_crypto::bmt_hash_with_span(&enc_span, &wire[8..]).unwrap();
+
+        let mut r = [0u8; 64];
+        r[..32].copy_from_slice(&addr);
+        r[32..].copy_from_slice(key);
+        (wire, r)
+    }
+
+    /// A single-leaf encrypted file: one chunk, content shorter than 4 KiB.
+    #[tokio::test]
+    async fn join_encrypted_single_leaf() {
+        let key = [0x33u8; 32];
+        let content = b"encrypted swarm feed payload".to_vec();
+        let (wire, root_ref) = build_enc_chunk(&content, content.len() as u64, &key);
+        let addr: [u8; 32] = root_ref[..32].try_into().unwrap();
+
+        let mut fetcher = MapFetcher::new();
+        fetcher.insert(addr, wire);
+
+        let out = join_encrypted(&fetcher, root_ref, DEFAULT_MAX_FILE_BYTES)
+            .await
+            .expect("encrypted single-leaf join");
+        assert_eq!(out, content);
+    }
+
+    /// A two-leaf encrypted file behind an encrypted intermediate root:
+    /// proves the joiner decrypts the intermediate, reads 64-byte child
+    /// references, and stitches the leaves back in order.
+    #[tokio::test]
+    async fn join_encrypted_two_leaf_tree() {
+        let mut fetcher = MapFetcher::new();
+
+        // Leaf 0: a full 4 KiB chunk of 'A'. Leaf 1: 100 bytes of 'B'.
+        let leaf0 = vec![b'A'; CHUNK_SIZE];
+        let leaf1 = vec![b'B'; 100];
+        let (w0, ref0) = build_enc_chunk(&leaf0, leaf0.len() as u64, &[0x01u8; 32]);
+        let (w1, ref1) = build_enc_chunk(&leaf1, leaf1.len() as u64, &[0x02u8; 32]);
+        fetcher.insert(ref0[..32].try_into().unwrap(), w0);
+        fetcher.insert(ref1[..32].try_into().unwrap(), w1);
+
+        // Root intermediate: payload is the two 64-byte child refs; its
+        // span is the whole file.
+        let mut root_payload = Vec::with_capacity(2 * 64);
+        root_payload.extend_from_slice(&ref0);
+        root_payload.extend_from_slice(&ref1);
+        let total = (leaf0.len() + leaf1.len()) as u64;
+        let (wroot, root_ref) = build_enc_chunk(&root_payload, total, &[0x99u8; 32]);
+        fetcher.insert(root_ref[..32].try_into().unwrap(), wroot);
+
+        let out = join_encrypted(&fetcher, root_ref, DEFAULT_MAX_FILE_BYTES)
+            .await
+            .expect("encrypted two-leaf join");
+
+        let mut expected = leaf0.clone();
+        expected.extend_from_slice(&leaf1);
+        assert_eq!(out, expected);
+    }
+
+    /// The size cap is enforced for encrypted downloads too.
+    #[tokio::test]
+    async fn join_encrypted_respects_max_bytes() {
+        let key = [0x44u8; 32];
+        let content = vec![0u8; 2000];
+        let (wire, root_ref) = build_enc_chunk(&content, content.len() as u64, &key);
+        let mut fetcher = MapFetcher::new();
+        fetcher.insert(root_ref[..32].try_into().unwrap(), wire);
+
+        match join_encrypted(&fetcher, root_ref, 1000).await {
+            Err(JoinError::TooLarge { cap, .. }) => assert_eq!(cap, 1000),
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
     }
 }
