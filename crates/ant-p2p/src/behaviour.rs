@@ -5720,34 +5720,7 @@ mod tests {
         let owner = ant_crypto::ethereum_address_from_public_key(&VerifyingKey::from(&sk));
         let topic: [u8; 32] = [0xaau8; 32];
 
-        // v1 sequence update at index 0: id = keccak256(topic ‖ index_be8),
-        // SOC address = keccak256(id ‖ owner), wire = id ‖ sig ‖ inner_cac.
-        let mut id_input = Vec::with_capacity(40);
-        id_input.extend_from_slice(&topic);
-        id_input.extend_from_slice(&0u64.to_be_bytes());
-        let id = ant_crypto::keccak256(&id_input);
-
-        let mut update_payload = Vec::with_capacity(40);
-        update_payload.extend_from_slice(&[0u8; 8]);
-        update_payload.extend_from_slice(&[0xbbu8; 32]);
-        let (inner_cac_addr, inner_cac_wire) = ant_crypto::cac_new(&update_payload).unwrap();
-
-        let mut sig_input = Vec::with_capacity(64);
-        sig_input.extend_from_slice(&id);
-        sig_input.extend_from_slice(&inner_cac_addr);
-        let prehash = ant_crypto::keccak256(&sig_input);
-        let sig = ant_crypto::sign_handshake_data(&secret, &prehash).unwrap();
-
-        let mut soc_addr_input = Vec::with_capacity(52);
-        soc_addr_input.extend_from_slice(&id);
-        soc_addr_input.extend_from_slice(&owner);
-        let soc_addr = ant_crypto::keccak256(&soc_addr_input);
-
-        let mut wire = Vec::with_capacity(ant_crypto::SOC_HEADER_SIZE + inner_cac_wire.len());
-        wire.extend_from_slice(&id);
-        wire.extend_from_slice(&sig);
-        wire.extend_from_slice(&inner_cac_wire);
-
+        let (soc_addr, wire) = feed_update_v1(&secret, &owner, &topic, 0, &[0xbbu8; 32]);
         let dir = tempfile::tempdir().unwrap();
         let disk = Arc::new(
             ant_retrieval::DiskChunkCache::open(dir.path().join("disk.sqlite"), 1 << 20).unwrap(),
@@ -5775,6 +5748,98 @@ mod tests {
                 assert_eq!(index, 0, "the cached index-0 update must resolve as latest");
             }
             other => panic!("expected the cached feed update to resolve, got {other:?}"),
+        }
+    }
+
+    /// Build a v1 sequence feed-update SOC exactly the way a bee-compatible
+    /// client (and the gateway's `upload_soc` → `PushSoc` path) addresses
+    /// it: `id = keccak256(topic ‖ index_be8)`, SOC address =
+    /// `keccak256(id ‖ owner)` — the same address
+    /// `ant_retrieval::sequence_update_address` recomputes when `GetFeed`
+    /// walks the sequence. Returns `(soc_address, wire)` where wire is
+    /// `id ‖ sig ‖ inner_cac`.
+    fn feed_update_v1(
+        secret: &[u8; 32],
+        owner: &[u8; 20],
+        topic: &[u8; 32],
+        index: u64,
+        wrapped_ref: &[u8; 32],
+    ) -> ([u8; 32], Vec<u8>) {
+        let mut id_input = Vec::with_capacity(40);
+        id_input.extend_from_slice(topic);
+        id_input.extend_from_slice(&index.to_be_bytes());
+        let id = ant_crypto::keccak256(&id_input);
+
+        let mut update_payload = Vec::with_capacity(40);
+        update_payload.extend_from_slice(&[0u8; 8]);
+        update_payload.extend_from_slice(wrapped_ref);
+        let (inner_cac_addr, inner_cac_wire) = ant_crypto::cac_new(&update_payload).unwrap();
+
+        let mut sig_input = Vec::with_capacity(64);
+        sig_input.extend_from_slice(&id);
+        sig_input.extend_from_slice(&inner_cac_addr);
+        let prehash = ant_crypto::keccak256(&sig_input);
+        let sig = ant_crypto::sign_handshake_data(secret, &prehash).unwrap();
+
+        let mut soc_addr_input = Vec::with_capacity(52);
+        soc_addr_input.extend_from_slice(&id);
+        soc_addr_input.extend_from_slice(owner);
+        let soc_addr = ant_crypto::keccak256(&soc_addr_input);
+
+        let mut wire = Vec::with_capacity(ant_crypto::SOC_HEADER_SIZE + inner_cac_wire.len());
+        wire.extend_from_slice(&id);
+        wire.extend_from_slice(&sig);
+        wire.extend_from_slice(&inner_cac_wire);
+        (soc_addr, wire)
+    }
+
+    /// The auto-index regression from #8: two consecutive feed updates
+    /// (indices 0 then 1) stashed in the node's local cache the way two
+    /// `POST /soc` writes would, then `GetFeed` must resolve **index 1**
+    /// (the latest) — not `feed_empty` and not the stale index 0. This is
+    /// the node-side guarantee that makes the client's auto-index
+    /// (`writeFeedEntry({name})` returns 0 then 1) and
+    /// `readFeedEntry({name})`-after-write deterministic with no network.
+    #[tokio::test]
+    async fn get_feed_resolves_latest_across_two_cached_updates() {
+        use k256::ecdsa::{SigningKey, VerifyingKey};
+
+        let secret: [u8; 32] = [9u8; 32];
+        let sk = SigningKey::from_bytes((&secret).into()).unwrap();
+        let owner = ant_crypto::ethereum_address_from_public_key(&VerifyingKey::from(&sk));
+        let topic: [u8; 32] = [0xccu8; 32];
+
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Arc::new(
+            ant_retrieval::DiskChunkCache::open(dir.path().join("disk.sqlite"), 1 << 20).unwrap(),
+        );
+        // Two sequential updates pointing at distinct references.
+        for (index, wrapped) in [(0u64, [0x01u8; 32]), (1u64, [0x02u8; 32])] {
+            let (addr, wire) = feed_update_v1(&secret, &owner, &topic, index, &wrapped);
+            disk.put(addr, wire).await.unwrap();
+        }
+
+        let mut state = state_with_disk_cache(disk);
+        let mut peerstore = PeerStore::disabled();
+        let control = test_control();
+        let (ack_tx, ack_rx) = oneshot::channel();
+        handle_control_command(
+            &mut state,
+            &mut peerstore,
+            &control,
+            None,
+            0,
+            ControlCommand::GetFeed {
+                owner,
+                topic,
+                ack: ack_tx,
+            },
+        );
+        match ack_rx.await.unwrap() {
+            ControlAck::FeedResolved { index, .. } => {
+                assert_eq!(index, 1, "latest of two cached updates must be index 1");
+            }
+            other => panic!("expected the latest cached update to resolve, got {other:?}"),
         }
     }
 }
