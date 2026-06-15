@@ -288,6 +288,37 @@ const PROBE_RETRIES: u32 = 3;
 /// Backoff between transient-error retries of a single index probe.
 const PROBE_RETRY_DELAY: Duration = Duration::from_millis(200);
 
+/// Wall-clock deadline for a *speculative* feed-update probe — every
+/// index past the confirmed-present anchor (the exponential bracket in
+/// phase 1, the binary-search midpoints in phase 2, and the look-ahead
+/// in phase 3).
+///
+/// The anchor (index 0) is never bounded: it must resolve, and on a
+/// remote feed its SOC legitimately comes from the network. But a
+/// *speculative* probe at an index that doesn't exist yet has no peer
+/// holding it, so [`RoutingFetcher`] burns its entire multi-peer
+/// retrieval budget (~30 s of "no peer found" / "not found" retries
+/// across the candidate set) before the miss can be declared. Every feed
+/// `latest` resolution paid that cost at least once — even when index 0
+/// was already local — which is why reading a single-writer feed through
+/// the gateway took ~27 s while reading plain content took milliseconds.
+///
+/// Bounding the speculative probes turns "find latest" back into a
+/// sub-second operation for the common feed. A genuinely
+/// present-but-slow update that loses the race against this deadline is
+/// folded into "absent" for this resolution and recovered on the next
+/// one (feeds are polled), exactly as bee's bounded async finder treats
+/// an update it couldn't fetch within its own per-probe budget.
+///
+/// Sized below a single absent SOC fetch's natural cost (~2-3 s of
+/// closest-peer walking on the live network): a reachable update in its
+/// neighbourhood answers in well under this, while a genuinely-absent
+/// index is cut off promptly instead of running the peer walk to
+/// exhaustion. Combined with the *parallel* look-ahead (phase 3 probes
+/// the whole confirmation window at once), a single-writer feed resolves
+/// in ~1 round-trip instead of one-per-probe.
+const FEED_PROBE_TIMEOUT: Duration = Duration::from_millis(800);
+
 /// Outcome of probing one sequence index.
 enum ProbeOutcome {
     /// SOC fetched and verified at this index.
@@ -319,12 +350,55 @@ async fn probe(
     feed: &Feed,
     index: u64,
     probed: &mut u64,
+    deadline: Option<Duration>,
 ) -> Result<ProbeOutcome, FeedError> {
     *probed += 1;
+    probe_once(fetcher, feed, index, deadline).await
+}
+
+/// One sequence-index probe without touching the `probed` counter, so
+/// the phase-3 look-ahead can fan a whole window out concurrently and
+/// account for the count itself. Behaviour is otherwise identical to
+/// [`probe`] (deadline handling, transient retries, SOC verification).
+async fn probe_once(
+    fetcher: &dyn ChunkFetcher,
+    feed: &Feed,
+    index: u64,
+    deadline: Option<Duration>,
+) -> Result<ProbeOutcome, FeedError> {
     let addr = sequence_update_address(feed, index);
     let mut attempt: u32 = 0;
     loop {
-        match fetcher.fetch(addr).await {
+        let fetched = match deadline {
+            // Speculative probe: cap the wall-clock so an absent index
+            // can't burn the fetcher's full multi-peer retrieval budget.
+            // A timeout is folded into "transient" — an upper bound for
+            // the bracket / not-present for the look-ahead — rather than a
+            // definitive "absent", so we never assert the feed ended on a
+            // slow probe; the next resolution re-checks.
+            Some(d) => match tokio::time::timeout(d, fetcher.fetch(addr)).await {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    debug!(
+                        target: "ant_retrieval::feed",
+                        index,
+                        deadline_ms = d.as_millis() as u64,
+                        "speculative feed probe timed out; folding into a transient miss",
+                    );
+                    return Ok(ProbeOutcome::Transient(
+                        format!(
+                            "feed probe for index {index} exceeded {} ms deadline",
+                            d.as_millis()
+                        )
+                        .into(),
+                    ));
+                }
+            },
+            // Anchor probe (index 0): unbounded — it must resolve, and on a
+            // remote feed it legitimately comes from the network.
+            None => fetcher.fetch(addr).await,
+        };
+        match fetched {
             Ok(wire) => {
                 let decoded = decode_sequence_update(&wire, addr, feed)?;
                 trace!(
@@ -408,8 +482,8 @@ pub async fn resolve_sequence_feed_full(
 ) -> Result<FeedResolution, FeedError> {
     let mut probed: u64 = 0;
 
-    // Phase 0 — anchor on index 0.
-    let (mut latest_index, mut latest) = match probe(fetcher, feed, 0, &mut probed).await? {
+    // Phase 0 — anchor on index 0 (unbounded: it must resolve).
+    let (mut latest_index, mut latest) = match probe(fetcher, feed, 0, &mut probed, None).await? {
         ProbeOutcome::Present(u) => (0u64, u),
         ProbeOutcome::Absent => return Err(FeedError::NoUpdates { probed }),
         ProbeOutcome::Transient(e) => return Err(FeedError::Fetch(e)),
@@ -430,7 +504,15 @@ pub async fn resolve_sequence_feed_full(
                 hi = u64::MAX;
                 break;
             }
-            if let ProbeOutcome::Present(u) = probe(fetcher, feed, candidate, &mut probed).await? {
+            if let ProbeOutcome::Present(u) = probe(
+                fetcher,
+                feed,
+                candidate,
+                &mut probed,
+                Some(FEED_PROBE_TIMEOUT),
+            )
+            .await?
+            {
                 lo = candidate;
                 lo_update = u;
                 step = step.saturating_mul(2);
@@ -445,7 +527,9 @@ pub async fn resolve_sequence_feed_full(
         // Phase 2 — binary search the boundary in (lo, hi).
         while hi - lo > 1 {
             let mid = lo + (hi - lo) / 2;
-            if let ProbeOutcome::Present(u) = probe(fetcher, feed, mid, &mut probed).await? {
+            if let ProbeOutcome::Present(u) =
+                probe(fetcher, feed, mid, &mut probed, Some(FEED_PROBE_TIMEOUT)).await?
+            {
                 lo = mid;
                 lo_update = u;
             } else {
@@ -458,15 +542,33 @@ pub async fn resolve_sequence_feed_full(
 
         // Phase 3 — confirm the end. If the bracket/boundary was pulled
         // down by a transient miss, a probe ahead will reveal the hidden
-        // update; adopt it and loop. Otherwise `latest_index` is final.
+        // update; adopt the *lowest* such index and loop. Otherwise
+        // `latest_index` is final.
+        //
+        // The whole `2^k` confirmation window is probed concurrently:
+        // these are independent existence checks and, on a healthy feed,
+        // every one is absent, so running them sequentially paid the
+        // per-probe network cost `LOOKAHEAD_LEVELS + 1` times on every
+        // resolution (the dominant feed-read latency). Fanning them out
+        // collapses that to a single round-trip's wall-clock.
+        let candidates: Vec<u64> = (0..=LOOKAHEAD_LEVELS)
+            .map_while(|k| latest_index.checked_add(1u64 << k))
+            .collect();
+        probed += candidates.len() as u64;
+        let outcomes = futures::future::join_all(candidates.iter().map(|&i| async move {
+            (
+                i,
+                probe_once(fetcher, feed, i, Some(FEED_PROBE_TIMEOUT)).await,
+            )
+        }))
+        .await;
         let mut higher: Option<(u64, DecodedUpdate)> = None;
-        for k in 0..=LOOKAHEAD_LEVELS {
-            let Some(i) = latest_index.checked_add(1u64 << k) else {
-                break;
-            };
-            if let ProbeOutcome::Present(u) = probe(fetcher, feed, i, &mut probed).await? {
-                higher = Some((i, u));
-                break;
+        for (i, outcome) in outcomes {
+            if let ProbeOutcome::Present(u) = outcome? {
+                match higher {
+                    Some((found, _)) if found <= i => {}
+                    _ => higher = Some((i, u)),
+                }
             }
         }
         match higher {
@@ -705,6 +807,8 @@ mod tests {
     use k256::ecdsa::{SigningKey, VerifyingKey};
     use std::collections::HashMap;
     use std::error::Error as StdError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     /// Tiny in-memory fetcher used by the SOC verification end-to-end
     /// tests below. Mirrors `mantaray::tests::MapFetcher` to keep the
@@ -777,6 +881,94 @@ mod tests {
                     format!("not found: {}", hex::encode(addr)).into()
                 })
         }
+    }
+
+    /// Fetcher that serves a known set of chunks instantly but makes every
+    /// *absent* address take a long wall-clock time before reporting a
+    /// "not found" — the live-network shape of a speculative feed probe
+    /// at an index no peer holds (`RoutingFetcher` walks its whole
+    /// candidate set before concluding the miss). Used to pin that the
+    /// finder bounds those probes instead of paying the full miss cost.
+    struct SlowAbsentFetcher {
+        chunks: HashMap<[u8; 32], Vec<u8>>,
+        absent_delay: Duration,
+        absent_hits: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl ChunkFetcher for SlowAbsentFetcher {
+        async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
+            if let Some(wire) = self.chunks.get(&addr) {
+                return Ok(wire.clone());
+            }
+            self.absent_hits.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.absent_delay).await;
+            Err(format!("not found: {}", hex::encode(addr)).into())
+        }
+    }
+
+    /// A single-update feed resolves promptly even when every absent
+    /// look-ahead index would take an eternity to report its miss. This is
+    /// the gateway-feed-latency regression: before bounding the
+    /// speculative probes, resolving a one-writer feed paid one full
+    /// retrieval budget (~30 s on the live network) on the bracket probe
+    /// past index 0, so `/bzz/<feedManifest>/` took ~27 s while plain
+    /// content read in milliseconds.
+    #[tokio::test(start_paused = true)]
+    async fn speculative_probes_are_deadline_bounded() {
+        let secret: [u8; 32] = [9u8; 32];
+        let owner = deterministic_eth_address(&secret);
+        let topic: [u8; 32] = [0x5au8; 32];
+        let target_ref: [u8; 32] = [0xccu8; 32];
+        let feed = Feed {
+            owner,
+            topic,
+            kind: FeedType::Sequence,
+        };
+
+        let (soc_addr, soc_wire) = make_sequence_update_v1(&secret, &owner, &topic, 0, &target_ref);
+
+        let mut chunks = HashMap::new();
+        chunks.insert(soc_addr, soc_wire);
+        // The reference the v1 update points at must resolve — that fetch is
+        // real content (classify_payload), not a speculative probe, so it
+        // stays present-and-fast here.
+        chunks.insert(target_ref, cac_new(b"board index payload").unwrap().1);
+
+        // A single unbounded miss would take 10 minutes; the finder must
+        // not wait one out.
+        let absent_delay = Duration::from_mins(10);
+        let absent_hits = Arc::new(AtomicUsize::new(0));
+        let fetcher = SlowAbsentFetcher {
+            chunks,
+            absent_delay,
+            absent_hits: absent_hits.clone(),
+        };
+
+        let start = tokio::time::Instant::now();
+        let resolution = resolve_sequence_feed_full(&fetcher, &feed).await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            resolution.index, 0,
+            "single-writer feed's latest is index 0"
+        );
+        assert_eq!(resolution.reference, target_ref);
+        // The finder did exercise the speculative (absent) probe path...
+        assert!(
+            absent_hits.load(Ordering::SeqCst) >= 1,
+            "expected at least one speculative absent probe",
+        );
+        // ...but every such probe is capped at FEED_PROBE_TIMEOUT and the
+        // look-ahead window is probed concurrently, so the whole walk costs
+        // a small, bounded number of deadlines — not one per probe, and
+        // nowhere near a single unbounded miss. The bracket (sequential)
+        // plus the concurrent look-ahead is ~2 deadlines; allow generous
+        // slack for scheduling.
+        assert!(
+            elapsed < FEED_PROBE_TIMEOUT * 6,
+            "feed resolution took {elapsed:?}; speculative probes must be deadline-bounded and \
+             the look-ahead concurrent (a single unbounded miss is {absent_delay:?})",
+        );
     }
 
     /// Build a v1 sequence-feed update SOC chunk that binds `wrapped_ref`
