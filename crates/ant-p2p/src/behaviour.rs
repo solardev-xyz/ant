@@ -2003,6 +2003,37 @@ fn handle_control_command(
                         );
                     }
                 }
+                // Also cache the wrapped CAC carried inside the SOC. The SOC
+                // wire is `id(32) ‖ sig(65) ‖ span(8) ‖ payload`; everything
+                // after the 97-byte header is a content-addressed chunk
+                // (`span ‖ payload`). For a single-chunk (v2) feed update that
+                // wrapped CAC *is* the content root the feed points at, and
+                // bee-js never uploads it as a standalone chunk — so without
+                // this a feed `latest` read (GetFeed resolves the SOC, then
+                // GetBytes the resolved reference) can't serve our own write
+                // until pushsync propagates, and read-after-own-write returns
+                // `feed_empty`. Caching it under its own CAC address closes
+                // that gap, mirroring the SOC cache above (content-addressed,
+                // so it's a no-op-correct extra entry for non-feed SOCs too).
+                let inner = &wire[SOC_HEADER..];
+                if let Ok(inner_span) = <[u8; 8]>::try_from(&inner[..8]) {
+                    if let Some(inner_addr) =
+                        ant_crypto::bmt::bmt_hash_with_span(&inner_span, &inner[8..])
+                    {
+                        if let Some(mem) = &mem_cache {
+                            mem.put(inner_addr, inner.to_vec());
+                        }
+                        if let Some(disk) = &disk_cache {
+                            if let Err(e) = disk.put(inner_addr, inner.to_vec()).await {
+                                warn!(
+                                    target: "ant_p2p",
+                                    addr = %hex::encode(inner_addr),
+                                    "failed to cache wrapped feed CAC locally: {e}",
+                                );
+                            }
+                        }
+                    }
+                }
                 let mut fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx)
                     .with_push_skip(push_skip)
                     .with_network_id(network_id);
