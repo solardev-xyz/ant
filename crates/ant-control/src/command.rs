@@ -399,6 +399,12 @@ pub enum ControlAck {
         total_bytes: u64,
         content_type: Option<String>,
         filename: Option<String>,
+        /// `true` when the resolved reference was a **feed manifest**, so
+        /// the content is mutable at the (stable) bzz URL and the gateway
+        /// must serve it with `Cache-Control: no-cache` instead of the
+        /// immutable cache normal content-addressed bzz responses get.
+        /// Defaults to `false` for static manifests.
+        mutable: bool,
     },
     BytesChunk {
         data: Vec<u8>,

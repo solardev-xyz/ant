@@ -136,6 +136,12 @@ pub struct LookupResult {
     /// All metadata at the matched value node. Caller may inspect for
     /// `Filename` etc.
     pub metadata: HashMap<String, String>,
+    /// `true` when `root_addr` was a **feed manifest** that we
+    /// dereferenced to reach `data_ref`. The resolved content is then
+    /// *mutable* at the (stable) manifest reference — the same bzz URL
+    /// returns newer content as the feed advances — so callers must not
+    /// cache the response immutably. `false` for a plain static manifest.
+    pub is_feed: bool,
 }
 
 /// One path/value discovered while walking a mantaray manifest.
@@ -169,19 +175,22 @@ pub struct ManifestEntry {
 /// to whichever rolling content root is current. Callers wrap their
 /// usual lookup against the returned address, so the rest of the
 /// manifest decoder doesn't need to know feeds exist.
+/// Returns `(effective_root, is_feed)`: `is_feed` is `true` when
+/// `root_addr` was a feed manifest (so the resolved content is mutable at
+/// the stable manifest reference and must not be cached immutably).
 pub async fn resolve_feed_root(
     fetcher: &dyn ChunkFetcher,
     root_addr: [u8; 32],
-) -> Result<[u8; 32], ManifestError> {
+) -> Result<([u8; 32], bool), ManifestError> {
     let root_node = load_node(fetcher, root_addr).await?;
     // The feed metadata lives on the `/` fork's metadata blob; on the
     // root node itself there is none. Look there first; if it isn't
     // present, this isn't a feed manifest.
     let Some(slash_fork) = root_node.forks.get(&b'/') else {
-        return Ok(root_addr);
+        return Ok((root_addr, false));
     };
     let Some(feed) = feed_from_metadata(&slash_fork.metadata)? else {
-        return Ok(root_addr);
+        return Ok((root_addr, false));
     };
     debug!(
         target: "ant_retrieval::mantaray",
@@ -190,7 +199,7 @@ pub async fn resolve_feed_root(
         "feed manifest detected; dereferencing",
     );
     match feed.kind {
-        FeedType::Sequence => Ok(resolve_sequence_feed(fetcher, &feed).await?),
+        FeedType::Sequence => Ok((resolve_sequence_feed(fetcher, &feed).await?, true)),
     }
 }
 
@@ -215,7 +224,7 @@ pub async fn lookup_path(
 ) -> Result<LookupResult, ManifestError> {
     let path = path.trim_start_matches('/');
 
-    let effective_root = resolve_feed_root(fetcher, root_addr).await?;
+    let (effective_root, is_feed) = resolve_feed_root(fetcher, root_addr).await?;
     let root_node = load_node(fetcher, effective_root).await?;
     debug!(
         target: "ant_retrieval::mantaray",
@@ -254,13 +263,15 @@ pub async fn lookup_path(
         });
     }
 
-    walk(
+    let mut result = walk(
         fetcher,
         root_node,
         effective_path.as_bytes(),
         &effective_path,
     )
-    .await
+    .await?;
+    result.is_feed = is_feed;
+    Ok(result)
 }
 
 /// Concurrent in-flight chunk fetches when populating per-entry sizes
@@ -300,7 +311,7 @@ pub async fn list_manifest_paths(
     fetcher: &dyn ChunkFetcher,
     root_addr: [u8; 32],
 ) -> Result<Vec<ManifestEntry>, ManifestError> {
-    let effective_root = resolve_feed_root(fetcher, root_addr).await?;
+    let (effective_root, _is_feed) = resolve_feed_root(fetcher, root_addr).await?;
     let root_node = load_node(fetcher, effective_root).await?;
     let mut entries = Vec::new();
     let mut visited = HashSet::from([effective_root]);
@@ -390,6 +401,10 @@ fn walk<'a>(
                 data_ref,
                 content_type,
                 metadata: node.metadata,
+                // Set by `lookup_path` once it knows whether the root was a
+                // feed manifest; the walker itself works on the resolved
+                // (post-dereference) root and can't tell.
+                is_feed: false,
             });
         }
 

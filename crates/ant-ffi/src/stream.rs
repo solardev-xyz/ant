@@ -291,6 +291,7 @@ async fn head_request(
                     total_bytes,
                     content_type,
                     filename,
+                    mutable: _,
                 })) => {
                     drain_until_done(&mut ack_rx).await;
                     return Ok((total_bytes, content_type, filename));

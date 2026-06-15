@@ -150,6 +150,7 @@ async fn gateway_raises_joiner_max_bytes_above_cli_default() {
                             total_bytes: 4,
                             content_type: Some("text/plain".to_string()),
                             filename: None,
+                            mutable: false,
                         })
                         .await;
                     let _ = ack
@@ -403,6 +404,7 @@ async fn head_dispatches_head_only_flag() {
                         total_bytes: 1024,
                         content_type: Some("video/mp4".to_string()),
                         filename: Some("clip.mp4".to_string()),
+                        mutable: false,
                     })
                     .await;
                 if !head_only {

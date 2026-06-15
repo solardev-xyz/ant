@@ -724,8 +724,8 @@ async fn stream_via_fetcher(
 ) {
     let is_bzz = path.is_some();
     let result = async {
-        let (data_ref, content_type, filename) = match path {
-            None => (reference, None, None),
+        let (data_ref, content_type, filename, mutable) = match path {
+            None => (reference, None, None, false),
             Some(p) => {
                 let lookup = lookup_path(fetcher, reference, &p)
                     .await
@@ -741,7 +741,12 @@ async fn stream_via_fetcher(
                             .map(std::string::ToString::to_string)
                     }
                 });
-                (lookup.data_ref, lookup.content_type, filename)
+                (
+                    lookup.data_ref,
+                    lookup.content_type,
+                    filename,
+                    lookup.is_feed,
+                )
             }
         };
         let root = fetcher.fetch(data_ref).await.map_err(|e| e.to_string())?;
@@ -759,6 +764,7 @@ async fn stream_via_fetcher(
                 total_bytes: total,
                 content_type,
                 filename,
+                mutable,
             }
         } else {
             ControlAck::BytesStreamStart { total_bytes: total }

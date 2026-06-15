@@ -142,6 +142,16 @@ fn set_immutable_cache_headers(resp: &mut Response) {
         .headers_mut()
         .insert(header::CACHE_CONTROL, IMMUTABLE_CACHE_CONTROL);
 }
+/// Override a response's `Cache-Control` with `no-cache`, for content
+/// that is *mutable* at its URL — feed-backed bzz references resolve to
+/// rolling content at a stable reference, so the immutable cache the
+/// content-addressed builders apply by default would pin a stale
+/// resolution. Used to downgrade those responses after the fact.
+fn set_mutable_cache_headers(resp: &mut Response) {
+    let _ = resp
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, MUTABLE_CACHE_CONTROL);
+}
 /// Hard cap on a `/bytes` or `/bzz` request even with no header.
 ///
 /// Sized for the realistic worst case observed in production: a 44 MiB
@@ -1495,15 +1505,25 @@ async fn bzz_inner(
         .clone()
         .unwrap_or_else(|| "application/octet-stream".to_string());
     let filename = started.filename.clone();
+    // Feed-backed bzz references resolve to mutable content at a stable
+    // URL; serving them immutably (as `streaming_response` does by
+    // default) makes browsers/proxies pin a stale resolution and never
+    // re-fetch — the exact "feed never updates" failure. Downgrade to
+    // `no-cache` for these.
+    let mutable = started.mutable;
 
     if parsed_range.is_none() {
-        return streaming_response(
+        let mut resp = streaming_response(
             head_only,
             total,
             started.into_body(head_only),
             &content_type,
             filename.as_deref(),
         );
+        if mutable {
+            set_mutable_cache_headers(&mut resp);
+        }
+        return resp;
     }
 
     let carry_guard = started.take_activity_guard();
@@ -1528,7 +1548,7 @@ async fn bzz_inner(
         Err(e) => return e,
     };
     let body_len = end - start + 1;
-    partial_content_response(
+    let mut resp = partial_content_response(
         head_only,
         total,
         start,
@@ -1537,7 +1557,11 @@ async fn bzz_inner(
         ranged.into_body(head_only),
         &content_type,
         filename.as_deref(),
-    )
+    );
+    if mutable {
+        set_mutable_cache_headers(&mut resp);
+    }
+    resp
 }
 
 #[derive(Debug, Serialize)]
@@ -1607,6 +1631,10 @@ struct Started {
     /// or filename.
     content_type: Option<String>,
     filename: Option<String>,
+    /// `true` when the bzz reference resolved through a feed manifest, so
+    /// the response is mutable and must be served `no-cache`. Always
+    /// `false` for `StreamBytes`.
+    mutable: bool,
     first_chunk: Option<Vec<u8>>,
     rx: mpsc::Receiver<ControlAck>,
     /// RAII guard for the gateway-activity registry slot. Lives for
@@ -1795,6 +1823,7 @@ async fn consume_stream_prologue(
     let total_bytes;
     let mut content_type = None;
     let mut filename = None;
+    let mut mutable = false;
     loop {
         match tokio::time::timeout(timeout, rx.recv()).await {
             Ok(Some(ControlAck::BytesStreamStart { total_bytes: t })) if !expect_bzz => {
@@ -1805,10 +1834,12 @@ async fn consume_stream_prologue(
                 total_bytes: t,
                 content_type: ct,
                 filename: fn_,
+                mutable: m,
             })) if expect_bzz => {
                 total_bytes = t;
                 content_type = ct;
                 filename = fn_;
+                mutable = m;
                 break;
             }
             Ok(Some(ControlAck::Progress(p))) => {
@@ -1847,6 +1878,7 @@ async fn consume_stream_prologue(
             first_bytes: Vec::new(),
             content_type,
             filename,
+            mutable,
             first_chunk: None,
             rx,
             activity_guard,
@@ -1896,6 +1928,7 @@ async fn consume_stream_prologue(
         first_bytes,
         content_type,
         filename,
+        mutable,
         first_chunk,
         rx,
         activity_guard,

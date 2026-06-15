@@ -2766,6 +2766,7 @@ async fn run_stream_bzz(
     // (and its range-aware sibling) handle in-place subtree retries
     // themselves, so the consumer sees a continuous stream.
     let mut last_error = None;
+    let resolution_started = Instant::now();
     for attempt in 1..=MAX_FETCH_ATTEMPTS {
         if peers_rx.borrow().is_empty() {
             let _ = ack
@@ -2806,7 +2807,11 @@ async fn run_stream_bzz(
                     .await;
                 return;
             }
-            Err(e) if is_manifest_transient(&e) && attempt < MAX_FETCH_ATTEMPTS => {
+            Err(e)
+                if is_manifest_transient(&e)
+                    && attempt < MAX_FETCH_ATTEMPTS
+                    && resolution_started.elapsed() < RESOLUTION_RETRY_BUDGET =>
+            {
                 last_error = Some(format!("manifest lookup '{path}': {e}"));
                 let backoff = RETRY_BACKOFF_BASE * attempt as u32;
                 warn!(
@@ -2840,7 +2845,10 @@ async fn run_stream_bzz(
 
         let root = match fetcher.fetch(data_ref).await {
             Ok(r) => r,
-            Err(e) if attempt < MAX_FETCH_ATTEMPTS => {
+            Err(e)
+                if attempt < MAX_FETCH_ATTEMPTS
+                    && resolution_started.elapsed() < RESOLUTION_RETRY_BUDGET =>
+            {
                 last_error = Some(format!("fetch data root {}: {e}", hex::encode(data_ref)));
                 let backoff = RETRY_BACKOFF_BASE * attempt as u32;
                 warn!(
@@ -2882,6 +2890,7 @@ async fn run_stream_bzz(
                 total_bytes,
                 content_type: lookup.content_type,
                 filename,
+                mutable: lookup.is_feed,
             })
             .await
             .is_err()
@@ -3083,6 +3092,22 @@ fn send_terminal_ack(ack: &mpsc::Sender<ControlAck>, reply: ControlAck) {
 /// tail chunks more peer-set churn windows without re-downloading the
 /// already joined prefix.
 const MAX_FETCH_ATTEMPTS: usize = 10;
+
+/// Wall-clock ceiling on **retrying a failed manifest/feed resolution**
+/// (the `/bzz/{ref}/` pre-stream phase: manifest chunk → mantaray walk →
+/// feed latest-lookup → data-root chunk). `MAX_FETCH_ATTEMPTS` alone
+/// bounds the *count* of retries but not their *duration*: a single
+/// attempt can spend ~30 s hedging across an unhelpful peer set, so ten
+/// attempts plus back-off could hold an HTTP request open for minutes —
+/// e.g. an SPA polling a feed every 5 s would see the tab spin forever
+/// instead of getting a prompt error it can retry. This caps that
+/// pre-stream phase so the gateway returns a `502`/`504` quickly and the
+/// client can degrade gracefully. It does **not** bound content
+/// streaming: once `BzzStreamStart` is emitted the resolution loop has
+/// already returned, and the joiner does its own in-place subtree retries
+/// for the body. Generous enough (vs. a healthy sub-second resolution)
+/// that it only trips on a genuinely unreachable chunk.
+const RESOLUTION_RETRY_BUDGET: Duration = Duration::from_secs(30);
 
 /// Process-wide cap on concurrent `retrieve_chunk` calls (see
 /// `SwarmState::retrieval_inflight`). Bee's retrieval has no
