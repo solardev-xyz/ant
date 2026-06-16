@@ -616,7 +616,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mantaray::{list_manifest, lookup_path};
+    use crate::mantaray::{list_manifest, lookup_path, ManifestError};
     use crate::ChunkFetcher;
     use async_trait::async_trait;
     use std::collections::HashMap;
@@ -972,6 +972,116 @@ mod tests {
             resolved.is_err(),
             "feed manifest should be detected and attempt dereference, got {resolved:?}",
         );
+    }
+
+    /// Build a manifest whose `/` fork carries both
+    /// `website-index-document` and `website-error-document`, then push
+    /// every chunk into `fetcher`. The writer's public API only emits the
+    /// index document, so we assemble the trie by hand here to exercise
+    /// the reader's error-document fallback.
+    fn build_manifest_with_error_doc(
+        fetcher: &mut MapFetcher,
+        files: &[ManifestFile],
+        index: &str,
+        error: &str,
+    ) -> ChunkAddr {
+        let mut root = TrieNode::default();
+        for f in files {
+            let ct = f
+                .content_type
+                .clone()
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            trie_insert(
+                &mut root,
+                f.path.as_bytes(),
+                f.data_ref,
+                file_metadata(&ct, &f.path),
+            )
+            .unwrap();
+        }
+        let mut meta = BTreeMap::new();
+        meta.insert(MANTARAY_INDEX_DOC_KEY.to_string(), index.to_string());
+        meta.insert(crate::MANTARAY_ERROR_DOC_KEY.to_string(), error.to_string());
+        root.forks.insert(
+            b'/',
+            TrieFork {
+                prefix: b"/".to_vec(),
+                child: Box::new(TrieNode {
+                    value: Some(EmptyValue),
+                    ..Default::default()
+                }),
+                metadata_override: Some(meta),
+                path_separator: true,
+            },
+        );
+        let mut chunks = Vec::new();
+        let root_addr = serialize_node(&root, &mut chunks).unwrap();
+        for c in &chunks {
+            fetcher.ingest(c);
+        }
+        root_addr
+    }
+
+    /// Bee-compat `website-error-document` fallback: an otherwise-404 path
+    /// serves the declared error document, while explicit and index-doc
+    /// paths are unaffected.
+    #[tokio::test]
+    async fn error_document_fallback() {
+        let mut fetcher = MapFetcher::new();
+        let mut files = Vec::new();
+        let mut data_refs: HashMap<&str, [u8; 32]> = HashMap::new();
+        for name in ["index.html", "error.html"] {
+            let body = format!("<html>{name}</html>");
+            let split = crate::splitter::split_bytes(body.as_bytes());
+            for c in &split.chunks {
+                fetcher.ingest(c);
+            }
+            data_refs.insert(name, split.root);
+            files.push(ManifestFile {
+                path: name.to_string(),
+                content_type: Some("text/html".to_string()),
+                data_ref: split.root,
+            });
+        }
+        let root = build_manifest_with_error_doc(&mut fetcher, &files, "index.html", "error.html");
+
+        // A genuine miss falls back to the error document.
+        let miss = lookup_path(&fetcher, root, "does/not/exist").await.unwrap();
+        assert_eq!(miss.data_ref, data_refs["error.html"]);
+
+        // Explicit existing paths and the bare root are unaffected.
+        let explicit = lookup_path(&fetcher, root, "index.html").await.unwrap();
+        assert_eq!(explicit.data_ref, data_refs["index.html"]);
+        let bare = lookup_path(&fetcher, root, "").await.unwrap();
+        assert_eq!(bare.data_ref, data_refs["index.html"]);
+    }
+
+    /// Without a `website-error-document`, a miss still 404s (the
+    /// fallback must be opt-in via the metadata key).
+    #[tokio::test]
+    async fn no_error_document_still_not_found() {
+        let mut fetcher = MapFetcher::new();
+        let body = b"<html>hi</html>".to_vec();
+        let split = crate::splitter::split_bytes(&body);
+        for c in &split.chunks {
+            fetcher.ingest(c);
+        }
+        let manifest = build_collection_manifest(
+            &[ManifestFile {
+                path: "index.html".to_string(),
+                content_type: Some("text/html".to_string()),
+                data_ref: split.root,
+            }],
+            Some("index.html"),
+        )
+        .unwrap();
+        for c in &manifest.chunks {
+            fetcher.ingest(c);
+        }
+        let err = lookup_path(&fetcher, manifest.root, "does/not/exist")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ManifestError::NotFound { .. }), "got {err:?}");
     }
 
     /// JSON encoder produces strict, deterministic output for the keys

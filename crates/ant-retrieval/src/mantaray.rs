@@ -234,44 +234,112 @@ pub async fn lookup_path(
         "loaded mantaray root",
     );
 
-    // Empty-path resolution. Bee stores `website-index-document` as
+    // Bee stores `website-index-document` and `website-error-document` as
     // metadata on the **fork at byte '/'**, not on the root node itself.
     // (Marshalled as `m.Add("/", NewEntry(zero, {website-index-document:
-    // ...}))` in `bee/pkg/api/bzz.go::fileUploadHandler`.) Read it
-    // directly off the root's "/" fork; if absent, fall back to looking
-    // the empty path up as a value on the root.
-    let effective_path: String = if path.is_empty() {
-        match root_node
-            .forks
-            .get(&b'/')
-            .and_then(|f| f.metadata.get(MANTARAY_INDEX_DOC_KEY))
-        {
-            Some(idx) => idx.clone(),
-            None => String::new(),
-        }
-    } else {
-        path.to_string()
-    };
+    // ...}))` in `bee/pkg/api/bzz.go::fileUploadHandler`.) Read both off
+    // the root's "/" fork.
+    let slash_meta = root_node.forks.get(&b'/').map(|f| &f.metadata);
+    let index_doc = slash_meta
+        .and_then(|m| m.get(MANTARAY_INDEX_DOC_KEY))
+        .cloned();
+    let error_doc = slash_meta
+        .and_then(|m| m.get(MANTARAY_ERROR_DOC_KEY))
+        .cloned();
 
-    if effective_path.is_empty() {
-        // No index document and no path: the root would have to be a
-        // self-value node, which `bzzDownloadHandler` treats as 404. Be
-        // explicit so the user gets a friendlier message than "fork at
-        // 0x00 not found".
+    // Empty path: serve the index document if the manifest declares one.
+    // This matches what `bee/pkg/api/bzz.go` does for `bzz://<ref>/`.
+    if path.is_empty() {
+        if let Some(idx) = &index_doc {
+            if let Some(mut result) = try_walk(fetcher, &root_node, idx).await? {
+                result.is_feed = is_feed;
+                return Ok(result);
+            }
+        }
+        // No index document (or it didn't resolve): fall through to the
+        // error-document fallback below, then a friendly root 404.
+        if let Some(err) = &error_doc {
+            if let Some(mut result) = try_walk(fetcher, &root_node, err).await? {
+                result.is_feed = is_feed;
+                return Ok(result);
+            }
+        }
         return Err(ManifestError::NotFound {
             path: "(root)".into(),
         });
     }
 
-    let mut result = walk(
+    // Non-empty path: try the literal path first.
+    if let Some(mut result) = try_walk(fetcher, &root_node, path).await? {
+        result.is_feed = is_feed;
+        return Ok(result);
+    }
+
+    // Directory-suffix retry. Bee appends the single root-level index
+    // document to *any* directory path with `path.Join`, so a request for
+    // `developer/` (or `developer`) serves `developer/index.html`. Skip
+    // when the path already ends with the index document so we never
+    // double-suffix `.../index.html`.
+    if let Some(idx) = &index_doc {
+        if !path.ends_with(idx.as_str()) {
+            let with_index = join_index_document(path, idx);
+            if let Some(mut result) = try_walk(fetcher, &root_node, &with_index).await? {
+                result.is_feed = is_feed;
+                return Ok(result);
+            }
+        }
+    }
+
+    // Final fallback: the error document (Bee's `website-error-document`).
+    if let Some(err) = &error_doc {
+        if path != err {
+            if let Some(mut result) = try_walk(fetcher, &root_node, err).await? {
+                result.is_feed = is_feed;
+                return Ok(result);
+            }
+        }
+    }
+
+    Err(ManifestError::NotFound {
+        path: path.to_string(),
+    })
+}
+
+/// Walk the manifest for `effective_path`, mapping a "no such path" miss
+/// (`NotFound` / `DescendPastLeaf`) to `Ok(None)` so callers can try the
+/// next fallback, while still propagating real failures (fetch errors,
+/// non-manifest references, …). A `None` therefore means "this path isn't
+/// in the manifest"; an `Err` means "we couldn't tell".
+async fn try_walk(
+    fetcher: &dyn ChunkFetcher,
+    root_node: &Node,
+    effective_path: &str,
+) -> Result<Option<LookupResult>, ManifestError> {
+    match walk(
         fetcher,
-        root_node,
+        root_node.clone(),
         effective_path.as_bytes(),
-        &effective_path,
+        effective_path,
     )
-    .await?;
-    result.is_feed = is_feed;
-    Ok(result)
+    .await
+    {
+        Ok(result) => Ok(Some(result)),
+        Err(ManifestError::NotFound { .. } | ManifestError::DescendPastLeaf { .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Join a directory path with the index-document suffix the way Bee's
+/// `path.Join(pathVar, indexDocumentSuffixKey)` does: drop a trailing
+/// slash on the directory and separate the two with a single `/`. So
+/// `developer/` and `developer` both yield `developer/index.html`.
+fn join_index_document(path: &str, index_doc: &str) -> String {
+    let base = path.trim_end_matches('/');
+    if base.is_empty() {
+        index_doc.to_string()
+    } else {
+        format!("{base}/{index_doc}")
+    }
 }
 
 /// Concurrent in-flight chunk fetches when populating per-entry sizes
@@ -1051,6 +1119,91 @@ mod tests {
         );
     }
 
+    /// Build a fetcher pre-loaded with a multi-page collection (each
+    /// file a tiny HTML body) plus its `website-index-document:
+    /// index.html` manifest, and return `(fetcher, root, data_refs)`.
+    /// Mirrors what `swarm-deploy` produces for a static site.
+    fn website_fetcher(paths: &[&str]) -> (MapFetcher, [u8; 32], HashMap<String, [u8; 32]>) {
+        use crate::manifest_writer::{build_collection_manifest, ManifestFile};
+        let mut fetcher = MapFetcher::new();
+        let mut files = Vec::new();
+        let mut data_refs = HashMap::new();
+        for p in paths {
+            let body = format!("<html>{p}</html>");
+            let split = crate::splitter::split_bytes(body.as_bytes());
+            for c in &split.chunks {
+                fetcher.insert(c.address, c.wire.clone());
+            }
+            data_refs.insert((*p).to_string(), split.root);
+            files.push(ManifestFile {
+                path: (*p).to_string(),
+                content_type: Some("text/html".to_string()),
+                data_ref: split.root,
+            });
+        }
+        let manifest = build_collection_manifest(&files, Some("index.html")).unwrap();
+        for c in &manifest.chunks {
+            fetcher.insert(c.address, c.wire.clone());
+        }
+        (fetcher, manifest.root, data_refs)
+    }
+
+    /// Bee-compat directory-suffix fallback: a request for a directory
+    /// path (`developer/` or the slash-less `developer`) resolves to that
+    /// directory's `index.html`, and nested directories work too. Mirrors
+    /// `lookup_empty_path_uses_index_document` for non-root directories.
+    #[tokio::test]
+    async fn lookup_directory_path_uses_index_document() {
+        let (fetcher, root, refs) = website_fetcher(&[
+            "index.html",
+            "developer/index.html",
+            "developer/deep/index.html",
+        ]);
+
+        for (req, want) in [
+            ("developer/", "developer/index.html"),
+            ("developer", "developer/index.html"),
+            ("/developer/", "developer/index.html"),
+            ("developer/deep/", "developer/deep/index.html"),
+            ("developer/deep", "developer/deep/index.html"),
+        ] {
+            let res = lookup_path(&fetcher, root, req).await.unwrap();
+            assert_eq!(res.data_ref, refs[want], "request {req:?}");
+        }
+    }
+
+    /// A genuine miss still 404s — the directory-suffix retry must not
+    /// invent pages. Also covers "path already ending in index.html is
+    /// not double-suffixed": `missing/index.html` is looked up verbatim
+    /// (and not as `missing/index.html/index.html`).
+    #[tokio::test]
+    async fn lookup_missing_directory_still_not_found() {
+        let (fetcher, root, _refs) = website_fetcher(&["index.html", "developer/index.html"]);
+        for req in ["nonexistent/", "missing/index.html"] {
+            let err = lookup_path(&fetcher, root, req).await.unwrap_err();
+            assert!(
+                matches!(err, ManifestError::NotFound { .. }),
+                "request {req:?}: expected NotFound, got {err:?}",
+            );
+        }
+    }
+
+    /// `join_index_document` mirrors Bee's `path.Join(pathVar, indexDoc)`:
+    /// a trailing slash is collapsed, an empty base yields the bare index.
+    #[test]
+    fn join_index_document_matches_bee_path_join() {
+        assert_eq!(
+            join_index_document("developer", "index.html"),
+            "developer/index.html"
+        );
+        assert_eq!(
+            join_index_document("developer/", "index.html"),
+            "developer/index.html"
+        );
+        assert_eq!(join_index_document("a/b/", "index.html"), "a/b/index.html");
+        assert_eq!(join_index_document("", "index.html"), "index.html");
+    }
+
     /// Explicit path matches the same file via the `h` fork.
     #[tokio::test]
     async fn lookup_explicit_path() {
@@ -1138,15 +1291,16 @@ mod tests {
 
     /// End-to-end walk of the blog.swarm.eth content manifest for the
     /// path `/search`. This was the request that timed out in
-    /// production with a flood of `chunk=00000000…` retrievals. With
-    /// the parser in good shape, walking should return a clean
-    /// `NotFound` (the `s` fork's child node has prefix
-    /// `earch/index.html` which doesn't match the user's `earch`),
-    /// **without** ever asking the fetcher for an all-zero address.
-    /// `MapFetcher` panics on an unknown chunk, so any spurious
-    /// fetch surfaces as a test failure.
+    /// production with a flood of `chunk=00000000…` retrievals. The
+    /// literal `search` path misses (the `s` fork's child prefix is
+    /// `earch/index.html`, not `earch`), so the Bee-compatible
+    /// directory-index fallback now retries `search/index.html` — which
+    /// *is* a real entry in this manifest. We don't stage that leaf node,
+    /// so the lookup surfaces a `Fetch` error for the **real, non-zero**
+    /// leaf address `14c3a451…` and crucially **never** asks the fetcher
+    /// for the all-zero address that caused the original flood.
     #[tokio::test]
-    async fn walk_blog_swarm_eth_search_returns_not_found() {
+    async fn walk_blog_swarm_eth_search_falls_back_to_index_document() {
         const ROOT_PAYLOAD: &str = "00000000000000000000000000000000000000000000000000000000000000005768b3b6a7db56d21d1abff40d41cebfc83448fed8d7e9b06ec0d3b073f28f2000000000000000000000000000000000000000000000000000000000000000000000000000801000000000007a03a9040000000000000000000000000000000012012f00000000000000000000000000000000000000000000000000000000000cc878d32c96126d47f63fbe391114ee1438cd521146fc975dea1546d302b6c0003e7b22776562736974652d696e6465782d646f63756d656e74223a22696e6465782e68746d6c227d0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a12083430342e68746d6c000000000000000000000000000000000000000000009d2afcaf1de60508865777137fc2eafd61221b37101083a0b4847dc818d6b4e7005e7b22436f6e74656e742d54797065223a22746578742f68746d6c3b20636861727365743d7574662d38222c2246696c656e616d65223a223430342e68746d6c227d0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a1a1061646d696e2f2e67697469676e6f726500000000000000000000000000003891cf97520e77cc4b11d0606863f6d25b1476ee01e23eed4ec8196a74ac8fea005e7b22436f6e74656e742d54797065223a226170706c69636174696f6e2f6f637465742d73747265616d222c2246696c656e616d65223a222e67697469676e6f7265227d0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0401630000000000000000000000000000000000000000000000000000000000d7b04da63d26b8b8b40300102f810a7ca5247095d6c6a6d030d8d9f25e9dea71120b64656661756c742e706e6700000000000000000000000000000000000000e1eb16a43f2bd7d41cc476c129eace731e4c9f620b8d6241a6e3c051ba7b4bd7003e7b22436f6e74656e742d54797065223a22696d6167652f706e67222c2246696c656e616d65223a2264656661756c742e706e67227d0a0a0a0a0a0a0a0a0a0c03656e2f000000000000000000000000000000000000000000000000000000d30d9932f844f8aeeef19f8aa2a45fd90c83aba3afed92447ba0931b4cf29ddb0401660000000000000000000000000000000000000000000000000000000000348afc6f95e6dd6612631a66777352849add9f451f43490dd220f44a03ad548d0c05686976652f0000000000000000000000000000000000000000000000000094289260467f5cb1a285b1d6d772f585337e1202eacd148c0d2e95eca29206b1120a696e6465782e68746d6c0000000000000000000000000000000000000000ba2e49319f9718dedc1cebd3b3d1933c41b3212aa89677e2e5c5a1bae3518375005e7b22436f6e74656e742d54797065223a22746578742f68746d6c3b20636861727365743d7574662d38222c2246696c656e616d65223a22696e6465782e68746d6c227d0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0c097061676566696e642f00000000000000000000000000000000000000000031f2e6c0601ee97fd5127b3c00d4539b183b2dd8a4380f280b186f066bdfba7a0401730000000000000000000000000000000000000000000000000000000000e8aa9151a4c271bc7099cd1de086aa563b6b2e5ad8191e5208ad55fdaccb44840c0875706c6f6164732f000000000000000000000000000000000000000000002613920be866d1dc196a1ebe17bf89058d7f3236fbbb6b0206b286fab20d45eb0c0477616d2f0000000000000000000000000000000000000000000000000000fadf98f25eb13245da5a0ee52a9c899d964a5d8bd9b1716787a69779118c82df0c037a682f00000000000000000000000000000000000000000000000000000069892465cd55cbd6cce1e3fcca4b24566355dfa05fdbfadb80341181e60b640b";
         const S_PAYLOAD: &str = "00000000000000000000000000000000000000000000000000000000000000005768b3b6a7db56d21d1abff40d41cebfc83448fed8d7e9b06ec0d3b073f28f20000000000000000000000000000000000000000000000000000000000000000000000000000000000000000020028000000000000000000000000000000000001a1065617263682f696e6465782e68746d6c000000000000000000000000000014c3a451758dcac5dc003b131c20df4d012898f304c492d0264db0d6d1552bcc005e7b22436f6e74656e742d54797065223a22746578742f68746d6c3b20636861727365743d7574662d38222c2246696c656e616d65223a22696e6465782e68746d6c227d0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a120a6974656d61702e786d6c0000000000000000000000000000000000000000d8de45fc0674d70a63a8f51378f6a714a9e5d288ec925accf8b65d13a701d939003e7b22436f6e74656e742d54797065223a226170706c69636174696f6e2f786d6c222c2246696c656e616d65223a22736974656d61702e786d6c227d0a0a0a04057761726d5f00000000000000000000000000000000000000000000000000ced34a771ed8377594ea6fca11c76ec22f61d4366882c658dcb9ae7dba644ae3";
 
@@ -1173,10 +1327,24 @@ mod tests {
         let err = lookup_path(&fetcher, root_addr, "search")
             .await
             .unwrap_err();
-        assert!(
-            matches!(err, ManifestError::NotFound { .. }),
-            "expected NotFound, got {err:?}",
-        );
+        // The directory-index fallback descended into the real
+        // `search/index.html` leaf, whose node chunk we deliberately
+        // didn't stage. The error must name that exact non-zero address —
+        // and never the all-zero address from the original production bug.
+        match err {
+            ManifestError::Fetch(JoinError::FetchChunk { addr, .. }) => {
+                assert_eq!(
+                    addr, "14c3a451758dcac5dc003b131c20df4d012898f304c492d0264db0d6d1552bcc",
+                    "fallback should fetch the real search/index.html leaf",
+                );
+                assert_ne!(
+                    addr,
+                    hex::encode([0u8; 32]),
+                    "must never request the all-zero address",
+                );
+            }
+            other => panic!("expected Fetch(FetchChunk) for the index leaf, got {other:?}"),
+        }
     }
 
     /// Real-world fixture: the `s` child node from blog.swarm.eth's
