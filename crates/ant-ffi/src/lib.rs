@@ -28,6 +28,12 @@ mod jni;
 mod manifest;
 mod stream;
 
+// The gateway FFI lives in a private submodule; re-export its C-ABI
+// entry points at the crate root so workspace Rust callers (and tests)
+// can reference them by path, the same way `ant_init` is reachable.
+// The `#[no_mangle]` symbols are unaffected — this only adds Rust paths.
+pub use gateway::{ant_start_gateway, ant_stop_gateway};
+
 use ant_control::{
     ControlAck, ControlCommand, GetProgress, IdentityInfo, PeerInfo, RetrievalInfo, StatusSnapshot,
 };
