@@ -22,6 +22,7 @@
 //! retrieval pipeline; the mpsc command channel serialises dispatch.
 
 mod drive;
+mod gateway;
 #[cfg(feature = "jni")]
 mod jni;
 mod manifest;
@@ -139,6 +140,13 @@ pub struct AntHandle {
     /// so it's dead weight in the download-only (`chain`-off) slice.
     #[cfg_attr(not(feature = "chain"), allow(dead_code))]
     data_dir: PathBuf,
+    /// Background task running the in-process bee-shaped HTTP gateway
+    /// (`ant-gateway`) when `ant_start_gateway` has been called. `None`
+    /// until started; aborted + cleared by `ant_stop_gateway` (and
+    /// implicitly by `ant_shutdown` when the runtime is dropped). Lets
+    /// the iOS app serve `http://127.0.0.1:<port>` in-process instead of
+    /// spawning the `antd` daemon. See [`gateway`].
+    gateway_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// Live snapshot of the in-flight download, maintained by the
@@ -462,6 +470,7 @@ fn init_inner(data_dir: &Path) -> Result<AntHandle, FfiError> {
         signing_secret,
         eth,
         data_dir: data_dir.to_path_buf(),
+        gateway_task: Mutex::new(None),
     })
 }
 

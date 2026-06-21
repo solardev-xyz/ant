@@ -47,6 +47,12 @@ ant-crypto = { path = "../ant-crypto" }
 # download chunks; the postage / chequebook JSON-RPC writers belong
 # to desktop / antd, which keep the feature on through their own
 # default-features = true import of ant-chain.
+# Bee-shaped HTTP gateway, served in-process on a loopback port by
+# `ant_start_gateway`. iOS apps can't spawn the `antd` daemon, so the
+# gateway is booted inside the app process over the node loop
+# `ant_init` already started. `http-api` (default) is the only feature
+# needed; `chain` stays off here (wallet/stamps report bee zero-stubs).
+ant-gateway = { path = "../ant-gateway" }
 ant-node = { path = "../ant-node", default-features = false }
 ant-p2p = { path = "../ant-p2p", default-features = false }
 ant-postage = { path = "../ant-postage" }
