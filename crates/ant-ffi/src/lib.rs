@@ -95,6 +95,11 @@ const GNOSIS_CHAIN_ID: u64 = 100;
 /// this through the `UniFFI` surface so hosts can tune it per app.
 const MAX_DOWNLOAD_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Agent string this build advertises — through the node status channel
+/// (`ant_agent_string`) and the in-process gateway's `/health.version`.
+/// Shared by `init_inner` and [`gateway`] so the two can't drift.
+const ANT_FFI_AGENT: &str = concat!("ant-ffi/", env!("CARGO_PKG_VERSION"));
+
 /// Opaque handle returned to the Swift side. Lives for as long as the
 /// embedded node loop is running.
 pub struct AntHandle {
@@ -287,7 +292,7 @@ fn init_inner(data_dir: &Path) -> Result<AntHandle, FfiError> {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let initial_snapshot = StatusSnapshot {
-        agent: format!("ant-ffi/{}", env!("CARGO_PKG_VERSION")),
+        agent: ANT_FFI_AGENT.to_string(),
         protocol_version: ant_control::PROTOCOL_VERSION,
         network_id: 1,
         pid: std::process::id(),

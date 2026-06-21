@@ -65,8 +65,8 @@ pub unsafe extern "C" fn ant_start_gateway(
         let addr_str = if api_addr.is_null() {
             DEFAULT_API_ADDR.to_string()
         } else {
-            match CStr::from_ptr(api_addr).to_str() {
-                Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
+            match CStr::from_ptr(api_addr).to_str().map(str::trim) {
+                Ok(s) if !s.is_empty() => s.to_string(),
                 Ok(_) => DEFAULT_API_ADDR.to_string(),
                 Err(_) => {
                     write_out_err(out_err, "ant_start_gateway: api_addr is not valid UTF-8");
@@ -90,10 +90,12 @@ pub unsafe extern "C" fn ant_start_gateway(
         // retry can rebind.
         {
             let mut slot = handle.gateway_task.lock().unwrap();
-            match slot.as_ref() {
-                Some(task) if !task.is_finished() => return true,
-                _ => *slot = None,
+            if slot.as_ref().is_some_and(|task| !task.is_finished()) {
+                return true;
             }
+            // A finished task (bind error / aborted) is cleared so a
+            // retry can rebind.
+            *slot = None;
         }
 
         // Identity surface for `/addresses`. Overlay + peer-id come from
@@ -126,7 +128,7 @@ pub unsafe extern "C" fn ant_start_gateway(
         }
 
         let gw = GatewayHandle {
-            agent: Arc::new(format!("ant-ffi/{}", env!("CARGO_PKG_VERSION"))),
+            agent: Arc::new(crate::ANT_FFI_AGENT.to_string()),
             api_version: Arc::new(BEE_API_VERSION.to_string()),
             identity: Arc::new(GatewayIdentity {
                 overlay_hex,
