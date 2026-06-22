@@ -708,6 +708,7 @@ impl UploadManager {
             last_error: None,
             reference: None,
             heal_verified: false,
+            heal_finished: false,
             chunks_requeued: 0,
             stalled: false,
         };
@@ -1965,6 +1966,7 @@ impl UploadManager {
                     target: "ant_node::uploads",
                     job_id, "post-upload heal re-push failed: {e}",
                 );
+                self.mark_heal_finished(job_id);
                 return;
             }
         }
@@ -2004,6 +2006,11 @@ impl UploadManager {
                 "post-upload heal: final read-back inconclusive (peers not ready?) — leaving job completed, will retry on next startup",
             ),
         }
+        // Heal has run its full course for this job. `mark_heal_verified`
+        // already set this on the verified arms; this idempotent call
+        // covers the degraded / inconclusive arms so a `--await-sync`
+        // follower stops waiting instead of blocking forever.
+        self.mark_heal_finished(job_id);
     }
 
     /// Resolve a job's stored source path to a file that actually exists,
@@ -2051,10 +2058,39 @@ impl UploadManager {
         };
         let snap = {
             let mut info = handle.info.lock().expect("upload mutex poisoned");
-            if info.heal_verified {
+            if info.heal_verified && info.heal_finished {
                 return;
             }
             info.heal_verified = true;
+            // Verified implies the heal has run its course.
+            info.heal_finished = true;
+            info.last_update_unix = unix_seconds();
+            info.clone()
+        };
+        let _ = handle.progress.send(snap.clone());
+        let _ = snap.save(&UploadJobInfo::manifest_path(
+            &self.inner.state_dir,
+            &snap.job_id,
+        ));
+    }
+
+    /// Mark the post-upload heal as *finished* for `job_id` without
+    /// claiming `heal_verified` — the degraded path where heal ran every
+    /// round and re-pushed the shallow chunks but the final read-back was
+    /// still inconclusive. Broadcasting this lets a durability-waiting
+    /// follower (`antctl upload … --await-sync`, the app) stop waiting
+    /// instead of blocking forever on a network that can't confirm deep
+    /// placement right now (the startup heal pass will retry later).
+    fn mark_heal_finished(&self, job_id: &str) {
+        let Some(handle) = self.job_handle(job_id) else {
+            return;
+        };
+        let snap = {
+            let mut info = handle.info.lock().expect("upload mutex poisoned");
+            if info.heal_finished {
+                return;
+            }
+            info.heal_finished = true;
             info.last_update_unix = unix_seconds();
             info.clone()
         };
@@ -2611,6 +2647,8 @@ pub fn to_view(info: UploadJobInfo) -> UploadJobView {
         reference: info.reference,
         chunks_requeued: info.chunks_requeued,
         stalled: info.stalled,
+        heal_verified: info.heal_verified,
+        heal_finished: info.heal_finished,
     }
 }
 
@@ -3638,6 +3676,7 @@ mod tests {
             last_error: None,
             reference: None,
             heal_verified: false,
+            heal_finished: false,
             chunks_requeued: 0,
             stalled: false,
         };

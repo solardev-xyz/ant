@@ -315,6 +315,24 @@ pub struct UploadJobView {
     /// is a liveness hint, not a terminal status. Defaults to `false`.
     #[serde(default)]
     pub stalled: bool,
+    /// `true` once the post-upload self-heal confirmed every chunk is
+    /// *deep-reachable* (held by its true neighbourhood, not merely
+    /// reachable via the uploader's privileged link to a shallow
+    /// storer). This is the signal a client should wait for before
+    /// telling the user the file is "safe / available everywhere":
+    /// `status == "completed"` only means every chunk was pushed once
+    /// (some may have landed shallow and not yet propagated). Defaults
+    /// to `false` so older daemons / clients keep deserializing.
+    #[serde(default)]
+    pub heal_verified: bool,
+    /// `true` once the post-upload self-heal has finished its rounds for
+    /// this job, whether or not it could verify deep reachability
+    /// (`heal_verified`). Lets a client waiting on durability stop
+    /// waiting on the degraded path (heal ran, re-pushed the shallow
+    /// chunks, but the final read-back was still inconclusive) instead
+    /// of blocking forever. Defaults to `false`.
+    #[serde(default)]
+    pub heal_finished: bool,
 }
 
 /// Snapshot of the daemon's local postage stamp issuer.
@@ -809,6 +827,8 @@ mod tests {
             reference: None,
             chunks_requeued: 0,
             stalled: false,
+            heal_verified: false,
+            heal_finished: false,
         };
         for jobs in [Vec::new(), vec![view]] {
             let resp = Response::UploadList { jobs: jobs.clone() };
