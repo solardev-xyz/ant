@@ -76,6 +76,14 @@ jobs:
         # in the next job, doubling debug latency.
         run: cargo clippy -p ant-ffi --features jni --all-targets -- -D warnings
 
+      - name: cargo clippy (ant-ffi with chain feature)
+        # The iOS light-mode chain surface (on-chain `/wallet`,
+        # `/stamps`, `/chequebook` in `ant_start_gateway` and
+        # `ant_deploy_chequebook`) is gated behind a default-off
+        # feature, so the whole-workspace clippy above never compiles
+        # it — without this step a regression there ships uncaught.
+        run: cargo clippy -p ant-ffi --features chain --all-targets -- -D warnings
+
       - name: cargo test (lib only)
         # Lib tests cover the unit-test surface (BMT, joiner,
         # mantaray, parse_reference). Integration tests against

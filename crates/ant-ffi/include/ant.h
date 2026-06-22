@@ -351,10 +351,11 @@ char *ant_storage_discover(const AntHandle *handle,
  * publish-setup checklist's "chequebook deployed" step can complete.
  * Idempotent: if this device already deployed a chequebook it's returned
  * as-is (no redeploy); otherwise this signs an on-chain
- * factory.deploySimpleSwap (issuer = node EOA), persists the association,
- * and returns the new address. SUBMITS A REAL ON-CHAIN TRANSACTION:
- * spends gas (xDAI) plus the default xBZZ deposit, and BLOCKS until the
- * tx confirms. Light-mode only (requires the `chain` cargo feature;
+ * factory.deploySimpleSwap (issuer = node EOA) deployed UNFUNDED, persists
+ * the association, and returns the new address. SUBMITS A REAL ON-CHAIN
+ * TRANSACTION: spends gas (xDAI) only — zero xBZZ deposit, so the user's
+ * xBZZ stays in their wallet (bee still accepts the cheques) — and BLOCKS
+ * until the tx confirms. Light-mode only (requires the `chain` cargo feature;
  * otherwise returns NULL + an error). Returns
  *   {"chequebookAddress":"0x<40hex>"}
  * (free with ant_free_string), or NULL with an error in *out_err. The

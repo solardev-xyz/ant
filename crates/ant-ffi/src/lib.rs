@@ -1649,9 +1649,10 @@ pub unsafe extern "C" fn ant_storage_discover(
 /// Idempotent: if this device already deployed a chequebook (persisted at
 /// `<data_dir>/chequebook.json`) it's returned as-is, no redeploy.
 /// Otherwise this signs an on-chain `factory.deploySimpleSwap` (issuer =
-/// node EOA) — spending xDAI gas plus up to the default xBZZ deposit —
-/// persists the association, and returns the new address. This is an
-/// on-chain transaction: it spends gas/BZZ and **blocks** until the tx
+/// node EOA) deployed **unfunded** — xDAI gas only, zero xBZZ deposit
+/// (bee still accepts the cheques; the user's xBZZ stays in their
+/// wallet) — persists the association, and returns the new address. This
+/// is an on-chain transaction: it spends gas and **blocks** until the tx
 /// confirms. Light-mode (`chain`-feature) builds only.
 ///
 /// Returns a heap C string `{"chequebookAddress":"0x<40hex>"}` on success

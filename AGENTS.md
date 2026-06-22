@@ -8,7 +8,12 @@
    1. `cargo fmt --all -- --check`
    2. `cargo clippy --workspace --all-targets -- -D warnings`
    3. `cargo clippy -p ant-ffi --features jni --all-targets -- -D warnings`
-   4. `cargo test --workspace --lib`
+   4. `cargo clippy -p ant-ffi --features chain --all-targets -- -D warnings`
+   5. `cargo test --workspace --lib`
+ Steps 3 & 4 are separate because `ant-ffi`'s `jni` (Android) and `chain`
+ (iOS light-mode: on-chain `/wallet` `/stamps` `/chequebook`) features are
+ off by default, so the whole-workspace step 2 never compiles them — they
+ need an explicit per-crate lint or their code is never type-checked by CI.
  Never merge to `main` (or push a branch you expect to be merged) with a
  known-red gate. Toolchain upgrades can introduce new `clippy`/`rustfmt`
  findings on untouched code — fix those too (the gate is whole-repo, not

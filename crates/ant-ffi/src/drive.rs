@@ -831,9 +831,10 @@ pub(crate) fn settlement_status(h: &AntHandle) -> Result<String, DriveError> {
 /// iOS publish-setup checklist's "chequebook deployed" step. Idempotent:
 /// if `<data_dir>/chequebook.json` already records a chequebook, it's
 /// returned without a redeploy; otherwise this signs an on-chain
-/// `factory.deploySimpleSwap` (spending xDAI gas + up to
-/// [`DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR`] xBZZ), persists the association,
-/// and returns the new address. Blocks on the handle's tokio runtime.
+/// `factory.deploySimpleSwap` deployed **unfunded** (xDAI gas only, zero
+/// xBZZ deposit — bee still accepts the cheques and the user's xBZZ stays
+/// in their wallet), persists the association, and returns the new
+/// address. Blocks on the handle's tokio runtime.
 ///
 /// Returns `{"chequebookAddress":"0x<40hex>"}` JSON. The caller restarts
 /// the gateway afterwards so [`crate::ant_start_gateway`] reloads the

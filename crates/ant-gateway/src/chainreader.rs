@@ -10,9 +10,9 @@
 
 use std::sync::Arc;
 
+use crate::{ChainContext, ChainReader, ChainWriter};
 use ant_chain::tx::Wallet;
 use ant_chain::{ChainClient, GNOSIS_BZZ_TOKEN};
-use crate::{ChainContext, ChainReader, ChainWriter};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use primitive_types::U256;
@@ -199,6 +199,7 @@ fn parse_addr(s: &str) -> Result<[u8; 20]> {
 /// `wallet_secret` is also present, the on-chain write endpoints are
 /// enabled via an [`AntChainWriter`]. Returns `None` when no RPC is set
 /// so the gateway falls back to the bee zero-stub.
+#[must_use]
 pub fn build(
     rpc_url: Option<String>,
     postage_contract: String,
