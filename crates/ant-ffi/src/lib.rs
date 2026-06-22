@@ -1643,6 +1643,54 @@ pub unsafe extern "C" fn ant_storage_discover(
     }
 }
 
+/// Deploy (or return the already-persisted) node-owned chequebook so the
+/// iOS publish-setup checklist's "chequebook deployed" step can complete.
+///
+/// Idempotent: if this device already deployed a chequebook (persisted at
+/// `<data_dir>/chequebook.json`) it's returned as-is, no redeploy.
+/// Otherwise this signs an on-chain `factory.deploySimpleSwap` (issuer =
+/// node EOA) — spending xDAI gas plus up to the default xBZZ deposit —
+/// persists the association, and returns the new address. This is an
+/// on-chain transaction: it spends gas/BZZ and **blocks** until the tx
+/// confirms. Light-mode (`chain`-feature) builds only.
+///
+/// Returns a heap C string `{"chequebookAddress":"0x<40hex>"}` on success
+/// (free with [`ant_free_string`]), or `NULL` with an error written to
+/// `out_err`. The caller should restart the gateway afterwards (stop +
+/// start) so [`ant_start_gateway`] reloads the persisted chequebook into
+/// its `ChainContext` and `/chequebook/address` reflects it.
+///
+/// # Safety
+///
+/// See [`ant_upload_start`]. `gnosis_rpc` must be a valid NUL-terminated
+/// UTF-8 string. `out_err`, if non-null, must point to a writable
+/// `*mut c_char` slot.
+#[no_mangle]
+pub unsafe extern "C" fn ant_deploy_chequebook(
+    handle: *const AntHandle,
+    gnosis_rpc: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_deploy_chequebook", || {
+            let h = handle.as_ref().ok_or_else(null_handle)?;
+            let rpc = cstr_to_string(gnosis_rpc)?;
+            #[cfg(feature = "chain")]
+            {
+                if rpc.trim().is_empty() {
+                    return Err("ant_deploy_chequebook: gnosis_rpc required".to_string());
+                }
+                drive::deploy_chequebook(h, rpc).map_err(|e| e.to_string())
+            }
+            #[cfg(not(feature = "chain"))]
+            {
+                let _ = (h, rpc);
+                Err("ant_deploy_chequebook: built without the `chain` feature".to_string())
+            }
+        })
+    }
+}
+
 /// Price a storage plan: returns a JSON object with the plan cost
 /// (`total_cost_plur` / `total_cost_bzz`), the account's xBZZ / xDAI
 /// balances, and whether they cover it — the "payment information" the

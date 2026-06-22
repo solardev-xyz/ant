@@ -159,15 +159,31 @@ pub unsafe extern "C" fn ant_start_gateway(
         // via `ant_gateway::chainreader::build`.
         #[cfg(feature = "chain")]
         let chain = if gnosis_rpc.is_some() {
+            // Report a previously-deployed chequebook (persisted at
+            // `<data_dir>/chequebook.json` by `ant_deploy_chequebook` /
+            // the storage-buy flow) so `/chequebook/address` reflects it.
+            // Read-only + fast: this NEVER deploys here (that's
+            // `ant_deploy_chequebook`, which spends gas) and a load error
+            // degrades to `None` rather than failing gateway start.
+            let chequebook = match ant_chain::chequebook_store::load_persisted_chequebook(
+                &handle.data_dir.join("chequebook.json"),
+            ) {
+                Ok(cb) => cb,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "ant-ffi",
+                        "ant_start_gateway: ignoring chequebook association: {e}",
+                    );
+                    None
+                }
+            };
             ant_gateway::chainreader::build(
                 gnosis_rpc,
                 // No per-node postage-contract override on mobile: use
                 // the Gnosis mainnet default (matches `antd`'s default).
                 ant_chain::GNOSIS_POSTAGE_STAMP.to_string(),
                 handle.eth,
-                // The in-process gateway doesn't track a chequebook
-                // address; `/chequebook` reads degrade accordingly.
-                None,
+                chequebook,
                 ant_chain::tx::GNOSIS_CHAIN_ID,
                 Some(handle.signing_secret),
             )

@@ -827,6 +827,45 @@ pub(crate) fn settlement_status(h: &AntHandle) -> Result<String, DriveError> {
     })
 }
 
+/// Deploy (or return the already-persisted) node-owned chequebook for the
+/// iOS publish-setup checklist's "chequebook deployed" step. Idempotent:
+/// if `<data_dir>/chequebook.json` already records a chequebook, it's
+/// returned without a redeploy; otherwise this signs an on-chain
+/// `factory.deploySimpleSwap` (spending xDAI gas + up to
+/// [`DEFAULT_CHEQUEBOOK_DEPOSIT_PLUR`] xBZZ), persists the association,
+/// and returns the new address. Blocks on the handle's tokio runtime.
+///
+/// Returns `{"chequebookAddress":"0x<40hex>"}` JSON. The caller restarts
+/// the gateway afterwards so [`crate::ant_start_gateway`] reloads the
+/// persisted address into its `ChainContext` and `/chequebook/address`
+/// reports it.
+#[cfg(feature = "chain")]
+pub(crate) fn deploy_chequebook(h: &AntHandle, rpc: String) -> Result<String, DriveError> {
+    let secret = h.signing_secret;
+    let node_eth = h.eth;
+    let data_dir = h.data_dir.clone();
+
+    h.runtime.block_on(async move {
+        let client = ant_chain::ChainClient::new(rpc);
+        let wallet = ant_chain::tx::Wallet::new(secret, GNOSIS_CHAIN_ID)
+            .map_err(|e| DriveError::Op(format!("derive node wallet: {e}")))?;
+
+        // persisted → rediscover the wallet's existing on-chain chequebook
+        // → deploy a fresh one (persisting the association). Shared with
+        // `antd`'s resolve/rediscover/deploy mechanics, so a wallet that
+        // already deployed a chequebook (e.g. on desktop with the same
+        // vault) is adopted rather than duplicated.
+        match resolve_or_deploy_chequebook(&client, &wallet, &data_dir, node_eth).await? {
+            Some(cb) => to_json(&DeployedChequebook {
+                chequebook_address: format!("0x{}", hex::encode(cb)),
+            }),
+            None => Err(DriveError::Op(
+                "chequebook could not be deployed — wallet has no xDAI for gas".into(),
+            )),
+        }
+    })
+}
+
 /// Reuse / rediscover / deploy a chequebook for `node_eth`, persisting
 /// the association so future launches reload it directly. Returns the
 /// 20-byte chequebook address, or `None` when the wallet can't afford
@@ -978,6 +1017,16 @@ struct SettlementStatus {
     enabled: bool,
     /// `0x`-prefixed chequebook contract address when enabled.
     chequebook: Option<String>,
+}
+
+/// Wire shape for [`deploy_chequebook`]: the resolved (persisted or
+/// freshly deployed) chequebook contract address.
+#[cfg(feature = "chain")]
+#[derive(Serialize)]
+struct DeployedChequebook {
+    /// `0x`-prefixed chequebook contract address (`0x` + 40 hex).
+    #[serde(rename = "chequebookAddress")]
+    chequebook_address: String,
 }
 
 #[cfg(feature = "chain")]

@@ -347,6 +347,25 @@ char *ant_storage_discover(const AntHandle *handle,
                            char **out_err);
 
 /*
+ * Deploy (or return the already-persisted) node-owned chequebook so the
+ * publish-setup checklist's "chequebook deployed" step can complete.
+ * Idempotent: if this device already deployed a chequebook it's returned
+ * as-is (no redeploy); otherwise this signs an on-chain
+ * factory.deploySimpleSwap (issuer = node EOA), persists the association,
+ * and returns the new address. SUBMITS A REAL ON-CHAIN TRANSACTION:
+ * spends gas (xDAI) plus the default xBZZ deposit, and BLOCKS until the
+ * tx confirms. Light-mode only (requires the `chain` cargo feature;
+ * otherwise returns NULL + an error). Returns
+ *   {"chequebookAddress":"0x<40hex>"}
+ * (free with ant_free_string), or NULL with an error in *out_err. The
+ * caller should restart the gateway (ant_stop_gateway + ant_start_gateway)
+ * afterwards so /chequebook/address reflects the deployed chequebook.
+ */
+char *ant_deploy_chequebook(const AntHandle *handle,
+                            const char *gnosis_rpc,
+                            char **out_err);
+
+/*
  * Price a storage plan (no transaction). `depth` sets capacity
  * (2^depth chunks × 4 KiB); `days` sets how long it should last.
  * Returns a JSON object:
