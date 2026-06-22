@@ -113,15 +113,24 @@ pub unsafe extern "C" fn ant_start_gateway(
         // Idempotent: if a gateway is already live, do nothing. A task
         // that has finished (bind error / aborted) is cleared so a
         // retry can rebind.
-        {
-            let mut slot = handle.gateway_task.lock().unwrap();
-            if slot.as_ref().is_some_and(|task| !task.is_finished()) {
-                return true;
-            }
-            // A finished task (bind error / aborted) is cleared so a
-            // retry can rebind.
-            *slot = None;
+        //
+        // Hold this guard across the whole start (check → bind → build →
+        // spawn → store): releasing it after the check would let two
+        // concurrent starts both pass, both spawn `Gateway::serve` (the
+        // loser hits the bind race), and the dead `JoinHandle` overwrite
+        // the live one — leaving a gateway that `ant_stop_gateway` can't
+        // abort. Poison-tolerant (`into_inner`) so a panic elsewhere
+        // doesn't unwind out of this `extern "C"` fn and abort the host.
+        let mut slot = handle
+            .gateway_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.as_ref().is_some_and(|task| !task.is_finished()) {
+            return true;
         }
+        // A finished task (bind error / aborted) is cleared so a retry
+        // can rebind.
+        *slot = None;
 
         // Identity surface for `/addresses`. Overlay + peer-id come from
         // the live status snapshot; the compressed secp256k1 public key
@@ -138,7 +147,10 @@ pub unsafe extern "C" fn ant_start_gateway(
         let public_key_hex = match SigningKey::from_bytes((&handle.signing_secret).into()) {
             Ok(sk) => hex::encode(sk.verifying_key().to_encoded_point(true).as_bytes()),
             Err(e) => {
-                write_out_err(out_err, &format!("ant_start_gateway: invalid signing key: {e}"));
+                write_out_err(
+                    out_err,
+                    &format!("ant_start_gateway: invalid signing key: {e}"),
+                );
                 return false;
             }
         };
@@ -228,7 +240,7 @@ pub unsafe extern "C" fn ant_start_gateway(
                 tracing::error!(target: "ant-ffi", "in-process gateway ended: {e}");
             }
         });
-        *handle.gateway_task.lock().unwrap() = Some(task);
+        *slot = Some(task);
         true
     }
 }
@@ -247,7 +259,14 @@ pub unsafe extern "C" fn ant_stop_gateway(handle: *const AntHandle) -> bool {
         let Some(handle) = handle.as_ref() else {
             return false;
         };
-        match handle.gateway_task.lock().unwrap().take() {
+        // Poison-tolerant so a panic elsewhere can't unwind out of this
+        // `extern "C"` fn and abort the host (matches `ant_start_gateway`).
+        let task = handle
+            .gateway_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        match task {
             Some(task) => {
                 task.abort();
                 true
