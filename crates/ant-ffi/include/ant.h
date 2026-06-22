@@ -419,6 +419,13 @@ void ant_free_string(char *ptr);
  * `light_mode` drives GET /node.beeMode: nonzero -> "light" (publish /
  * feed / SOC writes allowed), zero -> "ultra-light" (read-only).
  *
+ * `gnosis_rpc` is the Gnosis JSON-RPC endpoint backing the on-chain
+ * /wallet, /stamps, and /chequebook surfaces. Pass NULL or "" to disable
+ * on-chain reads (those endpoints fall back to the bee zero-stub / 501).
+ * When set together with light_mode, it enables real /wallet balances
+ * and /stamps postage state (desktop `antd` parity). Honoured only when
+ * the library is built with the `chain` feature; ignored otherwise.
+ *
  * Returns true on success (or if a gateway is already running on this
  * handle). On failure returns false and writes an allocated message to
  * *out_err (free with ant_free_string). Idempotent: a second call while
@@ -427,6 +434,7 @@ void ant_free_string(char *ptr);
 bool ant_start_gateway(const AntHandle *handle,
                        const char *api_addr,
                        bool light_mode,
+                       const char *gnosis_rpc,
                        char **out_err);
 
 /*

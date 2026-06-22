@@ -1,6 +1,5 @@
 //! `antd` — Swarm light node daemon (M1.0: mainnet dial + BZZ handshake).
 
-mod chainreader;
 mod config;
 mod keystore;
 
@@ -682,7 +681,7 @@ async fn main() -> Result<()> {
         // all report the chequebook pushsync is actually drawing on.
         // The node's own signing key funds postage buys / chequebook
         // deposits and is the batch owner — same key that derives `eth`.
-        chainreader::build(
+        ant_gateway::chainreader::build(
             rpc,
             opt.postage_contract.clone(),
             eth,

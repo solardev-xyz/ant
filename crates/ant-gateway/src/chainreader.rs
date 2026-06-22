@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use ant_chain::tx::Wallet;
 use ant_chain::{ChainClient, GNOSIS_BZZ_TOKEN};
-use ant_gateway::{ChainContext, ChainReader, ChainWriter};
+use crate::{ChainContext, ChainReader, ChainWriter};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use primitive_types::U256;
