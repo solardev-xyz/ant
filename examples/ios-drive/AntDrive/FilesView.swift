@@ -1,47 +1,56 @@
 import CoreTransferable
+import ImageIO
 import PhotosUI
 import SwiftUI
 import UniformTypeIdentifiers
 
 /// The Files tab — a Dropbox-style list of everything the user has
-/// uploaded, with an Add menu (upload a file / add from a share link)
-/// and per-file actions (copy Swarm hash, pause/resume/cancel, retry).
+/// uploaded, with an Add menu (upload photos / upload a file) and
+/// per-file actions (copy Swarm hash, pause/resume/cancel, retry).
 struct FilesView: View {
     @EnvironmentObject var node: AntNode
 
     @State private var showImporter = false
     @State private var showPhotoPicker = false
-    @State private var showLinkSheet = false
     @State private var showGetStarted = false
     @State private var photoSelection: [PhotosPickerItem] = []
-    @State private var linkText = ""
     @State private var banner: String?
     @State private var showAddOptions = false
+    /// The file whose full-screen detail page is pushed, if any. A tiny
+    /// id wrapper (rather than the `UploadJob` value) so the detail page
+    /// re-resolves the live job from `node` and reflects ongoing changes.
+    @State private var openJob: JobRef?
 
     var body: some View {
-        ZStack {
-            LiquidGlassBackground(palette: .player)
+        NavigationStack {
+            ZStack {
+                LiquidGlassBackground(palette: .player)
 
-            ScrollView {
-                VStack(spacing: 18) {
-                    header
-                    if !node.hasStorage {
-                        getStartedCard
-                    } else if node.jobs.isEmpty {
-                        emptyState
-                    } else {
-                        ForEach(node.jobs) { job in
-                            FileRow(job: job, onCopy: copyHash, onPause: pause,
-                                    onResume: resume, onCancel: cancel)
+                ScrollView {
+                    VStack(spacing: 18) {
+                        header
+                        if !node.hasStorage {
+                            getStartedCard
+                        } else if node.jobs.isEmpty {
+                            emptyState
+                        } else {
+                            ForEach(node.jobs) { job in
+                                FileRow(job: job, onPause: pause,
+                                        onResume: resume, onCancel: cancel,
+                                        onOpen: { openJob = JobRef(id: job.id) })
+                            }
                         }
                     }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 12)
+                    .padding(.bottom, 130)
                 }
-                .padding(.horizontal, 16)
-                .padding(.top, 12)
-                .padding(.bottom, 130)
+                .scrollIndicators(.hidden)
             }
-            .scrollIndicators(.hidden)
-            .refreshable { await node.refreshAndReverify() }
+            .toolbar(.hidden, for: .navigationBar)
+            .navigationDestination(item: $openJob) { ref in
+                FileDetailView(jobId: ref.id)
+            }
         }
         .preferredColorScheme(.dark)
         .overlay(alignment: .top) { bannerView }
@@ -53,7 +62,6 @@ struct FilesView: View {
                       maxSelectionCount: 10,
                       matching: .any(of: [.images, .videos]))
         .onChange(of: photoSelection) { _, items in handlePhotos(items) }
-        .sheet(isPresented: $showLinkSheet) { linkSheet }
         .sheet(isPresented: $showGetStarted) { GetStartedView() }
         .task { await node.refreshAll() }
     }
@@ -112,7 +120,7 @@ struct FilesView: View {
             Text("No files yet")
                 .font(.title3.weight(.semibold))
                 .foregroundStyle(.white)
-            Text("Tap + to upload a file or add one from a link.")
+            Text("Tap + to upload photos or a file.")
                 .font(.subheadline)
                 .foregroundStyle(.white.opacity(0.65))
                 .multilineTextAlignment(.center)
@@ -123,10 +131,10 @@ struct FilesView: View {
 
     // MARK: add button + menu
 
-    /// The add button only appears once storage is active — uploads and
-    /// link imports require a storage plan, so before that the Get
-    /// Started greeter is the only call to action. It lives in the header
-    /// row, top-right, aligned with the "Files" headline.
+    /// The add button only appears once storage is active — uploads
+    /// require a storage plan, so before that the Get Started greeter is
+    /// the only call to action. It lives in the header row, top-right,
+    /// aligned with the "Files" headline.
     ///
     /// This is a plain glass `Button` (not a `Menu`): a `Menu` whose label
     /// carries a hand-applied `.glassEffect` flickers on iOS 26 because the
@@ -147,34 +155,9 @@ struct FilesView: View {
                                 titleVisibility: .visible) {
                 Button("Upload photos") { showPhotoPicker = true }
                 Button("Upload a file") { showImporter = true }
-                Button("Add from link") { showLinkSheet = true }
                 Button("Cancel", role: .cancel) {}
             }
         }
-    }
-
-    private var linkSheet: some View {
-        NavigationStack {
-            Form {
-                Section("Share link") {
-                    TextField("bzz://… or paste a link", text: $linkText)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                }
-            }
-            .navigationTitle("Add from link")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { showLinkSheet = false }
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Add") { addFromLink() }
-                        .disabled(linkText.trimmingCharacters(in: .whitespaces).isEmpty)
-                }
-            }
-        }
-        .presentationDetents([.height(220)])
     }
 
     @ViewBuilder private var bannerView: some View {
@@ -191,32 +174,9 @@ struct FilesView: View {
 
     // MARK: actions
 
-    /// Copy the bare Swarm hash (64-hex, no `0x`, no `bzz://`) straight to
-    /// the clipboard in a single tap — no share sheet, no submenu.
-    private func copyHash(_ job: UploadJob) {
-        guard let ref = job.reference, !ref.isEmpty else { return }
-        let hex = ref.hasPrefix("0x") ? String(ref.dropFirst(2)) : ref
-        UIPasteboard.general.string = hex
-        flash("Copied Swarm hash")
-    }
-
     private func pause(_ job: UploadJob) { Task { await node.pauseUpload(job.jobId) } }
     private func resume(_ job: UploadJob) { Task { await node.resumeUpload(job.jobId) } }
     private func cancel(_ job: UploadJob) { Task { await node.cancelUpload(job.jobId) } }
-
-    private func addFromLink() {
-        let ref = linkText.trimmingCharacters(in: .whitespaces)
-        showLinkSheet = false
-        linkText = ""
-        Task {
-            do {
-                _ = try await node.download(reference: ref)
-                flash("Imported from link")
-            } catch {
-                flash(error.localizedDescription)
-            }
-        }
-    }
 
     /// Stage each picked photo/video into the sandbox and kick off an
     /// upload, keeping the original iOS filename. `PhotosPickerItem` hands
@@ -322,74 +282,75 @@ func antdriveImportsDir() throws -> URL {
 private struct FileRow: View {
     @EnvironmentObject var node: AntNode
     let job: UploadJob
-    let onCopy: (UploadJob) -> Void
     let onPause: (UploadJob) -> Void
     let onResume: (UploadJob) -> Void
     let onCancel: (UploadJob) -> Void
+    let onOpen: () -> Void
 
     var body: some View {
         GlassCard(radius: 22) {
             HStack(spacing: 14) {
-                Image(systemName: icon)
-                    .font(.title2)
-                    .foregroundStyle(.white.opacity(0.9))
-                    .frame(width: 30)
+                FileThumbnail(job: job, fallbackIcon: icon)
 
                 VStack(alignment: .leading, spacing: 3) {
                     Text(job.displayName)
                         .font(.body.weight(.semibold))
                         .foregroundStyle(.white)
                         .lineLimit(1)
-                    Text("\(job.statusLabel) · \(formatBytes(job.sourceSize))")
+                    // One detail line: an optional status message (uploading
+                    // progress, paused/failed, or a propagation warning)
+                    // inline with the file size. Kept to a single line so
+                    // every row is the same height (the 40pt thumbnail sets
+                    // it); no separate progress bar or badge row.
+                    detailText
                         .font(.caption)
-                        .foregroundStyle(statusColor)
-                    if job.isActive, let f = job.fraction {
-                        ProgressView(value: f)
-                            .tint(.white.opacity(0.9))
-                            .padding(.top, 2)
-                    }
-                    if job.isDone { propagationBadge }
+                        .lineLimit(1)
                 }
                 Spacer(minLength: 8)
                 trailing
             }
         }
-        // Auto-verify a completed file: reuse a fresh (<24h) disk-cached
-        // verdict if we have one, otherwise probe the network once for the
-        // real "retrievable" verdict (rather than just the local "Online"
-        // state). Verdicts persist across launches, so a verified file
-        // isn't re-probed every cold start.
-        .task(id: autoVerifyKey) { await node.ensureVerified(job) }
+        // The whole card opens the file's detail page. Trailing controls
+        // (pause/resume/cancel/retry) are `Button`s, so their taps are
+        // consumed first and don't fall through to this gesture.
+        // No automatic verification here: a file is only checked when the
+        // user runs Check again / Deep verify on its detail page.
+        .contentShape(Rectangle())
+        .onTapGesture { onOpen() }
     }
 
-    /// Re-trigger the auto-verify when the job reaches the completed
-    /// state *and* once the peer set is healthy enough for the verdict
-    /// to mean something — a probe issued against a still-ramping peer
-    /// set reports false "missing" and would pin an orange badge for
-    /// the session. The status + peer-floor flag are part of the key so
-    /// the task re-runs on those transitions.
-    private var autoVerifyKey: String {
-        "\(job.id)#\(job.status)#\(node.peerCount >= AntNode.verifyPeerFloor ? "peers" : "none")"
+    /// The single detail line under the filename: the file size first
+    /// (always grey), then an optional status message coloured by state
+    /// (orange when something is wrong) — e.g. "1.3 MB · Uploading 45%". On
+    /// the happy path it's just the grey size.
+    private var detailText: Text {
+        let grey = Color.white.opacity(0.6)
+        let size = Text(formatBytes(job.sourceSize)).foregroundColor(grey)
+        guard let message = statusMessage else { return size }
+        return size
+            + Text(" · ").foregroundColor(grey)
+            + Text(message).foregroundColor(messageColor)
     }
 
-    /// Read-back verdict for a completed file: a spinner while probing,
-    /// then a green "Verified" or an orange "Not fully available yet"
-    /// once the network has been asked. The check resolves the manifest,
-    /// walks the chunk tree, and fetches every data chunk network-only —
-    /// distinct from the job's "Online" status, which only means the
-    /// upload was attempted locally.
-    @ViewBuilder private var propagationBadge: some View {
-        if node.verifying.contains(job.id) {
-            Label("Verifying chunks…", systemImage: "antenna.radiowaves.left.and.right")
-                .font(.caption2)
-                .foregroundStyle(.white.opacity(0.6))
-                .padding(.top, 1)
-        } else if let p = node.propagation[job.id] {
-            Label(p.label, systemImage: p.retrievable ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
-                .font(.caption2.weight(.medium))
-                .foregroundStyle(p.retrievable ? .green.opacity(0.9) : .orange)
-                .padding(.top, 1)
-        }
+    /// Colour for the inline status message: orange when the upload failed
+    /// or a completed file's network read-back came back not-retrievable,
+    /// neutral grey otherwise (uploading / paused).
+    private var messageColor: Color {
+        if job.isFailed { return .orange }
+        if job.isDone, let p = node.propagation[job.id], !p.retrievable { return .orange }
+        return .white.opacity(0.6)
+    }
+
+    /// The status word shown inline before the size, or `nil` on the happy
+    /// path (a completed, retrievable file shows only its size). Covers the
+    /// job's own states (uploading/paused/failed) and, for a completed file,
+    /// a failed network read-back ("Not fully available yet" / "Not found on
+    /// network"). A retrievable verdict — the expected outcome — stays
+    /// silent, as does the transient in-progress probe.
+    private var statusMessage: String? {
+        if !job.statusLabel.isEmpty { return job.statusLabel }
+        if job.isDone, let p = node.propagation[job.id], !p.retrievable { return p.label }
+        return nil
     }
 
     @ViewBuilder private var trailing: some View {
@@ -408,10 +369,10 @@ private struct FileRow: View {
                 }
             }
         } else if job.isDone {
-            Button { onCopy(job) } label: {
-                Image(systemName: "doc.on.doc")
-                    .font(.title3).foregroundStyle(.white.opacity(0.85))
-            }
+            // Copy moved to the detail page; the row just hints it's tappable.
+            Image(systemName: "chevron.right")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.white.opacity(0.4))
         } else if job.isFailed {
             Button { onResume(job) } label: {
                 Image(systemName: "arrow.clockwise.circle.fill")
@@ -420,21 +381,547 @@ private struct FileRow: View {
         }
     }
 
-    private var statusColor: Color {
-        if job.isFailed { return .orange }
-        if job.isDone { return .green.opacity(0.9) }
-        return .white.opacity(0.6)
+    private var icon: String { fileTypeIcon(for: job.contentType) }
+}
+
+/// SF Symbol name for a file's content type, shared by the list row and the
+/// detail page.
+func fileTypeIcon(for contentType: String?) -> String {
+    let ct = contentType ?? ""
+    if ct.hasPrefix("image") { return "photo" }
+    if ct.hasPrefix("video") { return "film" }
+    if ct.hasPrefix("audio") { return "music.note" }
+    if ct.hasPrefix("text") { return "doc.text" }
+    if ct.contains("pdf") { return "doc.richtext" }
+    if ct.contains("zip") || ct.contains("compressed") { return "archivebox" }
+    return "doc"
+}
+
+/// The leading element of a file row: a small rounded thumbnail for images
+/// whose staged source file is still on disk, falling back to the type's SF
+/// Symbol for everything else (videos, docs, or images we can't read yet).
+/// The staged file at `job.sourcePath` lives in the sandbox imports dir and
+/// isn't deleted after upload, so thumbnails survive across launches.
+private struct FileThumbnail: View {
+    let job: UploadJob
+    let fallbackIcon: String
+    /// Rendered side length in points; the loader downsamples to this at
+    /// device scale so a 12 MP HEIC never gets fully decoded into memory.
+    /// Defaults to the compact list size; the detail page passes a larger one.
+    var side: CGFloat = 40
+    var cornerRadius: CGFloat = 9
+    var iconFont: Font = .title2
+
+    @State private var image: UIImage?
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: side, height: side)
+                    .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            } else {
+                Image(systemName: fallbackIcon)
+                    .font(iconFont)
+                    .foregroundStyle(.white.opacity(0.9))
+                    .frame(width: side, height: side)
+            }
+        }
+        .task(id: "\(job.sourcePath)#\(side)") { await load() }
     }
 
-    private var icon: String {
-        let ct = job.contentType ?? ""
-        if ct.hasPrefix("image") { return "photo" }
-        if ct.hasPrefix("video") { return "film" }
-        if ct.hasPrefix("audio") { return "music.note" }
-        if ct.hasPrefix("text") { return "doc.text" }
-        if ct.contains("pdf") { return "doc.richtext" }
-        if ct.contains("zip") || ct.contains("compressed") { return "archivebox" }
-        return "doc"
+    private func load() async {
+        guard image == nil, (job.contentType ?? "").hasPrefix("image") else { return }
+        guard let url = localSourceURL(for: job) else { return }
+        let maxPixel = side * 3  // cover @3x Retina
+        let loaded = await Task.detached(priority: .utility) {
+            ThumbnailLoader.downsample(url: url, maxPixel: maxPixel)
+        }.value
+        guard let loaded else { return }
+        await MainActor.run { self.image = loaded }
+    }
+}
+
+/// Resolve the staged source file on disk. The stored `source_path` is an
+/// absolute path captured at upload time, but iOS can hand the app a new
+/// data-container UUID on reinstall/update, leaving that path dangling. The
+/// file itself still lives in the *current* imports dir under the same
+/// basename, so prefer that and fall back to the literal path. Shared by the
+/// thumbnail loader and the detail page's "Push again" re-upload.
+func localSourceURL(for job: UploadJob) -> URL? {
+    let fm = FileManager.default
+    let basename = (job.sourcePath as NSString).lastPathComponent
+    if let imports = try? antdriveImportsDir() {
+        let candidate = imports.appendingPathComponent(basename)
+        if fm.fileExists(atPath: candidate.path) { return candidate }
+    }
+    return fm.fileExists(atPath: job.sourcePath) ? URL(fileURLWithPath: job.sourcePath) : nil
+}
+
+/// Memory-efficient thumbnail decoding via ImageIO: decodes straight to a
+/// small bitmap (handling HEIC and EXIF orientation) instead of loading the
+/// full-resolution image. Results are cached in-memory by path so scrolling
+/// the list doesn't re-decode.
+private enum ThumbnailLoader {
+    private static let cache = NSCache<NSString, UIImage>()
+
+    static func downsample(url: URL, maxPixel: CGFloat) -> UIImage? {
+        let key = url.path as NSString
+        if let cached = cache.object(forKey: key) { return cached }
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+        ]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+        else { return nil }
+        let image = UIImage(cgImage: cg)
+        cache.setObject(image, forKey: key)
+        return image
+    }
+}
+
+// MARK: - File detail page
+
+/// Lightweight identifiable wrapper so `navigationDestination(item:)` can
+/// drive the push from just a job id; the detail page re-resolves the live
+/// `UploadJob` from the node on each render.
+struct JobRef: Identifiable, Hashable { let id: String }
+
+/// Full-screen detail page for one file: a large preview, all of its
+/// metadata, the network-verification verdict (with the underlying error
+/// when something is wrong), and recovery actions — copy, re-check, and a
+/// "Push again" re-upload when the file can't be verified.
+struct FileDetailView: View {
+    @EnvironmentObject var node: AntNode
+    @Environment(\.dismiss) private var dismiss
+    let jobId: String
+
+    @State private var banner: String?
+    @State private var busy = false
+
+    /// The live job, re-resolved from the node so progress and verdicts
+    /// stay current while the page is open.
+    private var job: UploadJob? { node.jobs.first { $0.id == jobId } }
+
+    var body: some View {
+        ZStack {
+            LiquidGlassBackground(palette: .player)
+
+            if let job {
+                ScrollView {
+                    VStack(spacing: 18) {
+                        previewCard(job)
+                        if job.isDone { verificationCard(job) }
+                        detailsCard(job)
+                        if let err = job.lastError, !err.isEmpty { errorCard(err) }
+                        actions(job)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 12)
+                    .padding(.bottom, 60)
+                }
+                .scrollIndicators(.hidden)
+            } else {
+                Text("This file is no longer available.")
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.7))
+            }
+        }
+        .navigationTitle(job?.displayName ?? "File")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(.hidden, for: .navigationBar)
+        .tint(.white)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                if let job, job.reference?.isEmpty == false {
+                    Menu {
+                        Button { copyHash(job) } label: { Label("Copy Swarm hash", systemImage: "number") }
+                        Button { copyLink(job) } label: { Label("Copy link", systemImage: "link") }
+                    } label: {
+                        Image(systemName: "square.and.arrow.up").foregroundStyle(.white)
+                    }
+                }
+            }
+        }
+        .overlay(alignment: .top) { bannerView }
+        .preferredColorScheme(.dark)
+        // No automatic verification — the user starts a check explicitly
+        // with Check again / Deep verify below.
+    }
+
+    // MARK: cards
+
+    private func previewCard(_ job: UploadJob) -> some View {
+        GlassCard {
+            HStack(spacing: 16) {
+                FileThumbnail(job: job, fallbackIcon: fileTypeIcon(for: job.contentType),
+                              side: 72, cornerRadius: 16, iconFont: .largeTitle)
+                VStack(alignment: .leading, spacing: 7) {
+                    Text(job.displayName)
+                        .font(.title3.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .lineLimit(3)
+                    Text(formatBytes(job.sourceSize))
+                        .font(.subheadline)
+                        .foregroundStyle(.white.opacity(0.7))
+                    statusBadge(job)
+                }
+                Spacer(minLength: 0)
+            }
+        }
+    }
+
+    private func statusBadge(_ job: UploadJob) -> some View {
+        let s = statusDisplay(job)
+        return Label(s.text, systemImage: s.icon)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(s.color)
+            .padding(.horizontal, 10).padding(.vertical, 5)
+            .background(s.color.opacity(0.16), in: .capsule)
+    }
+
+    @ViewBuilder
+    private func verificationCard(_ job: UploadJob) -> some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 12) {
+                sectionTitle("VERIFICATION")
+
+                if node.verifying.contains(job.id) {
+                    let prog = node.verifyProgress[job.id]
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack(spacing: 8) {
+                            Image(systemName: "antenna.radiowaves.left.and.right")
+                                .foregroundStyle(.blue)
+                            Text(prog?.label ?? "Checking the network…")
+                                .font(.subheadline).foregroundStyle(.white.opacity(0.85))
+                            Spacer()
+                            if let f = prog?.fraction {
+                                Text("\(Int(f * 100))%")
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(.white.opacity(0.6))
+                            }
+                        }
+                        // Determinate once the node reports leaf counts
+                        // (the "checking" phase); indeterminate during the
+                        // brief resolve/enumerate phases that precede it.
+                        if let f = prog?.fraction {
+                            ProgressView(value: f)
+                                .progressViewStyle(.linear)
+                                .tint(.blue)
+                        } else {
+                            ProgressView()
+                                .progressViewStyle(.linear)
+                                .tint(.blue)
+                        }
+                        Button(role: .cancel) { node.cancelVerify() } label: {
+                            Label("Cancel", systemImage: "xmark")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(.white)
+                                .frame(maxWidth: .infinity).padding(.vertical, 10)
+                                .glassEffect(.regular.tint(.white.opacity(0.12)), in: .capsule)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                } else if node.repushing.contains(job.id) {
+                    let prog = node.repushProgress[job.id]
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack(spacing: 8) {
+                            Image(systemName: "arrow.up.circle")
+                                .foregroundStyle(.orange)
+                            Text(prog?.label ?? "Re-pushing missing chunks…")
+                                .font(.subheadline).foregroundStyle(.white.opacity(0.85))
+                            Spacer()
+                            if let f = prog?.fraction {
+                                Text("\(Int(f * 100))%")
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(.white.opacity(0.6))
+                            }
+                        }
+                        // Determinate while chunks are being re-pushed
+                        // (counts known); indeterminate during the read-back
+                        // rounds that bracket it.
+                        if let f = prog?.fraction {
+                            ProgressView(value: f)
+                                .progressViewStyle(.linear)
+                                .tint(.orange)
+                        } else {
+                            ProgressView()
+                                .progressViewStyle(.linear)
+                                .tint(.orange)
+                        }
+                    }
+                } else if let p = node.propagation[job.id] {
+                    if p.retrievable {
+                        Label("Verified on the network", systemImage: "checkmark.seal.fill")
+                            .font(.headline).foregroundStyle(.green)
+                        Text("Every chunk of this file was fetched back from other nodes — it's fully available.")
+                            .font(.subheadline).foregroundStyle(.white.opacity(0.75))
+                    } else {
+                        Label(p.label, systemImage: "exclamationmark.triangle.fill")
+                            .font(.headline).foregroundStyle(.orange)
+                        Text(verificationExplanation(p))
+                            .font(.subheadline).foregroundStyle(.white.opacity(0.75))
+                        if let e = p.error, !e.isEmpty {
+                            Text(e)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.orange.opacity(0.9))
+                                .textSelection(.enabled)
+                        }
+                    }
+                    verifyMetrics(p)
+                } else {
+                    Text("Not checked yet.")
+                        .font(.subheadline).foregroundStyle(.white.opacity(0.7))
+                }
+
+                HStack(spacing: 10) {
+                    secondaryButton("Check again", icon: "arrow.clockwise") {
+                        Task { await node.reverify(job) }
+                    }
+                    secondaryButton("Deep verify", icon: "shield.lefthalf.filled") {
+                        Task { await node.reverify(job, probes: AntNode.deepVerifyProbes) }
+                    }
+                }
+                .disabled(node.verifying.contains(job.id) || job.reference?.isEmpty != false)
+
+                Text("Deep verify fetches every chunk from more independent peers, confirming how widely your file is replicated.")
+                    .font(.caption).foregroundStyle(.white.opacity(0.55))
+            }
+        }
+    }
+
+    private func verifyMetrics(_ p: PropagationInfo) -> some View {
+        VStack(spacing: 6) {
+            detailRow("Replication", "\(p.sources) route\(p.sources == 1 ? "" : "s")")
+            detailRow("Chunks checked", "\(p.checkedChunks) / \(p.totalChunks)")
+            if p.leafChunks > 0 {
+                detailRow("Data leaves sampled", "\(p.sampledLeaves) / \(p.leafChunks)")
+            }
+        }
+        .padding(.top, 2)
+    }
+
+    private func detailsCard(_ job: UploadJob) -> some View {
+        GlassCard {
+            VStack(spacing: 6) {
+                sectionTitle("DETAILS").frame(maxWidth: .infinity, alignment: .leading)
+                detailRow("Type", job.contentType ?? "Unknown")
+                detailRow("Size", formatBytes(job.sourceSize))
+                detailRow("Status", job.status.capitalized)
+                if job.isActive, let total = job.chunksTotal {
+                    detailRow("Pushed", "\(job.chunksPushed) / \(total) chunks")
+                }
+                detailRow("Created", formatUnixDate(job.createdAtUnix))
+                detailRow("Updated", formatUnixDate(job.lastUpdateUnix))
+                if let ref = job.reference, !ref.isEmpty {
+                    Button { copyHash(job) } label: {
+                        HStack(alignment: .top) {
+                            Text("Swarm hash")
+                                .font(.subheadline).foregroundStyle(.white.opacity(0.6))
+                            Spacer(minLength: 12)
+                            Text(shortHash(ref))
+                                .font(.subheadline.monospaced())
+                                .foregroundStyle(.white)
+                            Image(systemName: "doc.on.doc")
+                                .font(.caption).foregroundStyle(.white.opacity(0.6))
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    private func errorCard(_ message: String) -> some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 8) {
+                Label("Error", systemImage: "xmark.octagon.fill")
+                    .font(.headline).foregroundStyle(.red)
+                Text(message)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.white.opacity(0.85))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func actions(_ job: UploadJob) -> some View {
+        VStack(spacing: 12) {
+            // Recovery — retry a failed upload, or re-push a completed file
+            // that the network couldn't verify.
+            if job.isFailed {
+                prominentButton("Retry upload", icon: "arrow.clockwise", tint: .blue) {
+                    busy = true
+                    Task { await node.resumeUpload(job.jobId); busy = false; flash("Retrying…") }
+                }
+            } else if needsRepush(job) {
+                if localSourceURL(for: job) != nil {
+                    prominentButton("Push again", icon: "arrow.up.circle.fill", tint: .orange) {
+                        repush(job)
+                    }
+                    Text("Re-pushes only the missing chunks to the network, on this same file.")
+                        .font(.caption).foregroundStyle(.white.opacity(0.6))
+                        .multilineTextAlignment(.center)
+                } else {
+                    prominentButton("Push again", icon: "arrow.up.circle.fill", tint: .gray) {}
+                        .disabled(true)
+                    Text("The original file isn't on this device anymore, so it can't be pushed again.")
+                        .font(.caption).foregroundStyle(.white.opacity(0.6))
+                        .multilineTextAlignment(.center)
+                }
+            }
+
+            // State controls for an in-flight or paused upload.
+            if job.isActive {
+                secondaryButton("Pause", icon: "pause.fill") {
+                    Task { await node.pauseUpload(job.jobId) }
+                }
+            } else if job.isPaused {
+                secondaryButton("Resume", icon: "play.fill") {
+                    Task { await node.resumeUpload(job.jobId) }
+                }
+                secondaryButton("Cancel upload", icon: "xmark") {
+                    Task { await node.cancelUpload(job.jobId); dismiss() }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private var bannerView: some View {
+        if let banner {
+            Text(banner)
+                .font(.footnote.weight(.medium))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 18).padding(.vertical, 12)
+                .glassEffect(.regular.tint(.black.opacity(0.4)), in: .capsule)
+                .padding(.top, 8)
+                .transition(.move(edge: .top).combined(with: .opacity))
+        }
+    }
+
+    // MARK: building blocks
+
+    private func sectionTitle(_ s: String) -> some View {
+        Text(s)
+            .font(.system(.caption, design: .rounded).weight(.semibold))
+            .tracking(2)
+            .foregroundStyle(.white.opacity(0.6))
+    }
+
+    private func detailRow(_ label: String, _ value: String) -> some View {
+        HStack(alignment: .top) {
+            Text(label).font(.subheadline).foregroundStyle(.white.opacity(0.6))
+            Spacer(minLength: 12)
+            Text(value)
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(.white)
+                .multilineTextAlignment(.trailing)
+                .textSelection(.enabled)
+        }
+    }
+
+    private func prominentButton(_ title: String, icon: String, tint: Color,
+                                 action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                if busy { ProgressView().tint(.white) } else { Image(systemName: icon) }
+                Text(title)
+            }
+            .font(.headline).foregroundStyle(.white)
+            .frame(maxWidth: .infinity).padding(.vertical, 14)
+            .glassEffect(.regular.tint(tint.opacity(0.6)), in: .capsule)
+        }
+        .buttonStyle(.plain)
+        .disabled(busy)
+    }
+
+    private func secondaryButton(_ title: String, icon: String,
+                                 action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: icon)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity).padding(.vertical, 12)
+                .glassEffect(.regular.tint(.white.opacity(0.12)), in: .capsule)
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: logic
+
+    /// A completed file with a negative network verdict — the case the
+    /// "Push again" recovery action exists for.
+    private func needsRepush(_ job: UploadJob) -> Bool {
+        guard job.isDone, let p = node.propagation[job.id] else { return false }
+        return !p.retrievable
+    }
+
+    private func statusDisplay(_ job: UploadJob) -> (text: String, color: Color, icon: String) {
+        if job.isFailed { return ("Upload failed", .red, "xmark.octagon.fill") }
+        if job.isPaused { return ("Paused", .yellow, "pause.circle.fill") }
+        if job.isActive {
+            return (job.statusLabel.isEmpty ? "Uploading" : job.statusLabel, .blue, "arrow.up.circle.fill")
+        }
+        if job.isDone {
+            if node.verifying.contains(job.id) { return ("Checking…", .blue, "magnifyingglass") }
+            if let p = node.propagation[job.id] {
+                return p.retrievable
+                    ? ("Verified", .green, "checkmark.seal.fill")
+                    : ("Not verified", .orange, "exclamationmark.triangle.fill")
+            }
+            return ("Uploaded", .white.opacity(0.8), "checkmark.circle")
+        }
+        return (job.status.capitalized, .gray, "minus.circle")
+    }
+
+    private func verificationExplanation(_ p: PropagationInfo) -> String {
+        if p.totalChunks == 0 {
+            return "We couldn't find this file's data on the network. It may not have finished propagating, or the upload didn't reach other nodes."
+        }
+        return "Some of this file's chunks couldn't be fetched back from the network yet. It may still be propagating, or it may need pushing again."
+    }
+
+    /// Re-push only the missing chunks of this completed file, on the same
+    /// job — no new upload row. The node runs a background self-heal and we
+    /// stay on the page to watch it re-verify.
+    private func repush(_ job: UploadJob) {
+        Task { await node.repushUpload(job) }
+        flash("Re-pushing missing chunks…")
+    }
+
+    private func shortHash(_ ref: String) -> String {
+        let hex = ref.hasPrefix("0x") ? String(ref.dropFirst(2)) : ref
+        guard hex.count > 14 else { return hex }
+        return "\(hex.prefix(8))…\(hex.suffix(6))"
+    }
+
+    private func copyHash(_ job: UploadJob) {
+        guard let ref = job.reference, !ref.isEmpty else { return }
+        let hex = ref.hasPrefix("0x") ? String(ref.dropFirst(2)) : ref
+        UIPasteboard.general.string = hex
+        flash("Copied Swarm hash")
+    }
+
+    private func copyLink(_ job: UploadJob) {
+        guard let ref = job.reference, !ref.isEmpty else { return }
+        let hex = ref.hasPrefix("0x") ? String(ref.dropFirst(2)) : ref
+        UIPasteboard.general.string = "bzz://\(hex)"
+        flash("Copied link")
+    }
+
+    private func flash(_ message: String) {
+        withAnimation { banner = message }
+        Task {
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            withAnimation { banner = nil }
+        }
     }
 }
 

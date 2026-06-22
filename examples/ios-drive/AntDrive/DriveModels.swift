@@ -53,17 +53,22 @@ struct UploadJob: Codable, Identifiable, Equatable {
         return min(1.0, Double(chunksPushed) / Double(total))
     }
 
-    var isActive: Bool { status == "running" || status == "queued" }
+    var isActive: Bool { status == "running" || status == "pending" }
     var isPaused: Bool { status == "paused" }
     var isDone: Bool { status == "completed" }
     var isFailed: Bool { status == "failed" }
 
-    /// A friendly, non-Swarm status line for the row.
+    /// A friendly, non-Swarm status line for the row. Completed uploads
+    /// return an empty string: the network-verified "Verified" badge below
+    /// the status line is the real completion signal, so the row doesn't
+    /// also carry a weaker local "Online" word.
     var statusLabel: String {
         switch status {
-        case "completed": return "Online"
-        case "running": return fraction.map { "Uploading \(Int($0 * 100))%" } ?? "Uploading…"
-        case "queued": return "Waiting…"
+        case "completed": return ""
+        // `pending` is the daemon's pre-dispatch state (before the driver
+        // pushes its first chunk); from the user's view that's still part
+        // of uploading, so it shares the "Uploading…" label.
+        case "running", "pending": return fraction.map { "Uploading \(Int($0 * 100))%" } ?? "Uploading…"
         case "paused": return "Paused"
         case "failed": return "Upload failed"
         case "cancelled": return "Cancelled"
@@ -183,6 +188,104 @@ struct PropagationInfo: Codable, Equatable {
             return totalChunks == 0 ? "Not found on network" : "Not fully available yet"
         }
         return "Verified"
+    }
+}
+
+/// A streaming progress update during a propagation verification, decoded
+/// from the JSON lines `ant_storage_verify_propagation_progress` emits. The
+/// `checking` phase carries `checked`/`total` leaf counts (a determinate
+/// bar); the earlier `resolving`/`enumerating` phases carry neither.
+struct VerifyProgress: Equatable {
+    let phase: String
+    let checked: Int?
+    let total: Int?
+
+    /// 0…1 once the checking phase reports counts; `nil` for the
+    /// indeterminate early phases.
+    var fraction: Double? {
+        guard let checked, let total, total > 0 else { return nil }
+        return min(1.0, Double(checked) / Double(total))
+    }
+
+    /// Friendly one-line status for the verification card. Covers both the
+    /// verify phases (`resolving`/`enumerating`/`checking`) and the re-push
+    /// phase (`repushing`).
+    var label: String {
+        switch phase {
+        case "resolving": return "Resolving file…"
+        case "enumerating": return "Mapping chunks…"
+        case "checking":
+            if let checked, let total { return "Checking chunks \(checked)/\(total)" }
+            return "Checking the network…"
+        case "sources":
+            if let checked, let total { return "Checking replication \(checked)/\(total)" }
+            return "Measuring replication…"
+        case "repushing":
+            if let checked, let total { return "Re-pushing chunks \(checked)/\(total)" }
+            return "Re-pushing missing chunks…"
+        default: return "Checking the network…"
+        }
+    }
+
+    init(phase: String, checked: Int?, total: Int?) {
+        self.phase = phase
+        self.checked = checked
+        self.total = total
+    }
+
+    /// Decode one progress line; `nil` if it isn't a recognisable update.
+    init?(jsonLine: String) {
+        guard let data = jsonLine.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let phase = obj["phase"] as? String else { return nil }
+        self.phase = phase
+        self.checked = (obj["checked"] as? NSNumber)?.intValue
+        self.total = (obj["total"] as? NSNumber)?.intValue
+    }
+}
+
+/// Remaining lifetime of the connected storage plan, as returned by
+/// `ant_storage_validity`. Computed from the batch's on-chain remaining
+/// balance and the current postage price, so it needs a chain RPC and is
+/// fetched on demand (not on every status poll).
+struct StorageValidity: Codable, Equatable {
+    let enabled: Bool
+    let remainingSeconds: UInt64
+    let expiresUnix: UInt64
+
+    enum CodingKeys: String, CodingKey {
+        case enabled
+        case remainingSeconds = "remaining_seconds"
+        case expiresUnix = "expires_unix"
+    }
+
+    /// Coarse human duration for the storage card: "1 year" / "3 months" /
+    /// "12 days" / "5 hours" / "Expired".
+    var durationLabel: String {
+        guard remainingSeconds > 0 else { return "Expired" }
+        let days = remainingSeconds / 86_400
+        switch days {
+        case 0:
+            let hours = remainingSeconds / 3_600
+            return hours <= 1 ? "less than an hour" : "\(hours) hours"
+        case 1: return "1 day"
+        case 2...30: return "\(days) days"
+        case 31...364:
+            let months = days / 30
+            return months == 1 ? "1 month" : "\(months) months"
+        default:
+            let years = days / 365
+            return years == 1 ? "1 year" : "\(years) years"
+        }
+    }
+
+    /// Date-only expiry label (e.g. "19 Sep 2026").
+    var expiryDateLabel: String {
+        guard expiresUnix > 0 else { return "—" }
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .none
+        return f.string(from: Date(timeIntervalSince1970: TimeInterval(expiresUnix)))
     }
 }
 
@@ -328,6 +431,11 @@ enum DriveDecoder {
     static func quote(from json: String) -> StorageQuote? {
         guard let data = json.data(using: .utf8) else { return nil }
         return try? JSONDecoder().decode(StorageQuote.self, from: data)
+    }
+
+    static func validity(from json: String) -> StorageValidity? {
+        guard let data = json.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(StorageValidity.self, from: data)
     }
 }
 
