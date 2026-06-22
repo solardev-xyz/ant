@@ -42,8 +42,10 @@ const OP_TIMEOUT: Duration = Duration::from_secs(30);
 /// sample of data leaves over the live network — so it legitimately runs
 /// for many seconds on a big file. A generous ceiling keeps it from being
 /// cut short (which surfaced as a missing verdict / silent failure) while
-/// still guarding against a wedged loop.
-const VERIFY_TIMEOUT: Duration = Duration::from_mins(5);
+/// still guarding against a wedged loop. Raised now that a full check is
+/// uncapped (every leaf, however large the file); the user can also cancel
+/// a long check from the detail view, so a high ceiling is safe.
+const VERIFY_TIMEOUT: Duration = Duration::from_mins(30);
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum DriveError {
@@ -179,6 +181,62 @@ pub(crate) fn upload_job_command(
     })
 }
 
+/// "Push again" with streamed progress: re-push a completed job's missing
+/// chunks on the same job, handing each `{"phase":...,"checked"?,"total"?}`
+/// progress line to `on_progress` as it arrives, then return the updated
+/// job JSON. Mirrors [`verify_propagation_progress`]: the callback fires on
+/// the FFI runtime thread inline with the blocking call.
+pub(crate) fn upload_repush_progress(
+    h: &AntHandle,
+    job_id: String,
+    mut on_progress: impl FnMut(&str),
+) -> Result<String, DriveError> {
+    let cmd_tx = h.cmd_tx.clone();
+    h.runtime.block_on(async move {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let (prog_tx, mut prog_rx) = mpsc::unbounded_channel::<String>();
+        send(
+            &cmd_tx,
+            ControlCommand::UploadRepush {
+                job_id,
+                progress: Some(prog_tx),
+                ack: ack_tx,
+            },
+        )
+        .await?;
+
+        let finish = |ack: Result<ControlAck, oneshot::error::RecvError>| match ack {
+            Ok(ControlAck::UploadJob(view)) => to_json(&view),
+            Ok(ControlAck::NotReady { message } | ControlAck::Error { message }) => {
+                Err(DriveError::Op(message))
+            }
+            Ok(other) => Err(unexpected(&other)),
+            Err(_) => Err(DriveError::Op("node dropped the ack channel".into())),
+        };
+
+        // Heal can run a few read-back/re-push rounds; reuse the generous
+        // verification timeout as an upper bound.
+        let mut ack_rx = ack_rx;
+        let deadline = tokio::time::sleep(VERIFY_TIMEOUT);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                biased;
+                ack = &mut ack_rx => return finish(ack),
+                line = prog_rx.recv() => {
+                    match line {
+                        Some(l) => on_progress(&l),
+                        None => return finish((&mut ack_rx).await),
+                    }
+                }
+                () = &mut deadline => {
+                    return Err(DriveError::Op("operation timed out".into()));
+                }
+            }
+        }
+    })
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum JobCommand {
     Status,
@@ -221,6 +279,8 @@ pub(crate) fn verify_propagation(
                 reference,
                 samples,
                 probes,
+                progress: None,
+                cancel: None,
                 ack: ack_tx,
             },
         )
@@ -231,6 +291,77 @@ pub(crate) fn verify_propagation(
                 Err(DriveError::Op(message))
             }
             other => Err(unexpected(&other)),
+        }
+    })
+}
+
+/// Like [`verify_propagation`], but streams incremental progress: each
+/// `{"phase":...,"checked"?,"total"?}` JSON line the node emits is handed
+/// to `on_progress` as it arrives, before the final verdict JSON is
+/// returned. The callback runs on the FFI runtime thread inline with the
+/// blocking call, so the caller (Swift) keeps it cheap (a channel hop).
+pub(crate) fn verify_propagation_progress(
+    h: &AntHandle,
+    reference: [u8; 32],
+    samples: u8,
+    probes: u8,
+    mut on_progress: impl FnMut(&str),
+) -> Result<String, DriveError> {
+    let cmd_tx = h.cmd_tx.clone();
+    // Fresh cancel flag for this check: clear any prior request so a cancel
+    // can only ever abort the check it was aimed at. Shared with the node's
+    // verify task via the command.
+    h.verify_cancel
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    let cancel = h.verify_cancel.clone();
+    h.runtime.block_on(async move {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let (prog_tx, mut prog_rx) = mpsc::unbounded_channel::<String>();
+        send(
+            &cmd_tx,
+            ControlCommand::VerifyPropagation {
+                reference,
+                samples,
+                probes,
+                progress: Some(prog_tx),
+                cancel: Some(cancel),
+                ack: ack_tx,
+            },
+        )
+        .await?;
+
+        let finish = |ack: Result<ControlAck, oneshot::error::RecvError>| match ack {
+            Ok(ControlAck::Ok { message }) => Ok(message),
+            Ok(ControlAck::NotReady { message } | ControlAck::Error { message }) => {
+                Err(DriveError::Op(message))
+            }
+            Ok(other) => Err(unexpected(&other)),
+            Err(_) => Err(DriveError::Op("node dropped the ack channel".into())),
+        };
+
+        // Drain progress until the terminal ack lands (or we time out).
+        // Bias toward the ack so completion isn't delayed behind a backlog
+        // of progress lines.
+        let mut ack_rx = ack_rx;
+        let deadline = tokio::time::sleep(VERIFY_TIMEOUT);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                biased;
+                ack = &mut ack_rx => return finish(ack),
+                line = prog_rx.recv() => {
+                    match line {
+                        Some(l) => on_progress(&l),
+                        // Progress channel closed (verify finished); the ack
+                        // is next — await it directly rather than re-looping
+                        // on a now-closed receiver.
+                        None => return finish((&mut ack_rx).await),
+                    }
+                }
+                () = &mut deadline => {
+                    return Err(DriveError::Op("operation timed out".into()));
+                }
+            }
         }
     })
 }

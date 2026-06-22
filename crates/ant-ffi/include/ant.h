@@ -312,6 +312,58 @@ char *ant_storage_verify_propagation(const AntHandle *handle,
                                      char **out_err);
 
 /*
+ * Progress callback for ant_storage_verify_propagation_progress. Invoked
+ * once per progress update with a borrowed, NUL-terminated JSON string of
+ * the shape:
+ *   {"phase":"resolving"|"enumerating"|"checking",
+ *    "checked"?:int,"total"?:int}
+ * The "checking" phase carries "checked"/"total" leaf counts so the UI can
+ * draw a determinate bar; the earlier phases carry neither. The string is
+ * valid only for the duration of the call — copy out anything you keep.
+ * `ctx` is the opaque pointer passed through at call time.
+ */
+typedef void (*AntVerifyProgressCb)(const char *progress_json, void *ctx);
+
+/*
+ * Streaming variant of ant_storage_verify_propagation: identical result
+ * JSON (returned), but `on_progress` (if non-null) is called with `ctx`
+ * for each progress update as the check runs. The callback fires on the
+ * calling thread, inline with the blocking call, so keep it cheap. Pass a
+ * null `on_progress` to behave exactly like the non-streaming variant.
+ */
+char *ant_storage_verify_propagation_progress(const AntHandle *handle,
+                                              const char *reference,
+                                              uint8_t samples,
+                                              uint8_t probes,
+                                              AntVerifyProgressCb on_progress,
+                                              void *ctx,
+                                              char **out_err);
+
+/*
+ * Request cancellation of the in-flight propagation verification for this
+ * handle. Cooperative: the node aborts at the next phase/leaf boundary and
+ * the verify call returns a {"cancelled":true,...} body. No-op if nothing
+ * is verifying. Safe to call from another thread while the verify call is
+ * blocked.
+ */
+void ant_verify_cancel(const AntHandle *handle);
+
+/*
+ * "Push again" with streamed progress: re-push a completed job's missing
+ * chunks on the same job (no new job), calling `on_progress` (with `ctx`)
+ * for each progress update — reuses AntVerifyProgressCb; here the phases are
+ * "checking" (a read-back round) and "repushing" (with "checked"/"total"
+ * chunk counts). Returns the updated job JSON. A null `on_progress` runs
+ * the heal silently. The callback fires on the calling thread inline with
+ * the blocking call.
+ */
+char *ant_upload_repush_progress(const AntHandle *handle,
+                                 const char *job_id,
+                                 AntVerifyProgressCb on_progress,
+                                 void *ctx,
+                                 char **out_err);
+
+/*
  * Account identity as a JSON object:
  *   {"eth_address","overlay","peer_id","agent"}
  */

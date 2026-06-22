@@ -40,7 +40,7 @@ use ant_retrieval::DiskChunkCache;
 use k256::ecdsa::SigningKey;
 use libp2p::identity::{self, Keypair};
 use serde::{Deserialize, Serialize};
-use std::ffi::{c_char, c_int, CStr, CString};
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -123,6 +123,12 @@ pub struct AntHandle {
     /// immediately instead of waiting up to the next progress tick
     /// (~150 ms) / backoff interval (2 s).
     cancel_notify: Notify,
+    /// Cooperative cancel flag for an in-flight propagation verification.
+    /// `Arc` because it's shared into the node's verify task via the
+    /// `VerifyPropagation` command; flipped to `true` by
+    /// `ant_verify_cancel` and reset at the start of each new check so a
+    /// cancel only ever aborts the check it was aimed at.
+    verify_cancel: Arc<AtomicBool>,
     /// The node's secp256k1 signing secret. Stamps every postage batch
     /// the node owns (so `UploadRuntime::stamp_key` can sign) and backs
     /// `ant_account_export_key` for the `AntDrive` "back up your account"
@@ -459,6 +465,7 @@ fn init_inner(data_dir: &Path) -> Result<AntHandle, FfiError> {
         progress: Mutex::new(DownloadProgressState::default()),
         cancel_flag: AtomicBool::new(false),
         cancel_notify: Notify::new(),
+        verify_cancel: Arc::new(AtomicBool::new(false)),
         signing_secret,
         eth,
         data_dir: data_dir.to_path_buf(),
@@ -1369,7 +1376,10 @@ pub unsafe extern "C" fn ant_upload_pause(
     }
 }
 
-/// Resume a paused (or failed) upload. Returns the updated job JSON.
+/// Resume a paused (or failed) upload. Returns the updated job JSON. For a
+/// *completed* job this instead triggers a background self-heal that
+/// re-pushes only the job's missing chunks on the same job (the app's "push
+/// again"), returning the current job JSON immediately.
 ///
 /// # Safety
 ///
@@ -1388,6 +1398,41 @@ pub unsafe extern "C" fn ant_upload_resume(
             drive::JobCommand::Resume,
             "ant_upload_resume",
         )
+    }
+}
+
+/// "Push again" with streamed progress: re-push a completed job's missing
+/// chunks on the same job (no new job), invoking `on_progress` (with `ctx`)
+/// for each `{"phase":"checking"|"repushing","checked"?,"total"?}` update
+/// as the heal runs, then returning the updated job JSON. The callback
+/// fires on the calling thread inline with the (blocking) call, so keep it
+/// cheap. A null `on_progress` runs the heal without progress.
+///
+/// # Safety
+///
+/// See [`ant_upload_start`]. `on_progress`, if non-null, must be a valid
+/// function pointer that does not unwind across the FFI boundary; `ctx` is
+/// passed through opaquely and may be null.
+#[no_mangle]
+pub unsafe extern "C" fn ant_upload_repush_progress(
+    handle: *const AntHandle,
+    job_id: *const c_char,
+    on_progress: Option<AntVerifyProgressCb>,
+    ctx: *mut c_void,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_upload_repush_progress", || {
+            let h = handle.as_ref().ok_or_else(null_handle)?;
+            let job_id = cstr_to_string(job_id)?;
+            let ctx = ctx as usize;
+            drive::upload_repush_progress(h, job_id, |line: &str| {
+                if let (Some(cb), Ok(c)) = (on_progress, CString::new(line)) {
+                    cb(c.as_ptr(), ctx as *mut c_void);
+                }
+            })
+            .map_err(|e| e.to_string())
+        })
     }
 }
 
@@ -1510,6 +1555,76 @@ pub unsafe extern "C" fn ant_storage_verify_propagation(
             };
             drive::verify_propagation(h, root, samples, probes).map_err(|e| e.to_string())
         })
+    }
+}
+
+/// Callback invoked with each progress update during a streaming
+/// verification (see [`ant_storage_verify_propagation_progress`]). The
+/// `progress_json` pointer is a borrowed, NUL-terminated UTF-8 string of
+/// the shape `{"phase":"resolving"|"enumerating"|"checking",
+/// "checked"?:int,"total"?:int}` — valid only for the duration of the
+/// call, so copy out anything you need to keep. `ctx` is the opaque
+/// pointer passed through at call time.
+pub type AntVerifyProgressCb = extern "C" fn(progress_json: *const c_char, ctx: *mut c_void);
+
+/// Like [`ant_storage_verify_propagation`], but invokes `on_progress`
+/// (with `ctx`) for each incremental progress update as the check runs,
+/// then returns the same final verdict JSON. Progress is best-effort: a
+/// null `on_progress` simply behaves like the non-streaming variant. The
+/// callback fires on the calling thread, inline with the (blocking) call,
+/// so keep it cheap.
+///
+/// # Safety
+///
+/// See [`ant_storage_verify_propagation`]. `on_progress`, if non-null,
+/// must be a valid function pointer that does not unwind across the FFI
+/// boundary; `ctx` is passed through opaquely and may be null.
+#[no_mangle]
+pub unsafe extern "C" fn ant_storage_verify_propagation_progress(
+    handle: *const AntHandle,
+    reference: *const c_char,
+    samples: u8,
+    probes: u8,
+    on_progress: Option<AntVerifyProgressCb>,
+    ctx: *mut c_void,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_storage_verify_propagation_progress", || {
+            let h = handle.as_ref().ok_or_else(null_handle)?;
+            let reference = cstr_to_string(reference)?;
+            let root = match parse_reference(&reference).map_err(|e| e.to_string())? {
+                ParsedRef::Bytes(root) | ParsedRef::Bzz { root, .. } => root,
+            };
+            // `ctx` is a bare pointer the host owns; the FFI just relays it.
+            let ctx = ctx as usize;
+            drive::verify_propagation_progress(h, root, samples, probes, |line: &str| {
+                if let (Some(cb), Ok(c)) = (on_progress, CString::new(line)) {
+                    cb(c.as_ptr(), ctx as *mut c_void);
+                }
+            })
+            .map_err(|e| e.to_string())
+        })
+    }
+}
+
+/// Request cancellation of the in-flight propagation verification for this
+/// handle (started by `ant_storage_verify_propagation_progress` or the
+/// non-streaming variant). Cooperative: the node aborts at the next phase
+/// or leaf boundary and the verify call returns a `{"cancelled":true,...}`
+/// body. A no-op if nothing is being verified. Safe to call from any
+/// thread while the verify call is blocked on another.
+///
+/// # Safety
+///
+/// `handle` must be a live handle from [`ant_init`] (or null, which is a
+/// no-op).
+#[no_mangle]
+pub unsafe extern "C" fn ant_verify_cancel(handle: *const AntHandle) {
+    unsafe {
+        if let Some(h) = handle.as_ref() {
+            h.verify_cancel.store(true, Ordering::Relaxed);
+        }
     }
 }
 

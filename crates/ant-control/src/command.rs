@@ -12,6 +12,8 @@ use crate::protocol::{GetProgress, PostageStatusView, UploadJobView};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 /// Buffer depth for the streaming ack channel. Sized big enough to
@@ -252,6 +254,19 @@ pub enum ControlCommand {
         job_id: String,
         ack: oneshot::Sender<ControlAck>,
     },
+    /// Re-push a completed-but-degraded job's missing chunks on the same
+    /// job (the app's "push again"), running the self-heal to completion
+    /// and streaming progress while it does. `progress` (if set) receives
+    /// JSON lines `{"phase":"checking"|"repushing","checked"?:n,"total"?:n}`
+    /// — `checking` for each read-back round, `repushing` with a running
+    /// chunk count as the gap is re-pushed. The terminal `ack` is the
+    /// updated job JSON once the heal settles. `None` progress runs the
+    /// heal silently.
+    UploadRepush {
+        job_id: String,
+        progress: Option<mpsc::UnboundedSender<String>>,
+        ack: oneshot::Sender<ControlAck>,
+    },
     /// Subscribe to live upload progress. Sends zero or more
     /// [`ControlAck::UploadProgress`] frames followed by a terminal
     /// [`ControlAck::UploadJob`] / [`ControlAck::Error`] when the job
@@ -313,6 +328,18 @@ pub enum ControlCommand {
         reference: [u8; 32],
         samples: u8,
         probes: u8,
+        /// Optional sink for incremental progress while the (potentially
+        /// slow) leaf-checking pass runs. Each item is a JSON line of the
+        /// shape `{"phase":"resolving"|"enumerating"|"checking",
+        /// "checked"?:n,"total"?:n}`. `None` opts out: the socket
+        /// transport and CLI paths pass `None`; only the in-process FFI
+        /// (the `AntDrive` app) streams progress to drive a real bar.
+        progress: Option<mpsc::UnboundedSender<String>>,
+        /// Optional cooperative cancel flag. Set to `true` by the caller
+        /// (the FFI's `ant_verify_cancel`) to abort an in-flight check; the
+        /// verify polls it between phases and per leaf and returns a
+        /// `{"cancelled":true,...}` body promptly. `None` = not cancellable.
+        cancel: Option<Arc<AtomicBool>>,
         ack: oneshot::Sender<ControlAck>,
     },
     /// Read-back presence check for a specific set of chunk addresses.

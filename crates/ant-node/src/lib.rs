@@ -366,6 +366,22 @@ async fn intercept_commands(
                 let mgr = mgr.clone();
                 tokio::spawn(async move { uploads::run_follow(mgr, job_id, ack).await });
             }
+            ControlCommand::UploadRepush {
+                job_id,
+                progress,
+                ack,
+            } => {
+                let mgr = mgr.clone();
+                tokio::spawn(async move {
+                    let reply = match mgr.repush_with_progress(&job_id, progress).await {
+                        Ok(info) => ControlAck::UploadJob(uploads::to_view(info)),
+                        Err(e) => ControlAck::Error {
+                            message: e.to_string(),
+                        },
+                    };
+                    let _ = ack.send(reply);
+                });
+            }
             other => {
                 if inner_tx.send(other).await.is_err() {
                     break;

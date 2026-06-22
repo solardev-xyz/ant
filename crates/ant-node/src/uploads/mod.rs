@@ -219,6 +219,26 @@ const HEAL_VERIFY_BATCH: usize = 512;
 /// perfectly healthy chunks every launch on probe noise.
 const HEAL_PROBES: usize = 4;
 
+/// Optional sink for streamed re-push/heal progress (the app's "push
+/// again"). Each item is a JSON line `{"phase":"checking"|"repushing",
+/// "checked"?:n,"total"?:n}`. `None` runs the heal silently (startup heal,
+/// post-upload heal, antctl resume).
+type HealProgress = Option<mpsc::UnboundedSender<String>>;
+
+/// Emit one heal progress line, best-effort (a dropped receiver is a no-op
+/// and never stalls the heal).
+fn emit_heal(progress: &HealProgress, phase: &str, checked: Option<usize>, total: Option<usize>) {
+    let Some(tx) = progress else { return };
+    let mut v = serde_json::json!({ "phase": phase });
+    if let Some(c) = checked {
+        v["checked"] = c.into();
+    }
+    if let Some(t) = total {
+        v["total"] = t.into();
+    }
+    let _ = tx.send(v.to_string());
+}
+
 /// Skip the heal pass for files above this chunk count. Raised from
 /// 50 000 (~200 MB) to 2 000 000 (~8 GB) now that heal re-pushes from
 /// the local chunk store (see [`UploadManager::repush_missing`])
@@ -791,9 +811,31 @@ impl UploadManager {
 
     /// Bring a `Paused` (or `Failed`) job back to `Running`. Spawns
     /// a fresh driver task; the previous driver has already
-    /// exited.
+    /// exited. A `Completed` job instead triggers a background self-heal
+    /// that re-pushes only its missing chunks on the same job (see body);
+    /// other terminal states error with `BadState`.
     pub fn resume(&self, id: &str) -> Result<UploadJobInfo, UploadError> {
         let handle = self.resolve(id)?;
+
+        // A `Completed` job can't be driver-"resumed", but the app's
+        // "Push again" routes here for a completed file whose chunks didn't
+        // fully propagate. Rather than mint a new upload, kick off the same
+        // self-heal the daemon runs at startup: read the file back from the
+        // network and re-push ONLY the chunks that are missing (from the
+        // local chunk store, falling back to the source) against this same
+        // job. It runs in the background and leaves the job `Completed`
+        // throughout, so the caller gets the current snapshot back at once.
+        {
+            let status = handle.info.lock().expect("upload mutex poisoned").status;
+            if status == UploadStatus::Completed {
+                let snap = handle.snapshot();
+                let mgr = self.clone();
+                let handle = handle.clone();
+                tokio::spawn(async move { mgr.heal_completed_job(handle, None).await });
+                return Ok(snap);
+            }
+        }
+
         let snap = {
             let mut info = handle.info.lock().expect("upload mutex poisoned");
             match info.status {
@@ -942,7 +984,7 @@ impl UploadManager {
                     "starting background self-heal of unverified completed uploads (sequential)",
                 );
                 for handle in startup_heals {
-                    mgr.heal_completed_job(handle).await;
+                    mgr.heal_completed_job(handle, None).await;
                 }
                 info!(
                     target: "ant_node::uploads",
@@ -961,7 +1003,7 @@ impl UploadManager {
     /// path uses. Best-effort: a missing/changed source or an oversized
     /// file is logged and skipped. Awaited sequentially by the startup
     /// heal driver so the pass doesn't stampede postage / the network.
-    async fn heal_completed_job(&self, handle: Arc<JobHandle>) {
+    async fn heal_completed_job(&self, handle: Arc<JobHandle>, progress: HealProgress) {
         let snap = handle.snapshot();
         let job_id = snap.job_id.clone();
         let source_path = self.resolve_source_path(&snap.source_path);
@@ -1033,8 +1075,27 @@ impl UploadManager {
             snap.raw,
             snap.name.as_deref(),
             snap.content_type.as_deref(),
+            progress,
         )
         .await;
+    }
+
+    /// "Push again" with progress: run the self-heal for a `Completed` job
+    /// to completion, streaming progress to `progress`, then return the
+    /// job's snapshot. Re-pushes only the missing chunks on the same job —
+    /// no new job. Errors if the job is unknown or not completed.
+    pub async fn repush_with_progress(
+        &self,
+        job_id: &str,
+        progress: HealProgress,
+    ) -> Result<UploadJobInfo, UploadError> {
+        let handle = self.resolve(job_id)?;
+        let status = handle.info.lock().expect("upload mutex poisoned").status;
+        if status != UploadStatus::Completed {
+            return Err(UploadError::BadState(status));
+        }
+        self.heal_completed_job(handle.clone(), progress).await;
+        Ok(handle.snapshot())
     }
 
     fn mint_id(&self) -> String {
@@ -1441,6 +1502,7 @@ impl UploadManager {
                     raw,
                     name.as_deref(),
                     content_type.as_deref(),
+                    None,
                 )
                 .await;
             });
@@ -1855,9 +1917,11 @@ impl UploadManager {
         raw: bool,
         name: Option<&str>,
         content_type: Option<&str>,
+        progress: HealProgress,
     ) {
         for round in 0..MAX_HEAL_ROUNDS {
             tokio::time::sleep(HEAL_SETTLE_DELAY).await;
+            emit_heal(&progress, "checking", None, None);
             let Some(missing) = self.query_missing(all_addrs, HEAL_PROBES).await else {
                 // Read-back couldn't run (peers not ready / transport
                 // error). Do NOT claim the upload is healthy — just try
@@ -1893,6 +1957,7 @@ impl UploadManager {
                     raw,
                     name,
                     content_type,
+                    &progress,
                 )
                 .await
             {
@@ -1906,6 +1971,7 @@ impl UploadManager {
         // One final read-back after the last re-push round decides the
         // verdict.
         tokio::time::sleep(HEAL_SETTLE_DELAY).await;
+        emit_heal(&progress, "checking", None, None);
         match self.query_missing(all_addrs, HEAL_PROBES).await {
             Some(missing) if missing.is_empty() => {
                 info!(
@@ -2144,11 +2210,25 @@ impl UploadManager {
         raw: bool,
         name: Option<&str>,
         content_type: Option<&str>,
+        progress: &HealProgress,
     ) -> Result<(), UploadError> {
         let mut in_flight: FuturesUnordered<BoundedPushFuture> = FuturesUnordered::new();
         // Addresses still needing a re-push after the disk-cache pass.
         // Anything left is re-derived from the source file in pass 2.
         let mut remaining: HashSet<[u8; 32]> = missing.clone();
+
+        // Re-push progress: count each completed push against the missing
+        // set so the app can draw a determinate bar. `note_done!` is
+        // invoked at every drain point below.
+        let total = missing.len();
+        let mut pushed = 0usize;
+        emit_heal(progress, "repushing", Some(0), Some(total));
+        macro_rules! note_done {
+            () => {{
+                pushed += 1;
+                emit_heal(progress, "repushing", Some(pushed), Some(total));
+            }};
+        }
 
         // --- Pass 1: re-push from the local chunk store. ---
         if let Some(cache) = self.inner.disk_cache.clone() {
@@ -2159,6 +2239,7 @@ impl UploadManager {
                         if in_flight.len() >= MAX_PUSH_CONCURRENCY {
                             if let Some((_, res)) = in_flight.next().await {
                                 res?;
+                                note_done!();
                             }
                         }
                         in_flight.push(self.dispatch_push_bounded(
@@ -2209,6 +2290,7 @@ impl UploadManager {
                                 if in_flight.len() >= MAX_PUSH_CONCURRENCY {
                                     if let Some((_, res)) = in_flight.next().await {
                                         res?;
+                                        note_done!();
                                     }
                                 }
                                 in_flight.push(self.dispatch_push_bounded(
@@ -2256,6 +2338,7 @@ impl UploadManager {
 
         while let Some((_, res)) = in_flight.next().await {
             res?;
+            note_done!();
         }
         Ok(())
     }

@@ -532,6 +532,7 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
         | ControlCommand::UploadStatus { ack, .. }
         | ControlCommand::UploadPause { ack, .. }
         | ControlCommand::UploadResume { ack, .. }
+        | ControlCommand::UploadRepush { ack, .. }
         | ControlCommand::UploadCancel { ack, .. } => {
             let _ = ack.send(ControlAck::Error {
                 message: "Upload* not supported in gateway test fixtures".into(),
@@ -606,6 +607,8 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
             reference,
             samples,
             probes,
+            progress: _,
+            cancel: _,
             ack,
         } => {
             // The gateway fixture's `DirFetcher` is a flat chunk store,

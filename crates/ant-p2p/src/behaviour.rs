@@ -1665,6 +1665,8 @@ fn handle_control_command(
             reference,
             samples,
             probes,
+            progress,
+            cancel,
             ack,
         } => {
             // Deep read-back propagation check. Resolve the manifest,
@@ -1675,11 +1677,10 @@ fn handle_control_command(
             // we only snapshot the peer pool synchronously so we don't borrow
             // `state` into the task.
             //
-            // `samples == 0` is the thorough default: every data leaf for a
-            // small file, or a large evenly-spread sample (bounded by
-            // `MAX_FULL_VERIFY_LEAVES`) for a big one. A non-zero value probes
-            // only that many leaves — a weaker signal we keep for callers that
-            // explicitly want a quick spot-check.
+            // `samples == 0` is the thorough default: every data leaf,
+            // uncapped, however large the file. A non-zero value probes only
+            // that many evenly-spread leaves — a weaker, faster signal we keep
+            // for callers that explicitly want a quick spot-check.
             let samples = samples as usize;
             let probes = if probes == 0 { 2 } else { probes.min(8) } as usize;
             let peers: Vec<(PeerId, Overlay)> = state.peers_watch.subscribe().borrow().clone();
@@ -1694,7 +1695,7 @@ fn handle_control_command(
             let net = VerifyNet::from_state(state);
             tokio::spawn(async move {
                 let body = verify_propagation_deep(
-                    control, peers_rx, peers, reference, samples, probes, net,
+                    control, peers_rx, peers, reference, samples, probes, net, progress, cancel,
                 )
                 .await;
                 let _ = ack.send(ControlAck::Ok {
@@ -1736,8 +1737,12 @@ fn handle_control_command(
                 let missing = if probes == 0 {
                     verify_chunks_present(&fetcher, &addresses).await
                 } else {
-                    verify_chunks_present_deep(&control, &peers, &fetcher, &addresses, probes, &net)
-                        .await
+                    // Heal path: no UI to drive, so no progress sink and no
+                    // cancellation.
+                    verify_chunks_present_deep(
+                        &control, &peers, &fetcher, &addresses, probes, &net, None, 0, None,
+                    )
+                    .await
                 };
                 let body = serde_json::json!({
                     "checked": addresses.len(),
@@ -2452,6 +2457,7 @@ fn handle_control_command(
         | ControlCommand::UploadStatus { ack, .. }
         | ControlCommand::UploadPause { ack, .. }
         | ControlCommand::UploadResume { ack, .. }
+        | ControlCommand::UploadRepush { ack, .. }
         | ControlCommand::UploadCancel { ack, .. } => {
             let _ = ack.send(ControlAck::Error {
                 message: "upload manager not wired into the swarm loop".into(),
@@ -3695,6 +3701,7 @@ async fn verify_chunks_present(
 /// residual in exchange for verdicts that match gateway reality.
 /// Bounded concurrency so a large file's check doesn't open thousands
 /// of simultaneous streams.
+#[allow(clippy::too_many_arguments)]
 async fn verify_chunks_present_deep(
     control: &Control,
     peers: &[(PeerId, Overlay)],
@@ -3702,21 +3709,52 @@ async fn verify_chunks_present_deep(
     addresses: &[[u8; 32]],
     probes: usize,
     net: &VerifyNet,
+    // Optional progress sink + denominator: each item is a JSON line
+    // `{"phase":"checking","checked":n,"total":total}`, emitted as each
+    // leaf's neighbourhood probe completes. `None` opts out (the heal
+    // caller). The routed-confirmation second pass below isn't counted —
+    // it only runs for the misses and would make the bar jump backwards.
+    progress: Option<mpsc::UnboundedSender<String>>,
+    total: usize,
+    // Optional cooperative cancel: once set, in-flight per-leaf futures
+    // short-circuit (returning the leaf as "present" so it isn't flagged),
+    // so the stream drains near-instantly. The caller
+    // (`verify_propagation_deep`) re-checks the flag afterwards and reports
+    // cancellation instead of using this (now-partial) result.
+    cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Vec<[u8; 32]> {
     use futures::stream::StreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const CONCURRENCY: usize = 16;
     const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-    let flagged: Vec<[u8; 32]> =
-        futures::stream::iter(addresses.iter().copied().map(|addr| async move {
+    let checked = Arc::new(AtomicUsize::new(0));
+    let flagged: Vec<[u8; 32]> = futures::stream::iter(addresses.iter().copied().map(|addr| {
+        let checked = checked.clone();
+        let progress = progress.clone();
+        let cancel = cancel.clone();
+        async move {
+            if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+                // Skip remaining work; not flagged so the partial set stays
+                // clean (discarded by the caller on cancel anyway).
+                return (addr, true);
+            }
             let hits = probe_leaf_sources(control, peers, addr, probes, PROBE_TIMEOUT, net).await;
+            if let Some(tx) = &progress {
+                let done = checked.fetch_add(1, Ordering::Relaxed) + 1;
+                let _ = tx.send(
+                    serde_json::json!({ "phase": "checking", "checked": done, "total": total })
+                        .to_string(),
+                );
+            }
             (addr, hits > 0)
-        }))
-        .buffer_unordered(CONCURRENCY)
-        .filter_map(|(addr, present)| async move { (!present).then_some(addr) })
-        .collect()
-        .await;
+        }
+    }))
+    .buffer_unordered(CONCURRENCY)
+    .filter_map(|(addr, present)| async move { (!present).then_some(addr) })
+    .collect()
+    .await;
 
     if flagged.is_empty() {
         return flagged;
@@ -3784,16 +3822,6 @@ impl VerifyNet {
     }
 }
 
-/// Upper bound on how many data leaves a default verification
-/// (`samples == 0`) checks network-only. Small files (≲2 MB) sit under
-/// this, so every leaf is verified and the UI shows "all N chunks"; a
-/// larger file falls back to an evenly-spread sample of this size — a
-/// "large sample" that reliably catches a partially-propagated body while
-/// keeping the check bounded in wall time (per-leaf network fetches are
-/// far slower than a pipelined download). Sampling only a handful of
-/// leaves — the old behaviour — is what let broken files show "Verified".
-const MAX_FULL_VERIFY_LEAVES: usize = 512;
-
 /// How many leaves a verification additionally probes for the
 /// informational distinct-route ("sources") floor. Bounded because each
 /// probe is a second per-leaf round-trip on top of the reachability check.
@@ -3814,10 +3842,11 @@ const VERIFY_DEEP_PROBES: usize = 4;
 /// data root, enumerate the file's chunk tree (fetching every interior
 /// node network-only, which proves the skeleton is retrievable), then
 /// check the data leaves network-only — every leaf when `samples == 0`
-/// (bounded by [`MAX_FULL_VERIFY_LEAVES`]), otherwise an evenly-spread
+/// (a full, uncapped verification), otherwise an evenly-spread
 /// sample of `samples` leaves — and probe a bounded subset across up to
 /// `probes` distinct closest peers for the replication floor. Returns the
 /// JSON body described on [`ControlCommand::VerifyPropagation`].
+#[allow(clippy::too_many_arguments)]
 async fn verify_propagation_deep(
     control: Control,
     peers_rx: watch::Receiver<Vec<(PeerId, Overlay)>>,
@@ -3826,14 +3855,39 @@ async fn verify_propagation_deep(
     samples: usize,
     probes: usize,
     net: VerifyNet,
+    progress: Option<mpsc::UnboundedSender<String>>,
+    cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> serde_json::Value {
     use ant_retrieval::{
         enumerate_chunk_tree, lookup_path, ChunkFetcher, JoinOptions, ManifestError,
         DEFAULT_MAX_FILE_BYTES,
     };
 
+    // True once the caller (the app's Cancel button) has requested abort.
+    let cancelled = || {
+        cancel
+            .as_ref()
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    };
+
+    // Best-effort progress emitter; a dropped receiver (caller gone) just
+    // makes this a no-op, so emission never blocks or fails the pass.
+    let emit = |phase: &str, checked: Option<usize>, total: Option<usize>| {
+        if let Some(tx) = &progress {
+            let mut v = serde_json::json!({ "phase": phase });
+            if let Some(c) = checked {
+                v["checked"] = c.into();
+            }
+            if let Some(t) = total {
+                v["total"] = t.into();
+            }
+            let _ = tx.send(v.to_string());
+        }
+    };
+
     // Serialise with any other in-flight verification (see
     // `SwarmState::verify_gate`); the permit is held for the whole pass.
+    emit("resolving", None, None);
     let _gate = net
         .verify_gate
         .clone()
@@ -3856,6 +3910,18 @@ async fn verify_propagation_deep(
             "error": msg,
         })
     };
+    // Distinct from an error: a user-cancelled check carries `cancelled:true`
+    // and `error:"cancelled"` so the app clears the in-flight state without
+    // recording a (misleading) "not retrievable" verdict.
+    let cancelled_body = || {
+        let mut b = err_body("cancelled".to_string());
+        b["cancelled"] = true.into();
+        b
+    };
+
+    if cancelled() {
+        return cancelled_body();
+    }
 
     // Cache-free fetcher: manifest resolution and interior-node fetches
     // must hit the network, never the daemon's local store-then-push
@@ -3877,6 +3943,10 @@ async fn verify_propagation_deep(
         Err(e) => return err_body(format!("fetch data root: {e}")),
     };
 
+    if cancelled() {
+        return cancelled_body();
+    }
+    emit("enumerating", None, None);
     let inv = match enumerate_chunk_tree(
         &fetcher,
         data_ref,
@@ -3899,15 +3969,16 @@ async fn verify_propagation_deep(
     // Every interior node (and the data root) was fetched network-only
     // above, so the skeleton is retrievable. Now check the data leaves.
     //
-    // `samples == 0` checks *every* leaf (bounded by
-    // `MAX_FULL_VERIFY_LEAVES` so a huge file can't open an unbounded
-    // number of streams) — this is the authoritative verdict the UI
-    // shows as "Verified · all N chunks". A non-zero `samples` probes an
-    // evenly-spread subset only. Sampling a handful of leaves is what let
-    // a partially-propagated file (root + skeleton present, body chunks
-    // missing) pass as "Verified", so the default path is now full.
+    // `samples == 0` checks *every* data leaf — no cap. This is a full,
+    // end-to-end verification: the authoritative verdict the UI shows as
+    // "Verified". (There used to be a `MAX_FULL_VERIFY_LEAVES` ceiling that
+    // sampled large files; it was removed so a big file is verified in full
+    // rather than sampled, at the cost of more per-leaf network probes.)
+    // The check is still bounded in *concurrency* (see
+    // `verify_chunks_present_deep`), just not in coverage. A non-zero
+    // `samples` probes an evenly-spread subset only.
     let check_idx = if samples == 0 {
-        sample_indices(leaf_chunks, leaf_chunks.min(MAX_FULL_VERIFY_LEAVES))
+        sample_indices(leaf_chunks, leaf_chunks)
     } else {
         sample_indices(leaf_chunks, samples)
     };
@@ -3923,28 +3994,97 @@ async fn verify_propagation_deep(
     // false-failure rate on a light node (see
     // [`verify_chunks_present_deep`]). Same signal as the post-upload
     // heal, so the UI verdict and the heal can't disagree.
+    if cancelled() {
+        return cancelled_body();
+    }
     let deep_probes = probes.max(VERIFY_DEEP_PROBES);
-    let missing =
-        verify_chunks_present_deep(&control, &peers, &fetcher, &leaf_addrs, deep_probes, &net)
-            .await;
+    emit("checking", Some(0), Some(sampled_leaves));
+    let missing = verify_chunks_present_deep(
+        &control,
+        &peers,
+        &fetcher,
+        &leaf_addrs,
+        deep_probes,
+        &net,
+        progress.clone(),
+        sampled_leaves,
+        cancel.clone(),
+    )
+    .await;
+    // Cancelled mid-leaf-check: the missing set is partial and meaningless,
+    // so report cancellation rather than a verdict.
+    if cancelled() {
+        return cancelled_body();
+    }
     let leaves_retrievable = sampled_leaves - missing.len();
 
     // Informational replication floor: how many of a chunk's own closest
     // peers hold it directly (route diversity), separate from whether it's
-    // reachable at all. Probing this is a second round-trip per leaf, so we
-    // only sample a bounded, evenly-spread subset rather than every leaf.
+    // reachable at all. A bounded, evenly-spread sample — but probed
+    // *concurrently* and reported as its own "sources" progress phase, so
+    // the UI shows movement (replications checked X/Y) instead of a stalled
+    // 100% bar between the leaf check and the verdict.
     let probe_timeout = std::time::Duration::from_secs(10);
-    let mut min_sources = u32::MAX;
-    for i in sample_indices(leaf_addrs.len(), SOURCE_PROBE_SAMPLE.min(leaf_addrs.len())) {
-        let s =
-            probe_leaf_sources(&control, &peers, leaf_addrs[i], probes, probe_timeout, &net).await;
-        min_sources = min_sources.min(s);
-    }
-    let min_sources = if min_sources == u32::MAX {
+    let source_idx = sample_indices(leaf_addrs.len(), SOURCE_PROBE_SAMPLE.min(leaf_addrs.len()));
+    let source_total = source_idx.len();
+    let min_sources = if source_total == 0 {
         0
     } else {
-        min_sources
+        use futures::stream::StreamExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const SOURCE_PROBE_CONCURRENCY: usize = 16;
+
+        emit("sources", Some(0), Some(source_total));
+        let control_ref = &control;
+        let peers_ref = &peers;
+        let net_ref = &net;
+        let progress_ref = &progress;
+        let cancel_ref = &cancel;
+        let done = AtomicUsize::new(0);
+        let done_ref = &done;
+
+        let min = futures::stream::iter(source_idx.into_iter().map(|i| {
+            let addr = leaf_addrs[i];
+            async move {
+                if cancel_ref
+                    .as_ref()
+                    .is_some_and(|c| c.load(Ordering::Relaxed))
+                {
+                    return u32::MAX;
+                }
+                let s = probe_leaf_sources(
+                    control_ref,
+                    peers_ref,
+                    addr,
+                    probes,
+                    probe_timeout,
+                    net_ref,
+                )
+                .await;
+                if let Some(tx) = progress_ref {
+                    let n = done_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                    let _ = tx.send(
+                        serde_json::json!({ "phase": "sources", "checked": n, "total": source_total })
+                            .to_string(),
+                    );
+                }
+                s
+            }
+        }))
+        .buffer_unordered(SOURCE_PROBE_CONCURRENCY)
+        .fold(u32::MAX, |acc, s| async move { acc.min(s) })
+        .await;
+        if min == u32::MAX {
+            0
+        } else {
+            min
+        }
     };
+    // Cancelled during the replication probe → report cancellation, not a
+    // verdict computed from a partial sample.
+    if cancelled() {
+        return cancelled_body();
+    }
 
     let checked_chunks = intermediate_chunks + sampled_leaves;
     let retrievable_chunks = intermediate_chunks + leaves_retrievable;
