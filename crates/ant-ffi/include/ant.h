@@ -418,6 +418,19 @@ char *ant_storage_quote(const AntHandle *handle,
                         char **out_err);
 
 /*
+ * Remaining lifetime of the connected storage plan as a JSON object:
+ *   {"enabled":bool,"remaining_seconds":int,"expires_unix":int}
+ * Reads the batch's on-chain remaining balance and the current postage
+ * price and converts to wall-clock time. `enabled=false` (with zeroed
+ * fields) when no plan is connected. One light RPC round-trip — intended
+ * for an explicit refresh, not every status poll. Requires the `chain`
+ * cargo feature.
+ */
+char *ant_storage_validity(const AntHandle *handle,
+                           const char *gnosis_rpc,
+                           char **out_err);
+
+/*
  * Buy and activate a storage plan on Gnosis (approve + createBatch, then
  * register it for stamping). `amount_per_chunk` is the value from
  * ant_storage_quote so the charge matches the approved quote; `immutable`

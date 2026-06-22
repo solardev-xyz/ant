@@ -28,6 +28,8 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
+#[cfg(feature = "chain")]
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::AntHandle;
@@ -624,6 +626,60 @@ pub(crate) fn storage_quote(
     })
 }
 
+/// Remaining lifetime of the connected storage plan. Reads the batch's
+/// on-chain remaining per-chunk balance (`PostageStamp.remainingBalance`,
+/// i.e. normalised balance minus the cumulative outpayment) and the
+/// current price per chunk per block, then converts to wall-clock seconds
+/// via Gnosis block time. Returns `{enabled, remaining_seconds,
+/// expires_unix}`; `enabled = false` when no plan is connected. One
+/// `eth_call` each for price and balance — cheap enough to call from a
+/// pull-to-refresh, not on every status poll.
+#[cfg(feature = "chain")]
+pub(crate) fn storage_validity(h: &AntHandle, rpc: String) -> Result<String, DriveError> {
+    let cmd_tx = h.cmd_tx.clone();
+    h.runtime.block_on(async move {
+        // The connected batch id comes from the local issuer status.
+        let (ack_tx, ack_rx) = oneshot::channel();
+        send(&cmd_tx, ControlCommand::PostageStatus { ack: ack_tx }).await?;
+        let view = match recv_oneshot(ack_rx).await? {
+            ControlAck::PostageStatus(v) => v,
+            ControlAck::Error { message } => return Err(DriveError::Op(message)),
+            other => return Err(unexpected(&other)),
+        };
+        if !view.enabled || view.batch_id.is_empty() {
+            return to_json(&Validity {
+                enabled: false,
+                remaining_seconds: 0,
+                expires_unix: 0,
+            });
+        }
+        let batch_id = parse_batch_id(&view.batch_id)?;
+        let client = ant_chain::ChainClient::new(rpc);
+        // Price per chunk per block; clamp to 1 so a transient zero read
+        // doesn't blow the division up into a bogus eternity.
+        let price = client
+            .postage_last_price(ant_chain::GNOSIS_POSTAGE_STAMP)
+            .await
+            .map_err(|e| DriveError::Op(format!("read storage price: {e}")))?
+            .max(1);
+        let remaining = client
+            .postage_remaining_balance(ant_chain::GNOSIS_POSTAGE_STAMP, &batch_id)
+            .await
+            .map_err(|e| DriveError::Op(format!("read storage balance: {e}")))?;
+        let remaining_seconds = (remaining / price).saturating_mul(GNOSIS_BLOCK_SECS);
+        let remaining_seconds = u64::try_from(remaining_seconds).unwrap_or(u64::MAX);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        to_json(&Validity {
+            enabled: true,
+            remaining_seconds,
+            expires_unix: now.saturating_add(remaining_seconds),
+        })
+    })
+}
+
 /// Fair-value xDAI (wei) to swap for `needed_bzz` PLUR of xBZZ, plus a
 /// fee/slippage buffer. Reads the pool's live `sqrtPriceX96`: the raw
 /// price `(sqrtPriceX96/2^96)^2` is WXDAI-wei per BZZ-plur (token1 has
@@ -1109,6 +1165,19 @@ struct SettlementStatus {
     enabled: bool,
     /// `0x`-prefixed chequebook contract address when enabled.
     chequebook: Option<String>,
+}
+
+/// Remaining-lifetime payload for the storage card (see
+/// [`storage_validity`]).
+#[cfg(feature = "chain")]
+#[derive(Serialize)]
+struct Validity {
+    /// False when no plan is connected; the other fields are then 0.
+    enabled: bool,
+    /// Seconds of storage left before the batch expires.
+    remaining_seconds: u64,
+    /// Absolute Unix expiry (now + `remaining_seconds`), for a date label.
+    expires_unix: u64,
 }
 
 #[cfg(feature = "chain")]

@@ -1776,6 +1776,43 @@ pub unsafe extern "C" fn ant_storage_quote(
     }
 }
 
+/// Remaining lifetime of the connected storage plan as JSON
+/// `{enabled,remaining_seconds,expires_unix}`: reads the batch's on-chain
+/// remaining balance and the current postage price and converts to time.
+/// `enabled=false` (with zeroed fields) when no plan is connected.
+/// Requires the `chain` build feature. One light RPC round-trip — meant for
+/// an explicit refresh, not every status poll.
+///
+/// # Safety
+///
+/// See [`ant_upload_start`]. `gnosis_rpc` must be a valid NUL-terminated
+/// UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn ant_storage_validity(
+    handle: *const AntHandle,
+    gnosis_rpc: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_storage_validity", || {
+            let h = handle.as_ref().ok_or_else(null_handle)?;
+            let rpc = cstr_to_string(gnosis_rpc)?;
+            #[cfg(feature = "chain")]
+            {
+                drive::storage_validity(h, rpc).map_err(|e| e.to_string())
+            }
+            #[cfg(not(feature = "chain"))]
+            {
+                let _ = (h, rpc);
+                Err(
+                    "this build has no chain support (rebuild ant-ffi with --features chain)"
+                        .to_string(),
+                )
+            }
+        })
+    }
+}
+
 /// Buy and activate a storage plan on Gnosis (`approve` + `createBatch`,
 /// then register it so uploads can stamp against it). `amount_per_chunk`
 /// is the value returned by [`ant_storage_quote`] (so the charge matches
