@@ -120,13 +120,13 @@ const CHECKPOINT_INTERVAL_CHUNKS: u64 = 256;
 /// re-dispatches that all queue against the same hot storer set.
 const PUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(2);
 
-/// Per-chunk retry budget for the **bounded** push paths (post-upload
-/// heal re-push and startup heal). The *upload* path itself is
-/// unbounded — it re-queues a struggling chunk forever, bee-style, and
-/// never fails the job on transient peer churn (see [`RetryQueue`] and
-/// `run_job`). Heal keeps a bounded budget so a background heal task
-/// can't wedge forever on a dead network: it gives up the current
-/// round, and the next startup heal pass retries.
+/// Per-chunk retry budget for the **bounded** push paths (the
+/// post-upload heal re-push and the manual "Push again"). The *upload*
+/// path itself is unbounded — it re-queues a struggling chunk forever,
+/// bee-style, and never fails the job on transient peer churn (see
+/// [`RetryQueue`] and `run_job`). Heal keeps a bounded budget so a
+/// background heal task can't wedge forever on a dead network: it gives
+/// up the current round (the user can tap "Push again" to retry).
 ///
 /// Pushsync against a freshly-handshaked peer set occasionally fires a
 /// transient "no peers available" or "stamp signature rejected"
@@ -216,12 +216,12 @@ const HEAL_VERIFY_BATCH: usize = 512;
 /// routed download path before counting as missing. That's what lets
 /// heal detect and re-push shallow placements — including in files
 /// uploaded before the deep-push fix — without re-pushing hundreds of
-/// perfectly healthy chunks every launch on probe noise.
+/// perfectly healthy chunks on probe noise.
 const HEAL_PROBES: usize = 4;
 
 /// Optional sink for streamed re-push/heal progress (the app's "push
 /// again"). Each item is a JSON line `{"phase":"checking"|"repushing",
-/// "checked"?:n,"total"?:n}`. `None` runs the heal silently (startup heal,
+/// "checked"?:n,"total"?:n}`. `None` runs the heal silently (the
 /// post-upload heal, antctl resume).
 type HealProgress = Option<mpsc::UnboundedSender<String>>;
 
@@ -832,7 +832,7 @@ impl UploadManager {
                 let snap = handle.snapshot();
                 let mgr = self.clone();
                 let handle = handle.clone();
-                tokio::spawn(async move { mgr.heal_completed_job(handle, None).await });
+                tokio::spawn(async move { mgr.heal_completed_job(handle, false, None).await });
                 return Ok(snap);
             }
         }
@@ -893,7 +893,6 @@ impl UploadManager {
     pub fn rehydrate_from_disk(&self, auto_resume: bool) -> std::io::Result<usize> {
         let dir = &self.inner.state_dir;
         let mut count = 0;
-        let mut startup_heals: Vec<Arc<JobHandle>> = Vec::new();
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -956,55 +955,32 @@ impl UploadManager {
                     &self.inner.state_dir,
                     &job_id,
                 ));
-            } else if auto_resume
-                && matches!(handle.snapshot().status, UploadStatus::Completed)
-                && !handle.snapshot().heal_verified
-            {
-                // A previously-completed upload that was never confirmed
-                // deep-reachable (old daemon, an inconclusive final
-                // read-back, or a file uploaded before the deep-push fix).
-                // Queue a background deep-heal so shallow chunks self-repair
-                // without the operator re-uploading. Bounded: each file
-                // heals at most once — success sets `heal_verified` and
-                // future startups skip it.
-                startup_heals.push(handle);
             }
-        }
-        // Drive the startup heals *sequentially* on one background task.
-        // Healing every unverified file at once stampedes the postage
-        // batch (re-stamping thousands of chunks trips "collision bucket
-        // full") and floods the network/peer set; one-at-a-time keeps the
-        // self-repair gentle and lets each file settle before the next.
-        if !startup_heals.is_empty() {
-            let mgr = self.clone();
-            tokio::spawn(async move {
-                let total = startup_heals.len();
-                info!(
-                    target: "ant_node::uploads",
-                    jobs = total,
-                    "starting background self-heal of unverified completed uploads (sequential)",
-                );
-                for handle in startup_heals {
-                    mgr.heal_completed_job(handle, None).await;
-                }
-                info!(
-                    target: "ant_node::uploads",
-                    jobs = total,
-                    "background self-heal pass finished",
-                );
-            });
+            // No startup heal: previously-completed uploads are left as-is
+            // on boot. Healing now only runs right after an upload (the
+            // post-upload spawn) or when the user explicitly taps "Push
+            // again" (`repush_with_progress`). A constrained node's
+            // neighbourhood probes can't reliably judge a chunk's durability
+            // anyway, so an automatic boot-time re-push churns postage and
+            // the network without a dependable signal that it's needed.
         }
         Ok(count)
     }
 
-    /// Deep-heal one rehydrated `Completed` job that isn't yet
-    /// `heal_verified`. Re-validates the source file (existence + size),
-    /// re-derives the chunk set, then runs the same
-    /// [`verify_and_heal`](Self::verify_and_heal) loop the post-upload
-    /// path uses. Best-effort: a missing/changed source or an oversized
-    /// file is logged and skipped. Awaited sequentially by the startup
-    /// heal driver so the pass doesn't stampede postage / the network.
-    async fn heal_completed_job(&self, handle: Arc<JobHandle>, progress: HealProgress) {
+    /// Deep-heal one `Completed` job. Re-validates the source file
+    /// (existence + size), re-derives the chunk set, then runs the
+    /// [`verify_and_heal`](Self::verify_and_heal) loop. Best-effort: a
+    /// missing/changed source or an oversized file is logged and skipped.
+    /// Only two callers remain: the post-upload spawn right after an upload
+    /// completes, and the user-initiated "Push again"
+    /// ([`repush_with_progress`](Self::repush_with_progress)). There is no
+    /// startup heal — completed uploads are not re-pushed on boot.
+    async fn heal_completed_job(
+        &self,
+        handle: Arc<JobHandle>,
+        include_shallow: bool,
+        progress: HealProgress,
+    ) {
         let snap = handle.snapshot();
         let job_id = snap.job_id.clone();
         let source_path = self.resolve_source_path(&snap.source_path);
@@ -1021,7 +997,7 @@ impl UploadManager {
                 info!(
                     target: "ant_node::uploads",
                     job_id = %job_id,
-                    "skipping startup heal: source file changed since upload (size mismatch)",
+                    "skipping heal: source file changed since upload (size mismatch)",
                 );
                 return;
             }
@@ -1029,7 +1005,7 @@ impl UploadManager {
                 info!(
                     target: "ant_node::uploads",
                     job_id = %job_id,
-                    "skipping startup heal: source file no longer present",
+                    "skipping heal: source file no longer present",
                 );
                 return;
             }
@@ -1047,7 +1023,7 @@ impl UploadManager {
                 info!(
                     target: "ant_node::uploads",
                     job_id = %job_id,
-                    "skipping startup heal: file exceeds heal chunk cap",
+                    "skipping heal: file exceeds heal chunk cap",
                 );
                 return;
             }
@@ -1055,17 +1031,26 @@ impl UploadManager {
                 warn!(
                     target: "ant_node::uploads",
                     job_id = %job_id,
-                    "skipping startup heal: could not re-derive chunks: {e}",
+                    "skipping heal: could not re-derive chunks: {e}",
                 );
                 return;
             }
         };
 
         let batch_id = resolve_batch_id(snap.batch_id.as_deref(), self.inner.default_batch_id);
+        // `include_shallow` is set only by the user-initiated "Push again",
+        // so it also tells trigger (manual) from the automatic startup /
+        // post-upload heals — worth logging since they take different paths
+        // (single deterministic round vs. multi-round mop-up).
+        let trigger = if include_shallow {
+            "manual push-again"
+        } else {
+            "auto heal"
+        };
         info!(
             target: "ant_node::uploads",
-            job_id = %job_id, chunks = all_addrs.len(),
-            "running startup heal for previously-completed upload",
+            job_id = %job_id, chunks = all_addrs.len(), trigger, include_shallow,
+            "running {trigger} for completed upload",
         );
         self.verify_and_heal(
             &job_id,
@@ -1076,6 +1061,7 @@ impl UploadManager {
             snap.raw,
             snap.name.as_deref(),
             snap.content_type.as_deref(),
+            include_shallow,
             progress,
         )
         .await;
@@ -1095,7 +1081,10 @@ impl UploadManager {
         if status != UploadStatus::Completed {
             return Err(UploadError::BadState(status));
         }
-        self.heal_completed_job(handle.clone(), progress).await;
+        // Manual "Push again": re-push shallow placements too, so it
+        // actually repairs a file that loads but isn't durably stored.
+        self.heal_completed_job(handle.clone(), true, progress)
+            .await;
         Ok(handle.snapshot())
     }
 
@@ -1503,6 +1492,7 @@ impl UploadManager {
                     raw,
                     name.as_deref(),
                     content_type.as_deref(),
+                    false,
                     None,
                 )
                 .await;
@@ -1840,8 +1830,8 @@ impl UploadManager {
     /// bounded retry loop — the heal re-push path. Transient errors
     /// are retried up to `budget` attempts with jittered back-off,
     /// then the future returns `Err` so a background heal task can
-    /// give up the round (and the next startup pass retries) rather
-    /// than wedging forever.
+    /// give up the round (the user can tap "Push again" to retry)
+    /// rather than wedging forever.
     fn dispatch_push_bounded(
         &self,
         index: u64,
@@ -1892,15 +1882,15 @@ impl UploadManager {
     ///   leave it `Completed`;
     /// * chunks still shallow/absent after all rounds + re-pushes ⇒
     ///   leave the job `Completed` but **not** `heal_verified` (a
-    ///   "degraded" sub-state) and let the next startup heal pass try
-    ///   again. We deliberately do **not** flip a fully-pushed,
-    ///   already-retrievable upload to `Failed` just because some chunks
-    ///   are still only *shallow*: the data is reachable, heal keeps
-    ///   re-pushing to deepen it, and a false `Failed` on a retrievable
-    ///   file is worse than a slow convergence;
+    ///   "degraded" sub-state). We deliberately do **not** flip a
+    ///   fully-pushed, already-retrievable upload to `Failed` just
+    ///   because some chunks are still only *shallow*: the data is
+    ///   reachable, and a false `Failed` on a retrievable file is worse
+    ///   than leaving it degraded. There is no automatic retry — the user
+    ///   can tap "Push again" to try again;
     /// * read-back inconclusive (peers not ready / transport error) ⇒
-    ///   also leave it `Completed` but not `heal_verified`, so the next
-    ///   startup heal pass retries it.
+    ///   also leave it `Completed` but not `heal_verified` (again,
+    ///   retried only on a manual "Push again").
     ///
     /// Re-pushes pull payloads from the local chunk store first (see
     /// [`repush_missing`](Self::repush_missing)), falling back to the
@@ -1918,12 +1908,30 @@ impl UploadManager {
         raw: bool,
         name: Option<&str>,
         content_type: Option<&str>,
+        // `true` only for the user-initiated "Push again": also re-push
+        // merely-shallow chunks so it repairs a file that loads but isn't
+        // durably placed. The automatic heals pass `false` (re-push only
+        // genuinely-unreachable chunks) to avoid re-push storms on probe
+        // noise.
+        include_shallow: bool,
         progress: HealProgress,
     ) {
-        for round in 0..MAX_HEAL_ROUNDS {
+        // The manual "Push again" (`include_shallow`) does a single
+        // deterministic re-push pass: re-measuring the shallow set after a
+        // round of pushing/probing inflates it (the budget we just spent
+        // saturates peers, and a saturated peer can't confirm a chunk), so
+        // capturing it once, re-pushing, and letting the final read-back
+        // decide is both cheaper and more honest. The automatic heals
+        // re-measure across several rounds to mop up transient pushsync
+        // stragglers, where the extra budget is worth it.
+        let rounds = if include_shallow { 1 } else { MAX_HEAL_ROUNDS };
+        for round in 0..rounds {
             tokio::time::sleep(HEAL_SETTLE_DELAY).await;
             emit_heal(&progress, "checking", None, None);
-            let Some(missing) = self.query_missing(all_addrs, HEAL_PROBES).await else {
+            let Some(missing) = self
+                .query_missing(all_addrs, HEAL_PROBES, include_shallow)
+                .await
+            else {
                 // Read-back couldn't run (peers not ready / transport
                 // error). Do NOT claim the upload is healthy — just try
                 // again next round after another settle delay.
@@ -1974,7 +1982,10 @@ impl UploadManager {
         // verdict.
         tokio::time::sleep(HEAL_SETTLE_DELAY).await;
         emit_heal(&progress, "checking", None, None);
-        match self.query_missing(all_addrs, HEAL_PROBES).await {
+        match self
+            .query_missing(all_addrs, HEAL_PROBES, include_shallow)
+            .await
+        {
             Some(missing) if missing.is_empty() => {
                 info!(
                     target: "ant_node::uploads",
@@ -1987,23 +1998,24 @@ impl UploadManager {
             // round. The upload itself is `Completed` and the data is
             // retrievable (we pushed every chunk, and re-pushed the
             // shallow ones); it's just not *deeply* placed yet. Leave
-            // the job `Completed` but un-`heal_verified` so the next
-            // startup heal pass re-pushes again — never flip a
-            // retrievable upload to `Failed`. The chunk payloads live
-            // in the local store, so the retry doesn't need the source.
+            // the job `Completed` but un-`heal_verified` — never flip a
+            // retrievable upload to `Failed`. There is no startup heal, so
+            // this won't be retried automatically; the user can tap "Push
+            // again" to try once more (its payloads live in the local
+            // store, so the retry doesn't need the source).
             Some(missing) => {
                 let n = missing.len();
                 let total = all_addrs.len();
                 warn!(
                     target: "ant_node::uploads",
-                    job_id, missing = n, total, rounds = MAX_HEAL_ROUNDS,
-                    "post-upload heal: {n}/{total} chunks not deep-reachable after all rounds — leaving job completed (degraded), will re-push on next startup",
+                    job_id, missing = n, total, rounds,
+                    "post-upload heal: {n}/{total} chunks not deep-reachable after {rounds} re-push round(s) — leaving job completed (degraded); tap Push again to retry",
                 );
             }
             None => warn!(
                 target: "ant_node::uploads",
-                job_id, total = all_addrs.len(), rounds = MAX_HEAL_ROUNDS,
-                "post-upload heal: final read-back inconclusive (peers not ready?) — leaving job completed, will retry on next startup",
+                job_id, total = all_addrs.len(), rounds,
+                "post-upload heal: final read-back inconclusive (peers not ready?) — leaving job completed; tap Push again to retry",
             ),
         }
         // Heal has run its full course for this job. `mark_heal_verified`
@@ -2050,8 +2062,8 @@ impl UploadManager {
             .cloned()
     }
 
-    /// Mark a job's chunks confirmed deep-reachable so future startup heal
-    /// passes skip it. Persists the flag; leaves status untouched.
+    /// Mark a job's chunks confirmed deep-reachable. Persists the flag;
+    /// leaves status untouched.
     fn mark_heal_verified(&self, job_id: &str) {
         let Some(handle) = self.job_handle(job_id) else {
             return;
@@ -2080,7 +2092,7 @@ impl UploadManager {
     /// still inconclusive. Broadcasting this lets a durability-waiting
     /// follower (`antctl upload … --await-sync`, the app) stop waiting
     /// instead of blocking forever on a network that can't confirm deep
-    /// placement right now (the startup heal pass will retry later).
+    /// placement right now (the user can retry with a manual "Push again").
     fn mark_heal_finished(&self, job_id: &str) {
         let Some(handle) = self.job_handle(job_id) else {
             return;
@@ -2185,7 +2197,12 @@ impl UploadManager {
         }
     }
 
-    async fn query_missing(&self, all_addrs: &[[u8; 32]], probes: usize) -> Option<Vec<[u8; 32]>> {
+    async fn query_missing(
+        &self,
+        all_addrs: &[[u8; 32]],
+        probes: usize,
+        include_shallow: bool,
+    ) -> Option<Vec<[u8; 32]>> {
         let mut missing = Vec::new();
         for batch in all_addrs.chunks(HEAL_VERIFY_BATCH) {
             let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
@@ -2195,6 +2212,7 @@ impl UploadManager {
                 .send(ControlCommand::VerifyChunksPresent {
                     addresses: batch.to_vec(),
                     probes,
+                    include_shallow,
                     ack: ack_tx,
                 })
                 .await
@@ -2231,7 +2249,7 @@ impl UploadManager {
     /// through the deterministic splitter — but only if the file is
     /// still there. A deleted source with a populated cache heals fine;
     /// a deleted source with a cache miss simply can't re-push *those*
-    /// chunks this round (logged, retried on the next startup pass)
+    /// chunks this round (logged; the user can retry with "Push again")
     /// rather than failing the whole upload.
     ///
     /// Re-pushes use a bounded retry budget so a background heal task
@@ -2361,7 +2379,7 @@ impl UploadManager {
                     // Source gone and the cache didn't cover every
                     // missing chunk. Don't fail the upload: the cache
                     // pass may have re-pushed most of them. Log the
-                    // shortfall; the next startup heal pass retries.
+                    // shortfall; the user can retry with "Push again".
                     warn!(
                         target: "ant_node::uploads",
                         remaining = remaining.len(),
@@ -2399,8 +2417,9 @@ fn note_heal_addr(addrs: &mut Vec<[u8; 32]>, overflow: &mut bool, addr: [u8; 32]
 /// Re-derive the complete chunk address set (data leaves +
 /// intermediates + manifest) for a finished upload by re-streaming its
 /// source file through the deterministic splitter — the same traversal
-/// `run_job` does, minus the pushes. Used by the startup heal pass,
-/// which doesn't have the in-memory `heal_addrs` the upload run kept.
+/// `run_job` does, minus the pushes. Used by [`heal_completed_job`] (the
+/// manual "Push again"), which doesn't have the in-memory `heal_addrs`
+/// the upload run kept.
 ///
 /// Returns `Ok(None)` when the file exceeds [`HEAL_MAX_CHUNKS`] (heal is
 /// skipped for very large files, matching the post-upload path). The
@@ -2791,6 +2810,7 @@ mod tests {
                     ControlCommand::VerifyChunksPresent {
                         addresses,
                         probes: _,
+                        include_shallow: _,
                         ack,
                     } => {
                         // The background heal pass fires after every
@@ -2900,6 +2920,7 @@ mod tests {
                     ControlCommand::VerifyChunksPresent {
                         addresses,
                         probes: _,
+                        include_shallow: _,
                         ack,
                     } => {
                         let mut missing: Vec<String> = {

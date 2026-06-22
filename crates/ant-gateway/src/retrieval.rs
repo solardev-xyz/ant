@@ -34,7 +34,7 @@
 //! `ant_retrieval::DEFAULT_MAX_FILE_BYTES` (32 MiB) where `antctl get`
 //! is the only caller.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ant_control::{
     ActiveRequestGuard, ControlAck, ControlCommand, GatewayRequestKind, StreamRange,
@@ -169,6 +169,21 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_mins(10);
 /// retries on a single chunk without inheriting the much larger
 /// multi-chunk envelope.
 const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// Abort a streaming body once it goes this long without delivering any
+/// further bytes — even while the daemon keeps heart-beating `Progress`.
+///
+/// The node emits a `Progress` ack every ~150 ms regardless of whether
+/// data is actually flowing, so the body stream can't detect a stall by
+/// ack silence; it watches `bytes_done` (and delivered `BytesChunk`s)
+/// for forward movement instead. When the joiner gets wedged on a chunk
+/// it can't fetch (a missing/shallow tail leaf), bytes plateau while it
+/// burns its full multi-round retry budget — leaving a browser spinning
+/// on a half-loaded response for minutes. This cap fails the request
+/// fast instead. Sized comfortably above a single chunk's worst-case
+/// fetch (`RETRIEVE_TIMEOUT` 30 s plus a couple of hedged retries) so a
+/// slow-but-progressing transfer is never aborted.
+const BODY_STALL_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Per-request body-size ceiling for `/bytes` and `/bzz`. Bee streams,
 /// so it imposes no cap at all; the joiner used to materialise the
@@ -1679,25 +1694,54 @@ impl Started {
         let activity = activity_guard
             .as_ref()
             .map(ant_control::ActiveRequestGuard::handle);
+        // Stall detection: the joiner reports `bytes_done` on every
+        // `Progress` tick (~150 ms) whether or not data is moving, so we
+        // can't key off ack silence. Track the high-water byte mark and a
+        // sliding deadline that only advances when bytes actually do. If
+        // the deadline lapses the joiner is wedged on an unfetchable
+        // chunk — surface an error and tear the response down rather than
+        // wait out its multi-minute retry budget.
+        let deadline = Instant::now() + BODY_STALL_TIMEOUT;
         let body_stream = stream::unfold(
-            (first_chunk, rx, activity, activity_guard),
-            |(mut first, mut rx, activity, guard)| async move {
+            (first_chunk, rx, activity, activity_guard, 0u64, deadline),
+            |(mut first, mut rx, activity, guard, mut max_bytes, mut deadline)| async move {
                 if let Some(data) = first.take() {
+                    max_bytes = max_bytes.max(data.len() as u64);
+                    deadline = Instant::now() + BODY_STALL_TIMEOUT;
                     return Some((
                         Ok::<Bytes, std::io::Error>(Bytes::from(data)),
-                        (None, rx, activity, guard),
+                        (None, rx, activity, guard, max_bytes, deadline),
                     ));
                 }
                 loop {
-                    match rx.recv().await {
-                        Some(ControlAck::BytesChunk { data }) => {
+                    let now = Instant::now();
+                    let wait = deadline.saturating_duration_since(now);
+                    if wait.is_zero() {
+                        return Some((
+                            Err(std::io::Error::other(
+                                "stream stalled: a chunk could not be retrieved from the network",
+                            )),
+                            (None, rx, activity, guard, max_bytes, deadline),
+                        ));
+                    }
+                    match tokio::time::timeout(wait, rx.recv()).await {
+                        Err(_) => {
                             return Some((
-                                Ok::<Bytes, std::io::Error>(Bytes::from(data)),
-                                (None, rx, activity, guard),
+                                Err(std::io::Error::other(
+                                    "stream stalled: a chunk could not be retrieved from the network",
+                                )),
+                                (None, rx, activity, guard, max_bytes, deadline),
                             ));
                         }
-                        Some(ControlAck::StreamDone) | None => return None,
-                        Some(ControlAck::Progress(p)) => {
+                        Ok(Some(ControlAck::BytesChunk { data })) => {
+                            deadline = Instant::now() + BODY_STALL_TIMEOUT;
+                            return Some((
+                                Ok::<Bytes, std::io::Error>(Bytes::from(data)),
+                                (None, rx, activity, guard, max_bytes, deadline),
+                            ));
+                        }
+                        Ok(Some(ControlAck::StreamDone) | None) => return None,
+                        Ok(Some(ControlAck::Progress(p))) => {
                             if let Some(h) = activity.as_ref() {
                                 h.update(
                                     p.chunks_done,
@@ -1706,14 +1750,20 @@ impl Started {
                                     p.bytes_done,
                                 );
                             }
+                            // Only forward byte movement resets the stall
+                            // clock; a Progress tick on its own does not.
+                            if p.bytes_done > max_bytes {
+                                max_bytes = p.bytes_done;
+                                deadline = Instant::now() + BODY_STALL_TIMEOUT;
+                            }
                         }
-                        Some(ControlAck::Error { message }) => {
+                        Ok(Some(ControlAck::Error { message })) => {
                             return Some((
                                 Err(std::io::Error::other(message)),
-                                (None, rx, activity, guard),
+                                (None, rx, activity, guard, max_bytes, deadline),
                             ));
                         }
-                        Some(other) => {
+                        Ok(Some(other)) => {
                             warn!(
                                 target: "ant_gateway",
                                 ?other,
@@ -1721,7 +1771,7 @@ impl Started {
                             );
                             return Some((
                                 Err(std::io::Error::other("unexpected node ack")),
-                                (None, rx, activity, guard),
+                                (None, rx, activity, guard, max_bytes, deadline),
                             ));
                         }
                     }
@@ -1885,8 +1935,21 @@ async fn consume_stream_prologue(
         });
     }
 
+    // Same stall guard as the body stream: the node heart-beats `Progress`
+    // every ~150 ms, so a plain per-recv `timeout` would never fire while
+    // the joiner spins on a missing *first* leaf. Bound the wait on byte
+    // movement instead, capped by the request envelope.
+    let mut max_bytes = 0u64;
+    let mut stall_deadline = Instant::now() + BODY_STALL_TIMEOUT.min(timeout);
     let first_chunk = loop {
-        match tokio::time::timeout(timeout, rx.recv()).await {
+        let wait = stall_deadline.saturating_duration_since(Instant::now());
+        if wait.is_zero() {
+            return Err(json_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "retrieval stalled: a chunk could not be retrieved from the network",
+            ));
+        }
+        match tokio::time::timeout(wait, rx.recv()).await {
             Ok(Some(ControlAck::BytesChunk { data })) => break Some(data),
             Ok(Some(ControlAck::StreamDone)) => break None,
             Ok(Some(ControlAck::Progress(p))) => {
@@ -1897,6 +1960,10 @@ async fn consume_stream_prologue(
                         p.in_flight,
                         p.bytes_done,
                     );
+                }
+                if p.bytes_done > max_bytes {
+                    max_bytes = p.bytes_done;
+                    stall_deadline = Instant::now() + BODY_STALL_TIMEOUT.min(timeout);
                 }
             }
             Ok(Some(ControlAck::Error { message })) => {
@@ -1913,7 +1980,7 @@ async fn consume_stream_prologue(
             Err(_) => {
                 return Err(json_error(
                     StatusCode::GATEWAY_TIMEOUT,
-                    format!("retrieval timed out after {}s", timeout.as_secs()),
+                    "retrieval stalled: a chunk could not be retrieved from the network",
                 ));
             }
         }

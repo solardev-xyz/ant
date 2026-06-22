@@ -1706,6 +1706,7 @@ fn handle_control_command(
         ControlCommand::VerifyChunksPresent {
             addresses,
             probes,
+            include_shallow,
             ack,
         } => {
             // Read-back presence check for a specific address set (upload
@@ -1738,11 +1739,22 @@ fn handle_control_command(
                     verify_chunks_present(&fetcher, &addresses).await
                 } else {
                     // Heal path: no UI to drive, so no progress sink and no
-                    // cancellation.
-                    verify_chunks_present_deep(
+                    // cancellation. The automatic heals (`include_shallow ==
+                    // false`) re-push only what no route can serve
+                    // (`confirmed_missing`); the explicit "Push again"
+                    // (`include_shallow == true`) also re-pushes
+                    // merely-shallow chunks so it actually repairs a file
+                    // that loads but isn't durably placed (see
+                    // [`DeepPresence`]).
+                    let presence = verify_chunks_present_deep(
                         &control, &peers, &fetcher, &addresses, probes, &net, None, 0, None,
                     )
-                    .await
+                    .await;
+                    if include_shallow {
+                        presence.probe_missing
+                    } else {
+                        presence.confirmed_missing
+                    }
                 };
                 let body = serde_json::json!({
                     "checked": addresses.len(),
@@ -3578,10 +3590,25 @@ fn sample_indices(len: usize, max: usize) -> Vec<usize> {
 /// Each probe is a real, billable retrieval on the serving peer's
 /// accounting, so it goes through the same admission control
 /// (`Accounting::try_reserve`) and pseudosettle heartbeat as the
-/// production fetch path. A peer refused by admission control counts as
-/// a non-hit for this probe — better an under-count here than piling
-/// unpaid debt onto a peer until it blocklists us (which is what turned
-/// whole verify passes into false "missing" verdicts).
+/// production fetch path.
+///
+/// Crucially, a peer we *couldn't even ask* because our accounting with
+/// it is saturated is **not** counted as a "no" — it's left out of both
+/// `hits` and `answered`. Treating an admission-control skip as evidence
+/// the chunk is absent is what made shallow counts *grow* round over
+/// round: re-pushing and probing spend budget, more peers saturate, and
+/// each saturated peer used to drag a chunk into the "missing" set even
+/// though we never reached anyone who could answer. Callers must treat
+/// `answered == 0` as "unknown", never as "missing".
+struct LeafProbe {
+    /// Closest peers that returned the chunk.
+    hits: u32,
+    /// Closest peers we actually reached (admission control let us pay and
+    /// dispatch the fetch), whether they had it or not. Saturated/skipped
+    /// peers are excluded.
+    answered: u32,
+}
+
 async fn probe_leaf_sources(
     control: &Control,
     peers: &[(PeerId, Overlay)],
@@ -3589,7 +3616,7 @@ async fn probe_leaf_sources(
     probes: usize,
     probe_timeout: std::time::Duration,
     net: &VerifyNet,
-) -> u32 {
+) -> LeafProbe {
     use ant_retrieval::accounting::Accounting;
 
     let mut ranked: Vec<(PeerId, Overlay)> = peers.to_vec();
@@ -3614,8 +3641,9 @@ async fn probe_leaf_sources(
                     let price = Accounting::peer_price(&overlay, &addr);
                     match acc.try_reserve(peer, price) {
                         Some(g) => Some(g),
-                        // Saturated peer: skip rather than overdraw.
-                        None => return false,
+                        // Saturated peer: skip and report "unknown"
+                        // (neither answered nor hit), never a miss.
+                        None => return (false, false),
                     }
                 }
                 None => None,
@@ -3636,14 +3664,16 @@ async fn probe_leaf_sources(
                     let _ = tx.try_send(peer);
                 }
             }
-            hit
+            // We reached the peer (reservation succeeded), so this is a
+            // definitive answer regardless of hit/miss.
+            (hit, true)
         }
     });
-    futures::future::join_all(probes_iter)
-        .await
-        .into_iter()
-        .filter(|hit| *hit)
-        .count() as u32
+    let results = futures::future::join_all(probes_iter).await;
+    LeafProbe {
+        hits: results.iter().filter(|(hit, _)| *hit).count() as u32,
+        answered: results.iter().filter(|(_, answered)| *answered).count() as u32,
+    }
 }
 
 /// Read back a specific set of chunk addresses network-only and return
@@ -3675,11 +3705,35 @@ async fn verify_chunks_present(
     .await
 }
 
+/// Outcome of the two-stage deep presence check
+/// ([`verify_chunks_present_deep`]). The two sets answer two different
+/// questions and must not be conflated:
+///
+/// - `probe_missing` is the **third-party reachability** signal: a leaf
+///   here was not returned by any of its *own* closest peers, which is
+///   exactly the vantage a gateway has when it routes closest-first. A
+///   chunk that only landed shallow (held by a peer the uploader is
+///   directly linked to, but not in the chunk's neighbourhood) shows up
+///   here even though the uploader itself can still fetch it.
+/// - `confirmed_missing` is the **genuinely-gone** signal: the subset of
+///   `probe_missing` that *also* failed the privileged routed download,
+///   i.e. no route serves it at all. This is the only safe basis for a
+///   re-push (re-pushing a merely-shallow chunk from probe noise was the
+///   regression that motivated the routed confirmation pass).
+struct DeepPresence {
+    probe_missing: Vec<[u8; 32]>,
+    confirmed_missing: Vec<[u8; 32]>,
+}
+
 /// Deep read-back: for each address, first probe its `probes` closest
 /// known peers (the chunk's neighbourhood vantage), then — for every
 /// address those one-shot probes failed to find — confirm with the real
-/// routed download path before declaring it missing. An address is
-/// reported missing only when **both** passes come up empty.
+/// routed download path. Returns both sets (see [`DeepPresence`]): the
+/// probe misses (gateway-reachability) and the routed-confirmed misses
+/// (genuinely gone). The heal re-push keys on `confirmed_missing`; the
+/// user-facing "fully available" verdict keys on `probe_missing`, so a
+/// shallow placement the uploader can still privilege-fetch no longer
+/// reads as durably replicated.
 ///
 /// Why two stages: the closest-peer probes are single-attempt fetches
 /// with no hedging, no retry and no error backfill, so on a light node
@@ -3722,7 +3776,7 @@ async fn verify_chunks_present_deep(
     // (`verify_propagation_deep`) re-checks the flag afterwards and reports
     // cancellation instead of using this (now-partial) result.
     cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
-) -> Vec<[u8; 32]> {
+) -> DeepPresence {
     use futures::stream::StreamExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3730,42 +3784,57 @@ async fn verify_chunks_present_deep(
     const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
     let checked = Arc::new(AtomicUsize::new(0));
-    let flagged: Vec<[u8; 32]> = futures::stream::iter(addresses.iter().copied().map(|addr| {
-        let checked = checked.clone();
-        let progress = progress.clone();
-        let cancel = cancel.clone();
-        async move {
-            if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
-                // Skip remaining work; not flagged so the partial set stays
-                // clean (discarded by the caller on cancel anyway).
-                return (addr, true);
+    let probe_missing: Vec<[u8; 32]> =
+        futures::stream::iter(addresses.iter().copied().map(|addr| {
+            let checked = checked.clone();
+            let progress = progress.clone();
+            let cancel = cancel.clone();
+            async move {
+                if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    // Skip remaining work; not flagged so the partial set stays
+                    // clean (discarded by the caller on cancel anyway).
+                    return (addr, true);
+                }
+                let probe =
+                    probe_leaf_sources(control, peers, addr, probes, PROBE_TIMEOUT, net).await;
+                if let Some(tx) = &progress {
+                    let done = checked.fetch_add(1, Ordering::Relaxed) + 1;
+                    let _ = tx.send(
+                        serde_json::json!({ "phase": "checking", "checked": done, "total": total })
+                            .to_string(),
+                    );
+                }
+                // Flag as a probe miss only when we actually reached at
+                // least one of its closest peers and none had it. If every
+                // candidate was admission-control-saturated (`answered ==
+                // 0`) we learned nothing — treat it as present (unknown) so
+                // our own spent budget can't manufacture shallow chunks.
+                let present = probe.hits > 0 || probe.answered == 0;
+                (addr, present)
             }
-            let hits = probe_leaf_sources(control, peers, addr, probes, PROBE_TIMEOUT, net).await;
-            if let Some(tx) = &progress {
-                let done = checked.fetch_add(1, Ordering::Relaxed) + 1;
-                let _ = tx.send(
-                    serde_json::json!({ "phase": "checking", "checked": done, "total": total })
-                        .to_string(),
-                );
-            }
-            (addr, hits > 0)
-        }
-    }))
-    .buffer_unordered(CONCURRENCY)
-    .filter_map(|(addr, present)| async move { (!present).then_some(addr) })
-    .collect()
-    .await;
+        }))
+        .buffer_unordered(CONCURRENCY)
+        .filter_map(|(addr, present)| async move { (!present).then_some(addr) })
+        .collect()
+        .await;
 
-    if flagged.is_empty() {
-        return flagged;
+    if probe_missing.is_empty() {
+        return DeepPresence {
+            probe_missing,
+            confirmed_missing: Vec::new(),
+        };
     }
     debug!(
         target: "ant_p2p",
-        flagged = flagged.len(),
+        flagged = probe_missing.len(),
         checked = addresses.len(),
-        "deep probes missed some chunks; confirming via routed fetch before declaring missing",
+        "deep probes missed some chunks; confirming via routed fetch before declaring genuinely missing",
     );
-    verify_chunks_present(fetcher, &flagged).await
+    let confirmed_missing = verify_chunks_present(fetcher, &probe_missing).await;
+    DeepPresence {
+        probe_missing,
+        confirmed_missing,
+    }
 }
 
 /// Settlement + admission plumbing for every network-only verification
@@ -3900,12 +3969,14 @@ async fn verify_propagation_deep(
         serde_json::json!({
             "reference": ref_hex,
             "retrievable": false,
+            "fully_replicated": false,
             "total_chunks": 0,
             "leaf_chunks": 0,
             "intermediate_chunks": 0,
             "checked_chunks": 0,
             "retrievable_chunks": 0,
             "sampled_leaves": 0,
+            "shallow_leaves": 0,
             "sources": 0,
             "error": msg,
         })
@@ -3999,7 +4070,7 @@ async fn verify_propagation_deep(
     }
     let deep_probes = probes.max(VERIFY_DEEP_PROBES);
     emit("checking", Some(0), Some(sampled_leaves));
-    let missing = verify_chunks_present_deep(
+    let presence = verify_chunks_present_deep(
         &control,
         &peers,
         &fetcher,
@@ -4011,11 +4082,21 @@ async fn verify_propagation_deep(
         cancel.clone(),
     )
     .await;
-    // Cancelled mid-leaf-check: the missing set is partial and meaningless,
+    // Cancelled mid-leaf-check: the result is partial and meaningless,
     // so report cancellation rather than a verdict.
     if cancelled() {
         return cancelled_body();
     }
+    // Leaves no neighbourhood probe returned — the gateway-reachability
+    // signal. A non-empty set means at least one leaf only landed shallow
+    // (or is gone), so a third party routing closest-first can't get it.
+    let neighbourhood_missing = presence.probe_missing.len();
+    // Leaves genuinely unreachable from any route (the hard "not
+    // retrievable" basis); a subset of `neighbourhood_missing`.
+    let missing = presence.confirmed_missing;
+    // Leaves that exist but only via the uploader's privileged routed
+    // link, not their own closest peers — present yet not durably placed.
+    let shallow_leaves = neighbourhood_missing.saturating_sub(missing.len());
     let leaves_retrievable = sampled_leaves - missing.len();
 
     // Informational replication floor: how many of a chunk's own closest
@@ -4052,7 +4133,7 @@ async fn verify_propagation_deep(
                 {
                     return u32::MAX;
                 }
-                let s = probe_leaf_sources(
+                let probe = probe_leaf_sources(
                     control_ref,
                     peers_ref,
                     addr,
@@ -4068,7 +4149,15 @@ async fn verify_propagation_deep(
                             .to_string(),
                     );
                 }
-                s
+                // A leaf whose closest peers were all admission-control
+                // saturated couldn't be measured — return MAX so it's
+                // excluded from the min rather than collapsing the floor to
+                // zero on our own spent budget.
+                if probe.answered == 0 {
+                    u32::MAX
+                } else {
+                    probe.hits
+                }
             }
         }))
         .buffer_unordered(SOURCE_PROBE_CONCURRENCY)
@@ -4089,18 +4178,30 @@ async fn verify_propagation_deep(
     let checked_chunks = intermediate_chunks + sampled_leaves;
     let retrievable_chunks = intermediate_chunks + leaves_retrievable;
     // Intermediates are retrievable by construction (enumeration fetched
-    // them); the verdict turns on whether every checked leaf came back.
+    // them). `retrievable` means "exists somewhere" — every checked leaf
+    // came back on at least one route, possibly the uploader's privileged
+    // link.
     let retrievable = total_chunks > 0 && missing.is_empty();
+    // `fully_replicated` is the stronger, third-party verdict the UI shows
+    // as the confident "Verified": every checked leaf is reachable from
+    // its *own* closest peers (the gateway vantage, not the uploader's
+    // privileged route) AND the sampled replication floor is at least one.
+    // Either a shallow placement (`neighbourhood_missing > 0`) or a
+    // zero-source sample is enough to withhold it — those are exactly the
+    // files that verify "ok" here yet won't load from a public gateway.
+    let fully_replicated = retrievable && neighbourhood_missing == 0 && min_sources >= 1;
 
     serde_json::json!({
         "reference": ref_hex,
         "retrievable": retrievable,
+        "fully_replicated": fully_replicated,
         "total_chunks": total_chunks,
         "leaf_chunks": leaf_chunks,
         "intermediate_chunks": intermediate_chunks,
         "checked_chunks": checked_chunks,
         "retrievable_chunks": retrievable_chunks,
         "sampled_leaves": sampled_leaves,
+        "shallow_leaves": shallow_leaves,
         "sources": min_sources,
     })
 }

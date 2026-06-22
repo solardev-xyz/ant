@@ -364,6 +364,18 @@ pub enum ControlCommand {
     VerifyChunksPresent {
         addresses: Vec<[u8; 32]>,
         probes: usize,
+        /// Only meaningful when `probes > 0`. When `false` (the default,
+        /// used by the automatic post-upload heal), a chunk
+        /// counts missing only if **both** the neighbourhood probe and the
+        /// routed confirmation fail — i.e. no route can serve it. When
+        /// `true`, a chunk counts missing as soon as the neighbourhood
+        /// probe fails, *even if* the privileged routed path still serves
+        /// it: that flags merely-shallow placements for re-push. Reserved
+        /// for the explicit, user-initiated "Push again" (re-pushing a few
+        /// healthy chunks on probe noise is acceptable for a manual,
+        /// infrequent action, but would be a re-push storm on every
+        /// automatic heal — which is why it stays off by default).
+        include_shallow: bool,
         ack: oneshot::Sender<ControlAck>,
     },
     /// Resolve a sequence feed `(owner, topic)` to its latest update.

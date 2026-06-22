@@ -166,7 +166,7 @@ pub struct UploadJobInfo {
     /// durability-waiting client distinguish "heal still in progress"
     /// from "heal done — verified, or done its best on a degraded
     /// network". Defaults to `false` for jobs persisted by older
-    /// daemons; the startup heal pass refreshes it.
+    /// daemons; a manual "Push again" refreshes it.
     #[serde(default)]
     pub heal_finished: bool,
 }

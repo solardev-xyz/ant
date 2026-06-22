@@ -148,7 +148,19 @@ struct SettlementInfo: Codable, Equatable {
 /// root-only reachability check.
 struct PropagationInfo: Codable, Equatable {
     let reference: String
+    /// The primary verdict: every checked chunk came back over the
+    /// network's cache-free routed path — the *same* closest-first,
+    /// forwarder-routed path a public gateway uses. So this is real
+    /// "anyone can load it" retrievability, not a local-store shortcut.
     let retrievable: Bool
+    /// The stricter neighbourhood-floor signal: every checked leaf is
+    /// reachable from its *own* closest peers AND the sampled replication
+    /// floor is at least one. Kept as a secondary detail only — a
+    /// constrained mobile node frequently can't probe a chunk's closest
+    /// peers even for a file well-connected nodes fetch instantly, so this
+    /// is unreliable as the "is it safe?" verdict and must not gate it.
+    /// Optional so a verdict from an older daemon still decodes.
+    let fullyReplicated: Bool?
     /// Total chunks in the file's data tree (leaves + interior nodes).
     let totalChunks: UInt32
     let leafChunks: UInt32
@@ -157,6 +169,10 @@ struct PropagationInfo: Codable, Equatable {
     let checkedChunks: UInt32
     let retrievableChunks: UInt32
     let sampledLeaves: UInt32
+    /// Leaves that exist but only landed shallow — reachable via the
+    /// uploader's route, not from their own closest peers. Optional for
+    /// backward compatibility with older daemon payloads.
+    let shallowLeaves: UInt32?
     /// Minimum distinct-route count across sampled leaves — a
     /// replication floor.
     let sources: UInt32
@@ -167,27 +183,40 @@ struct PropagationInfo: Codable, Equatable {
     enum CodingKeys: String, CodingKey {
         case reference
         case retrievable
+        case fullyReplicated = "fully_replicated"
         case totalChunks = "total_chunks"
         case leafChunks = "leaf_chunks"
         case intermediateChunks = "intermediate_chunks"
         case checkedChunks = "checked_chunks"
         case retrievableChunks = "retrievable_chunks"
         case sampledLeaves = "sampled_leaves"
+        case shallowLeaves = "shallow_leaves"
         case sources
         case error
     }
 
-    /// Short, friendly verdict for a file row badge. Deliberately free
-    /// of chunk counts: the check probes a bounded sample of a large
-    /// file's chunks, so figures like "533/2537" read as if most of the
-    /// file went unchecked (and a raw missing count overstates a
-    /// transient probe shortfall). The binary verdict is the honest
-    /// signal.
+    /// The user-facing verdict: is every part of the file actually
+    /// retrievable from the network (by anyone, via the same forwarder
+    /// routing a public gateway uses)? This — not the local neighbourhood
+    /// replication floor — is what "safe" means. Gating on the floor cried
+    /// wolf on files that are genuinely fine: a phone often can't reach a
+    /// chunk's own closest peers even when the gateway fetches it in 0.6s.
+    var isStoredSafely: Bool { retrievable }
+
+    /// Stricter neighbourhood verdict, retained only as an informational
+    /// detail. Falls back to `retrievable` for older daemon payloads.
+    var isFullyReplicated: Bool { fullyReplicated ?? retrievable }
+
+    /// Count of leaves that exist but only landed shallow.
+    var shallowCount: UInt32 { shallowLeaves ?? 0 }
+
+    /// Short, plain-language verdict for a file row badge. Two clear
+    /// states only — the file is either safely stored or it isn't — so the
+    /// user never has to interpret jargon like "at risk". Deliberately
+    /// free of chunk counts (the check samples a bounded subset on large
+    /// files, so a raw count reads as if most of the file went unchecked).
     var label: String {
-        if !retrievable {
-            return totalChunks == 0 ? "Not found on network" : "Not fully available yet"
-        }
-        return "Verified"
+        isStoredSafely ? "Stored safely" : "Not fully stored"
     }
 }
 

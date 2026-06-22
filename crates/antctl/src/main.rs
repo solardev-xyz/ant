@@ -2734,8 +2734,13 @@ fn wait_until_synced(socket: &Path, job_id: &str, json: bool) -> Result<()> {
     let show_progress = !json && std::io::IsTerminal::is_terminal(&std::io::stderr());
     let mut spun = false;
     loop {
-        let resp = request_sync(socket, &Request::UploadStatus { job_id: job_id.to_string() })
-            .with_context(|| format!("talk to antd at {}", socket.display()))?;
+        let resp = request_sync(
+            socket,
+            &Request::UploadStatus {
+                job_id: job_id.to_string(),
+            },
+        )
+        .with_context(|| format!("talk to antd at {}", socket.display()))?;
         let view = match resp {
             Response::UploadJob(view) => view,
             Response::Error { message } => bail!("antd: {message}"),

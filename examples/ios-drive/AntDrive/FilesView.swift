@@ -337,7 +337,7 @@ private struct FileRow: View {
     /// neutral grey otherwise (uploading / paused).
     private var messageColor: Color {
         if job.isFailed { return .orange }
-        if job.isDone, let p = node.propagation[job.id], !p.retrievable { return .orange }
+        if job.isDone, let p = node.propagation[job.id], !p.isStoredSafely { return .orange }
         return .white.opacity(0.6)
     }
 
@@ -349,7 +349,7 @@ private struct FileRow: View {
     /// silent, as does the transient in-progress probe.
     private var statusMessage: String? {
         if !job.statusLabel.isEmpty { return job.statusLabel }
-        if job.isDone, let p = node.propagation[job.id], !p.retrievable { return p.label }
+        if job.isDone, let p = node.propagation[job.id], !p.isStoredSafely { return p.label }
         return nil
     }
 
@@ -656,13 +656,13 @@ struct FileDetailView: View {
                         }
                     }
                 } else if let p = node.propagation[job.id] {
-                    if p.retrievable {
-                        Label("Verified on the network", systemImage: "checkmark.seal.fill")
+                    if p.isStoredSafely {
+                        Label("Stored safely", systemImage: "checkmark.seal.fill")
                             .font(.headline).foregroundStyle(.green)
-                        Text("Every chunk of this file was fetched back from other nodes — it's fully available.")
+                        Text("Every part of this file is on the network and can be opened by anyone.")
                             .font(.subheadline).foregroundStyle(.white.opacity(0.75))
                     } else {
-                        Label(p.label, systemImage: "exclamationmark.triangle.fill")
+                        Label("Not fully stored", systemImage: "exclamationmark.triangle.fill")
                             .font(.headline).foregroundStyle(.orange)
                         Text(verificationExplanation(p))
                             .font(.subheadline).foregroundStyle(.white.opacity(0.75))
@@ -697,13 +697,52 @@ struct FileDetailView: View {
 
     private func verifyMetrics(_ p: PropagationInfo) -> some View {
         VStack(spacing: 6) {
-            detailRow("Replication", "\(p.sources) route\(p.sources == 1 ? "" : "s")")
+            replicationRow(p)
             detailRow("Chunks checked", "\(p.checkedChunks) / \(p.totalChunks)")
             if p.leafChunks > 0 {
                 detailRow("Data leaves sampled", "\(p.sampledLeaves) / \(p.leafChunks)")
             }
+            // Only surface an unreachable count when the file is actually
+            // broken — that's the number "Push again" acts on. Shallow-but-
+            // reachable parts aren't shown: they don't affect whether the
+            // file loads, and listing them under "Stored safely" reads as a
+            // problem when there isn't one.
+            if !p.retrievable {
+                let unreachable = p.checkedChunks >= p.retrievableChunks
+                    ? p.checkedChunks - p.retrievableChunks : 0
+                if unreachable > 0 {
+                    detailRow("Unreachable parts", "\(unreachable)")
+                }
+            }
         }
         .padding(.top, 2)
+    }
+
+    /// Replication floor — how many independent peers held the
+    /// least-replicated sampled chunk. Secondary, informational detail
+    /// only: the "Stored safely" verdict keys off actual retrievability, so
+    /// this never raises an alarm. A constrained node often can't measure a
+    /// chunk's own closest-peer copies even when the file is fully
+    /// retrievable, so we go green only when we positively saw 2+ routes
+    /// and otherwise show a neutral, factual line.
+    private func replicationRow(_ p: PropagationInfo) -> some View {
+        let color: Color = p.sources >= 2 ? .green : .white.opacity(0.85)
+        let icon: String = p.sources >= 2 ? "checkmark.circle.fill" : "arrow.triangle.branch"
+        let value: String
+        if p.sources >= 2 {
+            value = "\(p.sources) independent routes"
+        } else if p.sources == 1 {
+            value = "1 route"
+        } else {
+            value = p.retrievable ? "Reachable via forwarding" : "Not reachable"
+        }
+        return HStack(alignment: .firstTextBaseline) {
+            Text("Replication").font(.subheadline).foregroundStyle(.white.opacity(0.6))
+            Spacer(minLength: 12)
+            Label(value, systemImage: icon)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(color)
+        }
     }
 
     private func detailsCard(_ job: UploadJob) -> some View {
@@ -766,7 +805,7 @@ struct FileDetailView: View {
                     prominentButton("Push again", icon: "arrow.up.circle.fill", tint: .orange) {
                         repush(job)
                     }
-                    Text("Re-pushes only the missing chunks to the network, on this same file.")
+                    Text("Re-pushes the parts that didn't store properly, on this same file.")
                         .font(.caption).foregroundStyle(.white.opacity(0.6))
                         .multilineTextAlignment(.center)
                 } else {
@@ -856,11 +895,14 @@ struct FileDetailView: View {
 
     // MARK: logic
 
-    /// A completed file with a negative network verdict — the case the
-    /// "Push again" recovery action exists for.
+    /// A completed file with parts that aren't retrievable from the
+    /// network — the genuine "broken upload" case "Push again" exists to
+    /// repair. Shallow-but-reachable files are NOT offered a re-push:
+    /// they're fine for everyone, and re-pushing can't satisfy a verdict
+    /// that's limited by this device's own reach, not the file.
     private func needsRepush(_ job: UploadJob) -> Bool {
         guard job.isDone, let p = node.propagation[job.id] else { return false }
-        return !p.retrievable
+        return !p.isStoredSafely
     }
 
     private func statusDisplay(_ job: UploadJob) -> (text: String, color: Color, icon: String) {
@@ -872,20 +914,23 @@ struct FileDetailView: View {
         if job.isDone {
             if node.verifying.contains(job.id) { return ("Checking…", .blue, "magnifyingglass") }
             if let p = node.propagation[job.id] {
-                return p.retrievable
-                    ? ("Verified", .green, "checkmark.seal.fill")
-                    : ("Not verified", .orange, "exclamationmark.triangle.fill")
+                return p.isStoredSafely
+                    ? ("Stored safely", .green, "checkmark.seal.fill")
+                    : ("Not fully stored", .orange, "exclamationmark.triangle.fill")
             }
             return ("Uploaded", .white.opacity(0.8), "checkmark.circle")
         }
         return (job.status.capitalized, .gray, "minus.circle")
     }
 
+    /// Only shown for the genuinely-broken state (`!isStoredSafely`): some
+    /// parts aren't retrievable from the network at all, so Push again has
+    /// real work to do.
     private func verificationExplanation(_ p: PropagationInfo) -> String {
         if p.totalChunks == 0 {
-            return "We couldn't find this file's data on the network. It may not have finished propagating, or the upload didn't reach other nodes."
+            return "We couldn't find this file on the network. Push it again to store it."
         }
-        return "Some of this file's chunks couldn't be fetched back from the network yet. It may still be propagating, or it may need pushing again."
+        return "Some parts of this file aren't on the network yet, so others may not be able to open it. Push it again to store the missing parts."
     }
 
     /// Re-push only the missing chunks of this completed file, on the same
