@@ -47,6 +47,10 @@ async fn readiness_200_when_peer_handshaked() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
+    // Bee marshals a JSON status body; clients (bee-js, our Swift
+    // `BeeReadiness`) index `status`, so a bodyless 200 reads as not-ready.
+    let json: Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert_eq!(json["status"], "ready");
 }
 
 /// `/readiness` answers 503 when no peer has handshaked yet.
@@ -63,6 +67,8 @@ async fn readiness_503_when_no_peers() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let json: Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert_eq!(json["status"], "unready");
 }
 
 #[tokio::test]
