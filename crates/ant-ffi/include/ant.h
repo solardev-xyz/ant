@@ -18,6 +18,7 @@
 #ifndef ANT_FFI_H
 #define ANT_FFI_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
@@ -471,6 +472,34 @@ void ant_free_buffer(unsigned char *ptr, size_t len);
  * a no-op.
  */
 void ant_free_string(char *ptr);
+
+/*
+ * Start the in-process bee-shaped HTTP gateway on `api_addr` (pass NULL
+ * or "" for the default 127.0.0.1:1633), serving the node this handle
+ * owns. Lets an iOS app expose the same HTTP API `antd` serves
+ * (/bzz, /bytes, /chunks, /feeds, /soc, /tags, status, plus bee-stubbed
+ * /wallet, /stamps, /chequebook) without spawning a separate daemon
+ * process.
+ *
+ * `light_mode` drives GET /node.beeMode: nonzero -> "light" (publish /
+ * feed / SOC writes allowed), zero -> "ultra-light" (read-only).
+ *
+ * Returns true on success (or if a gateway is already running on this
+ * handle). On failure returns false and writes an allocated message to
+ * *out_err (free with ant_free_string). Idempotent: a second call while
+ * one is live is a no-op success. Run off the main thread.
+ */
+bool ant_start_gateway(const AntHandle *handle,
+                       const char *api_addr,
+                       bool light_mode,
+                       char **out_err);
+
+/*
+ * Stop the in-process HTTP gateway started by ant_start_gateway.
+ * Returns true if a gateway was running and was stopped, false if none
+ * was running (or `handle` is NULL). Safe to call repeatedly.
+ */
+bool ant_stop_gateway(const AntHandle *handle);
 
 /*
  * Shut the embedded node down and free the handle. After this

@@ -22,10 +22,17 @@
 //! retrieval pipeline; the mpsc command channel serialises dispatch.
 
 mod drive;
+mod gateway;
 #[cfg(feature = "jni")]
 mod jni;
 mod manifest;
 mod stream;
+
+// The gateway FFI lives in a private submodule; re-export its C-ABI
+// entry points at the crate root so workspace Rust callers (and tests)
+// can reference them by path, the same way `ant_init` is reachable.
+// The `#[no_mangle]` symbols are unaffected — this only adds Rust paths.
+pub use gateway::{ant_start_gateway, ant_stop_gateway};
 
 use ant_control::{
     ControlAck, ControlCommand, GetProgress, IdentityInfo, PeerInfo, RetrievalInfo, StatusSnapshot,
@@ -94,6 +101,11 @@ const GNOSIS_CHAIN_ID: u64 = 100;
 /// this through the `UniFFI` surface so hosts can tune it per app.
 const MAX_DOWNLOAD_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Agent string this build advertises — through the node status channel
+/// (`ant_agent_string`) and the in-process gateway's `/health.version`.
+/// Shared by `init_inner` and [`gateway`] so the two can't drift.
+const ANT_FFI_AGENT: &str = concat!("ant-ffi/", env!("CARGO_PKG_VERSION"));
+
 /// Opaque handle returned to the Swift side. Lives for as long as the
 /// embedded node loop is running.
 pub struct AntHandle {
@@ -145,6 +157,13 @@ pub struct AntHandle {
     /// so it's dead weight in the download-only (`chain`-off) slice.
     #[cfg_attr(not(feature = "chain"), allow(dead_code))]
     data_dir: PathBuf,
+    /// Background task running the in-process bee-shaped HTTP gateway
+    /// (`ant-gateway`) when `ant_start_gateway` has been called. `None`
+    /// until started; aborted + cleared by `ant_stop_gateway` (and
+    /// implicitly by `ant_shutdown` when the runtime is dropped). Lets
+    /// the iOS app serve `http://127.0.0.1:<port>` in-process instead of
+    /// spawning the `antd` daemon. See [`gateway`].
+    gateway_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// Live snapshot of the in-flight download, maintained by the
@@ -285,7 +304,7 @@ fn init_inner(data_dir: &Path) -> Result<AntHandle, FfiError> {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let initial_snapshot = StatusSnapshot {
-        agent: format!("ant-ffi/{}", env!("CARGO_PKG_VERSION")),
+        agent: ANT_FFI_AGENT.to_string(),
         protocol_version: ant_control::PROTOCOL_VERSION,
         network_id: 1,
         pid: std::process::id(),
@@ -469,6 +488,7 @@ fn init_inner(data_dir: &Path) -> Result<AntHandle, FfiError> {
         signing_secret,
         eth,
         data_dir: data_dir.to_path_buf(),
+        gateway_task: Mutex::new(None),
     })
 }
 
