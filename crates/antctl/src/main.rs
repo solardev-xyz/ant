@@ -287,6 +287,18 @@ enum UploadCommand {
         /// and prints live progress.
         #[arg(long)]
         detach: bool,
+        /// Don't return until the upload is *durable* — i.e. the
+        /// daemon's post-upload self-heal has confirmed every chunk
+        /// is deep-reachable from its true neighbourhood (or run its
+        /// full course on a degraded network). Plain `completed`
+        /// only means every chunk was pushed once; some may have
+        /// landed on a shallow storer and not yet propagated, so a
+        /// fresh node "on the far side of Swarm" can't fetch them
+        /// for a few seconds-to-minutes. Use this for upload flows
+        /// (e.g. a photo backup) that must be retrievable everywhere
+        /// the instant the call returns. Ignored with `--detach`.
+        #[arg(long)]
+        await_sync: bool,
     },
     /// List every known upload job (running, paused, completed,
     /// cancelled, failed). Output is sorted by creation time with
@@ -302,6 +314,12 @@ enum UploadCommand {
     Follow {
         /// Job id, or any unique prefix.
         job_id: String,
+        /// After the job reaches `completed`, keep waiting until the
+        /// post-upload self-heal confirms deep reachability
+        /// (`heal_verified`) or finishes its rounds. See
+        /// `upload start --await-sync`.
+        #[arg(long)]
+        await_sync: bool,
     },
     /// Soft-stop a running job. The driver drains in-flight pushes,
     /// checkpoints state, and parks. Use `resume` to bring it back.
@@ -2613,6 +2631,7 @@ fn run_upload(socket: &Path, command: UploadCommand, json: bool) -> Result<()> {
             raw,
             no_preflight,
             detach,
+            await_sync,
         } => {
             let abs_path = path
                 .canonicalize()
@@ -2649,6 +2668,9 @@ fn run_upload(socket: &Path, command: UploadCommand, json: bool) -> Result<()> {
             }
             if !detach {
                 follow_upload(socket, &job_id, json)?;
+                if await_sync {
+                    wait_until_synced(socket, &job_id, json)?;
+                }
             }
         }
         UploadCommand::List => {
@@ -2691,11 +2713,76 @@ fn run_upload(socket: &Path, command: UploadCommand, json: bool) -> Result<()> {
                 .with_context(|| format!("talk to antd at {}", socket.display()))?;
             print_upload_response(resp, json)?;
         }
-        UploadCommand::Follow { job_id } => {
+        UploadCommand::Follow { job_id, await_sync } => {
             follow_upload(socket, &job_id, json)?;
+            if await_sync {
+                wait_until_synced(socket, &job_id, json)?;
+            }
         }
     }
     Ok(())
+}
+
+/// Poll the daemon's job status until the post-upload self-heal has
+/// finished (`heal_finished`), then report whether deep reachability was
+/// confirmed (`heal_verified`). Used by `--await-sync` so a caller learns
+/// when an upload is durable — every chunk retrievable from its true
+/// neighbourhood — rather than merely pushed once. The heal runs in the
+/// daemon regardless; this just waits for and surfaces its verdict.
+fn wait_until_synced(socket: &Path, job_id: &str, json: bool) -> Result<()> {
+    const POLL: std::time::Duration = std::time::Duration::from_secs(2);
+    let show_progress = !json && std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let mut spun = false;
+    loop {
+        let resp = request_sync(
+            socket,
+            &Request::UploadStatus {
+                job_id: job_id.to_string(),
+            },
+        )
+        .with_context(|| format!("talk to antd at {}", socket.display()))?;
+        let view = match resp {
+            Response::UploadJob(view) => view,
+            Response::Error { message } => bail!("antd: {message}"),
+            other => bail!("unexpected response: {other:?}"),
+        };
+        // Only `completed` jobs get a heal pass; a failed/cancelled job
+        // will never finish heal, so don't wait on it.
+        if view.status != "completed" || view.heal_finished {
+            if show_progress && spun {
+                eprintln!();
+            }
+            let verdict = if view.heal_verified {
+                "durable — every chunk deep-reachable from its neighbourhood"
+            } else if view.status == "completed" {
+                "completed but NOT deep-verified (degraded network); the daemon will retry heal on next start"
+            } else {
+                "job is not in a completed state"
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "job_id": view.job_id,
+                        "status": view.status,
+                        "heal_verified": view.heal_verified,
+                        "heal_finished": view.heal_finished,
+                        "reference": view.reference,
+                        "durable": view.heal_verified,
+                    })
+                );
+            } else {
+                eprintln!("upload {}: {verdict}", view.job_id);
+            }
+            return Ok(());
+        }
+        if show_progress {
+            eprint!("\rwaiting for deep-reachability heal…");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            spun = true;
+        }
+        std::thread::sleep(POLL);
+    }
 }
 
 fn print_upload_response(resp: Response, json: bool) -> Result<()> {
@@ -2894,6 +2981,16 @@ fn format_upload_view_block(view: &UploadJobView) -> String {
         writeln!(out, "reference: {r}").unwrap();
         let scheme = if view.raw { "bytes" } else { "bzz" };
         writeln!(out, "url:       {scheme}://{}", r.trim_start_matches("0x")).unwrap();
+    }
+    if view.status == "completed" {
+        let durability = if view.heal_verified {
+            "verified (every chunk deep-reachable from its neighbourhood)"
+        } else if view.heal_finished {
+            "completed but not deep-verified (degraded network; daemon retries on next start)"
+        } else {
+            "healing… (deep-reachability check in progress)"
+        };
+        writeln!(out, "durable:   {durability}").unwrap();
     }
     if let Some(e) = &view.last_error {
         writeln!(out, "error:     {e}").unwrap();

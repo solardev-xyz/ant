@@ -34,31 +34,31 @@ final class AntNode: ObservableObject {
     @Published private(set) var plan: StoragePlan?
     @Published private(set) var account: AccountInfo?
     @Published private(set) var settlement: SettlementInfo?
-    /// Read-back propagation results, keyed by upload job id. Populated
-    /// on demand by `verifyPropagation(_:)`; `nil` for a job means "not
-    /// checked yet".
+    /// Remaining lifetime of the connected plan. Fetched on demand
+    /// (`refreshValidity`) since it needs a chain RPC; `nil` until then.
+    @Published private(set) var validity: StorageValidity?
+    /// Read-back propagation results, keyed by upload job id. Populated only
+    /// by an explicit check from the file detail page (`reverify`); `nil`
+    /// for a job means "not checked yet" (there is no automatic check).
     @Published private(set) var propagation: [String: PropagationInfo] = [:]
     /// Job ids with an in-flight propagation check, so the UI can show a
     /// spinner and avoid firing duplicate probes.
     @Published private(set) var verifying: Set<String> = []
+    /// Live progress for an in-flight verification, keyed by job id. Set
+    /// while `verifying` contains the id and cleared when it finishes;
+    /// drives the determinate progress bar on the file detail page.
+    @Published private(set) var verifyProgress: [String: VerifyProgress] = [:]
+    /// Job ids with an in-flight "Push again" re-push/heal, so the detail
+    /// page can show a re-pushing indicator until the follow-up re-verify.
+    @Published private(set) var repushing: Set<String> = []
+    /// Live progress for an in-flight re-push, keyed by job id (phases
+    /// "checking" / "repushing"); drives the determinate bar while a file
+    /// is being pushed again.
+    @Published private(set) var repushProgress: [String: VerifyProgress] = [:]
 
     private var handle: OpaquePointer?
     private var peerPollTask: Task<Void, Never>?
     private var refreshTask: Task<Void, Never>?
-
-    /// Disk-backed propagation verdicts, keyed by the Swarm reference
-    /// (content-addressed, so stable across restarts). Lets a verified
-    /// file stay verified across launches instead of re-probing the
-    /// network every cold start. Only *positive* verdicts are stored, so a
-    /// not-yet-propagated file is re-checked next launch rather than being
-    /// pinned to a stale "missing" result.
-    private var verdictCache: [String: CachedVerdict] = [:]
-    private static let verdictTTL: TimeInterval = 24 * 60 * 60
-
-    private struct CachedVerdict: Codable {
-        let info: PropagationInfo
-        let checkedAtUnix: UInt64
-    }
 
     // MARK: - Lifecycle
 
@@ -83,7 +83,6 @@ final class AntNode: ObservableObject {
         }
         handle = raw
         status = .ready
-        loadVerdictCache()
         startPollingPeers()
         await refreshAll()
         startAutoRefresh()
@@ -97,27 +96,6 @@ final class AntNode: ObservableObject {
         peerCount = 0
         await Task.detached(priority: .userInitiated) { ant_shutdown(h) }.value
         status = .idle
-    }
-
-    // MARK: - Downloads (import by link)
-
-    /// Fetch a shared link's bytes. Used by "Add from link" to import a
-    /// file someone shared into the user's library view.
-    func download(reference: String) async throws -> Data {
-        guard let h = handle else { throw AntError.notReady }
-        return try await Task.detached(priority: .userInitiated) {
-            var len = 0
-            var errPtr: UnsafeMutablePointer<CChar>? = nil
-            let body = reference.withCString { ant_download(h, $0, &len, &errPtr) }
-            if let body {
-                let data = Data(bytes: body, count: len)
-                ant_free_buffer(body, len)
-                return data
-            }
-            let msg = errPtr.flatMap { String(cString: $0) } ?? "download failed"
-            if let errPtr { ant_free_string(errPtr) }
-            throw AntError.op(msg)
-        }.value
     }
 
     // MARK: - Uploads
@@ -149,6 +127,57 @@ final class AntNode: ObservableObject {
     func pauseUpload(_ jobId: String) async { await jobControl(jobId, ant_upload_pause) }
     func resumeUpload(_ jobId: String) async { await jobControl(jobId, ant_upload_resume) }
     func cancelUpload(_ jobId: String) async { await jobControl(jobId, ant_upload_cancel) }
+
+    /// "Push again" for a completed file whose chunks didn't fully
+    /// propagate. Runs a self-heal on the *same* job — re-pushing only the
+    /// missing chunks (from the local chunk store, falling back to the
+    /// source) — and streams progress into `repushProgress` so the detail
+    /// page shows a determinate bar. No new upload row is created. When the
+    /// heal settles, re-verifies so the row reflects the new verdict.
+    func repushUpload(_ job: UploadJob) async {
+        guard let h = handle, job.isDone else { return }
+        if repushing.contains(job.id) { return }
+        repushing.insert(job.id)
+        // Drop the stale "not verified" verdict so the card shows the
+        // re-pushing state, not the old failure, while the heal runs.
+        propagation[job.id] = nil
+        repushProgress[job.id] = VerifyProgress(phase: "checking", checked: nil, total: nil)
+        defer { repushing.remove(job.id); repushProgress[job.id] = nil }
+
+        let jobId = job.id
+        _ = await withCheckedContinuation { (cont: CheckedContinuation<String?, Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let box = VerifyProgressBox { line in
+                    guard let p = VerifyProgress(jsonLine: line) else { return }
+                    Task { @MainActor [weak self] in self?.repushProgress[jobId] = p }
+                }
+                let ctx = Unmanaged.passRetained(box).toOpaque()
+                let cb: @convention(c) (UnsafePointer<CChar>?, UnsafeMutableRawPointer?) -> Void = { cstr, ctxp in
+                    guard let cstr, let ctxp else { return }
+                    Unmanaged<VerifyProgressBox>.fromOpaque(ctxp)
+                        .takeUnretainedValue()
+                        .handler(String(cString: cstr))
+                }
+                var errPtr: UnsafeMutablePointer<CChar>? = nil
+                let raw = jobId.withCString {
+                    ant_upload_repush_progress(h, $0, cb, ctx, &errPtr)
+                }
+                Unmanaged<VerifyProgressBox>.fromOpaque(ctx).release()
+                if let raw {
+                    let s = String(cString: raw)
+                    ant_free_string(raw)
+                    cont.resume(returning: s)
+                } else {
+                    if let errPtr { ant_free_string(errPtr) }
+                    cont.resume(returning: nil)
+                }
+            }
+        }
+
+        await refreshJobs()
+        // Confirm the outcome on the same row.
+        await reverify(job)
+    }
 
     private func jobControl(
         _ jobId: String,
@@ -218,104 +247,90 @@ final class AntNode: ObservableObject {
 
     // MARK: - Propagation verification
 
-    /// Check that a completed upload actually propagated by resolving its
-    /// manifest, enumerating the file's chunk tree, and checking the real
-    /// data leaves over the network — bypassing our local copy. Stores the
-    /// result in `propagation[job.id]` for the file row. `samples == 0`
-    /// (the default) checks *every* leaf — the only verdict strong enough
-    /// to catch a partially-propagated file; a non-zero value spot-checks
-    /// that many evenly-spread leaves. `probes` is how many distinct
-    /// closest peers to ask per chunk (route diversity / replication,
-    /// clamped 1…8).
+    /// Streaming verification: checks that a completed upload actually
+    /// propagated by resolving its manifest, enumerating the chunk tree, and
+    /// checking *every* data leaf over the network (bypassing our local
+    /// copy), publishing incremental `verifyProgress` so the UI can draw a
+    /// determinate bar. Only ever run on explicit user action from the file
+    /// detail page — there is no automatic verification. The FFI call blocks
+    /// on a background queue; its C progress callback hops each update back
+    /// to the main actor. `probes` is how many distinct closest peers to ask
+    /// per chunk (replication depth, clamped 1…8).
     @discardableResult
-    func verifyPropagation(_ job: UploadJob, samples: UInt8 = 0, probes: UInt8 = 2) async -> PropagationInfo? {
+    func verifyPropagationStreaming(_ job: UploadJob, samples: UInt8 = 0,
+                                    probes: UInt8 = 2) async -> PropagationInfo? {
         guard let h = handle, let reference = job.reference, !reference.isEmpty else { return nil }
         if verifying.contains(job.id) { return propagation[job.id] }
         verifying.insert(job.id)
-        defer { verifying.remove(job.id) }
-        guard let json = try? await Self.string(name: "verify propagation", { errPtr in
-            reference.withCString { ant_storage_verify_propagation(h, $0, samples, probes, errPtr) }
-        }) else { return nil }
-        let info = DriveDecoder.propagation(from: json)
-        if let info {
-            propagation[job.id] = info
-            // Persist only a clean, fully-retrievable verdict. A partial or
-            // not-yet-propagated result is left out so the next launch
-            // re-probes rather than trusting a stale "missing".
-            if info.retrievable, info.error == nil {
-                verdictCache[Self.normalizedRef(reference)] =
-                    CachedVerdict(info: info, checkedAtUnix: UInt64(Date().timeIntervalSince1970))
-                saveVerdictCache()
+        verifyProgress[job.id] = VerifyProgress(phase: "resolving", checked: nil, total: nil)
+        defer { verifying.remove(job.id); verifyProgress[job.id] = nil }
+
+        let jobId = job.id
+        let json: String? = await withCheckedContinuation { (cont: CheckedContinuation<String?, Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let box = VerifyProgressBox { line in
+                    guard let p = VerifyProgress(jsonLine: line) else { return }
+                    Task { @MainActor [weak self] in self?.verifyProgress[jobId] = p }
+                }
+                let ctx = Unmanaged.passRetained(box).toOpaque()
+                let cb: @convention(c) (UnsafePointer<CChar>?, UnsafeMutableRawPointer?) -> Void = { cstr, ctxp in
+                    guard let cstr, let ctxp else { return }
+                    Unmanaged<VerifyProgressBox>.fromOpaque(ctxp)
+                        .takeUnretainedValue()
+                        .handler(String(cString: cstr))
+                }
+                var errPtr: UnsafeMutablePointer<CChar>? = nil
+                let raw = reference.withCString {
+                    ant_storage_verify_propagation_progress(h, $0, samples, probes, cb, ctx, &errPtr)
+                }
+                // Balance the passRetained above now the C call (and its
+                // callbacks) are done.
+                Unmanaged<VerifyProgressBox>.fromOpaque(ctx).release()
+                if let raw {
+                    let s = String(cString: raw)
+                    ant_free_string(raw)
+                    cont.resume(returning: s)
+                } else {
+                    if let errPtr { ant_free_string(errPtr) }
+                    cont.resume(returning: nil)
+                }
             }
         }
+
+        guard let json, let info = DriveDecoder.propagation(from: json) else { return nil }
+        // A user-cancelled check returns a cancelled body — leave the file
+        // unchecked (no verdict) rather than recording a bogus "missing".
+        if info.error == "cancelled" { return nil }
+        propagation[jobId] = info
         return info
     }
 
-    /// Minimum connected peers before an auto-verify is worth running.
-    /// A probe fired while the peer set is still ramping (the first
-    /// handshakes land within a second of launch) checks chunks against
-    /// a near-empty routing view, comes back "missing", and pins an
-    /// orange badge for the whole session. The set climbs to ~100 within
-    /// ~20 s, so waiting for a healthy floor costs little.
-    static let verifyPeerFloor = 30
-
-    /// Populate a completed row's verdict, preferring the disk cache: a
-    /// fresh (<24h) cached verdict is reused without touching the network;
-    /// otherwise the file is probed once. Drives the per-row auto-verify.
-    func ensureVerified(_ job: UploadJob) async {
-        guard job.isDone, let reference = job.reference, !reference.isEmpty,
-              peerCount >= Self.verifyPeerFloor else { return }
-        if propagation[job.id] != nil { return }
-        if let cached = freshVerdict(for: reference) {
-            propagation[job.id] = cached
-            return
-        }
-        await verifyPropagation(job)
+    /// Cancel the in-flight verification (the detail page's Cancel button).
+    /// Cooperative: the node aborts at the next phase/leaf boundary and the
+    /// streaming call returns, clearing `verifying`.
+    func cancelVerify() {
+        guard let h = handle else { return }
+        ant_verify_cancel(h)
     }
 
-    /// A cached verdict for `reference` if one exists and is younger than
-    /// the TTL, else `nil` (missing or expired → re-probe).
-    private func freshVerdict(for reference: String) -> PropagationInfo? {
-        guard let entry = verdictCache[Self.normalizedRef(reference)] else { return nil }
-        let age = Date().timeIntervalSince1970 - Double(entry.checkedAtUnix)
-        return age < Self.verdictTTL ? entry.info : nil
+    /// Run a fresh network check of a single completed file from the detail
+    /// page's "Check again" / "Deep verify" buttons. Every chunk is checked
+    /// (`samples == 0`, uncapped); `probes` raises how many distinct closest
+    /// peers each chunk is fetched from — a replication-depth knob (1…8).
+    /// Deep verify passes the max so the reported `sources` floor reflects
+    /// real redundancy, not just "at least one copy exists".
+    func reverify(_ job: UploadJob, probes: UInt8 = 2) async {
+        guard job.reference?.isEmpty == false else { return }
+        propagation[job.id] = nil
+        await verifyPropagationStreaming(job, samples: 0, probes: probes)
     }
 
-    /// Drop every completed file's cached + in-memory verdict and re-probe
-    /// the network, bypassing the TTL. Wired to pull-to-refresh so a manual
-    /// refresh always re-checks. Probes run concurrently in the background
-    /// so the gesture returns promptly while rows show their own spinners.
-    private func forceReverifyCompleted() {
-        let completed = jobs.filter { $0.isDone && ($0.reference?.isEmpty == false) }
-        guard !completed.isEmpty else { return }
-        for job in completed {
-            propagation[job.id] = nil
-            if let ref = job.reference { verdictCache[Self.normalizedRef(ref)] = nil }
-        }
-        saveVerdictCache()
-        for job in completed {
-            Task { _ = await verifyPropagation(job) }
-        }
-    }
+    /// Probe depth for a thorough, user-requested "Deep verify": fetch
+    /// every chunk from as many distinct closest peers as the FFI allows.
+    static let deepVerifyProbes: UInt8 = 8
 
     private static func normalizedRef(_ r: String) -> String {
         (r.hasPrefix("0x") ? String(r.dropFirst(2)) : r).lowercased()
-    }
-
-    private static func verdictCacheURL() -> URL {
-        resolveDataDir().appendingPathComponent("verify-cache.json")
-    }
-
-    private func loadVerdictCache() {
-        guard let data = try? Data(contentsOf: Self.verdictCacheURL()),
-              let decoded = try? JSONDecoder().decode([String: CachedVerdict].self, from: data)
-        else { return }
-        verdictCache = decoded
-    }
-
-    private func saveVerdictCache() {
-        guard let data = try? JSONEncoder().encode(verdictCache) else { return }
-        try? data.write(to: Self.verdictCacheURL(), options: .atomic)
     }
 
     // MARK: - Account
@@ -336,20 +351,37 @@ final class AntNode: ObservableObject {
         await refreshSettlement()
     }
 
-    /// Pull-to-refresh: refresh everything, then force a fresh propagation
-    /// re-check of every completed file (ignoring the 24h cache).
-    func refreshAndReverify() async {
-        await refreshAll()
-        forceReverifyCompleted()
-    }
-
     func refreshJobs() async {
         guard let h = handle else { return }
         if let json = try? await Self.string(name: "list uploads", { errPtr in
             ant_upload_list(h, errPtr)
         }) {
-            jobs = DriveDecoder.jobs(from: json).sorted { $0.createdAtUnix > $1.createdAtUnix }
+            jobs = Self.dedupedByContent(DriveDecoder.jobs(from: json))
         }
+    }
+
+    /// Collapse jobs that point at the same content so a file never shows
+    /// twice. A Swarm reference is a content hash, so two completed jobs
+    /// with the same reference are the same file (e.g. a file uploaded — or,
+    /// before the in-place fix, "pushed again" — twice). Within a reference
+    /// group the most useful row wins: a completed one over a non-completed
+    /// one, then the most recent. Jobs without a reference yet
+    /// (in-progress / failed) are content-unknown, so each is kept. The
+    /// result is ordered newest-first for display.
+    private static func dedupedByContent(_ jobs: [UploadJob]) -> [UploadJob] {
+        let ranked = jobs.sorted {
+            if $0.isDone != $1.isDone { return $0.isDone && !$1.isDone }
+            return $0.createdAtUnix > $1.createdAtUnix
+        }
+        var seen = Set<String>()
+        var kept: [UploadJob] = []
+        for job in ranked {
+            if let ref = job.reference, !ref.isEmpty {
+                if !seen.insert(normalizedRef(ref)).inserted { continue }
+            }
+            kept.append(job)
+        }
+        return kept.sorted { $0.createdAtUnix > $1.createdAtUnix }
     }
 
     func refreshPlan() async {
@@ -367,6 +399,19 @@ final class AntNode: ObservableObject {
             ant_account_info(h, errPtr)
         }) {
             account = DriveDecoder.account(from: json)
+        }
+    }
+
+    /// Fetch the connected plan's remaining lifetime from chain. Needs a
+    /// Gnosis RPC URL; a no-op (leaving the last value) when none is set or
+    /// no plan is connected. Best-effort: a flaky RPC just leaves the
+    /// previous value in place rather than clearing the card.
+    func refreshValidity(rpc: String) async {
+        guard let h = handle, !rpc.isEmpty, hasStorage else { return }
+        if let json = try? await Self.string(name: "storage validity", { errPtr in
+            rpc.withCString { ant_storage_validity(h, $0, errPtr) }
+        }), let v = DriveDecoder.validity(from: json) {
+            validity = v
         }
     }
 
@@ -459,6 +504,15 @@ final class AntNode: ObservableObject {
         try? FileManager.default.removeItem(at: dest)
         try? FileManager.default.copyItem(at: bundled, to: dest)
     }
+}
+
+/// Boxes a Swift progress handler so it can be carried through the FFI's
+/// `void *ctx` and recovered inside the C function-pointer callback (which
+/// itself can't capture state). Retained for the duration of one verify
+/// call and released once it returns.
+private final class VerifyProgressBox {
+    let handler: (String) -> Void
+    init(_ handler: @escaping (String) -> Void) { self.handler = handler }
 }
 
 enum AntError: LocalizedError {

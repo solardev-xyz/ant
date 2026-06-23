@@ -53,17 +53,22 @@ struct UploadJob: Codable, Identifiable, Equatable {
         return min(1.0, Double(chunksPushed) / Double(total))
     }
 
-    var isActive: Bool { status == "running" || status == "queued" }
+    var isActive: Bool { status == "running" || status == "pending" }
     var isPaused: Bool { status == "paused" }
     var isDone: Bool { status == "completed" }
     var isFailed: Bool { status == "failed" }
 
-    /// A friendly, non-Swarm status line for the row.
+    /// A friendly, non-Swarm status line for the row. Completed uploads
+    /// return an empty string: the network-verified "Verified" badge below
+    /// the status line is the real completion signal, so the row doesn't
+    /// also carry a weaker local "Online" word.
     var statusLabel: String {
         switch status {
-        case "completed": return "Online"
-        case "running": return fraction.map { "Uploading \(Int($0 * 100))%" } ?? "Uploading…"
-        case "queued": return "Waiting…"
+        case "completed": return ""
+        // `pending` is the daemon's pre-dispatch state (before the driver
+        // pushes its first chunk); from the user's view that's still part
+        // of uploading, so it shares the "Uploading…" label.
+        case "running", "pending": return fraction.map { "Uploading \(Int($0 * 100))%" } ?? "Uploading…"
         case "paused": return "Paused"
         case "failed": return "Upload failed"
         case "cancelled": return "Cancelled"
@@ -143,7 +148,19 @@ struct SettlementInfo: Codable, Equatable {
 /// root-only reachability check.
 struct PropagationInfo: Codable, Equatable {
     let reference: String
+    /// The primary verdict: every checked chunk came back over the
+    /// network's cache-free routed path — the *same* closest-first,
+    /// forwarder-routed path a public gateway uses. So this is real
+    /// "anyone can load it" retrievability, not a local-store shortcut.
     let retrievable: Bool
+    /// The stricter neighbourhood-floor signal: every checked leaf is
+    /// reachable from its *own* closest peers AND the sampled replication
+    /// floor is at least one. Kept as a secondary detail only — a
+    /// constrained mobile node frequently can't probe a chunk's closest
+    /// peers even for a file well-connected nodes fetch instantly, so this
+    /// is unreliable as the "is it safe?" verdict and must not gate it.
+    /// Optional so a verdict from an older daemon still decodes.
+    let fullyReplicated: Bool?
     /// Total chunks in the file's data tree (leaves + interior nodes).
     let totalChunks: UInt32
     let leafChunks: UInt32
@@ -152,6 +169,10 @@ struct PropagationInfo: Codable, Equatable {
     let checkedChunks: UInt32
     let retrievableChunks: UInt32
     let sampledLeaves: UInt32
+    /// Leaves that exist but only landed shallow — reachable via the
+    /// uploader's route, not from their own closest peers. Optional for
+    /// backward compatibility with older daemon payloads.
+    let shallowLeaves: UInt32?
     /// Minimum distinct-route count across sampled leaves — a
     /// replication floor.
     let sources: UInt32
@@ -162,27 +183,138 @@ struct PropagationInfo: Codable, Equatable {
     enum CodingKeys: String, CodingKey {
         case reference
         case retrievable
+        case fullyReplicated = "fully_replicated"
         case totalChunks = "total_chunks"
         case leafChunks = "leaf_chunks"
         case intermediateChunks = "intermediate_chunks"
         case checkedChunks = "checked_chunks"
         case retrievableChunks = "retrievable_chunks"
         case sampledLeaves = "sampled_leaves"
+        case shallowLeaves = "shallow_leaves"
         case sources
         case error
     }
 
-    /// Short, friendly verdict for a file row badge. Deliberately free
-    /// of chunk counts: the check probes a bounded sample of a large
-    /// file's chunks, so figures like "533/2537" read as if most of the
-    /// file went unchecked (and a raw missing count overstates a
-    /// transient probe shortfall). The binary verdict is the honest
-    /// signal.
+    /// The user-facing verdict: is every part of the file actually
+    /// retrievable from the network (by anyone, via the same forwarder
+    /// routing a public gateway uses)? This — not the local neighbourhood
+    /// replication floor — is what "safe" means. Gating on the floor cried
+    /// wolf on files that are genuinely fine: a phone often can't reach a
+    /// chunk's own closest peers even when the gateway fetches it in 0.6s.
+    var isStoredSafely: Bool { retrievable }
+
+    /// Stricter neighbourhood verdict, retained only as an informational
+    /// detail. Falls back to `retrievable` for older daemon payloads.
+    var isFullyReplicated: Bool { fullyReplicated ?? retrievable }
+
+    /// Count of leaves that exist but only landed shallow.
+    var shallowCount: UInt32 { shallowLeaves ?? 0 }
+
+    /// Short, plain-language verdict for a file row badge. Two clear
+    /// states only — the file is either safely stored or it isn't — so the
+    /// user never has to interpret jargon like "at risk". Deliberately
+    /// free of chunk counts (the check samples a bounded subset on large
+    /// files, so a raw count reads as if most of the file went unchecked).
     var label: String {
-        if !retrievable {
-            return totalChunks == 0 ? "Not found on network" : "Not fully available yet"
+        isStoredSafely ? "Stored safely" : "Not fully stored"
+    }
+}
+
+/// A streaming progress update during a propagation verification, decoded
+/// from the JSON lines `ant_storage_verify_propagation_progress` emits. The
+/// `checking` phase carries `checked`/`total` leaf counts (a determinate
+/// bar); the earlier `resolving`/`enumerating` phases carry neither.
+struct VerifyProgress: Equatable {
+    let phase: String
+    let checked: Int?
+    let total: Int?
+
+    /// 0…1 once the checking phase reports counts; `nil` for the
+    /// indeterminate early phases.
+    var fraction: Double? {
+        guard let checked, let total, total > 0 else { return nil }
+        return min(1.0, Double(checked) / Double(total))
+    }
+
+    /// Friendly one-line status for the verification card. Covers both the
+    /// verify phases (`resolving`/`enumerating`/`checking`) and the re-push
+    /// phase (`repushing`).
+    var label: String {
+        switch phase {
+        case "resolving": return "Resolving file…"
+        case "enumerating": return "Mapping chunks…"
+        case "checking":
+            if let checked, let total { return "Checking chunks \(checked)/\(total)" }
+            return "Checking the network…"
+        case "sources":
+            if let checked, let total { return "Checking replication \(checked)/\(total)" }
+            return "Measuring replication…"
+        case "repushing":
+            if let checked, let total { return "Re-pushing chunks \(checked)/\(total)" }
+            return "Re-pushing missing chunks…"
+        default: return "Checking the network…"
         }
-        return "Verified"
+    }
+
+    init(phase: String, checked: Int?, total: Int?) {
+        self.phase = phase
+        self.checked = checked
+        self.total = total
+    }
+
+    /// Decode one progress line; `nil` if it isn't a recognisable update.
+    init?(jsonLine: String) {
+        guard let data = jsonLine.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let phase = obj["phase"] as? String else { return nil }
+        self.phase = phase
+        self.checked = (obj["checked"] as? NSNumber)?.intValue
+        self.total = (obj["total"] as? NSNumber)?.intValue
+    }
+}
+
+/// Remaining lifetime of the connected storage plan, as returned by
+/// `ant_storage_validity`. Computed from the batch's on-chain remaining
+/// balance and the current postage price, so it needs a chain RPC and is
+/// fetched on demand (not on every status poll).
+struct StorageValidity: Codable, Equatable {
+    let enabled: Bool
+    let remainingSeconds: UInt64
+    let expiresUnix: UInt64
+
+    enum CodingKeys: String, CodingKey {
+        case enabled
+        case remainingSeconds = "remaining_seconds"
+        case expiresUnix = "expires_unix"
+    }
+
+    /// Coarse human duration for the storage card: "1 year" / "3 months" /
+    /// "12 days" / "5 hours" / "Expired".
+    var durationLabel: String {
+        guard remainingSeconds > 0 else { return "Expired" }
+        let days = remainingSeconds / 86_400
+        switch days {
+        case 0:
+            let hours = remainingSeconds / 3_600
+            return hours <= 1 ? "less than an hour" : "\(hours) hours"
+        case 1: return "1 day"
+        case 2...30: return "\(days) days"
+        case 31...364:
+            let months = days / 30
+            return months == 1 ? "1 month" : "\(months) months"
+        default:
+            let years = days / 365
+            return years == 1 ? "1 year" : "\(years) years"
+        }
+    }
+
+    /// Date-only expiry label (e.g. "19 Sep 2026").
+    var expiryDateLabel: String {
+        guard expiresUnix > 0 else { return "—" }
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .none
+        return f.string(from: Date(timeIntervalSince1970: TimeInterval(expiresUnix)))
     }
 }
 
@@ -328,6 +460,11 @@ enum DriveDecoder {
     static func quote(from json: String) -> StorageQuote? {
         guard let data = json.data(using: .utf8) else { return nil }
         return try? JSONDecoder().decode(StorageQuote.self, from: data)
+    }
+
+    static func validity(from json: String) -> StorageValidity? {
+        guard let data = json.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(StorageValidity.self, from: data)
     }
 }
 

@@ -28,6 +28,8 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
+#[cfg(feature = "chain")]
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::AntHandle;
@@ -42,8 +44,10 @@ const OP_TIMEOUT: Duration = Duration::from_secs(30);
 /// sample of data leaves over the live network — so it legitimately runs
 /// for many seconds on a big file. A generous ceiling keeps it from being
 /// cut short (which surfaced as a missing verdict / silent failure) while
-/// still guarding against a wedged loop.
-const VERIFY_TIMEOUT: Duration = Duration::from_mins(5);
+/// still guarding against a wedged loop. Raised now that a full check is
+/// uncapped (every leaf, however large the file); the user can also cancel
+/// a long check from the detail view, so a high ceiling is safe.
+const VERIFY_TIMEOUT: Duration = Duration::from_mins(30);
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum DriveError {
@@ -179,6 +183,62 @@ pub(crate) fn upload_job_command(
     })
 }
 
+/// "Push again" with streamed progress: re-push a completed job's missing
+/// chunks on the same job, handing each `{"phase":...,"checked"?,"total"?}`
+/// progress line to `on_progress` as it arrives, then return the updated
+/// job JSON. Mirrors [`verify_propagation_progress`]: the callback fires on
+/// the FFI runtime thread inline with the blocking call.
+pub(crate) fn upload_repush_progress(
+    h: &AntHandle,
+    job_id: String,
+    mut on_progress: impl FnMut(&str),
+) -> Result<String, DriveError> {
+    let cmd_tx = h.cmd_tx.clone();
+    h.runtime.block_on(async move {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let (prog_tx, mut prog_rx) = mpsc::unbounded_channel::<String>();
+        send(
+            &cmd_tx,
+            ControlCommand::UploadRepush {
+                job_id,
+                progress: Some(prog_tx),
+                ack: ack_tx,
+            },
+        )
+        .await?;
+
+        let finish = |ack: Result<ControlAck, oneshot::error::RecvError>| match ack {
+            Ok(ControlAck::UploadJob(view)) => to_json(&view),
+            Ok(ControlAck::NotReady { message } | ControlAck::Error { message }) => {
+                Err(DriveError::Op(message))
+            }
+            Ok(other) => Err(unexpected(&other)),
+            Err(_) => Err(DriveError::Op("node dropped the ack channel".into())),
+        };
+
+        // Heal can run a few read-back/re-push rounds; reuse the generous
+        // verification timeout as an upper bound.
+        let mut ack_rx = ack_rx;
+        let deadline = tokio::time::sleep(VERIFY_TIMEOUT);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                biased;
+                ack = &mut ack_rx => return finish(ack),
+                line = prog_rx.recv() => {
+                    match line {
+                        Some(l) => on_progress(&l),
+                        None => return finish((&mut ack_rx).await),
+                    }
+                }
+                () = &mut deadline => {
+                    return Err(DriveError::Op("operation timed out".into()));
+                }
+            }
+        }
+    })
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum JobCommand {
     Status,
@@ -221,6 +281,8 @@ pub(crate) fn verify_propagation(
                 reference,
                 samples,
                 probes,
+                progress: None,
+                cancel: None,
                 ack: ack_tx,
             },
         )
@@ -231,6 +293,77 @@ pub(crate) fn verify_propagation(
                 Err(DriveError::Op(message))
             }
             other => Err(unexpected(&other)),
+        }
+    })
+}
+
+/// Like [`verify_propagation`], but streams incremental progress: each
+/// `{"phase":...,"checked"?,"total"?}` JSON line the node emits is handed
+/// to `on_progress` as it arrives, before the final verdict JSON is
+/// returned. The callback runs on the FFI runtime thread inline with the
+/// blocking call, so the caller (Swift) keeps it cheap (a channel hop).
+pub(crate) fn verify_propagation_progress(
+    h: &AntHandle,
+    reference: [u8; 32],
+    samples: u8,
+    probes: u8,
+    mut on_progress: impl FnMut(&str),
+) -> Result<String, DriveError> {
+    let cmd_tx = h.cmd_tx.clone();
+    // Fresh cancel flag for this check: clear any prior request so a cancel
+    // can only ever abort the check it was aimed at. Shared with the node's
+    // verify task via the command.
+    h.verify_cancel
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    let cancel = h.verify_cancel.clone();
+    h.runtime.block_on(async move {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let (prog_tx, mut prog_rx) = mpsc::unbounded_channel::<String>();
+        send(
+            &cmd_tx,
+            ControlCommand::VerifyPropagation {
+                reference,
+                samples,
+                probes,
+                progress: Some(prog_tx),
+                cancel: Some(cancel),
+                ack: ack_tx,
+            },
+        )
+        .await?;
+
+        let finish = |ack: Result<ControlAck, oneshot::error::RecvError>| match ack {
+            Ok(ControlAck::Ok { message }) => Ok(message),
+            Ok(ControlAck::NotReady { message } | ControlAck::Error { message }) => {
+                Err(DriveError::Op(message))
+            }
+            Ok(other) => Err(unexpected(&other)),
+            Err(_) => Err(DriveError::Op("node dropped the ack channel".into())),
+        };
+
+        // Drain progress until the terminal ack lands (or we time out).
+        // Bias toward the ack so completion isn't delayed behind a backlog
+        // of progress lines.
+        let mut ack_rx = ack_rx;
+        let deadline = tokio::time::sleep(VERIFY_TIMEOUT);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                biased;
+                ack = &mut ack_rx => return finish(ack),
+                line = prog_rx.recv() => {
+                    match line {
+                        Some(l) => on_progress(&l),
+                        // Progress channel closed (verify finished); the ack
+                        // is next — await it directly rather than re-looping
+                        // on a now-closed receiver.
+                        None => return finish((&mut ack_rx).await),
+                    }
+                }
+                () = &mut deadline => {
+                    return Err(DriveError::Op("operation timed out".into()));
+                }
+            }
         }
     })
 }
@@ -489,6 +622,59 @@ pub(crate) fn storage_quote(
             xdai_to_send: xdai_to_send.to_string(),
             xdai_to_send_display: format_native(xdai_to_send),
             sufficient_funds: xdai >= xdai_required,
+        })
+    })
+}
+
+/// Remaining lifetime of the connected storage plan. Reads the batch's
+/// on-chain remaining per-chunk balance (`PostageStamp.remainingBalance`,
+/// i.e. normalised balance minus the cumulative outpayment) and the
+/// current price per chunk per block, then converts to wall-clock seconds
+/// via Gnosis block time. Returns `{enabled, remaining_seconds,
+/// expires_unix}`; `enabled = false` when no plan is connected. One
+/// `eth_call` each for price and balance — cheap enough to call from a
+/// pull-to-refresh, not on every status poll.
+#[cfg(feature = "chain")]
+pub(crate) fn storage_validity(h: &AntHandle, rpc: String) -> Result<String, DriveError> {
+    let cmd_tx = h.cmd_tx.clone();
+    h.runtime.block_on(async move {
+        // The connected batch id comes from the local issuer status.
+        let (ack_tx, ack_rx) = oneshot::channel();
+        send(&cmd_tx, ControlCommand::PostageStatus { ack: ack_tx }).await?;
+        let view = match recv_oneshot(ack_rx).await? {
+            ControlAck::PostageStatus(v) => v,
+            ControlAck::Error { message } => return Err(DriveError::Op(message)),
+            other => return Err(unexpected(&other)),
+        };
+        if !view.enabled || view.batch_id.is_empty() {
+            return to_json(&Validity {
+                enabled: false,
+                remaining_seconds: 0,
+                expires_unix: 0,
+            });
+        }
+        let batch_id = parse_batch_id(&view.batch_id)?;
+        let client = ant_chain::ChainClient::new(rpc);
+        // Price per chunk per block; clamp to 1 so a transient zero read
+        // doesn't blow the division up into a bogus eternity.
+        let price = client
+            .postage_last_price(ant_chain::GNOSIS_POSTAGE_STAMP)
+            .await
+            .map_err(|e| DriveError::Op(format!("read storage price: {e}")))?
+            .max(1);
+        let remaining = client
+            .postage_remaining_balance(ant_chain::GNOSIS_POSTAGE_STAMP, &batch_id)
+            .await
+            .map_err(|e| DriveError::Op(format!("read storage balance: {e}")))?;
+        let remaining_seconds = (remaining / price).saturating_mul(GNOSIS_BLOCK_SECS);
+        let remaining_seconds = u64::try_from(remaining_seconds).unwrap_or(u64::MAX);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        to_json(&Validity {
+            enabled: true,
+            remaining_seconds,
+            expires_unix: now.saturating_add(remaining_seconds),
         })
     })
 }
@@ -1028,6 +1214,19 @@ struct DeployedChequebook {
     /// `0x`-prefixed chequebook contract address (`0x` + 40 hex).
     #[serde(rename = "chequebookAddress")]
     chequebook_address: String,
+}
+
+/// Remaining-lifetime payload for the storage card (see
+/// [`storage_validity`]).
+#[cfg(feature = "chain")]
+#[derive(Serialize)]
+struct Validity {
+    /// False when no plan is connected; the other fields are then 0.
+    enabled: bool,
+    /// Seconds of storage left before the batch expires.
+    remaining_seconds: u64,
+    /// Absolute Unix expiry (now + `remaining_seconds`), for a date label.
+    expires_unix: u64,
 }
 
 #[cfg(feature = "chain")]

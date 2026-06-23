@@ -153,6 +153,17 @@ func formatBytesPerSec(_ bps: Double) -> String {
     return "\(formatBytes(UInt64(bps)))/s"
 }
 
+/// Format a Unix timestamp (seconds) as a short local date + time, e.g.
+/// "19 Jun 2026 at 14:32". Used by the file detail page.
+func formatUnixDate(_ unix: UInt64) -> String {
+    guard unix > 0 else { return "—" }
+    let date = Date(timeIntervalSince1970: TimeInterval(unix))
+    let f = DateFormatter()
+    f.dateStyle = .medium
+    f.timeStyle = .short
+    return f.string(from: date)
+}
+
 func formatDuration(_ seconds: TimeInterval) -> String {
     guard seconds.isFinite, !seconds.isNaN, seconds >= 0 else { return "0:00" }
     let total = Int(seconds.rounded())

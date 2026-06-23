@@ -39,13 +39,19 @@ struct StorageView: View {
                 .padding(.bottom, 130)
             }
             .scrollIndicators(.hidden)
-            .refreshable { await node.refreshAll() }
+            .refreshable {
+                await node.refreshAll()
+                await node.refreshValidity(rpc: rpc)
+            }
         }
         .preferredColorScheme(.dark)
         .overlay(alignment: .top) { bannerView }
         .sheet(isPresented: $showConnect) { connectSheet }
         .sheet(isPresented: $showKey) { keySheet }
-        .task { await node.refreshAll() }
+        .task {
+            await node.refreshAll()
+            await node.refreshValidity(rpc: rpc)
+        }
     }
 
     // MARK: header
@@ -88,6 +94,17 @@ struct StorageView: View {
                     Text("\(formatBytes(plan.freeBytes)) free")
                         .font(.caption)
                         .foregroundStyle(.white.opacity(0.6))
+                    if let v = node.validity, v.enabled {
+                        // How long the plan stays valid before the postage
+                        // batch expires (derived from on-chain balance).
+                        Label {
+                            Text("Valid for \(v.durationLabel) · until \(v.expiryDateLabel)")
+                        } icon: {
+                            Image(systemName: "clock")
+                        }
+                        .font(.caption)
+                        .foregroundStyle(v.remainingSeconds == 0 ? .orange : .white.opacity(0.6))
+                    }
                 } else {
                     Text("No storage plan")
                         .font(.system(.title2, design: .rounded).weight(.semibold))

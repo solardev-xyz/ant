@@ -1139,8 +1139,8 @@ mod tests {
         assert_eq!(after_full, first);
     }
 
-    /// The `.stamps` sidecar must survive a restart so the startup heal
-    /// reuses stamps instead of re-issuing them.
+    /// The `.stamps` sidecar must survive a restart so a later heal
+    /// (manual "Push again") reuses stamps instead of re-issuing them.
     #[test]
     fn stamp_cache_persists_across_restart() {
         let secret = random_secp256k1_secret();

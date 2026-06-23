@@ -161,6 +161,14 @@ pub struct UploadJobInfo {
     /// Never persisted as a terminal state; defaults to `false`.
     #[serde(default)]
     pub stalled: bool,
+    /// Set once the post-upload self-heal has run its rounds for this
+    /// job (whether or not it could confirm `heal_verified`). Lets a
+    /// durability-waiting client distinguish "heal still in progress"
+    /// from "heal done — verified, or done its best on a degraded
+    /// network". Defaults to `false` for jobs persisted by older
+    /// daemons; a manual "Push again" refreshes it.
+    #[serde(default)]
+    pub heal_finished: bool,
 }
 
 impl UploadJobInfo {
