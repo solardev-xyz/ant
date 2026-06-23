@@ -12,7 +12,7 @@ path = "src/main.rs"
 ant-chain = { path = "../ant-chain" }
 ant-control = { path = "../ant-control" }
 ant-crypto = { path = "../ant-crypto" }
-ant-gateway = { path = "../ant-gateway" }
+ant-gateway = { path = "../ant-gateway", features = ["chain"] }
 ant-node = { path = "../ant-node" }
 ant-p2p = { path = "../ant-p2p" }
 # `bee-recover`: read a carried-over bee `stamperstore` to seed the

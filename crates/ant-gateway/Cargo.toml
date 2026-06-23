@@ -5,15 +5,18 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+ant-chain = { path = "../ant-chain", optional = true }
 ant-control = { path = "../ant-control" }
 ant-crypto = { path = "../ant-crypto", optional = true }
 ant-retrieval = { path = "../ant-retrieval" }
+anyhow = { workspace = true, optional = true }
 async-trait.workspace = true
 axum = { workspace = true, optional = true }
 bytes = "1.11.1"
 futures = "0.3.31"
 hex.workspace = true
 hyper = { workspace = true, optional = true }
+primitive-types = { version = "0.14.0", default-features = false, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 # Tar reader for `POST /bzz` collection uploads. Pure-Rust, no compression
@@ -43,6 +46,7 @@ tower = { version = "0.5.3", features = ["util"] }
 [features]
 default = ["http-api"]
 http-api = ["dep:axum", "dep:hyper", "dep:tower", "dep:ant-crypto"]
+chain = ["http-api", "dep:ant-chain", "dep:anyhow", "dep:primitive-types"]
 
 [lints]
 workspace = true

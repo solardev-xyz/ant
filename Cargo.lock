@@ -174,6 +174,7 @@ dependencies = [
 name = "ant-gateway"
 version = "0.5.29"
 dependencies = [
+ "ant-chain",
  "ant-control",
  "ant-crypto",
  "ant-retrieval",
@@ -186,6 +187,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "k256",
+ "primitive-types",
  "serde",
  "serde_json",
  "sha2 0.11.0",

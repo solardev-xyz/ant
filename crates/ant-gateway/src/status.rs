@@ -42,8 +42,10 @@ pub async fn health(State(handle): State<GatewayHandle>) -> Response {
 }
 
 /// `GET /readiness`. `200` once we have at least one BZZ-handshaked
-/// peer; `503` until then. Bee returns `200 OK` with no body when ready
-/// and `503` (no body either) when not — we follow that exactly.
+/// peer; `503` until then. Bee marshals a JSON status body in BOTH cases
+/// (`{"status":"ready",…}` / `{"status":"unready",…}`, same shape as
+/// `/health`) — bee-js and our Swift `BeeReadiness` both index `status`,
+/// so a bodyless `200` reads as not-ready. We mirror `/health`'s body.
 pub async fn readiness(State(handle): State<GatewayHandle>) -> Response {
     let snap = handle.status.borrow();
     let ready = snap.peers.connected > 0
@@ -52,10 +54,15 @@ pub async fn readiness(State(handle): State<GatewayHandle>) -> Response {
             .connected_peers
             .iter()
             .any(|p| p.bzz_overlay.is_some());
+    let body = Json(HealthBody {
+        status: if ready { "ready" } else { "unready" },
+        version: handle.agent.as_str().to_string(),
+        api_version: handle.api_version.as_str().to_string(),
+    });
     if ready {
-        StatusCode::OK.into_response()
+        body.into_response()
     } else {
-        StatusCode::SERVICE_UNAVAILABLE.into_response()
+        (StatusCode::SERVICE_UNAVAILABLE, body).into_response()
     }
 }
 

@@ -399,6 +399,26 @@ char *ant_storage_discover(const AntHandle *handle,
                            char **out_err);
 
 /*
+ * Deploy (or return the already-persisted) node-owned chequebook so the
+ * publish-setup checklist's "chequebook deployed" step can complete.
+ * Idempotent: if this device already deployed a chequebook it's returned
+ * as-is (no redeploy); otherwise this signs an on-chain
+ * factory.deploySimpleSwap (issuer = node EOA) deployed UNFUNDED, persists
+ * the association, and returns the new address. SUBMITS A REAL ON-CHAIN
+ * TRANSACTION: spends gas (xDAI) only — zero xBZZ deposit, so the user's
+ * xBZZ stays in their wallet (bee still accepts the cheques) — and BLOCKS
+ * until the tx confirms. Light-mode only (requires the `chain` cargo feature;
+ * otherwise returns NULL + an error). Returns
+ *   {"chequebookAddress":"0x<40hex>"}
+ * (free with ant_free_string), or NULL with an error in *out_err. The
+ * caller should restart the gateway (ant_stop_gateway + ant_start_gateway)
+ * afterwards so /chequebook/address reflects the deployed chequebook.
+ */
+char *ant_deploy_chequebook(const AntHandle *handle,
+                            const char *gnosis_rpc,
+                            char **out_err);
+
+/*
  * Price a storage plan (no transaction). `depth` sets capacity
  * (2^depth chunks × 4 KiB); `days` sets how long it should last.
  * Returns a JSON object:
@@ -484,6 +504,13 @@ void ant_free_string(char *ptr);
  * `light_mode` drives GET /node.beeMode: nonzero -> "light" (publish /
  * feed / SOC writes allowed), zero -> "ultra-light" (read-only).
  *
+ * `gnosis_rpc` is the Gnosis JSON-RPC endpoint backing the on-chain
+ * /wallet, /stamps, and /chequebook surfaces. Pass NULL or "" to disable
+ * on-chain reads (those endpoints fall back to the bee zero-stub / 501).
+ * When set together with light_mode, it enables real /wallet balances
+ * and /stamps postage state (desktop `antd` parity). Honoured only when
+ * the library is built with the `chain` feature; ignored otherwise.
+ *
  * Returns true on success (or if a gateway is already running on this
  * handle). On failure returns false and writes an allocated message to
  * *out_err (free with ant_free_string). Idempotent: a second call while
@@ -492,6 +519,7 @@ void ant_free_string(char *ptr);
 bool ant_start_gateway(const AntHandle *handle,
                        const char *api_addr,
                        bool light_mode,
+                       const char *gnosis_rpc,
                        char **out_err);
 
 /*

@@ -37,6 +37,14 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// `light` (Freedom's `checkSwarmPreFlight` allows publish/feed/SOC
 /// writes), `false` advertises `ultra-light` (read-only browsing).
 ///
+/// `gnosis_rpc` is the Gnosis JSON-RPC endpoint backing the on-chain
+/// `/wallet`, `/stamps`, and `/chequebook` surfaces. Pass null/empty to
+/// disable on-chain reads (those endpoints fall back to the bee
+/// zero-stub / `501`). When set together with `light_mode`, it enables
+/// real `/wallet` balances and `/stamps` postage state, reaching desktop
+/// (`antd`) parity. Only honoured when the crate is built with the
+/// `chain` feature; ignored otherwise.
+///
 /// Returns `true` on success (or if a gateway is already running),
 /// `false` on error with an allocated message written to `out_err`
 /// (free with [`crate::ant_free_string`]). Idempotent: a second call
@@ -45,14 +53,15 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:1633";
 /// # Safety
 ///
 /// `handle` must come from [`crate::ant_init`] and must not have been
-/// passed to [`crate::ant_shutdown`]. `api_addr`, if non-null, must be a
-/// NUL-terminated UTF-8 string. `out_err`, if non-null, must point to a
-/// writable `*mut c_char` slot.
+/// passed to [`crate::ant_shutdown`]. `api_addr` and `gnosis_rpc`, if
+/// non-null, must be NUL-terminated UTF-8 strings. `out_err`, if
+/// non-null, must point to a writable `*mut c_char` slot.
 #[no_mangle]
 pub unsafe extern "C" fn ant_start_gateway(
     handle: *const AntHandle,
     api_addr: *const c_char,
     light_mode: bool,
+    gnosis_rpc: *const c_char,
     out_err: *mut *mut c_char,
 ) -> bool {
     unsafe {
@@ -82,6 +91,22 @@ pub unsafe extern "C" fn ant_start_gateway(
                     &format!("ant_start_gateway: invalid api_addr `{addr_str}`: {e}"),
                 );
                 return false;
+            }
+        };
+
+        // Optional Gnosis JSON-RPC endpoint backing the on-chain
+        // `/wallet` / `/stamps` / `/chequebook` surfaces. Same parse as
+        // `api_addr`: null/empty -> None, invalid UTF-8 is a hard error.
+        let gnosis_rpc = if gnosis_rpc.is_null() {
+            None
+        } else {
+            match CStr::from_ptr(gnosis_rpc).to_str().map(str::trim) {
+                Ok(s) if !s.is_empty() => Some(s.to_string()),
+                Ok(_) => None,
+                Err(_) => {
+                    write_out_err(out_err, "ant_start_gateway: gnosis_rpc is not valid UTF-8");
+                    return false;
+                }
             }
         };
 
@@ -139,6 +164,47 @@ pub unsafe extern "C" fn ant_start_gateway(
             return false;
         }
 
+        // On-chain context for `/wallet` / `/stamps` / `/chequebook`.
+        // Built only when the `chain` feature is on AND a Gnosis RPC was
+        // supplied; otherwise the gateway falls back to the bee
+        // zero-stub / `501`. Mirrors how `antd` wires its `ChainContext`
+        // via `ant_gateway::chainreader::build`.
+        #[cfg(feature = "chain")]
+        let chain = if gnosis_rpc.is_some() {
+            // Report a previously-deployed chequebook (persisted at
+            // `<data_dir>/chequebook.json` by `ant_deploy_chequebook` /
+            // the storage-buy flow) so `/chequebook/address` reflects it.
+            // Read-only + fast: this NEVER deploys here (that's
+            // `ant_deploy_chequebook`, which spends gas) and a load error
+            // degrades to `None` rather than failing gateway start.
+            let chequebook = match ant_chain::chequebook_store::load_persisted_chequebook(
+                &handle.data_dir.join("chequebook.json"),
+            ) {
+                Ok(cb) => cb,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "ant-ffi",
+                        "ant_start_gateway: ignoring chequebook association: {e}",
+                    );
+                    None
+                }
+            };
+            ant_gateway::chainreader::build(
+                gnosis_rpc,
+                // No per-node postage-contract override on mobile: use
+                // the Gnosis mainnet default (matches `antd`'s default).
+                ant_chain::GNOSIS_POSTAGE_STAMP.to_string(),
+                handle.eth,
+                chequebook,
+                ant_chain::tx::GNOSIS_CHAIN_ID,
+                Some(handle.signing_secret),
+            )
+        } else {
+            None
+        };
+        #[cfg(not(feature = "chain"))]
+        let _ = gnosis_rpc;
+
         let gw = GatewayHandle {
             agent: Arc::new(crate::ANT_FFI_AGENT.to_string()),
             api_version: Arc::new(BEE_API_VERSION.to_string()),
@@ -159,9 +225,13 @@ pub unsafe extern "C" fn ant_start_gateway(
             // origin, so the gateway must echo `null` in CORS — matches
             // bee started with `--cors-allowed-origins=null`.
             cors: Arc::new(CorsConfig::new(["null"])),
-            // No on-chain reader yet: `/wallet` + `/chequebook` report
-            // bee zero-stubs and chain-state endpoints fall to 501.
-            // Light-mode postage parity wires a `ChainContext` later.
+            // On-chain reader/writer when built with `chain` and a
+            // Gnosis RPC was supplied (see `chain` above); otherwise
+            // `None`, so `/wallet` + `/chequebook` report bee zero-stubs
+            // and chain-state endpoints fall to 501.
+            #[cfg(feature = "chain")]
+            chain,
+            #[cfg(not(feature = "chain"))]
             chain: None,
         };
 

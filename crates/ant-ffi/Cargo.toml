@@ -35,7 +35,7 @@ jni = ["dep:jni"]
 # example app turns it on via `cargo xtask build-ios-* --features chain`
 # because its Storage tab needs to read the user's postage batch from
 # Gnosis. The download-only `ios-download` app leaves it off.
-chain = ["dep:ant-chain", "ant-chain/chain-rpc", "dep:primitive-types"]
+chain = ["dep:ant-chain", "ant-chain/chain-rpc", "dep:primitive-types", "ant-gateway/chain"]
 
 [dependencies]
 ant-chain = { path = "../ant-chain", default-features = false, optional = true }

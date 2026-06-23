@@ -29,6 +29,8 @@
 
 #[cfg(feature = "http-api")]
 mod chain;
+#[cfg(feature = "chain")]
+pub mod chainreader;
 #[cfg(feature = "http-api")]
 mod cors;
 #[cfg(feature = "http-api")]
