@@ -20,6 +20,23 @@
  just your diff) rather than leaving `main` red. If a finding is a genuine
  false positive, prefer a narrowly-scoped `#[allow(...)]` with a comment
  over disabling the lint workspace-wide.
+   - **Per-crate clippy (`-p foo`) is not a substitute for the gate.** It
+    skips `cargo fmt` and, more importantly, skips `--all-targets`, so it
+    never compiles test/integration targets or the rest of the workspace.
+    A change that builds clean under `-p ant-ffi -p ant-p2p` can still be
+    red on the real gate. Run steps 1–5 verbatim before opening *or*
+    pushing to a PR — not a hand-picked subset. (This was learned the hard
+    way: PR #16 went red twice post-open on exactly these two blind spots.)
+   - **Adding a variant to a widely-matched enum touches more places than
+    your diff shows.** `ControlCommand` (and `ControlAck`) is matched
+    exhaustively in several spots across crates — the production node loop
+    in `ant-p2p` (`handle_control_command` *and* its run-loop command arm),
+    plus **test-only stubs** like the fake node loop in
+    `ant-gateway/tests/common/mod.rs`. After adding a variant, grep the
+    workspace for every `match` on it (`rg 'ControlCommand::'`) and wire it
+    everywhere. The test stubs only fail under `--all-targets`, which is
+    precisely why step 2 is whole-workspace-all-targets and per-crate
+    checks miss them.
 - Bump the patch version (`x.y.Z` → `x.y.Z+1`) of every workspace
  crate whose Cargo.toml declares one — currently `antd`, `antctl`,
  `antop`, `ant-chain`, `ant-control`, `ant-crypto`, `ant-ffi`,
