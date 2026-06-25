@@ -1563,7 +1563,31 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
                 // live during gateway-only / fully-idle periods.
             }
             Some(cmd) = recv_command(commands.as_mut()) => {
-                handle_control_command(&mut state, &mut peerstore, &control, cfg.upload.clone(), cfg.network_id, cmd);
+                match cmd {
+                    // Recovery after an OS suspension needs the loop-local
+                    // dial machinery (bootnodes + the bootstrap dial channel
+                    // + the backoff/interval clocks), none of which
+                    // `handle_control_command` has, so it's handled inline
+                    // here rather than threaded through that signature.
+                    ControlCommand::Resume { ack } => {
+                        let warmed = force_resume(
+                            &cfg.bootnodes,
+                            &mut state,
+                            &peerstore,
+                            &mut backoff,
+                            &mut last_bootstrap_at,
+                            &mut last_top_up_at,
+                            local_peer_id,
+                            &bootnode_dial_tx,
+                        );
+                        let _ = ack.send(ControlAck::Ok {
+                            message: format!(
+                                "resume: re-warmed {warmed} peer hints; bootstrap re-dial fired",
+                            ),
+                        });
+                    }
+                    other => handle_control_command(&mut state, &mut peerstore, &control, cfg.upload.clone(), cfg.network_id, other),
+                }
             }
             _ = &mut shutdown => {
                 info!(target: "ant_p2p", "shutdown signal; flushing peerstore");
@@ -2479,6 +2503,15 @@ fn handle_control_command(
             // `ack` is an mpsc sender — drop after one error frame.
             let _ = ack.try_send(ControlAck::Error {
                 message: "upload manager not wired into the swarm loop".into(),
+            });
+        }
+        // Intercepted by the run loop's command arm (it owns the bootnode
+        // dial channel + backoff clocks `force_resume` needs). This arm is
+        // defense in depth: it keeps the match exhaustive and errors loudly
+        // if a future caller ever bypasses the loop. Not reached in practice.
+        ControlCommand::Resume { ack } => {
+            let _ = ack.send(ControlAck::Error {
+                message: "resume must be handled by the swarm loop".into(),
             });
         }
         ControlCommand::PostageStatus { ack } => {
@@ -4570,6 +4603,69 @@ fn maybe_top_up_peers(
     }
 }
 
+/// Force a post-suspension recovery, driven by an explicit
+/// [`ControlCommand::Resume`]. Re-warms the dial queue from the on-disk
+/// peerstore and fires a fresh bootstrap dial **unconditionally** — unlike
+/// [`maybe_top_up_peers`] / [`maybe_rebootstrap`], which only fire once the
+/// peer *count* has visibly collapsed.
+///
+/// The count gate is exactly what wedges an embedded node after a long OS
+/// suspension (iOS background reap): the kernel sockets are dead but libp2p
+/// hasn't seen the FIN, so `bzz_peers` still looks full and neither
+/// automatic guard fires — the node sits on a swarm of zombies and the next
+/// retrieval hangs. Bypassing the gate re-opens live sockets to the
+/// bootnodes (and, through their hive gossip, the wider set) in parallel,
+/// so retrieval has working routes again while the dead connections fall
+/// away as the host touches them.
+///
+/// Returns the number of warm peer hints re-queued. Surviving connections
+/// are left untouched: re-warming only enqueues hints (`enqueue_hint` skips
+/// peers that are already `bzz` / `pending` / `dialing`), and the bootnode
+/// dial path skips peers we're already connected to — so a healthy
+/// short-background resume is close to a no-op rather than a full
+/// re-handshake.
+#[allow(clippy::too_many_arguments)]
+fn force_resume(
+    bootnodes: &[Multiaddr],
+    state: &mut SwarmState,
+    peerstore: &PeerStore,
+    backoff: &mut Duration,
+    last_bootstrap_at: &mut Instant,
+    last_top_up_at: &mut Instant,
+    local_peer_id: PeerId,
+    bootnode_dial_tx: &mpsc::Sender<Multiaddr>,
+) -> usize {
+    // Clear the dedup so peers we've connected to before can re-enter the
+    // queue; `enqueue_hint` still filters currently-live peers, so a
+    // wholesale clear doesn't disturb surviving connections.
+    state.seen_hints.clear();
+    let warm = peerstore.warm_hints();
+    let warmed = warm.len();
+    for hint in warm {
+        state.enqueue_hint(hint, local_peer_id);
+    }
+    // Unpark the automatic guards: reset the bootstrap backoff and rewind
+    // both cadence clocks so the loop-top maintenance can re-fire
+    // immediately if this resume doesn't fully recover the set on its own.
+    *backoff = MIN_BACKOFF;
+    *last_bootstrap_at = Instant::now()
+        .checked_sub(MIN_BACKOFF)
+        .unwrap_or_else(Instant::now);
+    *last_top_up_at = Instant::now()
+        .checked_sub(PEER_TOP_UP_INTERVAL)
+        .unwrap_or_else(Instant::now);
+    if !bootnodes.is_empty() {
+        spawn_bootstrap_dial(bootnodes, bootnode_dial_tx.clone());
+    }
+    info!(
+        target: "ant_p2p",
+        warmed,
+        peer_set_size = state.peer_set_size(),
+        "resume: re-warmed dial queue + fired bootstrap re-dial",
+    );
+    warmed
+}
+
 /// Pick known-but-unconnected peers to dial into under-populated shallow
 /// bins. Pure selection (no swarm access) so the policy is unit-testable:
 /// for each bin `0..BIN_BALANCE_MAX_BIN` whose *connected* count is below
@@ -5554,6 +5650,74 @@ mod tests {
             addrs: Vec::new(),
             overlay,
         }
+    }
+
+    /// `force_resume` is the post-suspension recovery lever, so its whole
+    /// job is to act **even when the automatic guards would stay parked**:
+    /// a swarm full of half-open zombies still looks healthy
+    /// (`bzz_peers` non-empty, backoff far from elapsing), which is exactly
+    /// when `maybe_top_up_peers` / `maybe_rebootstrap` do nothing. The
+    /// resume must unconditionally clear the hint dedup and rewind the
+    /// backoff + cadence clocks so the loop-top maintenance is free to
+    /// re-fire immediately.
+    #[tokio::test]
+    async fn force_resume_unparks_guards_despite_healthy_looking_swarm() {
+        let mut state = SwarmState::new(
+            32,
+            [0u8; 32],
+            false,
+            None,
+            None,
+            None,
+            crate::PeerEthMap::new(),
+        );
+        // Make the swarm *look* healthy: a connected peer and a peer we've
+        // already deduped. This is the half-open state — the count gates
+        // see no reason to act.
+        state.bzz_peers.insert(pid());
+        state.seen_hints.insert(pid());
+
+        // Backoff maxed out and clocks "just fired": the automatic guards
+        // are parked behind their cadence.
+        let mut backoff = MAX_BACKOFF;
+        let mut last_bootstrap_at = Instant::now();
+        let mut last_top_up_at = Instant::now();
+
+        // Empty bootnodes → no real DNS / dial spawned, so the test stays
+        // hermetic; the gate-bypass bookkeeping is what we're asserting.
+        let (tx, _rx) = mpsc::channel::<Multiaddr>(8);
+        let warmed = force_resume(
+            &[],
+            &mut state,
+            &PeerStore::disabled(),
+            &mut backoff,
+            &mut last_bootstrap_at,
+            &mut last_top_up_at,
+            pid(),
+            &tx,
+        );
+
+        assert_eq!(warmed, 0, "a disabled peerstore re-queues no warm hints");
+        assert!(
+            state.seen_hints.is_empty(),
+            "resume must clear the dedup so previously-seen peers can re-enter",
+        );
+        assert_eq!(
+            backoff, MIN_BACKOFF,
+            "resume must reset the bootstrap backoff"
+        );
+        assert!(
+            last_bootstrap_at.elapsed() >= MIN_BACKOFF,
+            "resume must rewind the bootstrap clock so maybe_rebootstrap is free to fire",
+        );
+        assert!(
+            last_top_up_at.elapsed() >= PEER_TOP_UP_INTERVAL,
+            "resume must rewind the top-up clock so maybe_top_up_peers is free to fire",
+        );
+        assert!(
+            state.bzz_peers.len() == 1,
+            "resume must not disturb surviving connections",
+        );
     }
 
     /// The balance pass must dial only into bins below the minimum, take

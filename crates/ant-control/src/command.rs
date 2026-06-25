@@ -39,6 +39,26 @@ pub enum ControlCommand {
     /// Drop the on-disk peerstore snapshot and clear the in-memory dedup
     /// state. Does not disconnect current peers.
     ResetPeerstore { ack: oneshot::Sender<ControlAck> },
+    /// Force a post-suspension recovery of the swarm. Re-warms the dial
+    /// queue from the on-disk peerstore and fires a fresh bootstrap dial
+    /// **unconditionally** — bypassing the count-based gates that keep the
+    /// automatic `maybe_top_up_peers` / `maybe_rebootstrap` maintenance
+    /// parked while the swarm still *believes* it has peers.
+    ///
+    /// This is the lever an embedded host (the iOS in-process node) pulls
+    /// on a background→foreground transition: after a long OS suspension
+    /// the libp2p connections are half-open (the kernel sockets were
+    /// reaped but no FIN was seen, so `bzz_peers` looks healthy) and
+    /// nothing re-dials — the next retrieval hangs and the page renders
+    /// blank. A fresh bootstrap dial opens new sockets in parallel so
+    /// retrieval has live routes again; the dead connections fail
+    /// individual requests and get reaped as the host touches them.
+    ///
+    /// Cheap and idempotent — safe to call on every foreground. The ack is
+    /// a [`ControlAck::Ok`] whose message reports how many warm hints were
+    /// re-queued. Does **not** forcibly disconnect surviving peers (a
+    /// healthy short-background resume must not pay a full re-handshake).
+    Resume { ack: oneshot::Sender<ControlAck> },
     /// Retrieve a chunk by 32-byte reference. The node loop picks the
     /// closest BZZ peer, runs `ant_retrieval::retrieve_chunk`, and acks
     /// with the verified payload bytes (or an error string).

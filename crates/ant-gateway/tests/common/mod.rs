@@ -481,6 +481,13 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
                 message: "ok".to_string(),
             });
         }
+        ControlCommand::Resume { ack } => {
+            // The fake loop has no swarm to re-warm; ack Ok like the real
+            // node loop so the match stays exhaustive.
+            let _ = ack.send(ControlAck::Ok {
+                message: "ok".to_string(),
+            });
+        }
         ControlCommand::PushSoc {
             address, wire, ack, ..
         } => {

@@ -804,6 +804,61 @@ pub unsafe extern "C" fn ant_peer_count(handle: *const AntHandle) -> i32 {
     }
 }
 
+/// Prompt the running node to recover after an OS suspension (e.g. an iOS
+/// background reap): re-warm the dial queue and re-dial bootstrap + known
+/// peers, **without** a full [`ant_shutdown`] / [`ant_init`]. Cheap and
+/// idempotent — safe to call on every foreground transition.
+///
+/// After a long suspension the in-process node's libp2p connections are
+/// half-open (the kernel sockets were reaped but no FIN arrived, so the
+/// peer counter still looks healthy) and nothing re-dials, so the next
+/// `bzz://` retrieval hangs and the page renders blank. This re-opens live
+/// sockets to the bootnodes in parallel so retrieval has working routes
+/// again; the dead connections fall away as they're touched. It does not
+/// forcibly disconnect surviving peers — a healthy short-background resume
+/// stays close to a no-op rather than paying a full re-handshake.
+///
+/// This recovers the *swarm* only. If the in-process gateway's localhost
+/// listener was also torn down, rebind it separately with
+/// [`ant_stop_gateway`] + [`ant_start_gateway`] (a plain re-call to
+/// `ant_start_gateway` is a no-op while its serve task is still alive).
+///
+/// Returns `0` on success. Returns `-1` on a null handle and `-2` if the
+/// node loop didn't ack (already shut down); in the `-2` case an allocated
+/// error string is written into `*out_err` (free it with
+/// [`ant_free_string`]).
+///
+/// # Safety
+///
+/// * `handle` must come from [`ant_init`] and must not have been passed to
+///   [`ant_shutdown`].
+/// * `out_err` must point at a writable `*mut c_char` slot, or be null to
+///   opt out of error reporting.
+#[no_mangle]
+pub unsafe extern "C" fn ant_resume(handle: *const AntHandle, out_err: *mut *mut c_char) -> i32 {
+    unsafe {
+        clear_out_err(out_err);
+        let Some(handle) = handle.as_ref() else {
+            write_out_err(out_err, "ant_resume: null handle");
+            return -1;
+        };
+        match catch_unwind(AssertUnwindSafe(|| drive::resume(handle))) {
+            Ok(Ok(msg)) => {
+                tracing::info!(target: "ant-ffi", "{msg}");
+                0
+            }
+            Ok(Err(e)) => {
+                write_out_err(out_err, &e.to_string());
+                -2
+            }
+            Err(_) => {
+                write_out_err(out_err, "panic in ant_resume");
+                -2
+            }
+        }
+    }
+}
+
 /// Snapshot the running node's `agent` string from the live status
 /// channel — currently `ant-ffi/<crate-version>` set at
 /// [`ant_init`] time. Lets the host display the version that is
