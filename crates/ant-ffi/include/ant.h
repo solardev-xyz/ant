@@ -100,6 +100,27 @@ unsigned char *ant_download(AntHandle *handle,
 int ant_peer_count(const AntHandle *handle);
 
 /*
+ * Prompt the running node to recover after an OS suspension (e.g. an iOS
+ * background reap): re-warm the dial queue and re-dial bootstrap + known
+ * peers, WITHOUT a full ant_shutdown / ant_init. Cheap and idempotent —
+ * safe to call on every foreground transition.
+ *
+ * After a long suspension the in-process node's libp2p connections are
+ * half-open (sockets reaped, but the peer counter still looks healthy) and
+ * nothing re-dials, so the next bzz:// retrieval hangs and the page renders
+ * blank. This re-opens live sockets to the bootnodes in parallel so
+ * retrieval has working routes again. It recovers the swarm only — if the
+ * gateway's localhost listener was also torn down, rebind it separately
+ * with ant_stop_gateway + ant_start_gateway.
+ *
+ * Returns 0 on success, -1 if `handle` is NULL, and -2 if the node loop
+ * didn't ack (already shut down) — in which case an allocated error string
+ * is written into *out_err (free with ant_free_string). `out_err` may be
+ * NULL to opt out of error reporting.
+ */
+int ant_resume(const AntHandle *handle, char **out_err);
+
+/*
  * Snapshot the running node's `agent` string from the live status
  * channel (currently `ant-ffi/<crate-version>`). Useful for displaying
  * the version of the embedded library actually running, independent

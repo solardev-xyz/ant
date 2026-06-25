@@ -156,6 +156,22 @@ final class AntNode: ObservableObject {
         ant_cancel_download(h)
     }
 
+    /// Force a post-suspension swarm recovery (issue #12): re-warm the
+    /// dial queue + re-dial bootstrap without a full restart. Returns a
+    /// short human-readable result for the smoke log. Safe to call any
+    /// time the handle is up; a healthy node treats it as ~a no-op.
+    func resume() -> String {
+        guard let h = handle else { return "resume: node not ready" }
+        var errPtr: UnsafeMutablePointer<CChar>? = nil
+        let rc = ant_resume(h, &errPtr)
+        if rc == 0 {
+            return "resume: ok (rc=0)"
+        }
+        let msg = errPtr.flatMap { String(cString: $0) } ?? "unknown"
+        if let errPtr = errPtr { ant_free_string(errPtr) }
+        return "resume: FAILED rc=\(rc): \(msg)"
+    }
+
     /// Bulk download without touching the published `downloadProgress`
     /// slot — used for ancillary fetches (album art, manifest probes)
     /// where surfacing a HUD over the main playback UI would be

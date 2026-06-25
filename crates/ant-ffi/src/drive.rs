@@ -248,6 +248,28 @@ pub(crate) enum JobCommand {
 }
 
 // ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+
+/// Nudge the running node to recover after an OS suspension: re-warm the
+/// dial queue and re-dial bootstrap, without a full `ant_shutdown` /
+/// `ant_init`. Returns the node's status message (how many peer hints were
+/// re-queued). Backs [`crate::ant_resume`]; see
+/// [`ControlCommand::Resume`] for the full rationale.
+pub(crate) fn resume(h: &AntHandle) -> Result<String, DriveError> {
+    let cmd_tx = h.cmd_tx.clone();
+    h.runtime.block_on(async move {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        send(&cmd_tx, ControlCommand::Resume { ack: ack_tx }).await?;
+        match recv_oneshot(ack_rx).await? {
+            ControlAck::Ok { message } => Ok(message),
+            ControlAck::Error { message } => Err(DriveError::Op(message)),
+            other => Err(unexpected(&other)),
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Storage plan
 // ---------------------------------------------------------------------------
 
