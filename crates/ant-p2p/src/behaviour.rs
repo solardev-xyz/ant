@@ -5702,7 +5702,10 @@ mod tests {
             state.seen_hints.is_empty(),
             "resume must clear the dedup so previously-seen peers can re-enter",
         );
-        assert_eq!(backoff, MIN_BACKOFF, "resume must reset the bootstrap backoff");
+        assert_eq!(
+            backoff, MIN_BACKOFF,
+            "resume must reset the bootstrap backoff"
+        );
         assert!(
             last_bootstrap_at.elapsed() >= MIN_BACKOFF,
             "resume must rewind the bootstrap clock so maybe_rebootstrap is free to fire",
