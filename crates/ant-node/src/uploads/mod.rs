@@ -233,11 +233,43 @@ const HEAL_PROBES: usize = 4;
 /// walks is genuinely populated, not barely. Tunable.
 const MIN_PEERS_FOR_AUTO_SHALLOW_HEAL: u32 = 12;
 
+/// Cap on concurrent **automatic** "Securing…" passes. Every completed
+/// upload — and every completed-but-unsecured job re-loaded at startup —
+/// wants a heal, but they all share the node's single command channel and
+/// network: run them all at once and each chunk read-back / re-push crawls,
+/// so no file's progress visibly moves (the "many files stuck Securing…"
+/// symptom). A small fair semaphore turns the heals into a queue — a few
+/// run at full speed while the rest park in FIFO order (surfaced to the UI
+/// as "queued") and start the instant a slot frees. Manual "Push again"
+/// bypasses this cap (it's user-initiated, one at a time, and awaited).
+/// Tunable.
+const MAX_CONCURRENT_HEALS: usize = 3;
+
 /// Optional sink for streamed re-push/heal progress (the app's "push
 /// again"). Each item is a JSON line `{"phase":"checking"|"repushing",
 /// "checked"?:n,"total"?:n}`. `None` runs the heal silently (the
 /// post-upload heal, antctl resume).
 type HealProgress = Option<mpsc::UnboundedSender<String>>;
+
+/// One queued automatic heal pass. Carries everything
+/// [`UploadManager::verify_and_heal`] needs so the work can be deferred
+/// behind the [`MAX_CONCURRENT_HEALS`] semaphore without re-reading job
+/// state. `addrs` is `Some` when the caller already holds the chunk
+/// address list in memory (the post-upload path — robust even if the
+/// source file is deleted right after upload); `None` means derive it
+/// from the source file when the pass actually runs (startup re-heal,
+/// `resume` of a completed job).
+struct HealRequest {
+    job_id: String,
+    mode: HealMode,
+    addrs: Option<Vec<[u8; 32]>>,
+    batch_id: [u8; 32],
+    source_path: PathBuf,
+    source_size: u64,
+    raw: bool,
+    name: Option<String>,
+    content_type: Option<String>,
+}
 
 /// What a [`verify_and_heal`](UploadManager::verify_and_heal) pass is allowed
 /// to re-push, and how many rounds it spends doing it. Decouples "how
@@ -667,6 +699,15 @@ struct UploadManagerInner {
     /// [`UploadManager::neighbourhood_ready`]). `None` in tests / older
     /// embedders → the heal stays conservative (reachable-only).
     status: Option<watch::Receiver<StatusSnapshot>>,
+    /// Bounds concurrent automatic heals to [`MAX_CONCURRENT_HEALS`]; the
+    /// rest of the enqueued passes park here (fair FIFO) and form the heal
+    /// queue, so a backlog of just-completed / rehydrated uploads secures a
+    /// few at a time instead of thundering the network and stalling.
+    heal_slots: Arc<tokio::sync::Semaphore>,
+    /// Job ids with an automatic heal queued or running, so a second
+    /// trigger for the same job (a fresh upload completing, a startup
+    /// re-heal, a `resume`) doesn't enqueue a duplicate pass.
+    heal_inflight: Mutex<HashSet<String>>,
 }
 
 impl UploadManager {
@@ -691,6 +732,8 @@ impl UploadManager {
                 default_batch_id,
                 disk_cache: None,
                 status: None,
+                heal_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HEALS)),
+                heal_inflight: Mutex::new(HashSet::new()),
             }),
         })
     }
@@ -806,6 +849,9 @@ impl UploadManager {
             reference: None,
             heal_verified: false,
             heal_finished: false,
+            heal_phase: None,
+            heal_checked: None,
+            heal_total: None,
             chunks_requeued: 0,
             stalled: false,
         };
@@ -927,11 +973,23 @@ impl UploadManager {
             let status = handle.info.lock().expect("upload mutex poisoned").status;
             if status == UploadStatus::Completed {
                 let snap = handle.snapshot();
-                let mgr = self.clone();
-                let handle = handle.clone();
-                tokio::spawn(async move {
-                    mgr.heal_completed_job(handle, HealMode::ReachableOnly, None)
-                        .await;
+                // Queue the heal (bounded + deduped) instead of spawning it
+                // unbounded; the worker re-derives the address list from the
+                // source. Returns the current snapshot immediately — the job
+                // stays `Completed` while it secures.
+                self.enqueue_heal(HealRequest {
+                    job_id: snap.job_id.clone(),
+                    mode: HealMode::ReachableOnly,
+                    addrs: None,
+                    batch_id: resolve_batch_id(
+                        snap.batch_id.as_deref(),
+                        self.inner.default_batch_id,
+                    ),
+                    source_path: snap.source_path.clone(),
+                    source_size: snap.source_size,
+                    raw: snap.raw,
+                    name: snap.name.clone(),
+                    content_type: snap.content_type.clone(),
                 });
                 return Ok(snap);
             }
@@ -1013,6 +1071,32 @@ impl UploadManager {
             let job_id = info.job_id.clone();
             let needs_restart =
                 matches!(info.status, UploadStatus::Running | UploadStatus::Pending,);
+            // A completed job whose self-heal never finished (the daemon was
+            // killed / redeployed mid-heal, or before it ran) needs its
+            // securing pass re-queued on boot — captured here before `info`
+            // is moved into the handle. `None` ⇒ leave it untouched.
+            let secure_req = (matches!(info.status, UploadStatus::Completed)
+                && !info.heal_finished)
+                .then(|| HealRequest {
+                    job_id: job_id.clone(),
+                    // Conservative at boot: confirm reachability and re-push
+                    // genuinely-missing chunks, but don't auto-promote shallow
+                    // placements — a thin startup routing table makes that
+                    // probe unreliable (the historical reason the post-upload
+                    // heal stayed reachable-only). "Push again" still does the
+                    // shallow-aware repair on demand.
+                    mode: HealMode::ReachableOnly,
+                    addrs: None,
+                    batch_id: resolve_batch_id(
+                        info.batch_id.as_deref(),
+                        self.inner.default_batch_id,
+                    ),
+                    source_path: info.source_path.clone(),
+                    source_size: info.source_size,
+                    raw: info.raw,
+                    name: info.name.clone(),
+                    content_type: info.content_type.clone(),
+                });
             let (progress_tx, _rx) = watch::channel(info.clone());
             let handle = Arc::new(JobHandle {
                 info: Mutex::new(info),
@@ -1056,25 +1140,136 @@ impl UploadManager {
                     &job_id,
                 ));
             }
-            // No startup heal: previously-completed uploads are left as-is
-            // on boot. Healing now only runs right after an upload (the
-            // post-upload spawn) or when the user explicitly taps "Push
-            // again" (`repush_with_progress`). A constrained node's
-            // neighbourhood probes can't reliably judge a chunk's durability
-            // anyway, so an automatic boot-time re-push churns postage and
-            // the network without a dependable signal that it's needed.
+            // Startup heal: finish securing any completed-but-unverified job
+            // whose heal was interrupted. Without this they sit "Securing…"
+            // forever — nothing else re-runs heal on boot. Bounded + queued
+            // by `enqueue_heal` so a backlog secures a few at a time instead
+            // of thundering the network, and reachable-only (see `mode`
+            // above) so a thin boot-time routing table doesn't churn postage.
+            if let Some(req) = secure_req {
+                info!(
+                    target: "ant_node::uploads",
+                    job_id, "queuing startup heal for unsecured completed upload",
+                );
+                self.enqueue_heal(req);
+            }
         }
         Ok(count)
+    }
+
+    /// Queue an automatic heal for a completed job, bounded by
+    /// [`MAX_CONCURRENT_HEALS`] and deduplicated against in-flight heals.
+    /// The spawned task parks on the semaphore — the job shows as "queued"
+    /// meanwhile — until a slot frees, then runs the pass and clears its
+    /// marker. Must be called from within a tokio runtime (the post-upload
+    /// driver task, `resume`, or `rehydrate_from_disk` under
+    /// `runtime.enter()`).
+    fn enqueue_heal(&self, req: HealRequest) {
+        let job_id = req.job_id.clone();
+        if !self
+            .inner
+            .heal_inflight
+            .lock()
+            .expect("heal inflight mutex poisoned")
+            .insert(job_id.clone())
+        {
+            return; // already queued or running — don't double-secure
+        }
+        // Surface the wait immediately so a backlog reads as "queued" rather
+        // than a frozen "Securing…". The worker overwrites this with
+        // "checking" / "repushing" once it starts; mark_heal_* clears it.
+        self.set_heal_progress(&job_id, "queued", None, None);
+        let mgr = self.clone();
+        tokio::spawn(async move {
+            // Park here until a heal slot frees (fair FIFO = the queue).
+            let permit = mgr.inner.heal_slots.clone().acquire_owned().await;
+            if permit.is_ok() {
+                mgr.run_heal(req).await;
+            }
+            mgr.inner
+                .heal_inflight
+                .lock()
+                .expect("heal inflight mutex poisoned")
+                .remove(&job_id);
+        });
+    }
+
+    /// Run one queued automatic heal to completion. Derives the chunk
+    /// address list if the request didn't carry it (the source must still
+    /// be present and the same size); a missing/oversized source can't be
+    /// verified, so the job is marked heal-finished to stop the endless
+    /// "Securing…". No progress sink — the automatic bar is driven by the
+    /// job snapshot via [`set_heal_progress`], not a stream.
+    async fn run_heal(&self, req: HealRequest) {
+        let addrs = if let Some(addrs) = req.addrs {
+            addrs
+        } else {
+            let resolved = self.resolve_source_path(&req.source_path);
+            match std::fs::metadata(&resolved) {
+                Ok(md) if md.len() == req.source_size => {}
+                _ => {
+                    info!(
+                        target: "ant_node::uploads",
+                        job_id = %req.job_id,
+                        "queued heal: source missing or changed — marking secured-as-is",
+                    );
+                    self.mark_heal_finished(&req.job_id);
+                    return;
+                }
+            }
+            match collect_heal_addrs(
+                &resolved,
+                req.source_size,
+                req.raw,
+                req.name.as_deref(),
+                req.content_type.as_deref(),
+            ) {
+                Ok(Some(addrs)) => addrs,
+                Ok(None) => {
+                    info!(
+                        target: "ant_node::uploads",
+                        job_id = %req.job_id,
+                        "queued heal: file exceeds heal chunk cap — skipping",
+                    );
+                    self.mark_heal_finished(&req.job_id);
+                    return;
+                }
+                Err(e) => {
+                    warn!(
+                        target: "ant_node::uploads",
+                        job_id = %req.job_id,
+                        "queued heal: could not re-derive chunks: {e}",
+                    );
+                    self.mark_heal_finished(&req.job_id);
+                    return;
+                }
+            }
+        };
+        self.verify_and_heal(
+            &req.job_id,
+            &addrs,
+            req.batch_id,
+            &req.source_path,
+            req.source_size,
+            req.raw,
+            req.name.as_deref(),
+            req.content_type.as_deref(),
+            req.mode,
+            None,
+        )
+        .await;
     }
 
     /// Deep-heal one `Completed` job. Re-validates the source file
     /// (existence + size), re-derives the chunk set, then runs the
     /// [`verify_and_heal`](Self::verify_and_heal) loop. Best-effort: a
     /// missing/changed source or an oversized file is logged and skipped.
-    /// Only two callers remain: the post-upload spawn right after an upload
-    /// completes, and the user-initiated "Push again"
-    /// ([`repush_with_progress`](Self::repush_with_progress)). There is no
-    /// startup heal — completed uploads are not re-pushed on boot.
+    /// Now only the user-initiated "Push again"
+    /// ([`repush_with_progress`](Self::repush_with_progress)) calls this
+    /// directly — it awaits the pass and streams progress. The automatic
+    /// heals (post-upload, `resume`, startup re-heal) go through the bounded
+    /// queue instead ([`enqueue_heal`](Self::enqueue_heal) →
+    /// [`run_heal`](Self::run_heal)).
     async fn heal_completed_job(
         &self,
         handle: Arc<JobHandle>,
@@ -1566,43 +1761,37 @@ impl UploadManager {
                 "skipping post-upload heal: file exceeds heal chunk cap",
             );
         } else if !handle.cancel_requested.load(Ordering::SeqCst) {
-            let mgr = self.clone();
-            let job_id = snap.job_id.clone();
-            let source_path = source_path.clone();
-            let source_size = snap.source_size;
-            let raw = snap.raw;
-            let name = snap.name.clone();
-            let content_type = snap.content_type.clone();
-            tokio::spawn(async move {
-                // Sketch B: on a well-connected node the per-chunk probe is
-                // trustworthy, so the automatic heal runs the full reachable
-                // mop-up AND a shallow-promotion pass — repairing both
-                // transient stragglers and shallow placements. On a
-                // constrained node the probe can't reliably judge durability,
-                // so stay reachable-only and leave shallow repair to the user.
-                let mode = if mgr.neighbourhood_ready() {
-                    info!(
-                        target: "ant_node::uploads",
-                        job_id = %job_id,
-                        "node well-connected — post-upload heal will also re-push shallow placements",
-                    );
-                    HealMode::ReachableThenShallow
-                } else {
-                    HealMode::ReachableOnly
-                };
-                mgr.verify_and_heal(
-                    &job_id,
-                    &heal_addrs,
-                    batch_id,
-                    &source_path,
-                    source_size,
-                    raw,
-                    name.as_deref(),
-                    content_type.as_deref(),
-                    mode,
-                    None,
-                )
-                .await;
+            // Sketch B: on a well-connected node the per-chunk probe is
+            // trustworthy, so the automatic heal runs the full reachable
+            // mop-up AND a shallow-promotion pass — repairing both transient
+            // stragglers and shallow placements. On a constrained node the
+            // probe can't reliably judge durability, so stay reachable-only
+            // and leave shallow repair to the user.
+            let mode = if self.neighbourhood_ready() {
+                info!(
+                    target: "ant_node::uploads",
+                    job_id = %snap.job_id,
+                    "node well-connected — post-upload heal will also re-push shallow placements",
+                );
+                HealMode::ReachableThenShallow
+            } else {
+                HealMode::ReachableOnly
+            };
+            // Queue rather than spawn unbounded: a burst of completing uploads
+            // would otherwise launch a heal each and thunder the one command
+            // channel, stalling them all. The address list is already in
+            // memory, so pass it through (robust even if the source is
+            // deleted right after upload).
+            self.enqueue_heal(HealRequest {
+                job_id: snap.job_id.clone(),
+                mode,
+                addrs: Some(heal_addrs),
+                batch_id,
+                source_path: source_path.clone(),
+                source_size: snap.source_size,
+                raw: snap.raw,
+                name: snap.name.clone(),
+                content_type: snap.content_type.clone(),
             });
         }
 
@@ -2037,8 +2226,10 @@ impl UploadManager {
         // since reachable-but-shallow chunks aren't counted here.
         for round in 0..mode.mopup_rounds() {
             tokio::time::sleep(HEAL_SETTLE_DELAY).await;
-            emit_heal(&progress, "checking", None, None);
-            let Some(missing) = self.query_missing(all_addrs, HEAL_PROBES, false).await else {
+            let Some(missing) = self
+                .query_missing(job_id, all_addrs, HEAL_PROBES, false, &progress)
+                .await
+            else {
                 // Read-back couldn't run (peers not ready / transport
                 // error). Do NOT claim the upload is healthy — just try
                 // again next round after another settle delay.
@@ -2071,6 +2262,7 @@ impl UploadManager {
             let missing_set: HashSet<[u8; 32]> = missing.into_iter().collect();
             if let Err(e) = self
                 .repush_missing(
+                    job_id,
                     &missing_set,
                     batch_id,
                     source_path,
@@ -2099,8 +2291,10 @@ impl UploadManager {
         let include_shallow = mode.promotes_shallow();
         if include_shallow {
             tokio::time::sleep(HEAL_SETTLE_DELAY).await;
-            emit_heal(&progress, "checking", None, None);
-            if let Some(missing) = self.query_missing(all_addrs, HEAL_PROBES, true).await {
+            if let Some(missing) = self
+                .query_missing(job_id, all_addrs, HEAL_PROBES, true, &progress)
+                .await
+            {
                 if !missing.is_empty() {
                     warn!(
                         target: "ant_node::uploads",
@@ -2110,6 +2304,7 @@ impl UploadManager {
                     let missing_set: HashSet<[u8; 32]> = missing.into_iter().collect();
                     if let Err(e) = self
                         .repush_missing(
+                            job_id,
                             &missing_set,
                             batch_id,
                             source_path,
@@ -2135,9 +2330,8 @@ impl UploadManager {
         // probes for the same depth the pass repaired: deep reachability when
         // shallow was promoted, plain reachability otherwise.
         tokio::time::sleep(HEAL_SETTLE_DELAY).await;
-        emit_heal(&progress, "checking", None, None);
         match self
-            .query_missing(all_addrs, HEAL_PROBES, include_shallow)
+            .query_missing(job_id, all_addrs, HEAL_PROBES, include_shallow, &progress)
             .await
         {
             Some(missing) if missing.is_empty() => {
@@ -2217,20 +2411,74 @@ impl UploadManager {
             .cloned()
     }
 
-    /// Mark a job's chunks confirmed deep-reachable. Persists the flag;
-    /// leaves status untouched.
+    /// Fold one live heal step into the job snapshot's transient
+    /// `heal_phase` / `heal_checked` / `heal_total` fields and broadcast it
+    /// to watchers — the app's determinate "Securing…" bar. Runtime-only:
+    /// never saved to disk (the fields are `skip_serializing`), and the
+    /// terminal `mark_heal_*` clear them when heal ends. A no-op for a job
+    /// the manager no longer holds.
+    fn set_heal_progress(
+        &self,
+        job_id: &str,
+        phase: &str,
+        checked: Option<u64>,
+        total: Option<u64>,
+    ) {
+        let Some(handle) = self.job_handle(job_id) else {
+            return;
+        };
+        let snap = {
+            let mut info = handle.info.lock().expect("upload mutex poisoned");
+            info.heal_phase = Some(phase.to_string());
+            info.heal_checked = checked;
+            info.heal_total = total;
+            info.clone()
+        };
+        let _ = handle.progress.send(snap);
+    }
+
+    /// Report one heal progress step to *both* sinks: the optional live
+    /// stream (`emit_heal`, the manual "Push again" bar) and the job
+    /// snapshot (`set_heal_progress`, the automatic "Securing…" bar).
+    /// Synchronous and in-order, so the terminal `mark_heal_*` clear always
+    /// wins over a trailing progress line.
+    fn report_heal(
+        &self,
+        job_id: &str,
+        progress: &HealProgress,
+        phase: &str,
+        checked: Option<usize>,
+        total: Option<usize>,
+    ) {
+        emit_heal(progress, phase, checked, total);
+        self.set_heal_progress(
+            job_id,
+            phase,
+            checked.map(|c| c as u64),
+            total.map(|t| t as u64),
+        );
+    }
+
+    /// Mark a job's chunks confirmed deep-reachable. Persists the flag and
+    /// clears any live "Securing…" progress; leaves status untouched.
     fn mark_heal_verified(&self, job_id: &str) {
         let Some(handle) = self.job_handle(job_id) else {
             return;
         };
         let snap = {
             let mut info = handle.info.lock().expect("upload mutex poisoned");
-            if info.heal_verified && info.heal_finished {
+            let progress_set = info.heal_phase.is_some()
+                || info.heal_checked.is_some()
+                || info.heal_total.is_some();
+            if info.heal_verified && info.heal_finished && !progress_set {
                 return;
             }
             info.heal_verified = true;
             // Verified implies the heal has run its course.
             info.heal_finished = true;
+            info.heal_phase = None;
+            info.heal_checked = None;
+            info.heal_total = None;
             info.last_update_unix = unix_seconds();
             info.clone()
         };
@@ -2254,10 +2502,16 @@ impl UploadManager {
         };
         let snap = {
             let mut info = handle.info.lock().expect("upload mutex poisoned");
-            if info.heal_finished {
+            let progress_set = info.heal_phase.is_some()
+                || info.heal_checked.is_some()
+                || info.heal_total.is_some();
+            if info.heal_finished && !progress_set {
                 return;
             }
             info.heal_finished = true;
+            info.heal_phase = None;
+            info.heal_checked = None;
+            info.heal_total = None;
             info.last_update_unix = unix_seconds();
             info.clone()
         };
@@ -2354,11 +2608,20 @@ impl UploadManager {
 
     async fn query_missing(
         &self,
+        job_id: &str,
         all_addrs: &[[u8; 32]],
         probes: usize,
         include_shallow: bool,
+        progress: &HealProgress,
     ) -> Option<Vec<[u8; 32]>> {
         let mut missing = Vec::new();
+        // Determinate "checking" progress: count chunks as each read-back
+        // batch is verified, so the "Securing…" bar advances across the
+        // read-back (the bulk of heal time on a healthy file, which never
+        // reaches the "repushing" phase).
+        let total = all_addrs.len();
+        let mut checked = 0usize;
+        self.report_heal(job_id, progress, "checking", Some(0), Some(total));
         for batch in all_addrs.chunks(HEAL_VERIFY_BATCH) {
             let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
             if self
@@ -2387,6 +2650,8 @@ impl UploadManager {
                 // verify now, so the read-back is inconclusive.
                 _ => return None,
             }
+            checked += batch.len();
+            self.report_heal(job_id, progress, "checking", Some(checked), Some(total));
         }
         Some(missing)
     }
@@ -2412,6 +2677,7 @@ impl UploadManager {
     #[allow(clippy::too_many_arguments)]
     async fn repush_missing(
         &self,
+        job_id: &str,
         missing: &HashSet<[u8; 32]>,
         batch_id: [u8; 32],
         source_path: &Path,
@@ -2431,11 +2697,11 @@ impl UploadManager {
         // invoked at every drain point below.
         let total = missing.len();
         let mut pushed = 0usize;
-        emit_heal(progress, "repushing", Some(0), Some(total));
+        self.report_heal(job_id, progress, "repushing", Some(0), Some(total));
         macro_rules! note_done {
             () => {{
                 pushed += 1;
-                emit_heal(progress, "repushing", Some(pushed), Some(total));
+                self.report_heal(job_id, progress, "repushing", Some(pushed), Some(total));
             }};
         }
 
@@ -2823,6 +3089,9 @@ pub fn to_view(info: UploadJobInfo) -> UploadJobView {
         stalled: info.stalled,
         heal_verified: info.heal_verified,
         heal_finished: info.heal_finished,
+        heal_phase: info.heal_phase,
+        heal_checked: info.heal_checked,
+        heal_total: info.heal_total,
     }
 }
 
@@ -4107,6 +4376,9 @@ mod tests {
             reference: None,
             heal_verified: false,
             heal_finished: false,
+            heal_phase: None,
+            heal_checked: None,
+            heal_total: None,
             chunks_requeued: 0,
             stalled: false,
         };

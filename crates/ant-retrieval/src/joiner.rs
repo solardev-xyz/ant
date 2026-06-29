@@ -57,6 +57,19 @@ pub const ENCRYPTED_REF_SIZE: usize = ant_crypto::REFERENCE_SIZE;
 /// us allocate gigabytes before noticing. Override per-call when there's a
 /// legitimate reason to fetch more.
 pub const DEFAULT_MAX_FILE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Span ceiling for **durability** enumeration (post-upload verify / deep
+/// verify), as opposed to the interactive CLI [`DEFAULT_MAX_FILE_BYTES`].
+/// A file the gateway will serve (up to ~16 GiB) must also be *verifiable*,
+/// or the verify path reuses the tight 32 MiB interactive cap and reports
+/// large-but-healthy uploads as "not fully stored" (the `file too large:
+/// span … cap 33554432` failure a 55 MB upload hits). Sized to the gateway
+/// serving ceiling. Enumeration only walks interior nodes and records
+/// 32-byte addresses, so even at the ceiling the memory cost is tens of
+/// MiB. Expressed as `u64` and narrowed at the call site with saturation,
+/// so 32-bit targets clamp to `usize::MAX` instead of overflowing.
+pub const DURABILITY_MAX_FILE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
 /// Hard ceiling on intermediate-chunk fan-out. `swarm.Branches`.
 const MAX_BRANCHES: usize = CHUNK_SIZE / 32;
 

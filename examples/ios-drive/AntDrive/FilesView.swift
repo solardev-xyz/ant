@@ -351,9 +351,21 @@ private struct FileRow: View {
     /// network"). A retrievable verdict — the expected outcome — stays
     /// silent, as does the transient in-progress probe.
     private var statusMessage: String? {
-        if !job.statusLabel.isEmpty { return job.statusLabel }
-        if job.isDone, let p = node.propagation[job.id], !p.isStoredSafely { return p.label }
-        return nil
+        // While uploading / paused / failed, the job's own status line wins.
+        if !job.isDone { return job.statusLabel.isEmpty ? nil : job.statusLabel }
+        // Completed: a user-run deep verify (propagation) is the richest
+        // verdict and *overrides* the daemon's heal flags, which can lag a
+        // successful "Push again" — heal may leave the job `degraded` while
+        // the re-verify confirms the file is now fully stored. Match the
+        // detail page's precedence so the row clears instead of stubbornly
+        // showing "Not fully backed up": warn only when the verify says
+        // not-stored-safely; stay silent when it confirms safe.
+        if let p = node.propagation[job.id] {
+            return p.isStoredSafely ? nil : p.label
+        }
+        // No deep verify yet — fall back to the job's own heal-derived label
+        // ("Securing…" / "Not fully backed up" / "").
+        return job.statusLabel.isEmpty ? nil : job.statusLabel
     }
 
     @ViewBuilder private var trailing: some View {
@@ -519,6 +531,7 @@ struct FileDetailView: View {
                 ScrollView {
                     VStack(spacing: 18) {
                         previewCard(job)
+                        transferCard(job)
                         if job.isDone { verificationCard(job) }
                         detailsCard(job)
                         if let err = job.lastError, !err.isEmpty { errorCard(err) }
@@ -586,6 +599,77 @@ struct FileDetailView: View {
             .foregroundStyle(s.color)
             .padding(.horizontal, 10).padding(.vertical, 5)
             .background(s.color.opacity(0.16), in: .capsule)
+    }
+
+    /// Live progress for the two long-running phases of getting a file onto
+    /// the network: the initial **upload** (pushing every chunk once) and the
+    /// post-upload **securing** heal (reading them back and re-storing any
+    /// that didn't land deeply). Each draws a determinate bar when the daemon
+    /// reports counts, and an indeterminate one during the brief steps that
+    /// don't. Renders nothing once the file is uploaded and secured.
+    @ViewBuilder
+    private func transferCard(_ job: UploadJob) -> some View {
+        if job.isActive {
+            GlassCard {
+                progressBlock(
+                    icon: "arrow.up.circle",
+                    title: job.fraction.map { "Uploading \(Int($0 * 100))%" } ?? "Uploading…",
+                    detail: job.chunksTotal.map { "\(job.chunksPushed) / \($0) parts pushed" },
+                    explanation: "Splitting the file into encrypted parts and pushing each one to the network.",
+                    fraction: job.fraction,
+                    tint: .blue)
+            }
+        } else if job.isSecuring {
+            GlassCard {
+                progressBlock(
+                    icon: job.isQueuedToSecure ? "clock" : "lock.shield",
+                    title: job.securingPhaseLabel,
+                    detail: securingDetail(job),
+                    explanation: job.isQueuedToSecure
+                        ? "Waiting its turn — the app secures a few files at a time so each finishes quickly instead of all crawling at once."
+                        : "Confirming every part landed in its true place on the network — and re-storing any that didn't — so anyone can open this file, not just this device.",
+                    fraction: job.securingFraction,
+                    tint: .blue)
+            }
+        }
+    }
+
+    /// "12 / 480 parts" for a securing step that carries determinate counts.
+    private func securingDetail(_ job: UploadJob) -> String? {
+        guard let checked = job.healChecked, let total = job.healTotal else { return nil }
+        return "\(checked) / \(total) parts"
+    }
+
+    /// Shared header + (in)determinate linear bar used by `transferCard`.
+    private func progressBlock(
+        icon: String,
+        title: String,
+        detail: String?,
+        explanation: String,
+        fraction: Double?,
+        tint: Color
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: icon).foregroundStyle(tint)
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white)
+                Spacer()
+                if let detail {
+                    Text(detail)
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.white.opacity(0.6))
+                }
+            }
+            if let fraction {
+                ProgressView(value: fraction).progressViewStyle(.linear).tint(tint)
+            } else {
+                ProgressView().progressViewStyle(.linear).tint(tint)
+            }
+            Text(explanation)
+                .font(.caption).foregroundStyle(.white.opacity(0.6))
+        }
     }
 
     @ViewBuilder

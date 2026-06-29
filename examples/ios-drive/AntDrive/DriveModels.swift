@@ -31,6 +31,16 @@ struct UploadJob: Codable, Identifiable, Equatable {
     /// whether or not it could confirm `healVerified`. Lets the UI stop
     /// showing "Securing…" once heal is done even on the degraded path.
     let healFinished: Bool
+    /// Live "Securing…" progress emitted by the daemon's automatic heal.
+    /// `healPhase` is the current step (`"checking"` while reading chunks
+    /// back, `"repushing"` while re-storing the ones that didn't land);
+    /// `healChecked` of `healTotal` is that step's determinate count. All
+    /// `nil` for an older daemon, for a step with no count, or once heal
+    /// finished and the daemon cleared them — so the UI falls back to an
+    /// indeterminate spinner.
+    let healPhase: String?
+    let healChecked: UInt64?
+    let healTotal: UInt64?
 
     var id: String { jobId }
 
@@ -50,6 +60,9 @@ struct UploadJob: Codable, Identifiable, Equatable {
         case reference
         case healVerified = "heal_verified"
         case healFinished = "heal_finished"
+        case healPhase = "heal_phase"
+        case healChecked = "heal_checked"
+        case healTotal = "heal_total"
     }
 
     /// Custom decode so the two heal fields default to `false` against an
@@ -72,6 +85,9 @@ struct UploadJob: Codable, Identifiable, Equatable {
         reference = try c.decodeIfPresent(String.self, forKey: .reference)
         healVerified = try c.decodeIfPresent(Bool.self, forKey: .healVerified) ?? false
         healFinished = try c.decodeIfPresent(Bool.self, forKey: .healFinished) ?? false
+        healPhase = try c.decodeIfPresent(String.self, forKey: .healPhase)
+        healChecked = try c.decodeIfPresent(UInt64.self, forKey: .healChecked)
+        healTotal = try c.decodeIfPresent(UInt64.self, forKey: .healTotal)
     }
 
     /// Best display name: the manifest name, else the source file's
@@ -86,6 +102,29 @@ struct UploadJob: Codable, Identifiable, Equatable {
     var fraction: Double? {
         guard let total = chunksTotal, total > 0 else { return nil }
         return min(1.0, Double(chunksPushed) / Double(total))
+    }
+
+    /// 0…1 progress of the post-upload "Securing…" heal, when the daemon is
+    /// reporting determinate counts for the current step; `nil` for a step
+    /// with no count (or an older daemon) so the UI shows a spinner instead.
+    var securingFraction: Double? {
+        guard let total = healTotal, total > 0, let checked = healChecked else { return nil }
+        return min(1.0, Double(checked) / Double(total))
+    }
+
+    /// `true` while this file is waiting its turn in the bounded heal queue
+    /// (the daemon caps how many secure at once). Distinct from actively
+    /// securing — the bar isn't moving because it hasn't started yet.
+    var isQueuedToSecure: Bool { isSecuring && healPhase == "queued" }
+
+    /// Human label for the current securing step.
+    var securingPhaseLabel: String {
+        switch healPhase {
+        case "queued": return "Waiting to secure…"
+        case "checking": return "Checking the network…"
+        case "repushing": return "Re-storing missing parts…"
+        default: return "Securing…"
+        }
     }
 
     var isActive: Bool { status == "running" || status == "pending" }
@@ -116,7 +155,10 @@ struct UploadJob: Codable, Identifiable, Equatable {
             // than implying it's already safe. Heal finished but couldn't
             // confirm deep reachability ⇒ flag it. Verified ⇒ stay silent
             // (the "Verified" badge is the completion signal).
-            if isSecuring { return "Securing…" }
+            if isSecuring {
+                if isQueuedToSecure { return "Queued" }
+                return securingFraction.map { "Securing \(Int($0 * 100))%" } ?? "Securing…"
+            }
             if isDegraded { return "Not fully backed up" }
             return ""
         // `pending` is the daemon's pre-dispatch state (before the driver
