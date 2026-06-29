@@ -587,7 +587,11 @@ async fn main() -> Result<()> {
     // (where the PushChunk handler already persisted them) instead of
     // re-reading the source file — so heal survives a deleted source
     // and a node restart.
-    .with_disk_cache(disk_cache.clone());
+    .with_disk_cache(disk_cache.clone())
+    // Read the live status watch so the automatic post-upload heal can
+    // also promote shallow placements once the node is well-connected
+    // enough for its closest-peer probe to be trustworthy (Sketch B).
+    .with_status_watch(Some(status_rx.clone()));
     let restored_jobs = upload_manager
         .rehydrate_from_disk(!opt.no_resume_uploads)
         .with_context(|| {
