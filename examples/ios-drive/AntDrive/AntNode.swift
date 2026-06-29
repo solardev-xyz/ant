@@ -441,16 +441,20 @@ final class AntNode: ObservableObject {
         }
     }
 
-    /// While any upload is in flight, refresh the job list ~once a second
-    /// so the Files tab shows live progress.
+    /// While any upload is in flight — or a completed one is still being
+    /// secured by the daemon's background heal — refresh the job list ~once a
+    /// second so the Files tab shows live progress and flips to "Verified" on
+    /// its own when `heal_verified` lands (no user tap).
     private func startAutoRefresh() {
         refreshTask?.cancel()
         refreshTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
                 guard let self else { return }
-                let active = await MainActor.run { self.jobs.contains { $0.isActive } }
-                if active { await self.refreshJobs() }
+                let busy = await MainActor.run {
+                    self.jobs.contains { $0.isActive || $0.isSecuring }
+                }
+                if busy { await self.refreshJobs() }
             }
         }
     }

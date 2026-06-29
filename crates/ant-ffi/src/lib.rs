@@ -384,7 +384,11 @@ fn init_inner(data_dir: &Path) -> Result<AntHandle, FfiError> {
         postage_dir: postage_dir.clone(),
     });
     let upload_manager = UploadManager::new(data_dir.join("uploads"), cmd_tx.clone(), None)
-        .map_err(|e| FfiError::Io(format!("open upload state dir: {e}")))?;
+        .map_err(|e| FfiError::Io(format!("open upload state dir: {e}")))?
+        // Read the live status watch so the automatic post-upload heal can
+        // also promote shallow placements once the node is well-connected
+        // enough for its closest-peer probe to be trustworthy (Sketch B).
+        .with_status_watch(Some(status_rx.clone()));
     {
         // `rehydrate_from_disk` may `tokio::spawn` (auto-resuming an
         // interrupted upload, or kicking off a startup self-heal for a

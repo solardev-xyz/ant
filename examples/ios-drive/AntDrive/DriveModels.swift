@@ -20,6 +20,17 @@ struct UploadJob: Codable, Identifiable, Equatable {
     let lastUpdateUnix: UInt64
     let lastError: String?
     let reference: String?
+    /// `true` once the daemon's automatic post-upload self-heal confirmed
+    /// every chunk is *deep-reachable* (held by its true neighbourhood, not
+    /// merely reachable via our privileged link to a shallow storer). This is
+    /// the real "safe / backed up" signal — `status == "completed"` only means
+    /// every chunk was pushed once. Defaults to `false` so an older daemon
+    /// that doesn't emit the field still decodes.
+    let healVerified: Bool
+    /// `true` once the post-upload heal finished its rounds for this job,
+    /// whether or not it could confirm `healVerified`. Lets the UI stop
+    /// showing "Securing…" once heal is done even on the degraded path.
+    let healFinished: Bool
 
     var id: String { jobId }
 
@@ -37,6 +48,30 @@ struct UploadJob: Codable, Identifiable, Equatable {
         case lastUpdateUnix = "last_update_unix"
         case lastError = "last_error"
         case reference
+        case healVerified = "heal_verified"
+        case healFinished = "heal_finished"
+    }
+
+    /// Custom decode so the two heal fields default to `false` against an
+    /// older daemon that doesn't emit them, instead of failing the whole
+    /// job list. Every other field decodes as before.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        jobId = try c.decode(String.self, forKey: .jobId)
+        sourcePath = try c.decode(String.self, forKey: .sourcePath)
+        sourceSize = try c.decode(UInt64.self, forKey: .sourceSize)
+        name = try c.decodeIfPresent(String.self, forKey: .name)
+        contentType = try c.decodeIfPresent(String.self, forKey: .contentType)
+        status = try c.decode(String.self, forKey: .status)
+        bytesPushed = try c.decode(UInt64.self, forKey: .bytesPushed)
+        chunksPushed = try c.decode(UInt64.self, forKey: .chunksPushed)
+        chunksTotal = try c.decodeIfPresent(UInt64.self, forKey: .chunksTotal)
+        createdAtUnix = try c.decode(UInt64.self, forKey: .createdAtUnix)
+        lastUpdateUnix = try c.decode(UInt64.self, forKey: .lastUpdateUnix)
+        lastError = try c.decodeIfPresent(String.self, forKey: .lastError)
+        reference = try c.decodeIfPresent(String.self, forKey: .reference)
+        healVerified = try c.decodeIfPresent(Bool.self, forKey: .healVerified) ?? false
+        healFinished = try c.decodeIfPresent(Bool.self, forKey: .healFinished) ?? false
     }
 
     /// Best display name: the manifest name, else the source file's
@@ -55,8 +90,20 @@ struct UploadJob: Codable, Identifiable, Equatable {
 
     var isActive: Bool { status == "running" || status == "pending" }
     var isPaused: Bool { status == "paused" }
+    /// Every chunk was pushed once. NOT the same as durable — the file may
+    /// still be settling into its neighbourhoods (see `isDurable`).
     var isDone: Bool { status == "completed" }
     var isFailed: Bool { status == "failed" }
+
+    /// Completed AND the daemon's automatic heal confirmed deep reachability:
+    /// the real "safe / backed up" state.
+    var isDurable: Bool { isDone && healVerified }
+    /// Completed but the background heal hasn't finished its rounds yet — the
+    /// file is still being secured. Drive a spinner / "Securing…" off this.
+    var isSecuring: Bool { isDone && !healFinished }
+    /// Completed, heal ran to the end, but couldn't confirm deep reachability:
+    /// some chunks landed shallow and didn't propagate. "Push again" repairs it.
+    var isDegraded: Bool { isDone && healFinished && !healVerified }
 
     /// A friendly, non-Swarm status line for the row. Completed uploads
     /// return an empty string: the network-verified "Verified" badge below
@@ -64,7 +111,14 @@ struct UploadJob: Codable, Identifiable, Equatable {
     /// also carry a weaker local "Online" word.
     var statusLabel: String {
         switch status {
-        case "completed": return ""
+        case "completed":
+            // Heal still running ⇒ tell the user it's being secured rather
+            // than implying it's already safe. Heal finished but couldn't
+            // confirm deep reachability ⇒ flag it. Verified ⇒ stay silent
+            // (the "Verified" badge is the completion signal).
+            if isSecuring { return "Securing…" }
+            if isDegraded { return "Not fully backed up" }
+            return ""
         // `pending` is the daemon's pre-dispatch state (before the driver
         // pushes its first chunk); from the user's view that's still part
         // of uploading, so it shares the "Uploading…" label.

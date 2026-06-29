@@ -338,6 +338,9 @@ private struct FileRow: View {
     private var messageColor: Color {
         if job.isFailed { return .orange }
         if job.isDone, let p = node.propagation[job.id], !p.isStoredSafely { return .orange }
+        // No manual deep-verify yet — fall back to the daemon's automatic heal
+        // verdict: a degraded heal is a genuine not-fully-stored warning.
+        if node.propagation[job.id] == nil, job.isDegraded { return .orange }
         return .white.opacity(0.6)
     }
 
@@ -901,8 +904,13 @@ struct FileDetailView: View {
     /// they're fine for everyone, and re-pushing can't satisfy a verdict
     /// that's limited by this device's own reach, not the file.
     private func needsRepush(_ job: UploadJob) -> Bool {
-        guard job.isDone, let p = node.propagation[job.id] else { return false }
-        return !p.isStoredSafely
+        guard job.isDone else { return false }
+        // A user-run deep verify is the richer verdict; otherwise fall back to
+        // the daemon's automatic heal result — a degraded heal (ran to the end
+        // but couldn't confirm deep reachability) is exactly what Push again
+        // repairs, so offer it without requiring a manual verify first.
+        if let p = node.propagation[job.id] { return !p.isStoredSafely }
+        return job.isDegraded
     }
 
     private func statusDisplay(_ job: UploadJob) -> (text: String, color: Color, icon: String) {
@@ -913,11 +921,17 @@ struct FileDetailView: View {
         }
         if job.isDone {
             if node.verifying.contains(job.id) { return ("Checking…", .blue, "magnifyingglass") }
+            // A user-run deep verify is the richest verdict — prefer it.
             if let p = node.propagation[job.id] {
                 return p.isStoredSafely
                     ? ("Stored safely", .green, "checkmark.seal.fill")
                     : ("Not fully stored", .orange, "exclamationmark.triangle.fill")
             }
+            // Otherwise show the daemon's free, automatic heal verdict so the
+            // file reports its real durability without the user tapping verify.
+            if job.isSecuring { return ("Securing…", .blue, "arrow.triangle.2.circlepath") }
+            if job.isDurable  { return ("Stored safely", .green, "checkmark.seal.fill") }
+            if job.isDegraded { return ("Not fully stored", .orange, "exclamationmark.triangle.fill") }
             return ("Uploaded", .white.opacity(0.8), "checkmark.circle")
         }
         return (job.status.capitalized, .gray, "minus.circle")

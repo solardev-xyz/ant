@@ -55,7 +55,7 @@
 
 pub mod state;
 
-use ant_control::{ControlAck, ControlCommand, UploadJobView};
+use ant_control::{ControlAck, ControlCommand, StatusSnapshot, UploadJobView};
 use ant_retrieval::{
     build_single_file_manifest, ManifestWriteError, SplitChunk, StreamingSplitter,
 };
@@ -219,11 +219,72 @@ const HEAL_VERIFY_BATCH: usize = 512;
 /// perfectly healthy chunks on probe noise.
 const HEAL_PROBES: usize = 4;
 
+/// Minimum connected BZZ peers before the **automatic** post-upload heal is
+/// allowed to also re-push *shallow* placements (Sketch B: readiness-gated
+/// auto shallow heal). Below this the node's per-chunk closest-peer probes
+/// can't reliably tell a shallow chunk from a healthy one — the routing
+/// table is too thin for the probe to reach the chunk's true neighbourhood,
+/// so an automatic shallow re-push would churn postage on probe noise (the
+/// exact reason the post-upload heal historically passed `include_shallow =
+/// false`). At or above this we trust the probe enough to promote shallow
+/// chunks unattended; a constrained node falls back to the conservative
+/// reachable-only heal and defers shallow repair to the user's manual "Push
+/// again". Set to ~3× [`HEAL_PROBES`] so the closest-peer set each probe
+/// walks is genuinely populated, not barely. Tunable.
+const MIN_PEERS_FOR_AUTO_SHALLOW_HEAL: u32 = 12;
+
 /// Optional sink for streamed re-push/heal progress (the app's "push
 /// again"). Each item is a JSON line `{"phase":"checking"|"repushing",
 /// "checked"?:n,"total"?:n}`. `None` runs the heal silently (the
 /// post-upload heal, antctl resume).
 type HealProgress = Option<mpsc::UnboundedSender<String>>;
+
+/// What a [`verify_and_heal`](UploadManager::verify_and_heal) pass is allowed
+/// to re-push, and how many rounds it spends doing it. Decouples "how
+/// thorough is the reachable mop-up" from "do we also promote shallow
+/// placements", so a well-connected node can have both (the old single
+/// `include_shallow` bool forced a choice — shallow meant exactly one round,
+/// losing the multi-round straggler mop-up).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HealMode {
+    /// Constrained-node automatic heal: up to [`MAX_HEAL_ROUNDS`] rounds
+    /// re-pushing only genuinely-unreachable chunks. Never touches
+    /// merely-shallow placements — the node's probe can't reliably judge
+    /// them, so re-pushing would churn postage on noise.
+    ReachableOnly,
+    /// Well-connected automatic heal: the full [`MAX_HEAL_ROUNDS`]
+    /// reachable-only mop-up *and then* one shallow-promotion round, so it
+    /// repairs both transient stragglers and shallow placements.
+    ReachableThenShallow,
+    /// Manual "Push again": a single deterministic shallow-aware round.
+    /// Re-measuring the shallow set mid-pass inflates it (the budget we just
+    /// spent saturates peers, and a saturated peer can't confirm a chunk), so
+    /// capture once, re-push, and let the final read-back decide.
+    ShallowOnce,
+}
+
+impl HealMode {
+    /// Rounds of reachable-only mop-up before the shallow pass / verdict.
+    fn mopup_rounds(self) -> usize {
+        match self {
+            HealMode::ShallowOnce => 0,
+            HealMode::ReachableOnly | HealMode::ReachableThenShallow => MAX_HEAL_ROUNDS,
+        }
+    }
+    /// Whether to run a shallow-aware promotion round (and decide the verdict
+    /// against the shallow set) after the mop-up.
+    fn promotes_shallow(self) -> bool {
+        matches!(self, HealMode::ReachableThenShallow | HealMode::ShallowOnce)
+    }
+    /// Human-readable trigger label for logs.
+    fn label(self) -> &'static str {
+        match self {
+            HealMode::ReachableOnly => "auto heal (reachable-only)",
+            HealMode::ReachableThenShallow => "auto heal (reachable + shallow)",
+            HealMode::ShallowOnce => "manual push-again",
+        }
+    }
+}
 
 /// Emit one heal progress line, best-effort (a dropped receiver is a no-op
 /// and never stalls the heal).
@@ -600,6 +661,12 @@ struct UploadManagerInner {
     /// node restart. `None` in tests / `--no-disk-cache`, where heal
     /// falls back to re-deriving chunks from the source file.
     disk_cache: Option<Arc<ant_retrieval::DiskChunkCache>>,
+    /// Live daemon status (the same `watch` the gateway's `/readiness`
+    /// reads). Lets the automatic post-upload heal gate its shallow re-push
+    /// on routing-table health (see [`MIN_PEERS_FOR_AUTO_SHALLOW_HEAL`] and
+    /// [`UploadManager::neighbourhood_ready`]). `None` in tests / older
+    /// embedders → the heal stays conservative (reachable-only).
+    status: Option<watch::Receiver<StatusSnapshot>>,
 }
 
 impl UploadManager {
@@ -623,6 +690,7 @@ impl UploadManager {
                 id_counter: AtomicU64::new(0),
                 default_batch_id,
                 disk_cache: None,
+                status: None,
             }),
         })
     }
@@ -644,6 +712,35 @@ impl UploadManager {
             inner.disk_cache = disk_cache;
         }
         self
+    }
+
+    /// Attach the daemon's live status `watch` so the automatic post-upload
+    /// heal can gate its shallow re-push on routing-table health (Sketch B).
+    /// Same lifecycle / `Arc::get_mut` rationale as [`with_disk_cache`]:
+    /// called once, before the manager is cloned into the node loop. `None`
+    /// (tests / embedders without a status sink) keeps the heal conservative.
+    #[must_use]
+    pub fn with_status_watch(mut self, status: Option<watch::Receiver<StatusSnapshot>>) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.status = status;
+        }
+        self
+    }
+
+    /// Whether the node is well-connected enough that the per-chunk
+    /// closest-peer probe heal uses can be trusted to distinguish a shallow
+    /// placement from a healthy one — the gate for letting the automatic
+    /// post-upload heal also re-push shallow chunks (Sketch B). A handshake
+    /// must have completed and at least [`MIN_PEERS_FOR_AUTO_SHALLOW_HEAL`]
+    /// BZZ peers be connected. With no status wired (tests) this is `false`,
+    /// so the heal stays reachable-only exactly as before.
+    fn neighbourhood_ready(&self) -> bool {
+        let Some(rx) = self.inner.status.as_ref() else {
+            return false;
+        };
+        let snap = rx.borrow();
+        snap.peers.last_handshake.is_some()
+            && snap.peers.connected >= MIN_PEERS_FOR_AUTO_SHALLOW_HEAL
     }
 
     /// State-dir path so the daemon can log it / surface it in
@@ -832,7 +929,10 @@ impl UploadManager {
                 let snap = handle.snapshot();
                 let mgr = self.clone();
                 let handle = handle.clone();
-                tokio::spawn(async move { mgr.heal_completed_job(handle, false, None).await });
+                tokio::spawn(async move {
+                    mgr.heal_completed_job(handle, HealMode::ReachableOnly, None)
+                        .await;
+                });
                 return Ok(snap);
             }
         }
@@ -978,7 +1078,7 @@ impl UploadManager {
     async fn heal_completed_job(
         &self,
         handle: Arc<JobHandle>,
-        include_shallow: bool,
+        mode: HealMode,
         progress: HealProgress,
     ) {
         let snap = handle.snapshot();
@@ -1038,19 +1138,10 @@ impl UploadManager {
         };
 
         let batch_id = resolve_batch_id(snap.batch_id.as_deref(), self.inner.default_batch_id);
-        // `include_shallow` is set only by the user-initiated "Push again",
-        // so it also tells trigger (manual) from the automatic startup /
-        // post-upload heals — worth logging since they take different paths
-        // (single deterministic round vs. multi-round mop-up).
-        let trigger = if include_shallow {
-            "manual push-again"
-        } else {
-            "auto heal"
-        };
         info!(
             target: "ant_node::uploads",
-            job_id = %job_id, chunks = all_addrs.len(), trigger, include_shallow,
-            "running {trigger} for completed upload",
+            job_id = %job_id, chunks = all_addrs.len(), mode = mode.label(),
+            "running {} for completed upload", mode.label(),
         );
         self.verify_and_heal(
             &job_id,
@@ -1061,7 +1152,7 @@ impl UploadManager {
             snap.raw,
             snap.name.as_deref(),
             snap.content_type.as_deref(),
-            include_shallow,
+            mode,
             progress,
         )
         .await;
@@ -1081,9 +1172,9 @@ impl UploadManager {
         if status != UploadStatus::Completed {
             return Err(UploadError::BadState(status));
         }
-        // Manual "Push again": re-push shallow placements too, so it
-        // actually repairs a file that loads but isn't durably stored.
-        self.heal_completed_job(handle.clone(), true, progress)
+        // Manual "Push again": a single shallow-aware round, so it actually
+        // repairs a file that loads but isn't durably stored.
+        self.heal_completed_job(handle.clone(), HealMode::ShallowOnce, progress)
             .await;
         Ok(handle.snapshot())
     }
@@ -1483,6 +1574,22 @@ impl UploadManager {
             let name = snap.name.clone();
             let content_type = snap.content_type.clone();
             tokio::spawn(async move {
+                // Sketch B: on a well-connected node the per-chunk probe is
+                // trustworthy, so the automatic heal runs the full reachable
+                // mop-up AND a shallow-promotion pass — repairing both
+                // transient stragglers and shallow placements. On a
+                // constrained node the probe can't reliably judge durability,
+                // so stay reachable-only and leave shallow repair to the user.
+                let mode = if mgr.neighbourhood_ready() {
+                    info!(
+                        target: "ant_node::uploads",
+                        job_id = %job_id,
+                        "node well-connected — post-upload heal will also re-push shallow placements",
+                    );
+                    HealMode::ReachableThenShallow
+                } else {
+                    HealMode::ReachableOnly
+                };
                 mgr.verify_and_heal(
                     &job_id,
                     &heal_addrs,
@@ -1492,7 +1599,7 @@ impl UploadManager {
                     raw,
                     name.as_deref(),
                     content_type.as_deref(),
-                    false,
+                    mode,
                     None,
                 )
                 .await;
@@ -1868,14 +1975,20 @@ impl UploadManager {
         })
     }
 
-    /// Post-upload self-heal loop. Reads `all_addrs` back from the
-    /// network with the *deep* presence check (via
-    /// [`ControlCommand::VerifyChunksPresent`] with [`HEAL_PROBES`]): a
-    /// chunk is healthy only if its true neighbourhood holds it, so a
-    /// chunk that merely landed shallow is treated as missing, re-derived
-    /// from the source file, and re-pushed (the deep-push path lands it
-    /// properly this time). Repeats up to [`MAX_HEAL_ROUNDS`] times, with
-    /// a settle delay before each read-back.
+    /// Post-upload self-heal. Reads `all_addrs` back from the network with
+    /// the *deep* presence check (via [`ControlCommand::VerifyChunksPresent`]
+    /// with [`HEAL_PROBES`]) and re-pushes what didn't land properly, in two
+    /// phases gated by [`HealMode`]:
+    ///
+    /// 1. **Reachable mop-up** — up to [`MAX_HEAL_ROUNDS`] rounds re-pushing
+    ///    only genuinely-unreachable chunks, to clear transient pushsync
+    ///    stragglers. (`ShallowOnce` skips this.)
+    /// 2. **Shallow promotion** — one deterministic round re-pushing
+    ///    merely-shallow chunks too, so a file that loads but isn't deeply
+    ///    placed becomes durable. Only `ReachableThenShallow` / `ShallowOnce`
+    ///    run it; `ReachableOnly` stops after phase 1.
+    ///
+    /// A settle delay precedes every read-back.
     ///
     /// Verdict:
     /// * every chunk deep-reachable ⇒ flag the job `heal_verified` and
@@ -1908,30 +2021,24 @@ impl UploadManager {
         raw: bool,
         name: Option<&str>,
         content_type: Option<&str>,
-        // `true` only for the user-initiated "Push again": also re-push
-        // merely-shallow chunks so it repairs a file that loads but isn't
-        // durably placed. The automatic heals pass `false` (re-push only
-        // genuinely-unreachable chunks) to avoid re-push storms on probe
-        // noise.
-        include_shallow: bool,
+        // Decides how thorough the reachable mop-up is and whether shallow
+        // placements are also promoted — see [`HealMode`]. The automatic
+        // heals pick `ReachableOnly` / `ReachableThenShallow` by connectivity;
+        // the manual "Push again" passes `ShallowOnce`.
+        mode: HealMode,
         progress: HealProgress,
     ) {
-        // The manual "Push again" (`include_shallow`) does a single
-        // deterministic re-push pass: re-measuring the shallow set after a
-        // round of pushing/probing inflates it (the budget we just spent
-        // saturates peers, and a saturated peer can't confirm a chunk), so
-        // capturing it once, re-pushing, and letting the final read-back
-        // decide is both cheaper and more honest. The automatic heals
-        // re-measure across several rounds to mop up transient pushsync
-        // stragglers, where the extra budget is worth it.
-        let rounds = if include_shallow { 1 } else { MAX_HEAL_ROUNDS };
-        for round in 0..rounds {
+        // Phase 1 — reachable-only mop-up. Re-push only genuinely-unreachable
+        // chunks (`include_shallow = false`), re-measuring each round to catch
+        // transient pushsync stragglers. Skipped entirely for `ShallowOnce`
+        // (the manual single-pass repair). A clean reachable read-back means
+        // "no unreachable chunks left" — for `ReachableOnly` that's the
+        // verdict; for `ReachableThenShallow` it just gates entry to phase 2,
+        // since reachable-but-shallow chunks aren't counted here.
+        for round in 0..mode.mopup_rounds() {
             tokio::time::sleep(HEAL_SETTLE_DELAY).await;
             emit_heal(&progress, "checking", None, None);
-            let Some(missing) = self
-                .query_missing(all_addrs, HEAL_PROBES, include_shallow)
-                .await
-            else {
+            let Some(missing) = self.query_missing(all_addrs, HEAL_PROBES, false).await else {
                 // Read-back couldn't run (peers not ready / transport
                 // error). Do NOT claim the upload is healthy — just try
                 // again next round after another settle delay.
@@ -1943,6 +2050,11 @@ impl UploadManager {
                 continue;
             };
             if missing.is_empty() {
+                if mode.promotes_shallow() {
+                    // Reachability settled; chunks may still be shallow.
+                    // Fall through to the shallow-promotion pass.
+                    break;
+                }
                 info!(
                     target: "ant_node::uploads",
                     job_id, round, chunks = all_addrs.len(),
@@ -1954,7 +2066,7 @@ impl UploadManager {
             warn!(
                 target: "ant_node::uploads",
                 job_id, round, missing = missing.len(), total = all_addrs.len(),
-                "post-upload heal: re-pushing shallow/unreachable chunks",
+                "post-upload heal: re-pushing unreachable chunks",
             );
             let missing_set: HashSet<[u8; 32]> = missing.into_iter().collect();
             if let Err(e) = self
@@ -1978,8 +2090,50 @@ impl UploadManager {
                 return;
             }
         }
-        // One final read-back after the last re-push round decides the
-        // verdict.
+        // Phase 2 — shallow promotion (one deterministic round). Capture the
+        // shallow set once, re-push it, and let the final read-back below
+        // decide: re-measuring mid-round inflates it (the budget we just spent
+        // saturates peers, and a saturated peer can't confirm a chunk). Only
+        // `ReachableThenShallow` / `ShallowOnce` run this; `ReachableOnly`
+        // skips straight to the reachable-set verdict.
+        let include_shallow = mode.promotes_shallow();
+        if include_shallow {
+            tokio::time::sleep(HEAL_SETTLE_DELAY).await;
+            emit_heal(&progress, "checking", None, None);
+            if let Some(missing) = self.query_missing(all_addrs, HEAL_PROBES, true).await {
+                if !missing.is_empty() {
+                    warn!(
+                        target: "ant_node::uploads",
+                        job_id, missing = missing.len(), total = all_addrs.len(),
+                        "post-upload heal: re-pushing shallow placements",
+                    );
+                    let missing_set: HashSet<[u8; 32]> = missing.into_iter().collect();
+                    if let Err(e) = self
+                        .repush_missing(
+                            &missing_set,
+                            batch_id,
+                            source_path,
+                            source_size,
+                            raw,
+                            name,
+                            content_type,
+                            &progress,
+                        )
+                        .await
+                    {
+                        warn!(
+                            target: "ant_node::uploads",
+                            job_id, "post-upload heal shallow re-push failed: {e}",
+                        );
+                        self.mark_heal_finished(job_id);
+                        return;
+                    }
+                }
+            }
+        }
+        // One final read-back after the last re-push decides the verdict. It
+        // probes for the same depth the pass repaired: deep reachability when
+        // shallow was promoted, plain reachability otherwise.
         tokio::time::sleep(HEAL_SETTLE_DELAY).await;
         emit_heal(&progress, "checking", None, None);
         match self
@@ -2008,13 +2162,14 @@ impl UploadManager {
                 let total = all_addrs.len();
                 warn!(
                     target: "ant_node::uploads",
-                    job_id, missing = n, total, rounds,
-                    "post-upload heal: {n}/{total} chunks not deep-reachable after {rounds} re-push round(s) — leaving job completed (degraded); tap Push again to retry",
+                    job_id, missing = n, total, mode = mode.label(),
+                    "post-upload heal: {n}/{total} chunks not deep-reachable after {} — leaving job completed (degraded); tap Push again to retry",
+                    mode.label(),
                 );
             }
             None => warn!(
                 target: "ant_node::uploads",
-                job_id, total = all_addrs.len(), rounds,
+                job_id, total = all_addrs.len(), mode = mode.label(),
                 "post-upload heal: final read-back inconclusive (peers not ready?) — leaving job completed; tap Push again to retry",
             ),
         }
@@ -2859,6 +3014,58 @@ mod tests {
         f
     }
 
+    /// A minimal completed-handshake report for status snapshots.
+    fn fake_handshake() -> ant_control::HandshakeReport {
+        ant_control::HandshakeReport {
+            remote_overlay: String::new(),
+            remote_peer_id: String::new(),
+            agent_version: String::new(),
+            full_node: true,
+            at_unix: 0,
+        }
+    }
+
+    /// Sketch B gate: the automatic post-upload heal only re-pushes shallow
+    /// placements once the node is well-connected — a completed handshake
+    /// AND at least `MIN_PEERS_FOR_AUTO_SHALLOW_HEAL` peers. No status wired,
+    /// too few peers, or no handshake all keep it conservative (false).
+    #[tokio::test]
+    async fn neighbourhood_ready_gates_shallow_heal() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let (tx, _rx) = mpsc::channel::<ControlCommand>(8);
+
+        // No status watch wired ⇒ conservative.
+        let bare =
+            UploadManager::new(state_dir.path().to_path_buf(), tx.clone(), None).expect("manager");
+        assert!(!bare.neighbourhood_ready(), "no status ⇒ not ready");
+
+        // Enough peers but no handshake yet ⇒ not ready.
+        let mut snap = ant_control::StatusSnapshot::default();
+        snap.peers.connected = MIN_PEERS_FOR_AUTO_SHALLOW_HEAL;
+        let (status_tx, status_rx) = watch::channel(snap);
+        let mgr = UploadManager::new(state_dir.path().to_path_buf(), tx, None)
+            .expect("manager")
+            .with_status_watch(Some(status_rx));
+        assert!(
+            !mgr.neighbourhood_ready(),
+            "peers but no handshake ⇒ not ready"
+        );
+
+        // Handshake done but a peer short ⇒ still not ready.
+        let mut snap = ant_control::StatusSnapshot::default();
+        snap.peers.connected = MIN_PEERS_FOR_AUTO_SHALLOW_HEAL - 1;
+        snap.peers.last_handshake = Some(fake_handshake());
+        status_tx.send(snap).expect("send");
+        assert!(!mgr.neighbourhood_ready(), "one peer short ⇒ not ready");
+
+        // Handshake done AND enough peers ⇒ ready.
+        let mut snap = ant_control::StatusSnapshot::default();
+        snap.peers.connected = MIN_PEERS_FOR_AUTO_SHALLOW_HEAL;
+        snap.peers.last_handshake = Some(fake_handshake());
+        status_tx.send(snap).expect("send");
+        assert!(mgr.neighbourhood_ready(), "handshake + peers ⇒ ready");
+    }
+
     /// State for the self-heal harness: which chunks are "present" on
     /// the fake network, how many times each was pushed, and the
     /// address we force to look missing on the first read-back.
@@ -3068,6 +3275,208 @@ mod tests {
             healed,
             "self-heal should have re-pushed the chunk forced missing on first read-back",
         );
+    }
+
+    /// Harness for the shallow-promotion path. Every pushed chunk is
+    /// "reachable" (so the reachable-only read-back, `include_shallow =
+    /// false`, finds nothing missing), but the first address it ever sees is
+    /// *shallow*: it shows as missing under `include_shallow = true` until it
+    /// has been pushed twice (the original upload push plus the shallow
+    /// promotion re-push). That lets a test prove `ReachableThenShallow`
+    /// runs phase 2 and re-pushes the shallow chunk, where `ReachableOnly`
+    /// would have left it alone.
+    fn spawn_fake_pushsync_shallow() -> (mpsc::Sender<ControlCommand>, Arc<HealHarness>) {
+        let (tx, mut rx) = mpsc::channel::<ControlCommand>(64);
+        let h = Arc::new(HealHarness {
+            present: Mutex::new(HashSet::new()),
+            dispatches: Mutex::new(HashMap::new()),
+            forced_target: Mutex::new(None),
+            verify_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let hc = h.clone();
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                match cmd {
+                    ControlCommand::PushChunk { wire, ack, .. } => {
+                        let mut span = [0u8; 8];
+                        span.copy_from_slice(&wire[..8]);
+                        let addr =
+                            ant_crypto::bmt::bmt_hash_with_span(&span, &wire[8..]).expect("BMT");
+                        hc.present.lock().expect("present").insert(addr);
+                        *hc.dispatches
+                            .lock()
+                            .expect("dispatch")
+                            .entry(addr)
+                            .or_insert(0) += 1;
+                        let _ = ack.send(ControlAck::ChunkUploaded {
+                            reference: format!("0x{}", hex::encode(addr)),
+                        });
+                    }
+                    ControlCommand::VerifyChunksPresent {
+                        addresses,
+                        probes: _,
+                        include_shallow,
+                        ack,
+                    } => {
+                        let mut missing: Vec<String> = {
+                            let present = hc.present.lock().expect("present");
+                            addresses
+                                .iter()
+                                .filter(|a| !present.contains(*a))
+                                .map(|a| format!("0x{}", hex::encode(a)))
+                                .collect()
+                        };
+                        // Designate the first-ever queried address as shallow.
+                        let target = {
+                            let mut t = hc.forced_target.lock().expect("target");
+                            if t.is_none() {
+                                *t = addresses.first().copied();
+                            }
+                            *t
+                        };
+                        // Under the deep (shallow-aware) check it reads missing
+                        // until the promotion round re-pushes it (push #2).
+                        if include_shallow {
+                            if let Some(tgt) = target {
+                                let pushed = hc
+                                    .dispatches
+                                    .lock()
+                                    .expect("dispatch")
+                                    .get(&tgt)
+                                    .copied()
+                                    .unwrap_or(0);
+                                if pushed < 2 {
+                                    let hexs = format!("0x{}", hex::encode(tgt));
+                                    if !missing.contains(&hexs) {
+                                        missing.push(hexs);
+                                    }
+                                }
+                            }
+                        }
+                        let body = serde_json::json!({
+                            "checked": addresses.len(),
+                            "missing": missing,
+                        });
+                        let _ = ack.send(ControlAck::Ok {
+                            message: body.to_string(),
+                        });
+                    }
+                    ControlCommand::PushSoc { ack, .. } => {
+                        let _ = ack.send(ControlAck::Error {
+                            message: "PushSoc unexpected in shallow heal test".into(),
+                        });
+                    }
+                    ControlCommand::PostageList { ack } => {
+                        let _ = ack.send(ControlAck::PostageList(Vec::new()));
+                    }
+                    other => panic!("unexpected control command in shallow heal test: {other:?}"),
+                }
+            }
+        });
+        (tx, h)
+    }
+
+    /// On a well-connected node the automatic post-upload heal runs the
+    /// shallow-promotion phase: a chunk that's reachable but only *shallow*
+    /// is re-pushed and the job ends `heal_verified`. A constrained node
+    /// (no ready status) would have stopped after the reachable-only mop-up
+    /// and left it shallow — so the same harness must NOT re-push it then.
+    #[tokio::test]
+    async fn well_connected_heal_promotes_shallow_chunk() {
+        let len = 20_000usize;
+        let payload: Vec<u8> = (0..len).map(|i| ((i * 13) % 251) as u8).collect();
+
+        // Well-connected: shallow chunk gets promoted (dispatched twice) and
+        // the job ends heal_verified.
+        {
+            let f = write_temp_file(&payload);
+            let state_dir = tempfile::tempdir().expect("tempdir");
+            let (tx, harness) = spawn_fake_pushsync_shallow();
+            let mut snap = ant_control::StatusSnapshot::default();
+            snap.peers.connected = MIN_PEERS_FOR_AUTO_SHALLOW_HEAL;
+            snap.peers.last_handshake = Some(fake_handshake());
+            let (_status_tx, status_rx) = watch::channel(snap);
+            let mgr = UploadManager::new(state_dir.path().to_path_buf(), tx, None)
+                .expect("manager")
+                .with_status_watch(Some(status_rx));
+
+            let id = mgr
+                .start(f.path().to_path_buf(), None, None, None, false)
+                .expect("start");
+            let mut rx = mgr.subscribe(&id).expect("subscribe");
+            loop {
+                if rx.borrow().clone().status.is_terminal() {
+                    break;
+                }
+                rx.changed().await.expect("watch");
+            }
+
+            let mut promoted = false;
+            for _ in 0..80 {
+                if let Some(t) = harness.target() {
+                    if harness.dispatch_count(t) >= 2
+                        && mgr.status(&id).expect("status").heal_verified
+                    {
+                        promoted = true;
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            assert!(
+                promoted,
+                "well-connected heal should re-push the shallow chunk and mark heal_verified",
+            );
+        }
+
+        // Constrained: no status wired ⇒ ReachableOnly ⇒ phase 2 never runs,
+        // so the shallow chunk is pushed exactly once and the job stays
+        // un-verified (degraded).
+        {
+            let f = write_temp_file(&payload);
+            let state_dir = tempfile::tempdir().expect("tempdir");
+            let (tx, harness) = spawn_fake_pushsync_shallow();
+            let mgr =
+                UploadManager::new(state_dir.path().to_path_buf(), tx, None).expect("manager");
+
+            let id = mgr
+                .start(f.path().to_path_buf(), None, None, None, false)
+                .expect("start");
+            let mut rx = mgr.subscribe(&id).expect("subscribe");
+            loop {
+                if rx.borrow().clone().status.is_terminal() {
+                    break;
+                }
+                rx.changed().await.expect("watch");
+            }
+
+            // Let the reachable-only heal run to completion (it finishes fast:
+            // the first reachable read-back finds nothing missing).
+            let mut finished = false;
+            for _ in 0..80 {
+                if mgr.status(&id).expect("status").heal_finished {
+                    finished = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            assert!(finished, "reachable-only heal should finish");
+            let snap = mgr.status(&id).expect("status");
+            // Reachable-only path verifies against the reachable read-back,
+            // which finds nothing missing — so it (correctly) reports
+            // heal_verified WITHOUT ever touching the shallow chunk.
+            assert!(
+                snap.heal_verified,
+                "reachable-only heal verifies reachability"
+            );
+            if let Some(t) = harness.target() {
+                assert_eq!(
+                    harness.dispatch_count(t),
+                    1,
+                    "reachable-only heal must NOT re-push the shallow chunk",
+                );
+            }
+        }
     }
 
     /// Fake node loop for the re-queue test: the first chunk address it
