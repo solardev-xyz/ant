@@ -1,0 +1,292 @@
+{
+  "schedule": [
+    0.0,
+    3.0,
+    8.0,
+    20.0,
+    45.0,
+    90.0
+  ],
+  "results": [
+    {
+      "size": 1024,
+      "run": 0,
+      "reference": "4a622be9939dfddb9e1e91e2042e8f44402b5c3c1b27c70100d7cbd6689e400b",
+      "status": "completed",
+      "upload_seconds": 0.12,
+      "first_file": {
+        "v1:2aa638": 0.0,
+        "v2:f1ebec": 0.0,
+        "v3:83eab7": 0.0,
+        "v4:a75fbe": 0.0,
+        "public-gw": 0.0
+      },
+      "first_root": {
+        "v1:2aa638": 0.0,
+        "v2:f1ebec": 0.0,
+        "v3:83eab7": 0.0,
+        "v4:a75fbe": 0.0,
+        "public-gw": 0.0
+      },
+      "targets": [
+        "v1:2aa638",
+        "v2:f1ebec",
+        "v3:83eab7",
+        "v4:a75fbe",
+        "public-gw"
+      ]
+    },
+    {
+      "size": 1024,
+      "run": 1,
+      "reference": "0c8a07128146fc7e61d2ef0dc86e503241ec82993376085ffa5e587519493aa8",
+      "status": "completed",
+      "upload_seconds": 0.11,
+      "first_file": {
+        "v1:2aa638": 0.0,
+        "v2:f1ebec": 0.0,
+        "v3:83eab7": 0.0,
+        "v4:a75fbe": 0.0,
+        "public-gw": 0.0
+      },
+      "first_root": {
+        "v1:2aa638": 0.0,
+        "v2:f1ebec": 0.0,
+        "v3:83eab7": 0.0,
+        "v4:a75fbe": 0.0,
+        "public-gw": 0.0
+      },
+      "targets": [
+        "v1:2aa638",
+        "v2:f1ebec",
+        "v3:83eab7",
+        "v4:a75fbe",
+        "public-gw"
+      ]
+    },
+    {
+      "size": 1048576,
+      "run": 0,
+      "reference": "f7ada71dfded8412205a4b675b7cdd17f86f3ce6fcc847101affb984275d0413",
+      "status": "completed",
+      "upload_seconds": 3.37,
+      "first_file": {
+        "v1:2aa638": 0.0,
+        "v2:f1ebec": 0.0,
+        "v3:83eab7": 0.0,
+        "v4:a75fbe": 0.0,
+        "public-gw": 0.0
+      },
+      "first_root": {
+        "v1:2aa638": 0.0,
+        "v2:f1ebec": 0.0,
+        "v3:83eab7": 0.0,
+        "v4:a75fbe": 0.0,
+        "public-gw": 0.0
+      },
+      "targets": [
+        "v1:2aa638",
+        "v2:f1ebec",
+        "v3:83eab7",
+        "v4:a75fbe",
+        "public-gw"
+      ]
+    },
+    {
+      "size": 1048576,
+      "run": 1,
+      "reference": "4f145dfc12b089998bcbece1900d60b495dea29bee1af207065e2aebdf9c594c",
+      "status": "completed",
+      "upload_seconds": 3.07,
+      "first_file": {
+        "v1:2aa638": 0.0,
+        "v2:f1ebec": 0.0,
+        "v3:83eab7": 0.0,
+        "v4:a75fbe": 0.0,
+        "public-gw": 0.0
+      },
+      "first_root": {
+        "v1:2aa638": 0.0,
+        "v2:f1ebec": 0.0,
+        "v3:83eab7": 0.0,
+        "v4:a75fbe": 0.0,
+        "public-gw": 0.0
+      },
+      "targets": [
+        "v1:2aa638",
+        "v2:f1ebec",
+        "v3:83eab7",
+        "v4:a75fbe",
+        "public-gw"
+      ]
+    },
+    {
+      "size": 3145728,
+      "run": 0,
+      "reference": "eee00ef0edaecfbde4716aae4ff13addaf167f5949e24eaa25728a9f01612541",
+      "status": "completed",
+      "upload_seconds": 6.42,
+      "first_file": {
+        "v1:2aa638": 0.0,
+        "v2:f1ebec": 0.0,
+        "v3:83eab7": 0.0,
+        "v4:a75fbe": 0.0,
+        "public-gw": 0.0
+      },
+      "first_root": {
+        "v1:2aa638": 0.0,
+        "v2:f1ebec": 0.0,
+        "v3:83eab7": 0.0,
+        "v4:a75fbe": 0.0,
+        "public-gw": 0.0
+      },
+      "targets": [
+        "v1:2aa638",
+        "v2:f1ebec",
+        "v3:83eab7",
+        "v4:a75fbe",
+        "public-gw"
+      ]
+    },
+    {
+      "size": 3145728,
+      "run": 1,
+      "reference": "d12182073aa4e44efe7aeba49b71ed31a48b11ee6370684d132c484838c2c0fb",
+      "status": "completed",
+      "upload_seconds": 6.94,
+      "first_file": {
+        "v1:2aa638": 0.0,
+        "v2:f1ebec": 0.0,
+        "v3:83eab7": 0.0,
+        "v4:a75fbe": 0.0,
+        "public-gw": 0.0
+      },
+      "first_root": {
+        "v1:2aa638": 0.0,
+        "v2:f1ebec": 0.0,
+        "v3:83eab7": 0.0,
+        "v4:a75fbe": 0.0,
+        "public-gw": 0.0
+      },
+      "targets": [
+        "v1:2aa638",
+        "v2:f1ebec",
+        "v3:83eab7",
+        "v4:a75fbe",
+        "public-gw"
+      ]
+    },
+    {
+      "size": 4194304,
+      "run": 0,
+      "reference": "acfac942ceac22ff142537b89bef02bec1d69c79ce91f869fd9e10122d0013f3",
+      "status": "completed",
+      "upload_seconds": 10.21,
+      "first_file": {
+        "v1:2aa638": 0.0,
+        "v2:f1ebec": 0.0,
+        "v3:83eab7": 0.0,
+        "v4:a75fbe": 0.0,
+        "public-gw": 0.0
+      },
+      "first_root": {
+        "v1:2aa638": 0.0,
+        "v2:f1ebec": 0.0,
+        "v3:83eab7": 0.0,
+        "v4:a75fbe": 0.0,
+        "public-gw": 0.0
+      },
+      "targets": [
+        "v1:2aa638",
+        "v2:f1ebec",
+        "v3:83eab7",
+        "v4:a75fbe",
+        "public-gw"
+      ]
+    },
+    {
+      "size": 4194304,
+      "run": 1,
+      "reference": "099100dbb6d72392207c3bff528e415b60dcbfccf26b39a0636db49352a8b47a",
+      "status": "completed",
+      "upload_seconds": 6.53,
+      "first_file": {
+        "v1:2aa638": 0.0,
+        "v2:f1ebec": 0.0,
+        "v3:83eab7": 0.0,
+        "v4:a75fbe": 0.0,
+        "public-gw": 0.0
+      },
+      "first_root": {
+        "v1:2aa638": 0.0,
+        "v2:f1ebec": 0.0,
+        "v3:83eab7": 0.0,
+        "v4:a75fbe": 0.0,
+        "public-gw": 0.0
+      },
+      "targets": [
+        "v1:2aa638",
+        "v2:f1ebec",
+        "v3:83eab7",
+        "v4:a75fbe",
+        "public-gw"
+      ]
+    },
+    {
+      "size": 8388608,
+      "run": 0,
+      "reference": "f8d78f4759dc0f6ea1b8aa088125eab3840151216dcb373110eeddedf112bb02",
+      "status": "completed",
+      "upload_seconds": 13.85,
+      "first_file": {
+        "v1:2aa638": 0.0,
+        "v2:f1ebec": 0.0,
+        "v3:83eab7": 0.0,
+        "v4:a75fbe": 0.0,
+        "public-gw": 0.0
+      },
+      "first_root": {
+        "v1:2aa638": 0.0,
+        "v2:f1ebec": 0.0,
+        "v3:83eab7": 0.0,
+        "v4:a75fbe": 0.0,
+        "public-gw": 0.0
+      },
+      "targets": [
+        "v1:2aa638",
+        "v2:f1ebec",
+        "v3:83eab7",
+        "v4:a75fbe",
+        "public-gw"
+      ]
+    },
+    {
+      "size": 8388608,
+      "run": 1,
+      "reference": "f63011b22f634e9ff852d26d84d252c90337ef8a2f74c17b79b5f47e80c82317",
+      "status": "completed",
+      "upload_seconds": 14.74,
+      "first_file": {
+        "v1:2aa638": 0.0,
+        "v2:f1ebec": 0.0,
+        "v3:83eab7": 0.0,
+        "v4:a75fbe": 0.0,
+        "public-gw": 0.0
+      },
+      "first_root": {
+        "v1:2aa638": 0.0,
+        "v2:f1ebec": 0.0,
+        "v3:83eab7": 0.0,
+        "v4:a75fbe": 0.0,
+        "public-gw": 0.0
+      },
+      "targets": [
+        "v1:2aa638",
+        "v2:f1ebec",
+        "v3:83eab7",
+        "v4:a75fbe",
+        "public-gw"
+      ]
+    }
+  ]
+}
