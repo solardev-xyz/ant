@@ -333,6 +333,21 @@ pub struct UploadJobView {
     /// of blocking forever. Defaults to `false`.
     #[serde(default)]
     pub heal_finished: bool,
+    /// Live post-upload self-heal ("Securing…") progress, surfaced while
+    /// the automatic heal runs so a client can draw a *determinate* bar
+    /// instead of an indeterminate spinner. `heal_phase` names the current
+    /// step — `"checking"` while reading chunks back, `"repushing"` while
+    /// re-sending the ones that didn't land; `heal_checked` / `heal_total`
+    /// are that step's counts (`heal_checked` of `heal_total`). All three
+    /// are absent for a daemon that doesn't report heal progress, for a
+    /// step with no determinate count, and once heal finishes (the daemon
+    /// clears them), so a client treats "all absent" as "not securing".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heal_phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heal_checked: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heal_total: Option<u64>,
 }
 
 /// Snapshot of the daemon's local postage stamp issuer.
@@ -829,6 +844,9 @@ mod tests {
             stalled: false,
             heal_verified: false,
             heal_finished: false,
+            heal_phase: None,
+            heal_checked: None,
+            heal_total: None,
         };
         for jobs in [Vec::new(), vec![view]] {
             let resp = Response::UploadList { jobs: jobs.clone() };

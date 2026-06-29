@@ -169,6 +169,19 @@ pub struct UploadJobInfo {
     /// daemons; a manual "Push again" refreshes it.
     #[serde(default)]
     pub heal_finished: bool,
+    /// Live "Securing…" (post-upload self-heal) progress, surfaced to
+    /// watchers while the automatic heal runs so the app can draw a
+    /// determinate bar. `heal_phase` is the current step (`"checking"` /
+    /// `"repushing"`); `heal_checked` of `heal_total` is that step's count.
+    /// Transient/runtime-only — `skip_serializing` keeps it out of the
+    /// persisted manifest (a reloaded job re-derives it when heal re-runs),
+    /// and the heal clears all three the moment it finishes.
+    #[serde(default, skip_serializing)]
+    pub heal_phase: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub heal_checked: Option<u64>,
+    #[serde(default, skip_serializing)]
+    pub heal_total: Option<u64>,
 }
 
 impl UploadJobInfo {
