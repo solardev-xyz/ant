@@ -3962,7 +3962,7 @@ async fn verify_propagation_deep(
 ) -> serde_json::Value {
     use ant_retrieval::{
         enumerate_chunk_tree, lookup_path, ChunkFetcher, JoinOptions, ManifestError,
-        DEFAULT_MAX_FILE_BYTES,
+        DURABILITY_MAX_FILE_BYTES,
     };
 
     // True once the caller (the app's Cancel button) has requested abort.
@@ -4051,11 +4051,17 @@ async fn verify_propagation_deep(
         return cancelled_body();
     }
     emit("enumerating", None, None);
+    // Durability verify must cover any file the gateway will serve (up to
+    // ~16 GiB), not the 32 MiB interactive cap — otherwise a large-but-
+    // healthy upload fails enumeration ("file too large: span … cap
+    // 33554432") and is reported "not fully stored". Saturate the u64 cap
+    // into usize so 32-bit targets clamp instead of overflowing.
+    let max_bytes = usize::try_from(DURABILITY_MAX_FILE_BYTES).unwrap_or(usize::MAX);
     let inv = match enumerate_chunk_tree(
         &fetcher,
         data_ref,
         &root,
-        DEFAULT_MAX_FILE_BYTES,
+        max_bytes,
         JoinOptions {
             allow_degraded_redundancy: true,
         },
