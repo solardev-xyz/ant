@@ -191,6 +191,10 @@ pub unsafe extern "C" fn ant_start_gateway(
             };
             ant_gateway::chainreader::build(
                 gnosis_rpc,
+                // No read-only fallback on mobile: chain reads stay gated
+                // on the host-supplied `gnosis_rpc` (this branch only runs
+                // when it's set), so behavior is unchanged.
+                None,
                 // No per-node postage-contract override on mobile: use
                 // the Gnosis mainnet default (matches `antd`'s default).
                 ant_chain::GNOSIS_POSTAGE_STAMP.to_string(),

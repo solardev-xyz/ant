@@ -169,6 +169,27 @@ pub async fn stamps(State(handle): State<GatewayHandle>) -> Response {
 /// blockTime`).
 const GNOSIS_BLOCK_TIME_SECS: u128 = 5;
 
+/// bee's `batchTTL` (seconds) from a batch's remaining per-chunk balance
+/// and the current storage price. `remaining` is
+/// `PostageStamp.remainingBalance(id)` — already `normalisedBalance −
+/// currentTotalOutPayment`, clamped to `0` on chain for an expired batch
+/// — so the only edge cases left are this layer's:
+///
+/// * `price == 0` → `-1` ("never expires"), matching bee's semantics for
+///   a chain that hasn't priced storage; also dodges divide-by-zero.
+/// * `remaining == 0` (drained / expired) → `0`.
+/// * an astronomically long life is clamped to `i64::MAX` rather than
+///   wrapping negative.
+fn batch_ttl_secs(remaining: u128, price: u128) -> i64 {
+    match remaining
+        .saturating_mul(GNOSIS_BLOCK_TIME_SECS)
+        .checked_div(price)
+    {
+        Some(ttl) => i64::try_from(ttl).unwrap_or(i64::MAX),
+        None => -1, // price == 0 → never expires (bee semantics)
+    }
+}
+
 /// How long the per-batch chain enrichment may take before `/stamps`
 /// gives up and returns the placeholder `amount` / `batchTTL`. The
 /// listing must stay responsive even if the RPC is slow.
@@ -201,13 +222,7 @@ async fn enrich_with_chain(stamps: &mut [StampEntry], handle: &GatewayHandle) {
             };
             // Normalised per-chunk balance bee reports as `amount`.
             entry.amount = remaining.saturating_add(total_out).to_string();
-            entry.batch_ttl = match remaining
-                .saturating_mul(GNOSIS_BLOCK_TIME_SECS)
-                .checked_div(price)
-            {
-                Some(ttl) => i64::try_from(ttl).unwrap_or(i64::MAX),
-                None => -1, // price == 0 → never expires (bee semantics)
-            };
+            entry.batch_ttl = batch_ttl_secs(remaining, price);
         }
     })
     .await;
@@ -244,4 +259,36 @@ pub async fn stamp(State(handle): State<GatewayHandle>, Path(id): Path<String>) 
 fn json_ok<T: Serialize>(value: &T) -> Response {
     use axum::response::IntoResponse;
     axum::Json(value).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ttl_is_remaining_over_price_times_block_time() {
+        // 1_000_000 PLUR left, 100 PLUR/chunk/block → 10_000 blocks
+        // × 5s = 50_000s.
+        assert_eq!(batch_ttl_secs(1_000_000, 100), 50_000);
+    }
+
+    #[test]
+    fn zero_price_never_expires() {
+        // bee reports -1 for an unpriced chain; also guards the divide.
+        assert_eq!(batch_ttl_secs(1_000_000, 0), -1);
+        assert_eq!(batch_ttl_secs(0, 0), -1);
+    }
+
+    #[test]
+    fn drained_batch_is_zero() {
+        // remainingBalance() already clamps an expired batch to 0 on
+        // chain, so 0 in means a 0s TTL out (not the placeholder).
+        assert_eq!(batch_ttl_secs(0, 100), 0);
+    }
+
+    #[test]
+    fn astronomical_ttl_clamps_to_i64_max() {
+        // Would overflow i64 → clamp instead of wrapping negative.
+        assert_eq!(batch_ttl_secs(u128::MAX, 1), i64::MAX);
+    }
 }
