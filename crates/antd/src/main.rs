@@ -685,8 +685,15 @@ async fn main() -> Result<()> {
         // all report the chequebook pushsync is actually drawing on.
         // The node's own signing key funds postage buys / chequebook
         // deposits and is the batch owner — same key that derives `eth`.
+        // Reads (incl. `/stamps` `batchTTL`) fall back to the public logs
+        // RPC when no operator `--gnosis-rpc-url` is set, so an
+        // ultra-light node still reports a real chain-derived TTL instead
+        // of the long placeholder (issue #21). Setting
+        // `--gnosis-logs-rpc-url=""` (which already disables recovery)
+        // opts a fully-offline node back out. Writes stay gated on `rpc`.
         ant_gateway::chainreader::build(
             rpc,
+            resolve_logs_rpc(&opt),
             opt.postage_contract.clone(),
             eth,
             chequebook_addr,

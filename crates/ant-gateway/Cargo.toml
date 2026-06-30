@@ -1,6 +1,6 @@
 [package]
 name = "ant-gateway"
-version = "0.5.32"
+version = "0.5.33"
 edition.workspace = true
 license.workspace = true
 

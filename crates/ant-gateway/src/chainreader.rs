@@ -3,10 +3,10 @@
 //! (PLAN.md J.5 A2/A3/D1/D2).
 //!
 //! Keeps the chain wiring in the binary: `ant-gateway` only sees the
-//! trait, so it stays free of `ant-chain` / `reqwest`. Built only when
-//! the operator configured a Gnosis RPC endpoint; otherwise the gateway
-//! gets `chain: None` and those endpoints degrade to the bee zero-stub /
-//! `501`.
+//! trait, so it stays free of `ant-chain` / `reqwest`. Built when either
+//! an operator RPC or a read-only fallback RPC is configured (see
+//! [`build`]); with neither the gateway gets `chain: None` and those
+//! endpoints degrade to the bee zero-stub / `501`.
 
 use std::sync::Arc;
 
@@ -193,44 +193,75 @@ fn parse_addr(s: &str) -> Result<[u8; 20]> {
     Ok(a)
 }
 
-/// Build the gateway's [`ChainContext`] when an RPC endpoint is
-/// configured. `wallet_eth` is the node's own Ethereum address (the key
-/// that funds postage + SWAP, matching bee's `/wallet`). When
-/// `wallet_secret` is also present, the on-chain write endpoints are
-/// enabled via an [`AntChainWriter`]. Returns `None` when no RPC is set
-/// so the gateway falls back to the bee zero-stub.
+/// Build the gateway's [`ChainContext`]. `wallet_eth` is the node's own
+/// Ethereum address (the key that funds postage + SWAP, matching bee's
+/// `/wallet`).
+///
+/// Reads and writes are sourced separately:
+///
+/// * **Reads** (`/wallet`, `/chainstate`, `/stamps` `amount`/`batchTTL`)
+///   use the operator's explicit `rpc_url` when set, else fall back to
+///   `read_fallback_rpc_url` — the always-available public endpoint
+///   `antd` already contacts for startup recovery (its `--gnosis-logs-rpc-url`).
+///   This is what lets an ultra-light node with no `--gnosis-rpc-url`
+///   still report a real postage `batchTTL` from chainstate (issue #21)
+///   instead of the long placeholder. Returns `None` only when *neither*
+///   RPC is set, so the gateway falls back to the bee zero-stub.
+/// * **Writes** (`buy`/`topup`/`dilute`/`deposit`) sign real Gnosis
+///   transactions, so the [`AntChainWriter`] is built only from the
+///   operator's explicit `rpc_url` plus a funded `wallet_secret` — never
+///   the shared public fallback. Absent either, the write endpoints
+///   degrade to `501`.
 #[must_use]
 pub fn build(
     rpc_url: Option<String>,
+    read_fallback_rpc_url: Option<String>,
     postage_contract: String,
     wallet_eth: [u8; 20],
     chequebook: Option<[u8; 20]>,
     chain_id: u64,
     wallet_secret: Option<[u8; 32]>,
 ) -> Option<Arc<ChainContext>> {
-    let rpc_url = rpc_url?;
+    // Treat blank strings as unset so an empty env/config value behaves
+    // like an absent one.
+    let write_rpc = rpc_url.filter(|s| !s.trim().is_empty());
+    let read_fallback = read_fallback_rpc_url.filter(|s| !s.trim().is_empty());
+    // Reads prefer the operator's RPC and fall back to the read-only
+    // endpoint; with neither there is no chain to read, so the gateway
+    // keeps its bee zero-stubs.
+    let read_rpc = write_rpc.clone().or(read_fallback)?;
     let reader = AntChainReader {
-        client: ChainClient::new(rpc_url.clone()),
+        client: ChainClient::new(read_rpc),
         postage_contract: postage_contract.clone(),
         bzz_token: GNOSIS_BZZ_TOKEN.to_string(),
     };
 
-    // The writer is optional: it needs a funded wallet key plus parseable
-    // contract addresses. Any parse failure disables writes (endpoints
-    // 501) rather than refusing to start the daemon.
-    let writer: Option<Arc<dyn ChainWriter>> = wallet_secret.and_then(|secret| {
-        let wallet = Wallet::new(secret, chain_id).ok()?;
-        let postage = parse_addr(&postage_contract).ok()?;
-        let bzz = parse_addr(GNOSIS_BZZ_TOKEN).ok()?;
-        Some(Arc::new(AntChainWriter {
-            wallet,
-            client: ChainClient::new(rpc_url),
-            postage_contract: postage,
-            bzz_token: bzz,
-            owner: wallet_eth,
-            chequebook,
-        }) as Arc<dyn ChainWriter>)
-    });
+    // The writer is optional: it needs the operator's explicit RPC, a
+    // funded wallet key, and parseable contract addresses. Any missing
+    // piece (or a parse failure) disables writes (endpoints 501) rather
+    // than refusing to start the daemon — and crucially keeps a
+    // read-only fallback node from silently signing transactions against
+    // a shared public RPC.
+    let writer: Option<Arc<dyn ChainWriter>> = match (write_rpc, wallet_secret) {
+        (Some(rpc), Some(secret)) => {
+            let wallet = Wallet::new(secret, chain_id).ok();
+            let postage = parse_addr(&postage_contract).ok();
+            let bzz = parse_addr(GNOSIS_BZZ_TOKEN).ok();
+            match (wallet, postage, bzz) {
+                (Some(wallet), Some(postage), Some(bzz)) => Some(Arc::new(AntChainWriter {
+                    wallet,
+                    client: ChainClient::new(rpc),
+                    postage_contract: postage,
+                    bzz_token: bzz,
+                    owner: wallet_eth,
+                    chequebook,
+                })
+                    as Arc<dyn ChainWriter>),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
 
     Some(Arc::new(ChainContext {
         reader: Arc::new(reader),
@@ -239,4 +270,86 @@ pub fn build(
         chain_id,
         writer,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RPC: &str = "https://rpc.example/operator";
+    const FALLBACK: &str = "https://rpc.gnosischain.com";
+    const SECRET: [u8; 32] = [0x11; 32];
+
+    #[test]
+    fn no_rpc_at_all_yields_no_chain() {
+        assert!(build(
+            None,
+            None,
+            "0xpostage".into(),
+            [0; 20],
+            None,
+            100,
+            Some(SECRET)
+        )
+        .is_none());
+        // Blank strings count as unset.
+        assert!(build(
+            Some("  ".into()),
+            Some(String::new()),
+            "0xpostage".into(),
+            [0; 20],
+            None,
+            100,
+            Some(SECRET),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn read_fallback_enables_reads_but_not_writes() {
+        // Ultra-light: no operator RPC, only the read-only fallback.
+        let ctx = build(
+            None,
+            Some(FALLBACK.into()),
+            "0x45a1502382541Cd610CC9068e88727426b696293".into(),
+            [0xAB; 20],
+            None,
+            100,
+            Some(SECRET),
+        )
+        .expect("reader built from fallback");
+        // Reads are available (so /stamps can compute a real batchTTL)...
+        // ...but writes are NOT, even with a wallet secret present.
+        assert!(ctx.writer.is_none());
+    }
+
+    #[test]
+    fn explicit_rpc_with_secret_enables_writes() {
+        let ctx = build(
+            Some(RPC.into()),
+            Some(FALLBACK.into()),
+            "0x45a1502382541Cd610CC9068e88727426b696293".into(),
+            [0xAB; 20],
+            None,
+            100,
+            Some(SECRET),
+        )
+        .expect("context built");
+        assert!(ctx.writer.is_some());
+    }
+
+    #[test]
+    fn explicit_rpc_without_secret_reads_only() {
+        let ctx = build(
+            Some(RPC.into()),
+            None,
+            "0x45a1502382541Cd610CC9068e88727426b696293".into(),
+            [0xAB; 20],
+            None,
+            100,
+            None,
+        )
+        .expect("context built");
+        assert!(ctx.writer.is_none());
+    }
 }
