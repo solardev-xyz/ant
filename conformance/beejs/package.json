@@ -1,0 +1,13 @@
+{
+  "name": "ant-beejs-pack",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Drive unmodified bee-js against ant (memgateway) and bee (beemock), comparing behavior and references",
+  "type": "module",
+  "scripts": {
+    "test": "node run.mjs"
+  },
+  "dependencies": {
+    "@ethersphere/bee-js": "^12.2.2"
+  }
+}
