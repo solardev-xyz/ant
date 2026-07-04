@@ -57,6 +57,7 @@ pub mod manifest_writer;
 pub mod mantaray;
 pub mod progress;
 pub mod splitter;
+pub mod traversal;
 
 pub use accounting::{Accounting, DebitGuard, HotHint, OVERDRAFT_REFRESH};
 pub use cache::{InMemoryChunkCache, DEFAULT_CAPACITY as DEFAULT_CACHE_CAPACITY};
@@ -85,6 +86,7 @@ pub use progress::{estimate_total_chunks, ProgressSample, ProgressTracker};
 pub use push_skip_cache::{PushSkipCache, DEFAULT_SKIP_TTL};
 pub use pushsync_settlement::{peer_chunk_price, PushsyncSettlement};
 pub use splitter::{split_bytes, SplitChunk, SplitResult, StreamingSplitter, BRANCHES};
+pub use traversal::{traverse_chunk_addresses, TraversalError};
 
 use ant_crypto::{cac_valid, soc_valid, CHUNK_SIZE, SOC_HEADER_SIZE, SPAN_SIZE};
 use async_trait::async_trait;

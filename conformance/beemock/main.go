@@ -27,6 +27,7 @@ import (
 	"github.com/ethersphere/bee/v2/pkg/feeds/factory"
 	"github.com/ethersphere/bee/v2/pkg/log"
 	p2pmock "github.com/ethersphere/bee/v2/pkg/p2p/mock"
+	"github.com/ethersphere/bee/v2/pkg/postage"
 	mockbatchstore "github.com/ethersphere/bee/v2/pkg/postage/batchstore/mock"
 	mockpost "github.com/ethersphere/bee/v2/pkg/postage/mock"
 	"github.com/ethersphere/bee/v2/pkg/pusher"
@@ -137,7 +138,26 @@ func main() {
 	stewardSvc := steward.New(storer, &localRetriever{getter: storer.ChunkStore()}, storer.Cache())
 
 	post := mockpost.New(mockpost.WithAcceptAll())
-	batchStore := mockbatchstore.New(mockbatchstore.WithAcceptAllExistsFunc())
+	// The mock batchstore must also carry a real *postage.Batch: bee's
+	// presigned-stamp upload path (`swarm-postage-stamp` header →
+	// newStampedPutter) calls batchStore.Get and dereferences
+	// batch.Owner to verify the stamp signer. Without WithBatch the
+	// mock returns a nil batch (with a nil error) and the handler
+	// panics — a mock artifact real bee (whose batchstore returns the
+	// on-chain batch) never exhibits. Owner is this node's address so
+	// stamps minted by our own POST /envelope validate.
+	batchStore := mockbatchstore.New(
+		mockbatchstore.WithAcceptAllExistsFunc(),
+		mockbatchstore.WithBatch(&postage.Batch{
+			ID:          batchID,
+			Value:       big.NewInt(100_000_000),
+			Start:       1,
+			Owner:       ethAddrBytes,
+			Depth:       24,
+			BucketDepth: 16,
+			Immutable:   false,
+		}),
+	)
 	accessControl := mockac.New()
 
 	// Remaining mocks, mirroring newTestServer defaults.

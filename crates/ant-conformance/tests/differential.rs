@@ -112,8 +112,14 @@ struct Step {
     path: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
-    /// Extract a JSON field (by key) from the response into a variable.
-    extract: Option<(&'static str, &'static str)>,
+    /// Extract JSON fields (by key) from the response into variables.
+    extract: Vec<(&'static str, &'static str)>,
+    /// Step-scoped volatile JSON keys: their values legitimately differ
+    /// between backends (e.g. envelope stamps signed by different node
+    /// keys), so they're masked *shape-preserving* — presence and value
+    /// length still compare — before the diff. Scoped per step so a
+    /// generic key name like `index` can't hide real diffs elsewhere.
+    volatile: &'static [&'static str],
 }
 
 impl Step {
@@ -124,7 +130,8 @@ impl Step {
             path: path.into(),
             headers: Vec::new(),
             body: Vec::new(),
-            extract: None,
+            extract: Vec::new(),
+            volatile: &[],
         }
     }
     fn header(mut self, k: &str, v: impl Into<String>) -> Self {
@@ -136,7 +143,11 @@ impl Step {
         self
     }
     fn extract(mut self, json_key: &'static str, var: &'static str) -> Self {
-        self.extract = Some((json_key, var));
+        self.extract.push((json_key, var));
+        self
+    }
+    fn volatile(mut self, keys: &'static [&'static str]) -> Self {
+        self.volatile = keys;
         self
     }
 }
@@ -184,23 +195,52 @@ struct Observation {
     body: BodyRepr,
 }
 
-fn mask_json(v: &mut Value) {
+fn mask_json(v: &mut Value, step_volatile: &[&str]) {
     match v {
         Value::Object(map) => {
             for (k, val) in map.iter_mut() {
                 if VOLATILE_JSON_KEYS.contains(&k.as_str()) {
                     *val = Value::String("<masked>".into());
+                } else if step_volatile.contains(&k.as_str()) {
+                    // Shape-preserving mask: the value differs
+                    // legitimately (e.g. a stamp signed by a different
+                    // node key) but its *length* must still match, so a
+                    // 64-hex signature where bee sends 130 hex still
+                    // diffs.
+                    let masked = match &*val {
+                        Value::String(s) => format!("<masked {} chars>", s.len()),
+                        other => format!("<masked {}>", kind_of(other)),
+                    };
+                    *val = Value::String(masked);
                 } else {
-                    mask_json(val);
+                    mask_json(val, step_volatile);
                 }
             }
         }
-        Value::Array(items) => items.iter_mut().for_each(mask_json),
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| mask_json(item, step_volatile)),
         _ => {}
     }
 }
 
-fn observe(status: u16, headers: &reqwest::header::HeaderMap, body: &[u8]) -> Observation {
+fn kind_of(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn observe(
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+    body: &[u8],
+    step_volatile: &[&str],
+) -> Observation {
     let mut kept = BTreeMap::new();
     for name in COMPARED_HEADERS {
         if let Some(v) = headers.get(*name) {
@@ -221,7 +261,7 @@ fn observe(status: u16, headers: &reqwest::header::HeaderMap, body: &[u8]) -> Ob
     } else if is_json {
         match serde_json::from_slice::<Value>(body) {
             Ok(mut v) => {
-                mask_json(&mut v);
+                mask_json(&mut v, step_volatile);
                 BodyRepr::Json(v.to_string())
             }
             Err(_) => BodyRepr::Bytes(hex::encode(body)),
@@ -295,18 +335,20 @@ async fn run_step(client: &reqwest::Client, backend: &mut Backend, step: &Step) 
     let headers = resp.headers().clone();
     let body = resp.bytes().await.expect("read body").to_vec();
 
-    if let Some((json_key, var)) = step.extract {
+    if !step.extract.is_empty() {
         if let Ok(v) = serde_json::from_slice::<Value>(&body) {
-            if let Some(field) = v.get(json_key) {
-                let val = match field {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                backend.vars.insert(var.to_string(), val);
+            for (json_key, var) in &step.extract {
+                if let Some(field) = v.get(json_key) {
+                    let val = match field {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    backend.vars.insert((*var).to_string(), val);
+                }
             }
         }
     }
-    observe(status, &headers, &body)
+    observe(status, &headers, &body, step.volatile)
 }
 
 struct Diff {
@@ -434,6 +476,13 @@ fn scenarios() -> Vec<Scenario> {
     let batch = "{batch}";
     let missing_ref = "00000000000000000000000000000000000000000000000000000000000000ff";
 
+    // Chunk for the presigned-stamp round trip: `POST /envelope` needs
+    // the address *before* the upload, so compute it client-side from a
+    // fixed payload (`cac_new` = span-prefixed BMT, what bee's
+    // `cac.NewWithDataSpan` computes server-side).
+    let (presigned_addr, presigned_wire) =
+        ant_crypto::cac_new(b"presigned stamp round trip payload").expect("payload fits a chunk");
+
     vec![
         Scenario {
             name: "bytes",
@@ -471,6 +520,28 @@ fn scenarios() -> Vec<Scenario> {
                     .header("content-type", "application/octet-stream")
                     .header("swarm-postage-batch-id", batch)
                     .body(vec![1u8, 2, 3]),
+                // Neither batch id nor pre-signed stamp: bee's
+                // `batchIdOrStampSig` 400 (the /chunks handler doesn't
+                // mark the batch header `required`, unlike /bytes).
+                Step::new("upload-no-postage", "POST", "/chunks")
+                    .header("content-type", "application/octet-stream")
+                    .body({
+                        let payload = b"no postage".to_vec();
+                        let mut wire = (payload.len() as u64).to_le_bytes().to_vec();
+                        wire.extend_from_slice(&payload);
+                        wire
+                    }),
+                // Well-formed hex that isn't a 113-byte stamp: bee's
+                // `Stamp.UnmarshalBinary` rejection, verbatim message.
+                Step::new("upload-short-stamp", "POST", "/chunks")
+                    .header("content-type", "application/octet-stream")
+                    .header("swarm-postage-stamp", "deadbeef")
+                    .body({
+                        let payload = b"short stamp".to_vec();
+                        let mut wire = (payload.len() as u64).to_le_bytes().to_vec();
+                        wire.extend_from_slice(&payload);
+                        wire
+                    }),
             ],
         },
         Scenario {
@@ -640,8 +711,79 @@ fn scenarios() -> Vec<Scenario> {
                 Step::new("stewardship-check", "GET", "/stewardship/{st_ref}"),
                 Step::new("stewardship-reupload", "PUT", "/stewardship/{st_ref}")
                     .header("swarm-postage-batch-id", batch),
+                // Never-uploaded root: retrievability is a clean false
+                // (bee maps the traversal's not-found to
+                // `{"isRetrievable": false}`, not an error).
+                Step::new(
+                    "stewardship-missing",
+                    "GET",
+                    format!("/stewardship/{missing_ref}"),
+                ),
+                // Re-upload requires the batch header (bee marks it
+                // `required` on PUT — mapStructure 400).
+                Step::new(
+                    "stewardship-reupload-no-batch",
+                    "PUT",
+                    "/stewardship/{st_ref}",
+                ),
+                // A manifest-rooted tree: stewardship must follow the
+                // mantaray forks down to the file data, not just the
+                // root span tree.
+                Step::new("seed-bzz", "POST", "/bzz?name=steward.txt")
+                    .header("content-type", "text/plain")
+                    .header("swarm-postage-batch-id", batch)
+                    .body(&b"stewardship manifest seed content, long enough to matter"[..])
+                    .extract("reference", "st_bzz_ref"),
+                Step::new(
+                    "stewardship-check-manifest",
+                    "GET",
+                    "/stewardship/{st_bzz_ref}",
+                ),
+                Step::new(
+                    "stewardship-reupload-manifest",
+                    "PUT",
+                    "/stewardship/{st_bzz_ref}",
+                )
+                .header("swarm-postage-batch-id", batch),
+                // Envelope: issuer/index/timestamp/signature values are
+                // signed by each backend's own node key, so they differ
+                // legitimately — masked shape-preserving (key presence
+                // + value length still compare).
                 Step::new("envelope", "POST", "/envelope/{st_ref}")
+                    .header("swarm-postage-batch-id", batch)
+                    .volatile(&["issuer", "index", "timestamp", "signature"]),
+                // Bee checks the header struct before the path, so the
+                // missing batch header wins even on a valid address.
+                Step::new("envelope-no-batch", "POST", "/envelope/{st_ref}"),
+                Step::new("envelope-bad-address", "POST", "/envelope/zznothex")
                     .header("swarm-postage-batch-id", batch),
+                // Presigned round trip: mint an envelope for a chunk
+                // address computed client-side, rebuild the 113-byte
+                // stamp from the response (per-backend vars — each
+                // backend must accept *its own* issuer's stamp), then
+                // upload the chunk with `swarm-postage-stamp` only.
+                Step::new(
+                    "envelope-for-presigned",
+                    "POST",
+                    format!("/envelope/{}", hex::encode(presigned_addr)),
+                )
+                .header("swarm-postage-batch-id", batch)
+                .volatile(&["issuer", "index", "timestamp", "signature"])
+                .extract("index", "env_index")
+                .extract("timestamp", "env_timestamp")
+                .extract("signature", "env_signature"),
+                Step::new("presigned-upload", "POST", "/chunks")
+                    .header("content-type", "application/octet-stream")
+                    .header(
+                        "swarm-postage-stamp",
+                        "{batch}{env_index}{env_timestamp}{env_signature}",
+                    )
+                    .body(presigned_wire.clone()),
+                Step::new(
+                    "presigned-download",
+                    "GET",
+                    format!("/chunks/{}", hex::encode(presigned_addr)),
+                ),
             ],
         },
     ]

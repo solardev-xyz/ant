@@ -9,16 +9,17 @@ publish = false
 ant-control = { path = "../ant-control" }
 ant-crypto = { path = "../ant-crypto" }
 ant-gateway = { path = "../ant-gateway" }
+ant-postage = { path = "../ant-postage" }
 ant-retrieval = { path = "../ant-retrieval" }
 async-trait.workspace = true
 axum.workspace = true
 hex.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
+k256.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-ant-postage = { path = "../ant-postage" }
 # Plain-HTTP client for the in-process gateway integration tests; no TLS
 # stack needed, so every default feature stays off. Version matches the
 # `reqwest` already in the workspace lockfile via `ant-chain`.

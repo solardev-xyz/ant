@@ -8,6 +8,7 @@ license.workspace = true
 ant-chain = { path = "../ant-chain", optional = true }
 ant-control = { path = "../ant-control" }
 ant-crypto = { path = "../ant-crypto", optional = true }
+ant-postage = { path = "../ant-postage", optional = true }
 ant-retrieval = { path = "../ant-retrieval" }
 anyhow = { workspace = true, optional = true }
 async-trait.workspace = true
@@ -45,7 +46,7 @@ tower = { version = "0.5.3", features = ["util"] }
 # closure — out of their dependency graph entirely.
 [features]
 default = ["http-api"]
-http-api = ["dep:axum", "dep:hyper", "dep:tower", "dep:ant-crypto"]
+http-api = ["dep:axum", "dep:hyper", "dep:tower", "dep:ant-crypto", "dep:ant-postage"]
 chain = ["http-api", "dep:ant-chain", "dep:anyhow", "dep:primitive-types"]
 
 [lints]

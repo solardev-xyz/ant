@@ -103,6 +103,83 @@ impl ChunkFetcher for MemChunkStore {
     }
 }
 
+/// In-memory postage runtime backing the `MemNode`'s `Envelope` /
+/// `StewardshipPut` handlers: a fixed node signing key plus one real
+/// [`ant_postage::StampIssuer`] per batch id, created lazily on first
+/// use. Mirrors beemock's `mockpost.WithAcceptAll()`, which hands out a
+/// usable issuer for *any* batch id — so the differential can stamp
+/// against whatever id the oracle advertises — while the stamps
+/// themselves are genuine: real bucket counters, real keccak digest,
+/// real secp256k1 signatures that `verify_stamp_owner` accepts.
+struct MemPostage {
+    secret: [u8; 32],
+    owner: [u8; 20],
+    issuers: Mutex<HashMap<[u8; 32], ant_postage::StampIssuer>>,
+}
+
+/// Batch geometry for lazily-created issuers: bee's default bucket
+/// depth (16) with enough headroom (depth 24) that a conformance run
+/// never saturates a bucket.
+const MEM_BATCH_DEPTH: u8 = 24;
+const MEM_BUCKET_DEPTH: u8 = 16;
+
+impl MemPostage {
+    fn new() -> Self {
+        // Any fixed scalar below the secp256k1 order works; a constant
+        // keeps the mem node's issuer address stable across runs.
+        let secret = [0xa5u8; 32];
+        let sk = k256::ecdsa::SigningKey::from_bytes(&secret.into())
+            .expect("fixed scalar is a valid secp256k1 secret");
+        let owner = ant_crypto::ethereum_address_from_public_key(sk.verifying_key());
+        Self {
+            secret,
+            owner,
+            issuers: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Issue (or reuse — the issuer's per-chunk stamp cache makes this
+    /// idempotent) a stamp for `address` under `batch_id`.
+    fn stamp(
+        &self,
+        batch_id: [u8; 32],
+        address: &[u8; 32],
+    ) -> Result<[u8; ant_postage::STAMP_SIZE], ant_postage::PostageError> {
+        let mut issuers = self
+            .issuers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let issuer = match issuers.entry(batch_id) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => e.insert(
+                ant_postage::StampIssuer::new(batch_id, MEM_BATCH_DEPTH, MEM_BUCKET_DEPTH, false)?,
+            ),
+        };
+        ant_postage::sign_stamp_bytes(&self.secret, issuer, address)
+    }
+}
+
+/// Validate a pre-signed 113-byte stamp the way the production node
+/// does: exact size, then signature recovery over the stamp digest for
+/// this chunk address.
+fn presigned_stamp_valid(pre: &[u8], addr: &[u8; 32]) -> Result<(), String> {
+    let stamp: [u8; ant_postage::STAMP_SIZE] = pre.try_into().map_err(|_| {
+        format!(
+            "presigned stamp must be {} bytes, got {}",
+            ant_postage::STAMP_SIZE,
+            pre.len()
+        )
+    })?;
+    let batch: &[u8; 32] = stamp[0..32].try_into().expect("slice length");
+    let index: &[u8; 8] = stamp[32..40].try_into().expect("slice length");
+    let ts: &[u8; 8] = stamp[40..48].try_into().expect("slice length");
+    let sig: &[u8; 65] = stamp[48..113].try_into().expect("slice length");
+    let digest = ant_postage::postage_sign_digest(addr, batch, index, ts);
+    ant_crypto::recover_public_key(sig, digest.as_ref())
+        .map(|_| ())
+        .map_err(|e| format!("presigned stamp signature invalid: {e}"))
+}
+
 /// Configuration for [`spawn_mem_gateway`]. `Default` gives an
 /// upload-capable (`light`-mode) gateway with bee's default (deny) CORS
 /// policy — the configuration conformance runs want.
@@ -188,11 +265,13 @@ pub async fn spawn_mem_gateway(cfg: MemGatewayConfig) -> MemGateway {
     // production node loop (and the gateway test fixture) do, so a
     // slow streaming download can't head-of-line-block an upload.
     let node_store = store.clone();
+    let postage = Arc::new(MemPostage::new());
     let node = tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
             let s = node_store.clone();
+            let p = postage.clone();
             tokio::spawn(async move {
-                handle_command(&s, cmd).await;
+                handle_command(&s, &p, cmd).await;
             });
         }
     });
@@ -309,15 +388,20 @@ fn mem_snapshot() -> StatusSnapshot {
 /// for the commands the gateway never exercises against content, what
 /// the `ant-gateway` test fixture returns), so no gateway handler ever
 /// hangs on an unanswered channel.
-async fn handle_command(store: &MemChunkStore, cmd: ControlCommand) {
+async fn handle_command(store: &MemChunkStore, postage: &MemPostage, cmd: ControlCommand) {
     match cmd {
         // ---- writes -------------------------------------------------
-        ControlCommand::PushChunk { wire, ack, .. } => {
+        ControlCommand::PushChunk {
+            wire, stamp, ack, ..
+        } => {
             // Validate like production: recompute the address by
             // BMT-hashing `span ‖ payload`. Then *store* the wire bytes
             // so the round-trip read works (the fixture only hashes).
             // The batch id is accepted unchecked — `MemNode` models an
-            // issuer that stamps anything.
+            // issuer that stamps anything. A pre-signed stamp (bee's
+            // `swarm-postage-stamp` header) is validated exactly like
+            // the production node does: size + signature recovery over
+            // the stamp digest for this chunk address.
             let reply = if wire.len() < 8 || wire.len() > 8 + 4096 {
                 ControlAck::Error {
                     message: format!("chunk wire size out of range: {} bytes", wire.len()),
@@ -327,9 +411,16 @@ async fn handle_command(store: &MemChunkStore, cmd: ControlCommand) {
                 span.copy_from_slice(&wire[..8]);
                 match ant_crypto::bmt_hash_with_span(&span, &wire[8..]) {
                     Some(addr) => {
-                        store.insert(addr, wire);
-                        ControlAck::ChunkUploaded {
-                            reference: format!("0x{}", hex::encode(addr)),
+                        let stamp_err = stamp
+                            .as_deref()
+                            .and_then(|pre| presigned_stamp_valid(pre, &addr).err());
+                        if let Some(message) = stamp_err {
+                            ControlAck::Error { message }
+                        } else {
+                            store.insert(addr, wire);
+                            ControlAck::ChunkUploaded {
+                                reference: format!("0x{}", hex::encode(addr)),
+                            }
                         }
                     }
                     None => ControlAck::Error {
@@ -340,7 +431,11 @@ async fn handle_command(store: &MemChunkStore, cmd: ControlCommand) {
             let _ = ack.send(reply);
         }
         ControlCommand::PushSoc {
-            address, wire, ack, ..
+            address,
+            wire,
+            stamp,
+            ack,
+            ..
         } => {
             // Re-validate the wire even though the gateway already ran
             // `soc_valid` (mirroring `ant-p2p`'s defensive re-check),
@@ -358,6 +453,11 @@ async fn handle_command(store: &MemChunkStore, cmd: ControlCommand) {
                 ControlAck::Error {
                     message: "soc validation failed".into(),
                 }
+            } else if let Some(message) = stamp
+                .as_deref()
+                .and_then(|pre| presigned_stamp_valid(pre, &address).err())
+            {
+                ControlAck::Error { message }
             } else {
                 let inner = wire[SOC_HEADER..].to_vec();
                 let mut inner_span = [0u8; 8];
@@ -560,6 +660,83 @@ async fn handle_command(store: &MemChunkStore, cmd: ControlCommand) {
                 Err(FeedError::NoUpdates { .. }) => ControlAck::FeedNotFound,
                 Err(e) => ControlAck::Error {
                     message: format!("feed lookup: {e}"),
+                },
+            };
+            let _ = ack.send(reply);
+        }
+        // ---- envelope + stewardship: wired for real ------------------
+        ControlCommand::Envelope {
+            address,
+            batch_id,
+            ack,
+        } => {
+            // Genuine signed stamp from the in-memory issuer — same
+            // digest, bucket accounting, and signature the production
+            // node produces; only the key differs from beemock's, so
+            // the differential masks the value and compares shape.
+            let reply = match postage.stamp(batch_id, &address) {
+                Ok(stamp) => ControlAck::Envelope {
+                    issuer: postage.owner,
+                    stamp,
+                },
+                Err(ant_postage::PostageError::BucketFull) => ControlAck::Error {
+                    message: "batch is overissued".into(),
+                },
+                Err(e) => ControlAck::Error {
+                    message: format!("stamp issue failed: {e}"),
+                },
+            };
+            let _ = ack.send(reply);
+        }
+        ControlCommand::StewardshipGet { reference, ack } => {
+            // Production traversal (span trees + mantaray manifests)
+            // over the in-memory store; a missing chunk anywhere in the
+            // tree — root included — reports `false`, like bee's
+            // steward mapping storage.ErrNotFound to not-retrievable.
+            let retrievable = match ant_retrieval::traverse_chunk_addresses(
+                store,
+                reference,
+                DEFAULT_MAX_FILE_BYTES,
+            )
+            .await
+            {
+                Ok(addrs) => addrs.iter().all(|addr| store.get(addr).is_some()),
+                Err(_) => false,
+            };
+            let _ = ack.send(ControlAck::Retrievable { retrievable });
+        }
+        ControlCommand::StewardshipPut { reference, ack, .. } => {
+            // Re-upload: traverse, then re-store every chunk (a push to
+            // the in-memory "network" is a store). Missing content
+            // fails like bee's `Reupload` traversal would.
+            let reply = match ant_retrieval::traverse_chunk_addresses(
+                store,
+                reference,
+                DEFAULT_MAX_FILE_BYTES,
+            )
+            .await
+            {
+                Ok(addrs) => {
+                    let mut missing = None;
+                    for addr in &addrs {
+                        if let Some(wire) = store.get(addr) {
+                            store.insert(*addr, wire);
+                        } else {
+                            missing = Some(*addr);
+                            break;
+                        }
+                    }
+                    match missing {
+                        None => ControlAck::Ok {
+                            message: format!("re-uploaded {} chunks", addrs.len()),
+                        },
+                        Some(addr) => ControlAck::Error {
+                            message: format!("fetch {}: chunk not found", hex::encode(addr)),
+                        },
+                    }
+                }
+                Err(e) => ControlAck::Error {
+                    message: format!("re-upload traversal failed: {e}"),
                 },
             };
             let _ = ack.send(reply);

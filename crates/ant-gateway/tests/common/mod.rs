@@ -639,6 +639,66 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
                 message: body.to_string(),
             });
         }
+        // Envelope issuance needs a stamp issuer + signing key, which
+        // the gateway fixture doesn't model (the real path is covered
+        // by `ant-p2p` and the conformance MemNode); surface a clear
+        // "not usable" so the handler's bee-shaped 422 branch is what a
+        // stray test observes.
+        ControlCommand::Envelope { batch_id, ack, .. } => {
+            let _ = ack.send(ControlAck::Error {
+                message: format!(
+                    "batch 0x{} not usable (no issuer in gateway test fixture)",
+                    hex::encode(batch_id)
+                ),
+            });
+        }
+        // Stewardship check: run the real traversal over the fixture's
+        // `DirFetcher` (it implements `ChunkFetcher`), then confirm
+        // every listed chunk is present — the same shape the production
+        // node-loop handler has.
+        ControlCommand::StewardshipGet { reference, ack } => {
+            let retrievable = match ant_retrieval::traverse_chunk_addresses(
+                fetcher,
+                reference,
+                DEFAULT_MAX_FILE_BYTES,
+            )
+            .await
+            {
+                Ok(addrs) => {
+                    let mut ok = true;
+                    for addr in addrs {
+                        if fetcher.fetch(addr).await.is_err() {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok
+                }
+                Err(_) => false,
+            };
+            let _ = ack.send(ControlAck::Retrievable { retrievable });
+        }
+        // Stewardship re-upload: the fixture has no network to push to;
+        // traversing + re-reading the fixture store is the closest
+        // no-op analogue, and it keeps the success/failure split real
+        // (missing content still errors like the production handler).
+        ControlCommand::StewardshipPut { reference, ack, .. } => {
+            let reply = match ant_retrieval::traverse_chunk_addresses(
+                fetcher,
+                reference,
+                DEFAULT_MAX_FILE_BYTES,
+            )
+            .await
+            {
+                Ok(addrs) => ControlAck::Ok {
+                    message: format!("re-uploaded {} chunks (test fixture)", addrs.len()),
+                },
+                Err(e) => ControlAck::Error {
+                    message: format!("re-upload traversal failed: {e}"),
+                },
+            };
+            let _ = ack.send(reply);
+        }
         ControlCommand::VerifyChunksPresent {
             addresses,
             probes: _,
