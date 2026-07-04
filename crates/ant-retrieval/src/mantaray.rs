@@ -1124,7 +1124,7 @@ mod tests {
     /// index.html` manifest, and return `(fetcher, root, data_refs)`.
     /// Mirrors what `swarm-deploy` produces for a static site.
     fn website_fetcher(paths: &[&str]) -> (MapFetcher, [u8; 32], HashMap<String, [u8; 32]>) {
-        use crate::manifest_writer::{build_collection_manifest, ManifestFile};
+        use crate::manifest_writer::{build_collection_manifest, IndexAnchor, ManifestFile};
         let mut fetcher = MapFetcher::new();
         let mut files = Vec::new();
         let mut data_refs = HashMap::new();
@@ -1141,7 +1141,8 @@ mod tests {
                 data_ref: split.root,
             });
         }
-        let manifest = build_collection_manifest(&files, Some("index.html")).unwrap();
+        let manifest =
+            build_collection_manifest(&files, Some("index.html"), IndexAnchor::ZeroEntry).unwrap();
         for c in &manifest.chunks {
             fetcher.insert(c.address, c.wire.clone());
         }

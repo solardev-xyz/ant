@@ -63,13 +63,19 @@
 //! A wrapped CAC of length 48 or 80 is **ambiguous** — it could be a v1
 //! payload or a v2 content chunk that happens to be that size. Bee's
 //! `resolveFeed` (`bee/pkg/api/bzz.go`) races both interpretations and
-//! returns whichever wrapped address is actually retrievable. We mirror
+//! requires the winning one's wrapped address to actually be
+//! retrievable from the chunk store; when neither resolves it fails
+//! with `feeds.WrappedChunkNotFoundError`, which the HTTP layer
+//! surfaces as `404 "wrapped chunk cannot be retrieved"`. We mirror
 //! that deterministically: for an ambiguous length we probe the v1
-//! reference, classify as v1 if it resolves, and otherwise fall back to
-//! v2 (the wrapped CAC's own address). Any other length is unambiguously
-//! v2. Encrypted (64-byte) v1 references can't be *served* yet — the
-//! joiner has no chunk decryption — but the v2 interpretation of an
-//! 80-byte wrapped CAC is still followed when its own address resolves.
+//! reference, classify as v1 if it resolves, and otherwise fail with
+//! [`FeedError::WrappedChunkNotFound`]. We do **not** fall back to
+//! serving the wrapped CAC itself as v2 — ant caches every SOC's
+//! wrapped CAC locally on `PushSoc` (for v2 read-after-own-write), so
+//! probing the wrapped CAC's own address is degenerate here and would
+//! serve a dead v1 update's raw `ts ‖ ref` payload as content where
+//! bee 404s. Any other length is unambiguously v2 and served without
+//! a probe, matching bee's single-branch v2 resolution.
 
 use crate::ChunkFetcher;
 use ant_crypto::{
@@ -130,6 +136,17 @@ pub enum FeedError {
     /// [`crate::join_encrypted`].
     #[error("feed resolves to an encrypted reference; use the full resolver")]
     EncryptedReference,
+    /// The latest update carries a legacy (v1-length) payload whose
+    /// referenced chunk is definitively not retrievable. Mirrors bee's
+    /// `feeds.WrappedChunkNotFoundError` (`bee/pkg/feeds/getter.go`):
+    /// `GET /feeds` surfaces it as `404 "wrapped chunk cannot be
+    /// retrieved"`, the bzz feed-dereference path as `404 "bzz download:
+    /// feed pointing to the wrapped chunk not found"`.
+    #[error("feed pointing to the wrapped chunk not found: {}", hex::encode(.reference))]
+    WrappedChunkNotFound {
+        /// The v1 reference (address part) that could not be retrieved.
+        reference: [u8; 32],
+    },
 }
 
 /// Owner + topic + type identifying a feed.
@@ -582,7 +599,7 @@ pub async fn resolve_sequence_feed_full(
 
     // Disambiguate v1 vs v2 only for the latest update — the intermediate
     // updates' references are never served.
-    let (reference, v2, decrypt_key) = classify_payload(fetcher, &latest).await;
+    let (reference, v2, decrypt_key) = classify_payload(fetcher, &latest).await?;
     debug!(
         target: "ant_retrieval::feed",
         latest_index,
@@ -607,41 +624,49 @@ pub async fn resolve_sequence_feed_full(
 /// content root). Returns `(reference, is_v2, decrypt_key)` where
 /// `decrypt_key` is `Some` only for an encrypted v1 reference.
 ///
-/// Mirrors bee's `resolveFeed` race (`bee/pkg/api/bzz.go`): a wrapped CAC
-/// of v1 length (48 unencrypted, 80 encrypted) is ambiguous, so we probe
-/// the v1 reference's address and classify as v1 when it resolves, falling
-/// back to v2 (the wrapped CAC's own address) on a definitive miss. A
+/// Mirrors bee's `resolveFeed` (`bee/pkg/api/bzz.go`): a wrapped CAC of
+/// v1 length (48 unencrypted, 80 encrypted) is ambiguous, so we probe
+/// the v1 reference's address and classify as v1 when it resolves. On a
+/// definitive miss we fail with [`FeedError::WrappedChunkNotFound`],
+/// matching bee's `feeds.WrappedChunkNotFoundError` for a legacy update
+/// whose referenced chunk is gone (see the module docs for why ant
+/// can't reproduce bee's store-backed v2 fallback probe here). A
 /// non-v1 length is unambiguously v2 and needs no probe.
 async fn classify_payload(
     fetcher: &dyn ChunkFetcher,
     decoded: &DecodedUpdate,
-) -> ([u8; 32], bool, Option<[u8; 32]>) {
+) -> Result<([u8; 32], bool, Option<[u8; 32]>), FeedError> {
     // Encrypted v1 (80-byte wrapped CAC): the reference is
     // `addr(32) ‖ key(32)`. Probe the address; if it resolves this is a
-    // genuine encrypted update, otherwise fall back to v2.
+    // genuine encrypted update, otherwise the update points at a chunk
+    // that cannot be retrieved.
     if let Some(enc_ref) = decoded.v1_enc_ref {
         let mut addr = [0u8; 32];
         addr.copy_from_slice(&enc_ref[..32]);
         let mut key = [0u8; 32];
         key.copy_from_slice(&enc_ref[32..]);
         return match fetcher.fetch(addr).await {
-            Err(e) if is_chunk_not_found(e.as_ref()) => (decoded.inner_cac_addr, true, None),
-            _ => (addr, false, Some(key)),
+            Err(e) if is_chunk_not_found(e.as_ref()) => {
+                Err(FeedError::WrappedChunkNotFound { reference: addr })
+            }
+            _ => Ok((addr, false, Some(key))),
         };
     }
     match decoded.v1_ref {
         // Unambiguous v2: the wrapped CAC is the content root chunk.
-        None => (decoded.inner_cac_addr, true, None),
-        // Ambiguous v1-length: probe the v1 reference. Bee returns
-        // whichever wrapped address is retrievable; we prefer v1 when it
-        // resolves and otherwise fall back to v2 only on a definitive
-        // miss. A non-miss fetch error (flaky peer) keeps the v1
-        // classification — the gateway re-fetches when it streams, and
-        // misclassifying a transient v1 as v2 would be worse than an
-        // honest retry.
+        None => Ok((decoded.inner_cac_addr, true, None)),
+        // Ambiguous v1-length: probe the v1 reference. Classify as v1
+        // when it resolves; a definitive miss means the legacy update
+        // points at an unretrievable chunk — bee 404s here rather than
+        // serving the raw `ts ‖ ref` payload as content. A non-miss
+        // fetch error (flaky peer) keeps the v1 classification — the
+        // gateway re-fetches when it streams, and failing a transient
+        // v1 would be worse than an honest retry.
         Some(v1_ref) => match fetcher.fetch(v1_ref).await {
-            Err(e) if is_chunk_not_found(e.as_ref()) => (decoded.inner_cac_addr, true, None),
-            _ => (v1_ref, false, None),
+            Err(e) if is_chunk_not_found(e.as_ref()) => {
+                Err(FeedError::WrappedChunkNotFound { reference: v1_ref })
+            }
+            _ => Ok((v1_ref, false, None)),
         },
     }
 }
@@ -1113,10 +1138,11 @@ mod tests {
     }
 
     /// An encrypted v1 update whose content address is *not* retrievable
-    /// falls back to v2 (the wrapped CAC's own address, no key) — the same
-    /// race bee runs for ambiguous payload lengths.
+    /// fails with `WrappedChunkNotFound` — bee's HTTP layer turns the
+    /// equivalent `feeds.WrappedChunkNotFoundError` into
+    /// `404 "wrapped chunk cannot be retrieved"`.
     #[tokio::test]
-    async fn resolve_encrypted_v1_unretrievable_falls_back_to_v2() {
+    async fn resolve_encrypted_v1_unretrievable_is_wrapped_chunk_not_found() {
         let secret: [u8; 32] = [0x31u8; 32];
         let owner = deterministic_eth_address(&secret);
         let topic: [u8; 32] = [0x77u8; 32];
@@ -1135,12 +1161,13 @@ mod tests {
         let mut fetcher = MapFetcher::new();
         fetcher.insert(soc_addr, soc_wire);
 
-        let resolution = resolve_sequence_feed_full(&fetcher, &feed).await.unwrap();
+        let err = resolve_sequence_feed_full(&fetcher, &feed)
+            .await
+            .expect_err("unretrievable encrypted ref must not resolve");
         assert!(
-            resolution.v2,
-            "unretrievable encrypted ref must fall back to v2"
+            matches!(err, FeedError::WrappedChunkNotFound { reference } if reference == [0x01u8; 32]),
+            "expected WrappedChunkNotFound, got: {err}"
         );
-        assert_eq!(resolution.decrypt_key, None);
     }
 
     fn deterministic_eth_address(secret: &[u8; 32]) -> [u8; 20] {
@@ -1261,10 +1288,11 @@ mod tests {
     }
 
     /// An ambiguous 48-byte wrapped CAC whose v1 reference is *not*
-    /// retrievable falls back to v2 — matching bee's resolveFeed, which
-    /// returns whichever wrapped address actually resolves.
+    /// retrievable fails with `WrappedChunkNotFound` — matching bee's
+    /// resolveFeed, which requires the wrapped address to actually
+    /// resolve and otherwise 404s ("wrapped chunk cannot be retrieved").
     #[tokio::test]
-    async fn resolve_v1_length_but_unretrievable_ref_falls_back_to_v2() {
+    async fn resolve_v1_length_but_unretrievable_ref_is_wrapped_chunk_not_found() {
         let secret: [u8; 32] = [0x66u8; 32];
         let owner = deterministic_eth_address(&secret);
         let topic: [u8; 32] = [0x77u8; 32];
@@ -1280,11 +1308,15 @@ mod tests {
         let mut fetcher = MapFetcher::new();
         fetcher.insert(soc_addr, soc_wire);
         // Deliberately do NOT stage `unretrievable_ref`: the v1 probe
-        // misses, so resolution falls back to the wrapped CAC address.
+        // misses, so resolution fails like bee's WrappedChunkNotFoundError.
 
-        let resolution = resolve_sequence_feed_full(&fetcher, &feed).await.unwrap();
-        assert_ne!(resolution.reference, unretrievable_ref);
-        assert!(resolution.v2, "unretrievable v1 ref must fall back to v2");
+        let err = resolve_sequence_feed_full(&fetcher, &feed)
+            .await
+            .expect_err("dead v1 ref must not resolve");
+        assert!(
+            matches!(err, FeedError::WrappedChunkNotFound { reference } if reference == unretrievable_ref),
+            "expected WrappedChunkNotFound, got: {err}"
+        );
     }
 
     /// An update signed by a *different* owner must be rejected: SOC
@@ -1397,6 +1429,9 @@ mod tests {
                 fetcher.insert(addr, wire);
             }
         }
+        // The latest update's v1 reference must be retrievable for the
+        // v1/v2 classification probe (a dead ref is WrappedChunkNotFound).
+        fetcher.insert(refs[3], cac_new(b"latest content").unwrap().1);
 
         let resolution = resolve_sequence_feed_full(&fetcher, &feed).await.unwrap();
         assert_eq!(
@@ -1426,6 +1461,8 @@ mod tests {
         let mut fetcher = FlakyFetcher::new();
         let (addr0, wire0) = make_sequence_update_v1(&secret, &owner, &topic, 0, &target_ref);
         fetcher.insert(addr0, wire0);
+        // Stage the v1 target so classification resolves as v1.
+        fetcher.insert(target_ref, cac_new(b"update content").unwrap().1);
         // The next index (1) — past the latest — fails transiently rather
         // than with a clean "not found". Every further lookahead index is a
         // genuine miss.

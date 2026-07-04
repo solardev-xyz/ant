@@ -47,7 +47,7 @@ use crate::{PinArgs, PinCollectionArgs};
 use ant_control::{request_sync, Request, Response};
 use ant_crypto::CHUNK_SIZE;
 use ant_retrieval::{
-    build_collection_manifest, build_single_file_manifest, ManifestFile, SplitChunk,
+    build_collection_manifest, build_single_file_manifest, IndexAnchor, ManifestFile, SplitChunk,
     StreamingSplitter,
 };
 use anyhow::{anyhow, bail, Context, Result};
@@ -192,8 +192,12 @@ pub fn run_collection(socket: &Path, args: PinCollectionArgs, json: bool) -> Res
         });
     }
 
-    let result = build_collection_manifest(&manifest_files, args.index.as_deref())
-        .map_err(|e| anyhow!("build collection manifest: {e}"))?;
+    let result = build_collection_manifest(
+        &manifest_files,
+        args.index.as_deref(),
+        IndexAnchor::ZeroEntry,
+    )
+    .map_err(|e| anyhow!("build collection manifest: {e}"))?;
 
     if let Some(expect_ref) = args.expect.as_ref() {
         let expected = parse_reference(expect_ref)?;

@@ -54,10 +54,12 @@ Swarm-Soc-Signature, Swarm-Act, Swarm-Act-Publisher, Swarm-Act-History-Address, 
 Gas-Price, Gas-Limit";
 
 /// `Access-Control-Expose-Headers`: the response headers cross-origin
-/// JS would otherwise be unable to read. bee-js needs `Swarm-Tag-Uid`
-/// (upload progress) and the feed-index pair; the content headers let a
-/// page-side `fetch` introspect length / type / disposition / range.
-const EXPOSE_HEADERS: &str = "Swarm-Tag-Uid, Swarm-Feed-Index, Swarm-Feed-Index-Next, \
+/// JS would otherwise be unable to read. Modern bee-js reads
+/// `Swarm-Tag` (bee's upload-session echo); older consumers read ant's
+/// legacy `Swarm-Tag-Uid`; the feed-index pair drives feed polling; the
+/// content headers let a page-side `fetch` introspect length / type /
+/// disposition / range.
+const EXPOSE_HEADERS: &str = "Swarm-Tag, Swarm-Tag-Uid, Swarm-Feed-Index, Swarm-Feed-Index-Next, \
 Swarm-Soc-Signature, Swarm-Act-History-Address, ETag, \
 Content-Type, Content-Length, Content-Disposition, Content-Range, Accept-Ranges";
 
