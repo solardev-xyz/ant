@@ -57,6 +57,7 @@ pub mod manifest_writer;
 pub mod mantaray;
 pub mod progress;
 pub mod rs;
+pub mod rs_encode;
 pub mod splitter;
 pub mod traversal;
 
@@ -87,6 +88,9 @@ pub use progress::{estimate_total_chunks, ProgressSample, ProgressTracker};
 pub use push_skip_cache::{PushSkipCache, DEFAULT_SKIP_TTL};
 pub use pushsync_settlement::{peer_chunk_price, PushsyncSettlement};
 pub use rs::{fetch_root_with_replicas, replica_addresses, REPLICAS_OWNER, REPLICA_COUNTS};
+pub use rs_encode::{
+    replica_chunks, split_bytes_with_redundancy, RedundantSplitResult, RedundantSplitter,
+};
 pub use splitter::{split_bytes, SplitChunk, SplitResult, StreamingSplitter, BRANCHES};
 pub use traversal::{traverse_chunk_addresses, TraversalError};
 

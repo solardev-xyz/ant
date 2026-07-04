@@ -40,8 +40,8 @@ use ant_control::{
     ActiveRequestGuard, ControlAck, ControlCommand, GatewayRequestKind, StreamRange,
 };
 use ant_retrieval::{
-    build_collection_manifest, build_single_file_manifest, split_bytes, IndexAnchor, ManifestFile,
-    SplitChunk,
+    build_collection_manifest, build_single_file_manifest, replica_chunks,
+    split_bytes_with_redundancy, IndexAnchor, ManifestFile, SplitChunk,
 };
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -80,6 +80,22 @@ const SWARM_REDUNDANCY_STRATEGY: HeaderName = HeaderName::from_static("swarm-red
 /// See [`SWARM_REDUNDANCY_STRATEGY`].
 const SWARM_REDUNDANCY_FALLBACK_MODE: HeaderName =
     HeaderName::from_static("swarm-redundancy-fallback-mode");
+/// Bee **upload** header (`POST /bytes`, `POST /bzz`, `POST /feeds`):
+/// erasure-code the chunk tree at redundancy level 0–4. Level > 0 adds
+/// Reed-Solomon parity chunks to every intermediate node
+/// (`ant_retrieval::rs_encode`, bee's `pkg/file/redundancy` pipeline)
+/// and uploads 2^level dispersed replica SOCs of every pipeline root
+/// (the data root and each manifest node), so the content stays
+/// retrievable when chunks go missing. Absent → `MEDIUM` (1), exactly
+/// like bee (`redundancy.DefaultUploadLevel` in every bee upload
+/// handler) — a multi-chunk upload must hash to the same reference on
+/// ant and bee even when the client sends no header. Send `0`
+/// explicitly to opt out.
+const SWARM_REDUNDANCY_LEVEL: HeaderName = HeaderName::from_static("swarm-redundancy-level");
+
+/// Bee's `redundancy.DefaultUploadLevel` (MEDIUM): applied when the
+/// upload header is absent or empty.
+const DEFAULT_UPLOAD_REDUNDANCY_LEVEL: u8 = 1;
 /// Bee request header: when `true`, treat the body as a tar archive and
 /// build a multi-file manifest. Default `false` (single-file upload).
 const SWARM_COLLECTION: HeaderName = HeaderName::from_static("swarm-collection");
@@ -549,6 +565,48 @@ pub(crate) fn parse_postage_batch_header(headers: &HeaderMap) -> Result<[u8; 32]
     }
 }
 
+/// Parse the `swarm-redundancy-level` upload header (0–4; absent or
+/// empty → [`DEFAULT_UPLOAD_REDUNDANCY_LEVEL`], matching bee's
+/// `DefaultUploadLevel = MEDIUM`). Error bodies replicate bee's `mapStructure`
+/// exactly, including the field casing split: Go's `strconv` parse
+/// failures report the map-tag-cased field (`Swarm-Redundancy-Level`,
+/// errors `invalid syntax` / `value out of range`), while a
+/// well-formed uint8 outside 0–4 fails bee's `rLevel` validator with
+/// the lowercased field and `want redundancy level to be between 0
+/// and 4` (`pkg/api/validation.go`).
+#[allow(clippy::result_large_err)]
+fn parse_redundancy_level_header(headers: &HeaderMap) -> Result<u8, Response> {
+    let Some(raw) = headers
+        .get(&SWARM_REDUNDANCY_LEVEL)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(DEFAULT_UPLOAD_REDUNDANCY_LEVEL);
+    };
+    match raw.parse::<u8>() {
+        Ok(level) if level <= ant_retrieval::rs::MAX_LEVEL => Ok(level),
+        Ok(_) => Err(params_error(
+            ParamKind::Header,
+            vec![Reason::new(
+                SWARM_REDUNDANCY_LEVEL.as_str(),
+                "want redundancy level to be between 0 and 4",
+            )],
+        )),
+        Err(e) => {
+            let msg = if *e.kind() == std::num::IntErrorKind::PosOverflow {
+                "value out of range"
+            } else {
+                "invalid syntax"
+            };
+            Err(params_error(
+                ParamKind::Header,
+                vec![Reason::new("Swarm-Redundancy-Level", msg)],
+            ))
+        }
+    }
+}
+
 /// A pre-signed 113-byte postage stamp from the `swarm-postage-stamp`
 /// request header, if the header is present and non-empty.
 ///
@@ -954,6 +1012,10 @@ pub async fn upload_bzz(
         Ok(b) => b,
         Err(resp) => return resp,
     };
+    let level = match parse_redundancy_level_header(&headers) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
 
     let collection = headers
         .get(SWARM_COLLECTION)
@@ -971,22 +1033,28 @@ pub async fn upload_bzz(
         .activity
         .begin(GatewayRequestKind::Bzz, activity_label);
 
-    let assembled = match assemble_bzz(&query, &headers, &body, collection) {
+    let assembled = match assemble_bzz(&query, &headers, &body, collection, level) {
         Ok(a) => a,
         Err(resp) => return resp,
     };
-    let total_chunks = assembled.chunks.len();
+    let total_chunks = assembled.chunks.len() + assembled.replicas.len();
     debug!(
         target: "ant_gateway",
         collection,
         body_len = body.len(),
-        chunks = total_chunks,
+        chunks = assembled.chunks.len(),
+        replicas = assembled.replicas.len(),
+        redundancy_level = level,
         manifest_root = %hex::encode(assembled.root),
         "bzz upload assembled"
     );
     guard.update(0, total_chunks as u64, total_chunks as u32, 0);
 
     if let Err(err_resp) = push_chunks(&handle, &assembled.chunks, batch_id, timeout, &guard).await
+    {
+        return err_resp;
+    }
+    if let Err(err_resp) = push_replica_socs(&handle, &assembled.replicas, batch_id, timeout).await
     {
         return err_resp;
     }
@@ -1087,24 +1155,37 @@ pub async fn upload_bytes(
         Ok(b) => b,
         Err(resp) => return resp,
     };
+    let level = match parse_redundancy_level_header(&headers) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
 
     let timeout = request_timeout(&headers, DEFAULT_REQUEST_TIMEOUT);
     let guard = handle
         .activity
         .begin(GatewayRequestKind::Bytes, "upload-bytes".to_string());
 
-    let split = split_bytes(&body);
-    let total_chunks = split.chunks.len();
+    let split = split_bytes_with_redundancy(&body, level);
+    // Redundant uploads also carry 2^level dispersed replica SOCs of
+    // the data root, like bee's `replicas.NewPutter` inside the
+    // pipeline sum.
+    let replicas = replica_chunks(&split.root, &split.root_wire, level);
+    let total_chunks = split.chunks.len() + replicas.len();
     debug!(
         target: "ant_gateway",
         body_len = body.len(),
-        chunks = total_chunks,
+        chunks = split.chunks.len(),
+        replicas = replicas.len(),
+        redundancy_level = level,
         data_root = %hex::encode(split.root),
         "bytes upload assembled"
     );
     guard.update(0, total_chunks as u64, total_chunks as u32, 0);
 
     if let Err(err_resp) = push_chunks(&handle, &split.chunks, batch_id, timeout, &guard).await {
+        return err_resp;
+    }
+    if let Err(err_resp) = push_replica_socs(&handle, &replicas, batch_id, timeout).await {
         return err_resp;
     }
 
@@ -1146,6 +1227,10 @@ pub async fn create_feed(
         Ok(b) => b,
         Err(resp) => return resp,
     };
+    let level = match parse_redundancy_level_header(&headers) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
 
     let timeout = request_timeout(&headers, CHUNK_REQUEST_TIMEOUT);
     let guard = handle.activity.begin(
@@ -1157,10 +1242,21 @@ pub async fn create_feed(
         Ok(m) => m,
         Err(e) => return map_manifest_error(e),
     };
-    let total_chunks = manifest.chunks.len();
+    // A feed manifest is a single mantaray node, so at redundancy
+    // level > 0 there is nothing to erasure-code — bee runs it through
+    // the redundant pipeline all the same, which only mints dispersed
+    // replicas of each node (pipeline root).
+    let mut replicas = Vec::new();
+    for node in &manifest.chunks {
+        replicas.extend(replica_chunks(&node.address, &node.wire, level));
+    }
+    let total_chunks = manifest.chunks.len() + replicas.len();
     guard.update(0, total_chunks as u64, total_chunks as u32, 0);
 
     if let Err(err_resp) = push_chunks(&handle, &manifest.chunks, batch_id, timeout, &guard).await {
+        return err_resp;
+    }
+    if let Err(err_resp) = push_replica_socs(&handle, &replicas, batch_id, timeout).await {
         return err_resp;
     }
 
@@ -1183,10 +1279,17 @@ pub async fn create_feed(
 
 /// Plan: address of the manifest root + every chunk that has to be
 /// pushed for the upload to be retrievable (data leaves +
-/// intermediate join chunks + manifest chunks).
+/// intermediate join chunks + parity chunks + manifest chunks), plus
+/// the dispersed replica SOCs a redundant upload carries.
 struct AssembledUpload {
     root: [u8; 32],
     chunks: Vec<SplitChunk>,
+    /// Replica SOCs to push via `PushSoc` when the redundancy level
+    /// is nonzero. Bee mints 2^level replicas of **every pipeline
+    /// root**: each file's data root and every mantaray manifest node
+    /// (each node is saved through its own mini-pipeline in bee's
+    /// loadsave, so each counts as a root).
+    replicas: Vec<SplitChunk>,
 }
 
 #[allow(clippy::result_large_err)]
@@ -1195,6 +1298,7 @@ fn assemble_bzz(
     headers: &HeaderMap,
     body: &Bytes,
     collection: bool,
+    level: u8,
 ) -> Result<AssembledUpload, Response> {
     if collection {
         let index_doc = headers
@@ -1202,7 +1306,7 @@ fn assemble_bzz(
             .and_then(|v| v.to_str().ok())
             .map(|s| s.trim().trim_start_matches('/').to_string())
             .filter(|s| !s.is_empty());
-        assemble_collection(body, index_doc.as_deref())
+        assemble_collection(body, index_doc.as_deref(), level)
     } else {
         let filename = query
             .name()
@@ -1222,7 +1326,7 @@ fn assemble_bzz(
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty() && s != "application/octet-stream");
 
-        assemble_single_file(body, &filename, content_type.as_deref())
+        assemble_single_file(body, &filename, content_type.as_deref(), level)
     }
 }
 
@@ -1231,25 +1335,36 @@ fn assemble_single_file(
     body: &Bytes,
     filename: &str,
     content_type: Option<&str>,
+    level: u8,
 ) -> Result<AssembledUpload, Response> {
-    let split = split_bytes(body);
+    let split = split_bytes_with_redundancy(body, level);
     let manifest = match build_single_file_manifest(filename, content_type, split.root) {
         Ok(m) => m,
         Err(e) => return Err(map_manifest_error(e)),
     };
+    let mut replicas = replica_chunks(&split.root, &split.root_wire, level);
+    for node in &manifest.chunks {
+        replicas.extend(replica_chunks(&node.address, &node.wire, level));
+    }
     let mut chunks = split.chunks;
     chunks.extend(manifest.chunks);
     Ok(AssembledUpload {
         root: manifest.root,
         chunks,
+        replicas,
     })
 }
 
 #[allow(clippy::result_large_err)]
-fn assemble_collection(body: &Bytes, index_doc: Option<&str>) -> Result<AssembledUpload, Response> {
+fn assemble_collection(
+    body: &Bytes,
+    index_doc: Option<&str>,
+    level: u8,
+) -> Result<AssembledUpload, Response> {
     let mut archive = tar::Archive::new(std::io::Cursor::new(body.as_ref()));
     let mut files: Vec<ManifestFile> = Vec::new();
     let mut data_chunks: Vec<SplitChunk> = Vec::new();
+    let mut replicas: Vec<SplitChunk> = Vec::new();
 
     let entries = match archive.entries() {
         Ok(e) => e,
@@ -1308,7 +1423,8 @@ fn assemble_collection(body: &Bytes, index_doc: Option<&str>) -> Result<Assemble
                 format!("tar entry {path_str}: read failed: {e}"),
             ));
         }
-        let split = split_bytes(&buf);
+        let split = split_bytes_with_redundancy(&buf, level);
+        replicas.extend(replica_chunks(&split.root, &split.root_wire, level));
         data_chunks.extend(split.chunks);
         let ct = content_type_from_extension(&path_str).map(std::string::ToString::to_string);
         files.push(ManifestFile {
@@ -1341,11 +1457,15 @@ fn assemble_collection(body: &Bytes, index_doc: Option<&str>) -> Result<Assemble
         Err(e) => return Err(map_manifest_error(e)),
     };
 
+    for node in &manifest.chunks {
+        replicas.extend(replica_chunks(&node.address, &node.wire, level));
+    }
     let mut chunks = data_chunks;
     chunks.extend(manifest.chunks);
     Ok(AssembledUpload {
         root: manifest.root,
         chunks,
+        replicas,
     })
 }
 
@@ -1449,6 +1569,73 @@ async fn push_chunks(
         let b = bytes_done.load(std::sync::atomic::Ordering::Relaxed);
         let in_flight = (total - p).min(u64::from(u32::MAX)) as u32;
         guard.update(p, total, in_flight, b);
+    }
+    Ok(())
+}
+
+/// Push dispersed-replica SOC chunks (minted by
+/// `ant_retrieval::replica_chunks`) via `PushSoc` control commands —
+/// the upload-side counterpart of bee's `replicas.NewPutter`, which
+/// stores the root's replica SOCs inside every redundant pipeline sum.
+/// Stamped against the same batch as the upload's CAC chunks. Empty
+/// input (redundancy level 0) is a no-op.
+#[allow(clippy::result_large_err)]
+async fn push_replica_socs(
+    handle: &GatewayHandle,
+    replicas: &[SplitChunk],
+    batch_id: [u8; 32],
+    timeout: std::time::Duration,
+) -> Result<(), Response> {
+    let push_one = |chunk: SplitChunk| {
+        let handle = handle.clone();
+        async move {
+            let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
+            let cmd = ControlCommand::PushSoc {
+                address: chunk.address,
+                wire: chunk.wire,
+                batch_id,
+                stamp: None,
+                ack: ack_tx,
+            };
+            if handle.commands.send(cmd).await.is_err() {
+                return Err(node_unavailable());
+            }
+            match tokio::time::timeout(timeout, ack_rx).await {
+                Ok(Ok(ControlAck::ChunkUploaded { .. })) => Ok(()),
+                Ok(Ok(ControlAck::Error { message })) => {
+                    let status = if message.starts_with("uploads not configured") {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    } else if message.contains("not usable") {
+                        StatusCode::BAD_REQUEST
+                    } else {
+                        StatusCode::BAD_GATEWAY
+                    };
+                    Err(json_error(
+                        status,
+                        format!("push replica failed: {message}"),
+                    ))
+                }
+                Ok(Ok(other)) => {
+                    warn!(target: "ant_gateway", ?other, "unexpected ack from PushSoc");
+                    Err(json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "unexpected node ack",
+                    ))
+                }
+                Ok(Err(_)) => Err(node_unavailable()),
+                Err(_) => Err(json_error(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    format!("upload timed out after {}s", timeout.as_secs()),
+                )),
+            }
+        }
+    };
+
+    let mut stream = stream::iter(replicas.iter().cloned())
+        .map(push_one)
+        .buffer_unordered(MAX_PUSH_CONCURRENCY);
+    while let Some(result) = stream.next().await {
+        result?;
     }
     Ok(())
 }

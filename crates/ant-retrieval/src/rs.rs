@@ -24,9 +24,10 @@
 //! This module implements the *read* side of both: the per-node
 //! [`RsDecoder`] used by the joiner to recover missing data children
 //! from parities, and [`fetch_root_with_replicas`] used wherever a
-//! bytes/bzz data root is fetched. Upload-side RS encoding is not
-//! implemented (ant uploads at level 0); neither is the encrypted
-//! (64-byte-reference) RS variant, which ant's read paths never produce.
+//! bytes/bzz data root is fetched. The *write* side lives in
+//! [`crate::rs_encode`] (redundant splitting + replica SOC minting)
+//! and reuses this module's tables and geometry. The encrypted
+//! (64-byte-reference) RS variant is implemented on neither side.
 //!
 //! The Reed-Solomon backend is the `reed-solomon-erasure` crate, which
 //! uses the same Backblaze/klauspost matrix construction as bee's
@@ -56,6 +57,17 @@ pub const REPLICAS_OWNER: [u8; 20] = [
     0xdc, 0x5b, 0x20, 0x84, 0x7f, 0x43, 0xd6, 0x79, 0x28, 0xf4, 0x9c, 0xd4, 0xf8, 0x5d, 0x69, 0x6b,
     0x5a, 0x76, 0x17, 0xb5,
 ];
+
+/// The well-known private key behind [`REPLICAS_OWNER`] (bee
+/// `pkg/replicas/replicas.go`: `crypto.DecodeSecp256k1PrivateKey(
+/// append([]byte{1}, make([]byte, 31)...))`). Deliberately public —
+/// anyone must be able to mint (and verify) dispersed replicas of any
+/// chunk; the upload side signs replica SOCs with it.
+pub const REPLICAS_OWNER_SECRET: [u8; 32] = {
+    let mut k = [0u8; 32];
+    k[0] = 1;
+    k
+};
 
 /// How many sibling shard fetches a recovery sweep keeps in flight at
 /// once. The sweep touches at most 128 chunks; 16 matches the joiner's
@@ -476,6 +488,17 @@ impl RsDecoder {
 /// so any prefix of the list is maximally spread over the address space.
 #[must_use]
 pub fn replica_addresses(addr: &[u8; 32], level: u8) -> Vec<[u8; 32]> {
+    replica_identities(addr, level)
+        .into_iter()
+        .map(|(_, soc_addr)| soc_addr)
+        .collect()
+}
+
+/// Like [`replica_addresses`], but also returning each replica's SOC
+/// id (`addr` with `id[0] = entropy`) — what the upload side needs to
+/// mint the replica SOC chunks (`crate::rs_encode::replica_chunks`).
+#[must_use]
+pub fn replica_identities(addr: &[u8; 32], level: u8) -> Vec<([u8; 32], [u8; 32])> {
     let level = level.min(MAX_LEVEL);
     let count = REPLICA_COUNTS[level as usize];
     if count == 0 {
@@ -488,7 +511,7 @@ pub fn replica_addresses(addr: &[u8; 32], level: u8) -> Vec<[u8; 32]> {
     let mut exist = [false; 30];
     let mut sizes = [0usize, 2, 4, 8];
     const BASES: [usize; 4] = [0, 2, 6, 14];
-    let mut queue: [Option<[u8; 32]>; 16] = [None; 16];
+    let mut queue: [Option<([u8; 32], [u8; 32])>; 16] = [None; 16];
 
     let mut inserted = 0usize;
     let mut entropy: u16 = 0;
@@ -522,7 +545,7 @@ pub fn replica_addresses(addr: &[u8; 32], level: u8) -> Vec<[u8; 32]> {
         }
         if let Some(l) = insert_level {
             let d = (l - 1) as usize;
-            queue[sizes[d]] = Some(soc_addr);
+            queue[sizes[d]] = Some((id, soc_addr));
             sizes[d] += 1;
             inserted += 1;
         }
