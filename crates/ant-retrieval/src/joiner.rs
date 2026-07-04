@@ -21,13 +21,20 @@
 //! the remainder. This is the [`subtrie_section`] formula and matches
 //! `bee/pkg/file/joiner.subtrieSection` byte-for-byte.
 //!
-//! # What's not handled
+//! # Erasure-coded (Reed-Solomon) files
 //!
-//! - **Erasure-coded / Reed-Solomon redundancy** on intermediate chunks
-//!   (`redundancy.Level != NONE`). Detected via the high bits of the span;
-//!   we reject the file with a clear error rather than silently mis-decoding.
-//!   This is uncommon for a plain `swarm-cli upload` of a small text file
-//!   or site, which is the main read-path target.
+//! Files uploaded with `swarm-redundancy-level` 1–4 carry the level in
+//! the top byte of every intermediate chunk's span (`level | 0x80`) and
+//! append parity references after the data references in each
+//! intermediate node. The joiner decodes the level per node, computes
+//! the parity count from the node's own span via the level's erasure
+//! table ([`crate::rs::reference_count`]), walks only the data
+//! references — with the branching factor reduced to the level's
+//! `maxShards` — and, when a data child cannot be fetched, recovers it
+//! from the remaining siblings + parities through a per-node
+//! [`crate::rs::RsDecoder`]. Recovered chunks are CAC-validated and fed
+//! back into the fetcher's caches. This is always on; see
+//! [`JoinOptions::allow_degraded_redundancy`] for the legacy flag.
 //!
 //! **Encrypted chunks** (`refLength == 64`) are handled by a separate
 //! entry point, [`join_encrypted`], which fetches each chunk by its
@@ -119,14 +126,15 @@ const STREAM_PIPE_DEPTH: usize = 64;
 /// fallbacks.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct JoinOptions {
-    /// Accept files whose root span carries a non-zero
-    /// redundancy/erasure-coding level byte. The joiner masks the level
-    /// byte off and walks the chunk tree as if it were level NONE,
-    /// which yields the correct bytes whenever every data chunk is
-    /// reachable. Reed-Solomon recovery itself is not implemented;
-    /// missing chunks remain fatal. Off by default — set explicitly via
-    /// `antctl get --allow-degraded-redundancy` so the user opts in to
-    /// "best-effort decode without the redundancy benefit".
+    /// **Legacy no-op.** Historically this gated reading files whose
+    /// root span carries a redundancy/erasure-coding level byte at all
+    /// (masking the level and hoping every data chunk was reachable).
+    /// The joiner now always decodes redundant trees with the correct
+    /// parity-aware geometry *and* recovers missing data chunks from
+    /// parities, which strictly supersedes both prior behaviors, so the
+    /// flag no longer changes anything. It is retained so existing CLI
+    /// (`antctl get --allow-degraded-redundancy`) and control-protocol
+    /// callers keep working unchanged.
     pub allow_degraded_redundancy: bool,
 }
 
@@ -141,12 +149,14 @@ pub enum JoinError {
     /// the reference length, or the chunk is shorter than declared.
     #[error("malformed intermediate chunk at offset {offset}: {detail}")]
     MalformedChunk { offset: u64, detail: String },
-    /// The chunk's span carries non-zero high bits, indicating
-    /// Reed-Solomon redundancy. We don't implement RS today; pass
-    /// [`JoinOptions::allow_degraded_redundancy`] to decode anyway
-    /// without the redundancy safety net.
-    #[error("redundancy / erasure coding not supported (level {level}); pass --allow-degraded-redundancy to decode without RS recovery")]
-    UnsupportedRedundancy { level: u8 },
+    /// A data chunk of a redundancy-encoded intermediate node could not
+    /// be fetched **and** Reed-Solomon recovery from the node's
+    /// remaining shards + parities failed (more than `parityCnt` chunks
+    /// of that node are unreachable, or the reconstruction output
+    /// failed CAC validation). Terminal: the recovery sweep already
+    /// re-tried every sibling, so retrying the subtree is pointless.
+    #[error("erasure recovery failed: {detail}")]
+    Recovery { detail: String },
     /// Encrypted chunks (64-byte refs) aren't supported. Only triggered
     /// if the *caller* passes a 64-byte root reference; for the
     /// 32-byte path we never decode a 64-byte ref-length intermediate.
@@ -197,25 +207,10 @@ pub async fn join_with_options(
     fetcher: &dyn ChunkFetcher,
     root_chunk_data: &[u8],
     max_bytes: usize,
-    options: JoinOptions,
+    _options: JoinOptions,
 ) -> Result<Vec<u8>, JoinError> {
     let (span_raw, payload) = split_chunk(root_chunk_data, 0)?;
-    let span_raw = if is_redundancy_none(span_raw) {
-        span_raw
-    } else if options.allow_degraded_redundancy {
-        let level = span_raw[7];
-        tracing::warn!(
-            target: "ant_retrieval::joiner",
-            level,
-            "root span carries redundancy level {level}; decoding without RS recovery (--allow-degraded-redundancy)",
-        );
-        let mut masked = span_raw;
-        masked[7] = 0;
-        masked
-    } else {
-        return Err(JoinError::UnsupportedRedundancy { level: span_raw[7] });
-    };
-    let span = u64::from_le_bytes(span_raw);
+    let (level, span, parity) = decode_root_span(span_raw);
     if span > max_bytes as u64 {
         return Err(JoinError::TooLarge {
             span,
@@ -223,7 +218,33 @@ pub async fn join_with_options(
         });
     }
 
-    join_subtree(fetcher, payload, span, 0).await
+    join_subtree(fetcher, payload, span, 0, level, parity).await
+}
+
+/// Decode a root chunk's span into `(redundancy level, plain span,
+/// parity ref count of the root node)`. Level 0 spans pass through
+/// unchanged with zero parity; level-encoded spans additionally derive
+/// the root's parity count from the file size via the level's erasure
+/// table, exactly like bee's `joiner.NewJoiner` does with
+/// `file.ReferenceCount`.
+fn decode_root_span(span_raw: [u8; 8]) -> (u8, u64, usize) {
+    let (level, plain) = crate::rs::decode_span(span_raw);
+    let span = u64::from_le_bytes(plain);
+    let parity = if level != 0 && span > CHUNK_SIZE as u64 {
+        crate::rs::reference_count(span, level).1
+    } else {
+        0
+    };
+    if level != 0 {
+        tracing::debug!(
+            target: "ant_retrieval::joiner",
+            level,
+            span,
+            parity,
+            "root span carries a redundancy level; RS-aware decode with recovery enabled",
+        );
+    }
+    (level, span, parity)
 }
 
 /// Flat inventory of the chunk addresses that make up a file's data
@@ -271,19 +292,10 @@ pub async fn enumerate_chunk_tree(
     root_addr: [u8; 32],
     root_chunk_data: &[u8],
     max_bytes: usize,
-    options: JoinOptions,
+    _options: JoinOptions,
 ) -> Result<ChunkInventory, JoinError> {
     let (span_raw, payload) = split_chunk(root_chunk_data, 0)?;
-    let span_raw = if is_redundancy_none(span_raw) {
-        span_raw
-    } else if options.allow_degraded_redundancy {
-        let mut masked = span_raw;
-        masked[7] = 0;
-        masked
-    } else {
-        return Err(JoinError::UnsupportedRedundancy { level: span_raw[7] });
-    };
-    let span = u64::from_le_bytes(span_raw);
+    let (level, span, parity) = decode_root_span(span_raw);
     if span > max_bytes as u64 {
         return Err(JoinError::TooLarge {
             span,
@@ -299,7 +311,7 @@ pub async fn enumerate_chunk_tree(
         return Ok(inv);
     }
     inv.intermediates.push(root_addr);
-    let sub = enumerate_subtree(fetcher, payload, span, 0).await?;
+    let sub = enumerate_subtree(fetcher, payload, span, 0, level, parity).await?;
     inv.leaves.extend(sub.leaves);
     inv.intermediates.extend(sub.intermediates);
     Ok(inv)
@@ -311,52 +323,29 @@ pub async fn enumerate_chunk_tree(
 /// nodes and records addresses rather than reconstructing bytes. Walks
 /// sequentially — interior nodes are ~1/128 of all chunks, so there's
 /// no need for the fan-out the byte-joiner uses.
+///
+/// For redundancy-encoded nodes the parity references are recorded as
+/// leaves (they are real, fetchable chunks a durability check should
+/// cover — bee's `IterateChunkAddresses` reports them too) but never
+/// descended into. Enumeration stays *strict*: a missing interior node
+/// fails the walk rather than being RS-recovered, because the callers
+/// (durability verify, stewardship) are asking "is everything stored?",
+/// not "can the file be salvaged?".
 fn enumerate_subtree<'a>(
     fetcher: &'a dyn ChunkFetcher,
     chunk_payload: &'a [u8],
     subtree_span: u64,
     offset: u64,
+    level: u8,
+    parity: usize,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<ChunkInventory, JoinError>> + Send + 'a>,
 > {
     Box::pin(async move {
-        if !chunk_payload.len().is_multiple_of(32) {
-            return Err(JoinError::MalformedChunk {
-                offset,
-                detail: format!(
-                    "intermediate payload len {} not a multiple of 32",
-                    chunk_payload.len()
-                ),
-            });
-        }
-        let effective = effective_payload_size(chunk_payload);
-        if effective == 0 {
-            return Err(JoinError::MalformedChunk {
-                offset,
-                detail: "intermediate chunk has no non-zero refs".into(),
-            });
-        }
-        let chunk_payload = &chunk_payload[..effective];
-        let refs = chunk_payload.len() / 32;
-        if refs > MAX_BRANCHES {
-            return Err(JoinError::MalformedChunk {
-                offset,
-                detail: format!("intermediate ref count {refs} out of range"),
-            });
-        }
-        let branch_size = subtrie_section(refs, subtree_span);
+        let node = parse_intermediate(chunk_payload, subtree_span, offset, level, parity)?;
 
         let mut inv = ChunkInventory::default();
-        let mut remaining = subtree_span;
-        let mut child_offset = offset;
-        for i in 0..refs {
-            let mut child_addr = [0u8; 32];
-            child_addr.copy_from_slice(&chunk_payload[i * 32..(i + 1) * 32]);
-            let child_span = if i == refs - 1 {
-                remaining
-            } else {
-                branch_size.min(remaining)
-            };
+        for (_, child_addr, child_span, child_offset) in node.specs {
             // A child covering at most one chunk's worth of bytes is a
             // data leaf; anything larger is another interior node we
             // must fetch to read its own children.
@@ -372,14 +361,22 @@ fn enumerate_subtree<'a>(
                         source: e,
                     })?;
                 let (_, child_payload) = split_chunk(&child, child_offset)?;
-                let sub =
-                    enumerate_subtree(fetcher, child_payload, child_span, child_offset).await?;
+                let (child_level, _, child_parity) =
+                    crate::rs::chunk_meta(&child).unwrap_or((0, 0, 0));
+                let sub = enumerate_subtree(
+                    fetcher,
+                    child_payload,
+                    child_span,
+                    child_offset,
+                    child_level,
+                    child_parity,
+                )
+                .await?;
                 inv.leaves.extend(sub.leaves);
                 inv.intermediates.extend(sub.intermediates);
             }
-            remaining = remaining.saturating_sub(child_span);
-            child_offset = child_offset.saturating_add(child_span);
         }
+        inv.leaves.extend(node.parity_addrs);
         Ok(inv)
     })
 }
@@ -449,21 +446,12 @@ pub async fn join_to_sender_range(
     fetcher: &dyn ChunkFetcher,
     root_chunk_data: &[u8],
     max_bytes: usize,
-    options: JoinOptions,
+    _options: JoinOptions,
     range: Option<ByteRange>,
     out: mpsc::Sender<Vec<u8>>,
 ) -> Result<(), JoinError> {
     let (span_raw, payload) = split_chunk(root_chunk_data, 0)?;
-    let span_raw = if is_redundancy_none(span_raw) {
-        span_raw
-    } else if options.allow_degraded_redundancy {
-        let mut masked = span_raw;
-        masked[7] = 0;
-        masked
-    } else {
-        return Err(JoinError::UnsupportedRedundancy { level: span_raw[7] });
-    };
-    let span = u64::from_le_bytes(span_raw);
+    let (level, span, parity) = decode_root_span(span_raw);
     if span > max_bytes as u64 {
         return Err(JoinError::TooLarge {
             span,
@@ -472,14 +460,163 @@ pub async fn join_to_sender_range(
     }
 
     match range {
-        None => join_subtree_to_sender(fetcher, payload, span, 0, &out).await,
+        None => join_subtree_to_sender(fetcher, payload, span, 0, level, parity, &out).await,
         Some(range) => {
             let clamped = ByteRange {
                 start: range.start.min(span.saturating_sub(1)),
                 end_inclusive: range.end_inclusive.min(span.saturating_sub(1)),
             };
-            join_subtree_range_to_sender(fetcher, payload, span, 0, clamped, &out).await
+            join_subtree_range_to_sender(fetcher, payload, span, 0, level, parity, clamped, &out)
+                .await
         }
+    }
+}
+
+/// Decoded layout of one intermediate chunk, shared by every tree
+/// walker: the per-data-child fetch specs, the parity references (if
+/// any), and — when the node is redundancy-encoded — the RS decoder its
+/// child fetches route through.
+struct IntermediateNode {
+    /// `(index, addr, child_span, child_offset)` for each **data**
+    /// child, in document order. Parity refs never appear here.
+    specs: Vec<(usize, [u8; 32], u64, u64)>,
+    /// The node's parity chunk addresses (empty at level 0).
+    parity_addrs: Vec<[u8; 32]>,
+    /// Present when `parity > 0`: recovery decoder over all
+    /// `shard_cnt + parity` references of this node.
+    decoder: Option<std::sync::Arc<crate::rs::RsDecoder>>,
+}
+
+/// Validate an intermediate chunk's payload and split it into data
+/// shard specs + parity refs.
+///
+/// `level`/`parity` describe **this** node (decoded from its own span
+/// by the caller). The reference layout is bee's: the payload holds
+/// `shard_cnt` data references followed by `parity` parity references,
+/// where `shard_cnt = effective_refs - parity`; the subtree geometry
+/// (`subtrie_section`) is computed over the *data* references only,
+/// with the branching factor shrunk to the level's `maxShards` because
+/// full intermediate nodes at level L hold only `maxShards(L)` data
+/// children (the rest of the 128 slots are parities).
+fn parse_intermediate(
+    chunk_payload: &[u8],
+    subtree_span: u64,
+    offset: u64,
+    level: u8,
+    parity: usize,
+) -> Result<IntermediateNode, JoinError> {
+    if !chunk_payload.len().is_multiple_of(32) {
+        return Err(JoinError::MalformedChunk {
+            offset,
+            detail: format!(
+                "intermediate payload len {} not a multiple of 32",
+                chunk_payload.len()
+            ),
+        });
+    }
+    // Bee's splitter zero-pads trailing ref slots when the last
+    // branch doesn't fill the chunk. Strip those before computing
+    // `refs`, otherwise we dispatch `fetch([0u8; 32])` requests
+    // that every peer rejects.
+    let effective = effective_payload_size(chunk_payload);
+    if effective == 0 {
+        return Err(JoinError::MalformedChunk {
+            offset,
+            detail: "intermediate chunk has no non-zero refs".into(),
+        });
+    }
+    let chunk_payload = &chunk_payload[..effective];
+    let refs = chunk_payload.len() / 32;
+    if refs > MAX_BRANCHES {
+        return Err(JoinError::MalformedChunk {
+            offset,
+            detail: format!("intermediate ref count {refs} out of range"),
+        });
+    }
+    if parity >= refs {
+        return Err(JoinError::MalformedChunk {
+            offset,
+            detail: format!(
+                "redundant intermediate chunk holds {refs} refs but its span implies {parity} parities",
+            ),
+        });
+    }
+    let shard_cnt = refs - parity;
+
+    let branching = if level == 0 {
+        MAX_BRANCHES as u64
+    } else {
+        crate::rs::max_shards(level) as u64
+    };
+    let branch_size = subtrie_section(shard_cnt, subtree_span, branching);
+
+    // Pre-compute (child_addr, child_span, child_offset) for every data
+    // sibling so the walkers can run without touching the parent payload
+    // again, and so the order is fixed before any I/O starts.
+    let mut specs: Vec<(usize, [u8; 32], u64, u64)> = Vec::with_capacity(shard_cnt);
+    let mut remaining = subtree_span;
+    let mut child_offset = offset;
+    for i in 0..shard_cnt {
+        let mut child_addr = [0u8; 32];
+        child_addr.copy_from_slice(&chunk_payload[i * 32..(i + 1) * 32]);
+        // Last child carries whatever's left; siblings each cover a
+        // full `branch_size` worth of file bytes.
+        let child_span = if i == shard_cnt - 1 {
+            remaining
+        } else {
+            branch_size.min(remaining)
+        };
+        specs.push((i, child_addr, child_span, child_offset));
+        remaining = remaining.saturating_sub(child_span);
+        child_offset = child_offset.saturating_add(child_span);
+    }
+
+    let mut parity_addrs = Vec::with_capacity(parity);
+    for i in shard_cnt..refs {
+        let mut addr = [0u8; 32];
+        addr.copy_from_slice(&chunk_payload[i * 32..(i + 1) * 32]);
+        parity_addrs.push(addr);
+    }
+
+    let decoder = (parity > 0).then(|| {
+        let mut all = Vec::with_capacity(refs);
+        for i in 0..refs {
+            let mut addr = [0u8; 32];
+            addr.copy_from_slice(&chunk_payload[i * 32..(i + 1) * 32]);
+            all.push(addr);
+        }
+        std::sync::Arc::new(crate::rs::RsDecoder::new(all, shard_cnt))
+    });
+
+    Ok(IntermediateNode {
+        specs,
+        parity_addrs,
+        decoder,
+    })
+}
+
+/// Fetch one data child of an intermediate node: directly for plain
+/// nodes, through the node's shared [`crate::rs::RsDecoder`] for
+/// redundancy-encoded nodes (which transparently recovers the chunk
+/// from parities on a miss).
+async fn fetch_child_chunk(
+    fetcher: &dyn ChunkFetcher,
+    decoder: Option<&std::sync::Arc<crate::rs::RsDecoder>>,
+    index: usize,
+    addr: [u8; 32],
+) -> Result<Vec<u8>, JoinError> {
+    match decoder {
+        Some(d) => d
+            .fetch_data_shard(fetcher, index)
+            .await
+            .map_err(|detail| JoinError::Recovery { detail }),
+        None => fetcher
+            .fetch(addr)
+            .await
+            .map_err(|e| JoinError::FetchChunk {
+                addr: hex::encode(addr),
+                source: e,
+            }),
     }
 }
 
@@ -498,6 +635,8 @@ fn join_subtree<'a>(
     chunk_payload: &'a [u8],
     subtree_span: u64,
     offset: u64,
+    level: u8,
+    parity: usize,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, JoinError>> + Send + 'a>> {
     Box::pin(async move {
         // Leaf: the chunk *is* the data. `subtree_span` was carried from
@@ -509,75 +648,39 @@ fn join_subtree<'a>(
 
         // Intermediate: payload must be `[ref32; N]`. We never accept
         // 64-byte (encrypted) refs in the joiner.
-        if !chunk_payload.len().is_multiple_of(32) {
-            return Err(JoinError::MalformedChunk {
-                offset,
-                detail: format!(
-                    "intermediate payload len {} not a multiple of 32",
-                    chunk_payload.len()
-                ),
-            });
-        }
-        // Bee's splitter zero-pads trailing ref slots when the last
-        // branch doesn't fill the chunk. Strip those before computing
-        // `refs`, otherwise we dispatch `fetch([0u8; 32])` requests
-        // that every peer rejects.
-        let effective = effective_payload_size(chunk_payload);
-        if effective == 0 {
-            return Err(JoinError::MalformedChunk {
-                offset,
-                detail: "intermediate chunk has no non-zero refs".into(),
-            });
-        }
-        let chunk_payload = &chunk_payload[..effective];
-        let refs = chunk_payload.len() / 32;
-        if refs > MAX_BRANCHES {
-            return Err(JoinError::MalformedChunk {
-                offset,
-                detail: format!("intermediate ref count {refs} out of range"),
-            });
-        }
-        let branch_size = subtrie_section(refs, subtree_span);
+        let node = parse_intermediate(chunk_payload, subtree_span, offset, level, parity)?;
+        let refs = node.specs.len();
         trace!(
             target: "ant_retrieval::joiner",
             refs,
+            parity,
+            level,
             subtree_span,
-            branch_size,
             fanout = FETCH_FANOUT.min(refs).max(1),
             "intermediate chunk",
         );
-
-        // Pre-compute (child_addr, child_span) for every sibling so the
-        // parallel fetch can run without touching the parent payload
-        // again, and so the order is fixed before we kick off any I/O.
-        let mut specs: Vec<(usize, [u8; 32], u64, u64)> = Vec::with_capacity(refs);
-        let mut remaining = subtree_span;
-        let mut child_offset = offset;
-        for i in 0..refs {
-            let mut child_addr = [0u8; 32];
-            child_addr.copy_from_slice(&chunk_payload[i * 32..(i + 1) * 32]);
-            // Last child carries whatever's left; siblings each cover a
-            // full `branch_size` worth of file bytes.
-            let child_span = if i == refs - 1 {
-                remaining
-            } else {
-                branch_size.min(remaining)
-            };
-            specs.push((i, child_addr, child_span, child_offset));
-            remaining = remaining.saturating_sub(child_span);
-            child_offset = child_offset.saturating_add(child_span);
-        }
 
         // Fan out whole subtrees, not just the immediate child chunk
         // fetch. `buffer_unordered` avoids head-of-line blocking when an
         // early sibling is tail-slow; the index lets us restore byte
         // order before concatenating.
         let fanout = FETCH_FANOUT.min(refs).max(1);
-        let mut children = stream::iter(specs.into_iter().map(
-            |(index, addr, child_span, child_offset)| async move {
-                let child =
-                    join_child_with_retries(fetcher, addr, child_span, child_offset).await?;
-                Ok((index, child))
+        let decoder = node.decoder;
+        let mut children = stream::iter(node.specs.into_iter().map(
+            |(index, addr, child_span, child_offset)| {
+                let decoder = decoder.clone();
+                async move {
+                    let child = join_child_with_retries(
+                        fetcher,
+                        decoder.as_ref(),
+                        index,
+                        addr,
+                        child_span,
+                        child_offset,
+                    )
+                    .await?;
+                    Ok((index, child))
+                }
             },
         ))
         .buffer_unordered(fanout);
@@ -596,11 +699,14 @@ fn join_subtree<'a>(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn join_subtree_to_sender<'a>(
     fetcher: &'a dyn ChunkFetcher,
     chunk_payload: &'a [u8],
     subtree_span: u64,
     offset: u64,
+    level: u8,
+    parity: usize,
     out: &'a mpsc::Sender<Vec<u8>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), JoinError>> + Send + 'a>> {
     Box::pin(async move {
@@ -611,49 +717,9 @@ fn join_subtree_to_sender<'a>(
             return Ok(());
         }
 
-        if !chunk_payload.len().is_multiple_of(32) {
-            return Err(JoinError::MalformedChunk {
-                offset,
-                detail: format!(
-                    "intermediate payload len {} not a multiple of 32",
-                    chunk_payload.len()
-                ),
-            });
-        }
-        // Strip trailing zero-padding before treating the chunk as a
-        // ref array; see `effective_payload_size` for the rationale.
-        let effective = effective_payload_size(chunk_payload);
-        if effective == 0 {
-            return Err(JoinError::MalformedChunk {
-                offset,
-                detail: "intermediate chunk has no non-zero refs".into(),
-            });
-        }
-        let chunk_payload = &chunk_payload[..effective];
-        let refs = chunk_payload.len() / 32;
-        if refs > MAX_BRANCHES {
-            return Err(JoinError::MalformedChunk {
-                offset,
-                detail: format!("intermediate ref count {refs} out of range"),
-            });
-        }
-
-        let branch_size = subtrie_section(refs, subtree_span);
-        let mut specs: Vec<([u8; 32], u64, u64)> = Vec::with_capacity(refs);
-        let mut remaining = subtree_span;
-        let mut child_offset = offset;
-        for i in 0..refs {
-            let mut child_addr = [0u8; 32];
-            child_addr.copy_from_slice(&chunk_payload[i * 32..(i + 1) * 32]);
-            let child_span = if i == refs - 1 {
-                remaining
-            } else {
-                branch_size.min(remaining)
-            };
-            specs.push((child_addr, child_span, child_offset));
-            remaining = remaining.saturating_sub(child_span);
-            child_offset = child_offset.saturating_add(child_span);
-        }
+        let node = parse_intermediate(chunk_payload, subtree_span, offset, level, parity)?;
+        let refs = node.specs.len();
+        let decoder = node.decoder;
 
         // Streaming pipelined fan-out. Each sibling subtree gets its own
         // bounded `mpsc::channel(STREAM_PIPE_DEPTH)`, so it can keep
@@ -675,11 +741,21 @@ fn join_subtree_to_sender<'a>(
         let fanout = FETCH_FANOUT.min(refs).max(1);
         let mut child_rxs: Vec<mpsc::Receiver<Vec<u8>>> = Vec::with_capacity(refs);
         let mut producers: Vec<ProducerFut<'a>> = Vec::with_capacity(refs);
-        for (addr, child_span, child_offset) in specs {
+        for (index, addr, child_span, child_offset) in node.specs {
             let (tx, rx) = mpsc::channel::<Vec<u8>>(STREAM_PIPE_DEPTH);
             child_rxs.push(rx);
+            let decoder = decoder.clone();
             producers.push(Box::pin(async move {
-                let r = join_child_to_sender(fetcher, addr, child_span, child_offset, &tx).await;
+                let r = join_child_to_sender(
+                    fetcher,
+                    decoder.as_ref(),
+                    index,
+                    addr,
+                    child_span,
+                    child_offset,
+                    &tx,
+                )
+                .await;
                 drop(tx);
                 r
             }));
@@ -719,33 +795,50 @@ fn join_subtree_to_sender<'a>(
 
 async fn join_child_to_sender(
     fetcher: &dyn ChunkFetcher,
+    decoder: Option<&std::sync::Arc<crate::rs::RsDecoder>>,
+    index: usize,
     addr: [u8; 32],
     child_span: u64,
     child_offset: u64,
     out: &mpsc::Sender<Vec<u8>>,
 ) -> Result<(), JoinError> {
-    let mut child_chunk = None;
+    let child_chunk = fetch_child_with_retries(fetcher, decoder, index, addr).await?;
+    let (_, child_payload) = split_chunk(&child_chunk, child_offset)?;
+    let (child_level, _, child_parity) = crate::rs::chunk_meta(&child_chunk).unwrap_or((0, 0, 0));
+    join_subtree_to_sender(
+        fetcher,
+        child_payload,
+        child_span,
+        child_offset,
+        child_level,
+        child_parity,
+        out,
+    )
+    .await
+}
+
+/// Streaming-path chunk fetch with in-place retries. Plain fetch misses
+/// are retried with backoff (the pre-RS behavior for transient mainnet
+/// misses); an erasure-recovery failure is terminal — the decoder's
+/// sweep already re-fetched every sibling of the node, so retrying
+/// can't add information.
+async fn fetch_child_with_retries(
+    fetcher: &dyn ChunkFetcher,
+    decoder: Option<&std::sync::Arc<crate::rs::RsDecoder>>,
+    index: usize,
+    addr: [u8; 32],
+) -> Result<Vec<u8>, JoinError> {
     for attempt in 1..=SUBTREE_RETRY_ATTEMPTS {
-        match fetcher.fetch(addr).await {
-            Ok(chunk) => {
-                child_chunk = Some(chunk);
-                break;
-            }
-            Err(e) if attempt < SUBTREE_RETRY_ATTEMPTS => {
+        match fetch_child_chunk(fetcher, decoder, index, addr).await {
+            Ok(chunk) => return Ok(chunk),
+            Err(e @ JoinError::FetchChunk { .. }) if attempt < SUBTREE_RETRY_ATTEMPTS => {
                 tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
                 drop(e);
             }
-            Err(e) => {
-                return Err(JoinError::FetchChunk {
-                    addr: hex::encode(addr),
-                    source: e,
-                });
-            }
+            Err(e) => return Err(e),
         }
     }
-    let child_chunk = child_chunk.expect("retry loop always runs at least once");
-    let (_, child_payload) = split_chunk(&child_chunk, child_offset)?;
-    join_subtree_to_sender(fetcher, child_payload, child_span, child_offset, out).await
+    unreachable!("retry loop returns on the final attempt");
 }
 
 /// Range-aware version of [`join_subtree_to_sender`].
@@ -761,11 +854,14 @@ async fn join_child_to_sender(
 /// drop any prefix before `range.start`; the rightmost is truncated at
 /// `range.end_inclusive + 1`. Output stays strictly in file order so
 /// the gateway can pipe it straight into the HTTP response body.
+#[allow(clippy::too_many_arguments)]
 fn join_subtree_range_to_sender<'a>(
     fetcher: &'a dyn ChunkFetcher,
     chunk_payload: &'a [u8],
     subtree_span: u64,
     offset: u64,
+    level: u8,
+    parity: usize,
     range: ByteRange,
     out: &'a mpsc::Sender<Vec<u8>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), JoinError>> + Send + 'a>> {
@@ -793,53 +889,19 @@ fn join_subtree_range_to_sender<'a>(
             return Ok(());
         }
 
-        if !chunk_payload.len().is_multiple_of(32) {
-            return Err(JoinError::MalformedChunk {
-                offset,
-                detail: format!(
-                    "intermediate payload len {} not a multiple of 32",
-                    chunk_payload.len()
-                ),
-            });
-        }
-        let effective = effective_payload_size(chunk_payload);
-        if effective == 0 {
-            return Err(JoinError::MalformedChunk {
-                offset,
-                detail: "intermediate chunk has no non-zero refs".into(),
-            });
-        }
-        let chunk_payload = &chunk_payload[..effective];
-        let refs = chunk_payload.len() / 32;
-        if refs > MAX_BRANCHES {
-            return Err(JoinError::MalformedChunk {
-                offset,
-                detail: format!("intermediate ref count {refs} out of range"),
-            });
-        }
-        let branch_size = subtrie_section(refs, subtree_span);
+        let node = parse_intermediate(chunk_payload, subtree_span, offset, level, parity)?;
+        let decoder = node.decoder;
 
-        // Build per-child specs first, then keep only the ones whose
+        // Keep only the children whose
         // [child_offset, child_offset+child_span) overlaps the range.
-        let mut specs: Vec<(usize, [u8; 32], u64, u64)> = Vec::with_capacity(refs);
-        let mut remaining = subtree_span;
-        let mut child_offset = offset;
-        for i in 0..refs {
-            let mut child_addr = [0u8; 32];
-            child_addr.copy_from_slice(&chunk_payload[i * 32..(i + 1) * 32]);
-            let child_span = if i == refs - 1 {
-                remaining
-            } else {
-                branch_size.min(remaining)
-            };
-            let child_end = child_offset + child_span;
-            let overlaps = child_end > range.start && child_offset <= range.end_inclusive;
-            if overlaps {
-                specs.push((i, child_addr, child_span, child_offset));
-            }
-            remaining = remaining.saturating_sub(child_span);
-            child_offset = child_offset.saturating_add(child_span);
-        }
+        let specs: Vec<(usize, [u8; 32], u64, u64)> = node
+            .specs
+            .into_iter()
+            .filter(|&(_, _, child_span, child_offset)| {
+                let child_end = child_offset + child_span;
+                child_end > range.start && child_offset <= range.end_inclusive
+            })
+            .collect();
 
         if specs.is_empty() {
             return Ok(());
@@ -851,61 +913,76 @@ fn join_subtree_range_to_sender<'a>(
         // in order. Inner full-coverage subtrees are still parallelised
         // by [`join_subtree_to_sender`] when we descend into them via
         // `join_child_to_sender`.
-        for (_, addr, child_span, child_offset) in specs {
+        for (index, addr, child_span, child_offset) in specs {
             let child_end = child_offset + child_span;
             let fully_inside = child_offset >= range.start && child_end <= range.end_inclusive + 1;
             if fully_inside {
-                join_child_to_sender(fetcher, addr, child_span, child_offset, out).await?;
+                join_child_to_sender(
+                    fetcher,
+                    decoder.as_ref(),
+                    index,
+                    addr,
+                    child_span,
+                    child_offset,
+                    out,
+                )
+                .await?;
             } else {
-                join_child_range_to_sender(fetcher, addr, child_span, child_offset, range, out)
-                    .await?;
+                join_child_range_to_sender(
+                    fetcher,
+                    decoder.as_ref(),
+                    index,
+                    addr,
+                    child_span,
+                    child_offset,
+                    range,
+                    out,
+                )
+                .await?;
             }
         }
         Ok(())
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn join_child_range_to_sender(
     fetcher: &dyn ChunkFetcher,
+    decoder: Option<&std::sync::Arc<crate::rs::RsDecoder>>,
+    index: usize,
     addr: [u8; 32],
     child_span: u64,
     child_offset: u64,
     range: ByteRange,
     out: &mpsc::Sender<Vec<u8>>,
 ) -> Result<(), JoinError> {
-    let mut child_chunk = None;
-    for attempt in 1..=SUBTREE_RETRY_ATTEMPTS {
-        match fetcher.fetch(addr).await {
-            Ok(chunk) => {
-                child_chunk = Some(chunk);
-                break;
-            }
-            Err(e) if attempt < SUBTREE_RETRY_ATTEMPTS => {
-                tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
-                drop(e);
-            }
-            Err(e) => {
-                return Err(JoinError::FetchChunk {
-                    addr: hex::encode(addr),
-                    source: e,
-                });
-            }
-        }
-    }
-    let child_chunk = child_chunk.expect("retry loop always runs at least once");
+    let child_chunk = fetch_child_with_retries(fetcher, decoder, index, addr).await?;
     let (_, child_payload) = split_chunk(&child_chunk, child_offset)?;
-    join_subtree_range_to_sender(fetcher, child_payload, child_span, child_offset, range, out).await
+    let (child_level, _, child_parity) = crate::rs::chunk_meta(&child_chunk).unwrap_or((0, 0, 0));
+    join_subtree_range_to_sender(
+        fetcher,
+        child_payload,
+        child_span,
+        child_offset,
+        child_level,
+        child_parity,
+        range,
+        out,
+    )
+    .await
 }
 
 async fn join_child_with_retries(
     fetcher: &dyn ChunkFetcher,
+    decoder: Option<&std::sync::Arc<crate::rs::RsDecoder>>,
+    index: usize,
     addr: [u8; 32],
     child_span: u64,
     child_offset: u64,
 ) -> Result<Vec<u8>, JoinError> {
     let mut last_err = None;
     for attempt in 1..=SUBTREE_RETRY_ATTEMPTS {
-        match join_child_once(fetcher, addr, child_span, child_offset).await {
+        match join_child_once(fetcher, decoder, index, addr, child_span, child_offset).await {
             Ok(child) => return Ok(child),
             Err(e) if is_transient_join_error(&e) && attempt < SUBTREE_RETRY_ATTEMPTS => {
                 last_err = Some(e);
@@ -919,19 +996,24 @@ async fn join_child_with_retries(
 
 async fn join_child_once(
     fetcher: &dyn ChunkFetcher,
+    decoder: Option<&std::sync::Arc<crate::rs::RsDecoder>>,
+    index: usize,
     addr: [u8; 32],
     child_span: u64,
     child_offset: u64,
 ) -> Result<Vec<u8>, JoinError> {
-    let child_chunk = fetcher
-        .fetch(addr)
-        .await
-        .map_err(|e| JoinError::FetchChunk {
-            addr: hex::encode(addr),
-            source: e,
-        })?;
+    let child_chunk = fetch_child_chunk(fetcher, decoder, index, addr).await?;
     let (_, child_payload) = split_chunk(&child_chunk, child_offset)?;
-    join_subtree(fetcher, child_payload, child_span, child_offset).await
+    let (child_level, _, child_parity) = crate::rs::chunk_meta(&child_chunk).unwrap_or((0, 0, 0));
+    join_subtree(
+        fetcher,
+        child_payload,
+        child_span,
+        child_offset,
+        child_level,
+        child_parity,
+    )
+    .await
 }
 
 const fn is_transient_join_error(err: &JoinError) -> bool {
@@ -950,14 +1032,6 @@ fn split_chunk(data: &[u8], offset: u64) -> Result<([u8; 8], &[u8]), JoinError> 
     let mut span = [0u8; 8];
     span.copy_from_slice(&data[..8]);
     Ok((span, &data[8..]))
-}
-
-/// Reject spans whose top byte is non-zero — bee uses the top bits of the
-/// span to encode the redundancy level for RS-protected intermediate
-/// chunks. A real file's span tops out at 2^56 bytes (~72 PB), so any
-/// legitimate span has its high byte clear.
-const fn is_redundancy_none(span: [u8; 8]) -> bool {
-    span[7] == 0
 }
 
 /// Effective payload size of an intermediate chunk: trailing 32-byte
@@ -996,15 +1070,16 @@ fn effective_payload_size(payload: &[u8]) -> usize {
 }
 
 /// Compute the per-child subtrie capacity of an intermediate chunk with
-/// `refs` children and total span `subtree_span`.
+/// `refs` **data** children and total span `subtree_span`.
 ///
 /// Mirrors `bee/pkg/file/joiner.subtrieSection`: starting from one chunk
-/// (`4096`), grow by the branching factor (128) until the last child fits
+/// (`4096`), grow by the branching factor until the last child fits
 /// within `branch_size`. The first `refs-1` children are full subtrees of
-/// `branch_size` bytes; the last child holds the remainder.
-const fn subtrie_section(refs: usize, subtree_span: u64) -> u64 {
+/// `branch_size` bytes; the last child holds the remainder. The branching
+/// factor is 128 for plain trees and the level's `maxShards` for
+/// redundancy-encoded trees (full nodes hold that many data refs).
+const fn subtrie_section(refs: usize, subtree_span: u64, branching: u64) -> u64 {
     let refs = refs as u64;
-    let branching = MAX_BRANCHES as u64;
     let mut branch_size = CHUNK_SIZE as u64;
     loop {
         // What's left over for the rightmost child if every other child
@@ -1415,13 +1490,9 @@ mod tests {
     #[tokio::test]
     async fn rejects_oversized_span() {
         let bogus_payload = vec![0u8; 32];
-        let mut wire = Vec::new();
-        wire.extend_from_slice(&u64::MAX.to_le_bytes());
-        wire.extend_from_slice(&bogus_payload);
-        // u64::MAX has top bit set so we trip UnsupportedRedundancy first.
-        // Use a span just over the cap to exercise TooLarge.
+        // A span just over the cap exercises TooLarge.
         let span: u64 = (DEFAULT_MAX_FILE_BYTES as u64) + 1;
-        wire.clear();
+        let mut wire = Vec::new();
         wire.extend_from_slice(&span.to_le_bytes());
         wire.extend_from_slice(&bogus_payload);
 
@@ -1430,46 +1501,136 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, JoinError::TooLarge { .. }));
-    }
 
-    /// Spans with the redundancy bits set are rejected by default —
-    /// silently mis-decoding a redundant file would produce garbled
-    /// output.
-    #[tokio::test]
-    async fn rejects_redundancy_span() {
-        let payload = vec![0u8; 32];
-        let mut span = [0u8; 8];
-        span[7] = 1; // any non-zero high byte
+        // A top byte of 1..=128 is NOT a redundancy level (bee's
+        // IsLevelEncoded needs > 128) — it reads as an absurd plain
+        // span, which the cap rejects the same way.
         let mut wire = Vec::new();
+        let mut span = [0u8; 8];
+        span[7] = 1;
         wire.extend_from_slice(&span);
-        wire.extend_from_slice(&payload);
-        let fetcher = MapFetcher::new();
+        wire.extend_from_slice(&bogus_payload);
         let err = join(&fetcher, &wire, DEFAULT_MAX_FILE_BYTES)
             .await
             .unwrap_err();
-        assert!(matches!(err, JoinError::UnsupportedRedundancy { level: 1 }));
+        assert!(matches!(err, JoinError::TooLarge { .. }));
     }
 
-    /// `--allow-degraded-redundancy` masks the level byte and decodes
-    /// the file as if it were level NONE. Verified end-to-end on a
-    /// single-leaf root: the joiner trusts the masked span and returns
-    /// the payload bytes truncated to that length.
+    /// A level-encoded span (`level | 0x80` in the top byte) on a
+    /// single-leaf root decodes like a plain leaf: the level is
+    /// stripped, the masked span is the payload length, and there are
+    /// no parities to account for (replica fallback handles small
+    /// redundant files; the tree itself is unchanged).
     #[tokio::test]
-    async fn allow_degraded_redundancy_masks_level_byte() {
+    async fn level_encoded_leaf_root_decodes() {
         let payload = b"hello swarm".to_vec();
         let (_, mut wire) = cac_new(&payload).unwrap();
         // Splice a level into the root span. The CAC address mismatch
         // doesn't matter here — we feed the wire bytes straight into
-        // `join_with_options`, bypassing the per-chunk verifier.
-        wire[7] = 3; // INSANE
+        // `join`, bypassing the per-chunk verifier.
+        wire[7] = 3 | 0x80; // INSANE
         let fetcher = MapFetcher::new();
-        let opts = JoinOptions {
-            allow_degraded_redundancy: true,
-        };
-        let out = join_with_options(&fetcher, &wire, DEFAULT_MAX_FILE_BYTES, opts)
+        let out = join(&fetcher, &wire, DEFAULT_MAX_FILE_BYTES).await.unwrap();
+        assert_eq!(out, payload);
+    }
+
+    /// Build a level-1 redundant single-level tree the way bee's
+    /// pipeline does: data leaves, RS-encode their padded wires into
+    /// parity chunks, append the parity refs after the data refs, and
+    /// mark the root span with `1 | 0x80`. Returns
+    /// `(root_wire, leaf_addrs, expected_bytes)` with every chunk
+    /// inserted into the fetcher.
+    fn build_redundant_fixture(
+        fetcher: &mut MapFetcher,
+        leaves: usize,
+        last_leaf_len: usize,
+    ) -> (Vec<u8>, Vec<[u8; 32]>, Vec<u8>) {
+        assert!(last_leaf_len <= CHUNK_SIZE);
+        let mut shards: Vec<Vec<u8>> = Vec::new();
+        let mut leaf_addrs = Vec::new();
+        let mut expected = Vec::new();
+        for i in 0..leaves {
+            let len = if i == leaves - 1 {
+                last_leaf_len
+            } else {
+                CHUNK_SIZE
+            };
+            let payload: Vec<u8> = (0..len).map(|b| (b as u8).wrapping_add(i as u8)).collect();
+            let (addr, wire) = cac_new(&payload).unwrap();
+            fetcher.insert(addr, wire.clone());
+            leaf_addrs.push(addr);
+            expected.extend_from_slice(&payload);
+            let mut padded = wire;
+            padded.resize(CHUNK_SIZE + 8, 0);
+            shards.push(padded);
+        }
+        let parity_cnt = crate::rs::get_parities(1, leaves);
+        let rs = reed_solomon_erasure::galois_8::ReedSolomon::new(leaves, parity_cnt).unwrap();
+        for _ in 0..parity_cnt {
+            shards.push(vec![0u8; CHUNK_SIZE + 8]);
+        }
+        rs.encode(&mut shards).unwrap();
+
+        let mut root_payload = Vec::new();
+        for addr in &leaf_addrs {
+            root_payload.extend_from_slice(addr);
+        }
+        for parity in &shards[leaves..] {
+            // A parity chunk's wire *is* the encoded shard: bee stores
+            // it with span = the first 8 encoded bytes.
+            let span: [u8; 8] = parity[..8].try_into().unwrap();
+            let addr = ant_crypto::bmt_hash_with_span(&span, &parity[8..]).unwrap();
+            fetcher.insert(addr, parity.clone());
+            root_payload.extend_from_slice(&addr);
+        }
+
+        let mut root_wire = Vec::new();
+        let mut span = (expected.len() as u64).to_le_bytes();
+        span[7] = 1 | 0x80; // MEDIUM
+        root_wire.extend_from_slice(&span);
+        root_wire.extend_from_slice(&root_payload);
+        (root_wire, leaf_addrs, expected)
+    }
+
+    /// RS recovery end-to-end on a synthetic level-1 tree: with up to
+    /// `parityCnt` data leaves missing (first and last included) the
+    /// join still returns the exact bytes.
+    #[tokio::test]
+    async fn recovers_missing_data_chunks_from_parities() {
+        let mut fetcher = MapFetcher::new();
+        // 5 full leaves + a short tail = spans 4096*5 + 100; level 1
+        // gives 4 parities for 6 shards.
+        let (root_wire, leaf_addrs, expected) = build_redundant_fixture(&mut fetcher, 6, 100);
+        // Delete first, last and one middle data leaf (3 <= 4 parities).
+        fetcher.chunks.remove(&leaf_addrs[0]);
+        fetcher.chunks.remove(&leaf_addrs[3]);
+        fetcher.chunks.remove(&leaf_addrs[5]);
+
+        let out = join(&fetcher, &root_wire, DEFAULT_MAX_FILE_BYTES)
             .await
             .unwrap();
-        assert_eq!(out, payload);
+        assert_eq!(out, expected);
+    }
+
+    /// Losing more data chunks than the node has parities fails with a
+    /// terminal `Recovery` error — promptly, because recovery errors
+    /// are not retried.
+    #[tokio::test]
+    async fn over_loss_fails_cleanly() {
+        let mut fetcher = MapFetcher::new();
+        let (root_wire, leaf_addrs, _) = build_redundant_fixture(&mut fetcher, 6, 100);
+        // 6 shards at level 1 → 4 parities; delete 5 data leaves.
+        for addr in leaf_addrs.iter().take(5) {
+            fetcher.chunks.remove(addr);
+        }
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            join(&fetcher, &root_wire, DEFAULT_MAX_FILE_BYTES),
+        )
+        .await
+        .expect("over-loss join must fail promptly, not hang")
+        .unwrap_err();
+        assert!(matches!(err, JoinError::Recovery { .. }), "got {err:?}");
     }
 
     /// Compute the CAC address of a constructed intermediate chunk for

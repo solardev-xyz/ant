@@ -1343,6 +1343,25 @@ impl ChunkFetcher for RoutingFetcher {
         )
         .into())
     }
+
+    /// Store a locally-reconstructed chunk (RS-recovered data shard or a
+    /// root rebuilt from a dispersed replica) in the same cache tiers a
+    /// successful network fetch would land in, so subsequent fetches —
+    /// including retries of the same request — are served locally.
+    async fn put_recovered(&self, addr: [u8; 32], wire: &[u8]) {
+        if let Some(cache) = self.cache.as_ref() {
+            cache.put(addr, wire.to_vec());
+        }
+        if let Some(disk) = self.disk_cache.as_ref() {
+            if let Err(e) = disk.put(addr, wire.to_vec()).await {
+                warn!(
+                    target: "ant_retrieval::fetcher",
+                    chunk = %hex::encode(addr),
+                    "disk cache write of recovered chunk failed: {e}",
+                );
+            }
+        }
+    }
 }
 
 /// Classify a retrieval failure as "this peer is broken" (true) vs
