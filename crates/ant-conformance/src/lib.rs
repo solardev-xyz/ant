@@ -14,6 +14,10 @@
 //! cd conformance/vectorgen && go run . -out ../vectors
 //! ```
 
+pub mod memnode;
+
+pub use memnode::{spawn_mem_gateway, MemChunkStore, MemGateway, MemGatewayConfig};
+
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::path::PathBuf;

@@ -1,0 +1,798 @@
+//! In-process, memory-backed instance of ant's production HTTP gateway.
+//!
+//! [`spawn_mem_gateway`] builds the **production** router via
+//! `ant_gateway::testkit::build_router` and wires its control-command
+//! channel to a "`MemNode`": a node loop that stores chunks in an
+//! in-memory map instead of pushing them to the swarm. Uploads
+//! (`POST /chunks`, `POST /soc/...`, `POST /bytes`, `POST /bzz`) land in
+//! the map after the same validation the real node performs; downloads
+//! (`GET /chunks`, `/soc`, `/bytes`, `/bzz`, `/feeds`) are served back
+//! through `ant-retrieval`'s production joiner / mantaray / feed logic
+//! running over that map. The result is a fully self-contained
+//! system-under-test for differential conformance testing against bee:
+//! upload→download round-trips work end-to-end over real HTTP on an
+//! ephemeral local port, with no network, disk, or chain dependency.
+//!
+//! The dispatch shape mirrors the fixture node loop in
+//! `ant-gateway/tests/common/mod.rs` so the gateway's `ControlAck`
+//! parsing is exercised exactly as production hits it; the differences
+//! are that `MemNode` *stores* pushed chunks (the fixture only hashes
+//! them) and that `GetFeed` is wired for real through
+//! [`ant_retrieval::resolve_sequence_feed_full`] (the fixture stubs it).
+
+use ant_control::{
+    ControlAck, ControlCommand, GatewayActivity, IdentityInfo, PeerConnectionInfo, PeerInfo,
+    RetrievalInfo, RoutingInfo, StatusSnapshot, StreamRange, PROTOCOL_VERSION,
+};
+use ant_gateway::testkit::build_router;
+use ant_gateway::{CorsConfig, GatewayHandle, GatewayIdentity, TagRegistry};
+use ant_retrieval::{
+    join_to_sender_range, join_with_options, list_manifest, lookup_path,
+    resolve_sequence_feed_full, ByteRange, ChunkFetcher, Feed, FeedError, FeedType, JoinOptions,
+    DEFAULT_MAX_FILE_BYTES,
+};
+use async_trait::async_trait;
+use std::collections::HashMap;
+use std::error::Error as StdError;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::{Arc, Mutex};
+use tokio::net::TcpListener;
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
+
+/// SOC wire header: `id(32) ‖ signature(65)`; the rest is the wrapped
+/// CAC (`span(8 LE) ‖ payload`).
+const SOC_HEADER: usize = 32 + 65;
+
+/// Shared in-memory chunk store backing the `MemNode`.
+///
+/// Keys are 32-byte chunk addresses; values are the chunk **wire
+/// bytes** — `span(8 LE) ‖ payload` for a CAC, `id ‖ sig ‖ inner_cac`
+/// for a SOC — exactly what bee's `swarm.Chunk.Data()` returns. Clones
+/// share the same map, so a handle kept by the caller sees (and can
+/// seed) everything the gateway stores.
+///
+/// Implements [`ChunkFetcher`], so `ant-retrieval`'s joiner, mantaray
+/// walker, and feed resolver run over it unchanged. The miss error
+/// message contains `"not found"` on purpose: `ant_retrieval::feed`'s
+/// `is_chunk_not_found` must classify a missing feed-update index as
+/// the end of the feed rather than a transient fetch failure.
+#[derive(Clone, Default)]
+pub struct MemChunkStore {
+    chunks: Arc<Mutex<HashMap<[u8; 32], Vec<u8>>>>,
+}
+
+impl MemChunkStore {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<[u8; 32], Vec<u8>>> {
+        self.chunks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Insert (or replace) the wire bytes stored at `addr`.
+    pub fn insert(&self, addr: [u8; 32], wire: Vec<u8>) {
+        self.lock().insert(addr, wire);
+    }
+
+    /// Wire bytes stored at `addr`, if any.
+    #[must_use]
+    pub fn get(&self, addr: &[u8; 32]) -> Option<Vec<u8>> {
+        self.lock().get(addr).cloned()
+    }
+
+    /// Number of chunks currently stored.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    /// True when no chunk has been stored yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+}
+
+#[async_trait]
+impl ChunkFetcher for MemChunkStore {
+    async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
+        self.get(&addr)
+            .ok_or_else(|| -> Box<dyn StdError + Send + Sync> {
+                format!("chunk {} not found", hex::encode(addr)).into()
+            })
+    }
+}
+
+/// Configuration for [`spawn_mem_gateway`]. `Default` gives an
+/// upload-capable (`light`-mode) gateway with bee's default (deny) CORS
+/// policy — the configuration conformance runs want.
+#[derive(Debug, Clone)]
+pub struct MemGatewayConfig {
+    /// Reported via `GET /node.beeMode`: `true` ⇒ `light` (the node
+    /// claims upload capability), `false` ⇒ `ultra-light` (read-only).
+    /// `MemNode` accepts uploads either way; this only drives the status
+    /// surface.
+    pub light_mode: bool,
+}
+
+impl Default for MemGatewayConfig {
+    fn default() -> Self {
+        Self { light_mode: true }
+    }
+}
+
+/// A running in-process gateway: production router + `MemNode` loop,
+/// served on an ephemeral local TCP port.
+///
+/// Obtain one via [`spawn_mem_gateway`]; stop it with
+/// [`MemGateway::shutdown`] (dropping it also works — the background
+/// tasks are detached and die with the runtime, they just don't get
+/// the graceful-shutdown pass).
+pub struct MemGateway {
+    addr: SocketAddr,
+    store: MemChunkStore,
+    server: JoinHandle<()>,
+    node: JoinHandle<()>,
+    shutdown: Option<oneshot::Sender<()>>,
+    /// Keeps the gateway's `watch::Receiver<StatusSnapshot>` from
+    /// observing `Closed` mid-test.
+    _status_tx: watch::Sender<StatusSnapshot>,
+}
+
+impl MemGateway {
+    /// The bound listen address (always `127.0.0.1:<ephemeral>`).
+    #[must_use]
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// `http://127.0.0.1:<port>` — base URL for client requests, no
+    /// trailing slash.
+    #[must_use]
+    pub fn base_url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    /// Handle on the backing chunk store, for seeding chunks directly
+    /// or asserting on what an upload persisted.
+    #[must_use]
+    pub fn store(&self) -> &MemChunkStore {
+        &self.store
+    }
+
+    /// Gracefully stop the HTTP server and wait for both background
+    /// tasks (server + `MemNode` loop) to finish.
+    pub async fn shutdown(mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        let _ = self.server.await;
+        // The node loop exits once every command sender is gone; the
+        // last one is inside the router the server task just dropped.
+        let _ = self.node.await;
+    }
+}
+
+/// Spawn the production gateway router over a fresh in-memory `MemNode`
+/// and serve it on an ephemeral `127.0.0.1` port.
+///
+/// The returned [`MemGateway`] carries the bound address, a handle on
+/// the chunk store, and the shutdown/join handles.
+pub async fn spawn_mem_gateway(cfg: MemGatewayConfig) -> MemGateway {
+    let store = MemChunkStore::default();
+
+    let (status_tx, status_rx) = watch::channel(mem_snapshot());
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<ControlCommand>(16);
+
+    // `MemNode` loop: dispatch every command on its own task, like the
+    // production node loop (and the gateway test fixture) do, so a
+    // slow streaming download can't head-of-line-block an upload.
+    let node_store = store.clone();
+    let node = tokio::spawn(async move {
+        while let Some(cmd) = cmd_rx.recv().await {
+            let s = node_store.clone();
+            tokio::spawn(async move {
+                handle_command(&s, cmd).await;
+            });
+        }
+    });
+
+    let handle = GatewayHandle {
+        agent: Arc::new("antd/mem".to_string()),
+        api_version: Arc::new("7.2.0".to_string()),
+        identity: Arc::new(mem_identity()),
+        status: status_rx,
+        commands: cmd_tx,
+        activity: GatewayActivity::new(),
+        light_mode: cfg.light_mode,
+        tags: Arc::new(TagRegistry::new()),
+        cors: Arc::new(CorsConfig::default()),
+        chain: None,
+    };
+    let router = build_router(handle);
+
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind ephemeral 127.0.0.1 port");
+    let addr = listener.local_addr().expect("read bound address");
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("serve in-memory gateway");
+    });
+
+    MemGateway {
+        addr,
+        store,
+        server,
+        node,
+        shutdown: Some(shutdown_tx),
+        _status_tx: status_tx,
+    }
+}
+
+/// Well-formed but obviously-fake identity, mirroring the gateway test
+/// fixture's `test_identity`.
+fn mem_identity() -> GatewayIdentity {
+    GatewayIdentity {
+        overlay_hex: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".to_string(),
+        ethereum_hex: "0x0102030405060708090a0b0c0d0e0f1011121314".to_string(),
+        public_key_hex: "020102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+            .to_string(),
+        peer_id: "12D3KooWMemGateway000000000000000000000000000".to_string(),
+    }
+}
+
+/// Status snapshot with one connected peer and a populated routing
+/// table, so `/readiness` reports ready and the status endpoints have
+/// something to render. Mirrors the gateway test fixture's
+/// `snapshot_with_one_peer`.
+fn mem_snapshot() -> StatusSnapshot {
+    StatusSnapshot {
+        agent: "antd/mem".to_string(),
+        protocol_version: PROTOCOL_VERSION,
+        network_id: 1,
+        pid: 0,
+        started_at_unix: 1_700_000_000,
+        identity: IdentityInfo {
+            eth_address: "0x0102030405060708090a0b0c0d0e0f1011121314".to_string(),
+            overlay: "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+                .to_string(),
+            peer_id: "12D3KooWMemGateway000000000000000000000000000".to_string(),
+        },
+        peers: PeerInfo {
+            connected: 1,
+            node_limit: 16,
+            connected_peers: vec![PeerConnectionInfo {
+                peer_id: "12D3KooWPeerOne00000000000000000000000000".to_string(),
+                direction: "Outbound".to_string(),
+                address: "/ip4/127.0.0.1/tcp/1634".to_string(),
+                connected_at_unix: 1_700_000_001,
+                agent_version: "bee/2.7.0".to_string(),
+                bzz_overlay: Some(
+                    "0xdeadbeef00000000000000000000000000000000000000000000000000000000"
+                        .to_string(),
+                ),
+                full_node: Some(true),
+                last_bzz_at_unix: Some(1_700_000_002),
+            }],
+            peer_pipeline: Vec::new(),
+            last_handshake: None,
+            time_to_first_peer_s: Some(0.5),
+            time_to_node_limit_s: None,
+            routing: RoutingInfo {
+                base_overlay: "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+                    .to_string(),
+                size: 1,
+                bins: {
+                    let mut bins = vec![0u32; 32];
+                    bins[5] = 1;
+                    bins
+                },
+                ..Default::default()
+            },
+        },
+        listeners: vec!["/ip4/127.0.0.1/tcp/1634".to_string()],
+        external_addresses: Vec::new(),
+        control_socket: "/tmp/antd.sock".to_string(),
+        retrieval: RetrievalInfo::default(),
+    }
+}
+
+/// `MemNode`'s single-command dispatcher. The ack shape of every arm
+/// matches what the production node loop in `ant-p2p` returns (or,
+/// for the commands the gateway never exercises against content, what
+/// the `ant-gateway` test fixture returns), so no gateway handler ever
+/// hangs on an unanswered channel.
+async fn handle_command(store: &MemChunkStore, cmd: ControlCommand) {
+    match cmd {
+        // ---- writes -------------------------------------------------
+        ControlCommand::PushChunk { wire, ack, .. } => {
+            // Validate like production: recompute the address by
+            // BMT-hashing `span ‖ payload`. Then *store* the wire bytes
+            // so the round-trip read works (the fixture only hashes).
+            // The batch id is accepted unchecked — `MemNode` models an
+            // issuer that stamps anything.
+            let reply = if wire.len() < 8 || wire.len() > 8 + 4096 {
+                ControlAck::Error {
+                    message: format!("chunk wire size out of range: {} bytes", wire.len()),
+                }
+            } else {
+                let mut span = [0u8; 8];
+                span.copy_from_slice(&wire[..8]);
+                match ant_crypto::bmt_hash_with_span(&span, &wire[8..]) {
+                    Some(addr) => {
+                        store.insert(addr, wire);
+                        ControlAck::ChunkUploaded {
+                            reference: format!("0x{}", hex::encode(addr)),
+                        }
+                    }
+                    None => ControlAck::Error {
+                        message: "failed to BMT-hash chunk".into(),
+                    },
+                }
+            };
+            let _ = ack.send(reply);
+        }
+        ControlCommand::PushSoc {
+            address, wire, ack, ..
+        } => {
+            // Re-validate the wire even though the gateway already ran
+            // `soc_valid` (mirroring `ant-p2p`'s defensive re-check),
+            // then store the SOC at its owner-bound address. Also store
+            // the wrapped CAC under its own BMT address, exactly like
+            // the production `PushSoc` handler caches it: a v2 feed
+            // update's wrapped CAC *is* the content root the subsequent
+            // `GetFeed` → `StreamBytes` read dereferences, and it is
+            // never uploaded as a standalone chunk.
+            let reply = if wire.len() < SOC_HEADER + 8 || wire.len() > SOC_HEADER + 8 + 4096 {
+                ControlAck::Error {
+                    message: format!("soc wire size out of range: {} bytes", wire.len()),
+                }
+            } else if !ant_crypto::soc_valid(&address, &wire) {
+                ControlAck::Error {
+                    message: "soc validation failed".into(),
+                }
+            } else {
+                let inner = wire[SOC_HEADER..].to_vec();
+                let mut inner_span = [0u8; 8];
+                inner_span.copy_from_slice(&inner[..8]);
+                if let Some(inner_addr) = ant_crypto::bmt_hash_with_span(&inner_span, &inner[8..]) {
+                    store.insert(inner_addr, inner);
+                }
+                store.insert(address, wire);
+                ControlAck::ChunkUploaded {
+                    reference: format!("0x{}", hex::encode(address)),
+                }
+            };
+            let _ = ack.send(reply);
+        }
+        // ---- single-chunk reads --------------------------------------
+        ControlCommand::GetChunkRaw { reference, ack } => {
+            let reply = match store.fetch(reference).await {
+                Ok(data) => ControlAck::Bytes { data },
+                Err(e) => ControlAck::Error {
+                    message: format!("fetch chunk {}: {e}", hex::encode(reference)),
+                },
+            };
+            let _ = ack.send(reply);
+        }
+        ControlCommand::GetChunk { reference, ack } => {
+            let reply = match store.fetch(reference).await {
+                Ok(data) => {
+                    // Strip the 8-byte span: `GetChunk` acks payload only.
+                    let payload = if data.len() >= 8 {
+                        data[8..].to_vec()
+                    } else {
+                        data
+                    };
+                    ControlAck::Bytes { data: payload }
+                }
+                Err(e) => ControlAck::Error {
+                    message: format!("fetch chunk {}: {e}", hex::encode(reference)),
+                },
+            };
+            let _ = ack.send(reply);
+        }
+        // ---- joined reads (production ant-retrieval logic) -----------
+        ControlCommand::GetBytes {
+            reference,
+            bypass_cache: _,
+            progress: _,
+            max_bytes,
+            ack,
+        } => {
+            let result = async {
+                let root = store.fetch(reference).await.map_err(|e| e.to_string())?;
+                let opts = JoinOptions {
+                    allow_degraded_redundancy: true,
+                };
+                let cap = byte_cap(max_bytes);
+                join_with_options(store, &root, cap, opts)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            .await;
+            let reply = match result {
+                Ok(data) => ControlAck::Bytes { data },
+                Err(e) => ControlAck::Error { message: e },
+            };
+            let _ = ack.send(reply).await;
+        }
+        ControlCommand::GetBytesEncrypted {
+            reference,
+            key,
+            bypass_cache: _,
+            max_bytes,
+            ack,
+        } => {
+            let mut root_ref = [0u8; ant_retrieval::ENCRYPTED_REF_SIZE];
+            root_ref[..32].copy_from_slice(&reference);
+            root_ref[32..].copy_from_slice(&key);
+            let cap = byte_cap(max_bytes);
+            let reply = match ant_retrieval::join_encrypted(store, root_ref, cap).await {
+                Ok(data) => ControlAck::Bytes { data },
+                Err(e) => ControlAck::Error {
+                    message: e.to_string(),
+                },
+            };
+            let _ = ack.send(reply).await;
+        }
+        ControlCommand::StreamBytes {
+            reference,
+            bypass_cache: _,
+            max_bytes,
+            range,
+            head_only,
+            ack,
+        } => {
+            stream_via_store(
+                store, reference, /* path */ None, /* allow_degraded */ true, max_bytes,
+                range, head_only, ack,
+            )
+            .await;
+        }
+        ControlCommand::StreamBzz {
+            reference,
+            path,
+            allow_degraded_redundancy,
+            bypass_cache: _,
+            max_bytes,
+            range,
+            head_only,
+            ack,
+        } => {
+            stream_via_store(
+                store,
+                reference,
+                Some(path),
+                allow_degraded_redundancy,
+                max_bytes,
+                range,
+                head_only,
+                ack,
+            )
+            .await;
+        }
+        ControlCommand::GetBzz {
+            reference,
+            path,
+            allow_degraded_redundancy,
+            bypass_cache: _,
+            progress: _,
+            max_bytes,
+            ack,
+        } => {
+            let result = async {
+                let lookup = lookup_path(store, reference, &path)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let root = store
+                    .fetch(lookup.data_ref)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let opts = JoinOptions {
+                    allow_degraded_redundancy,
+                };
+                let cap = byte_cap(max_bytes);
+                let body = join_with_options(store, &root, cap, opts)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok::<_, String>((body, lookup))
+            }
+            .await;
+            let reply = match result {
+                Ok((data, lookup)) => ControlAck::BzzBytes {
+                    data,
+                    content_type: lookup.content_type,
+                    filename: lookup.metadata.get("Filename").cloned(),
+                },
+                Err(e) => ControlAck::Error { message: e },
+            };
+            let _ = ack.send(reply).await;
+        }
+        ControlCommand::ListBzz {
+            reference,
+            bypass_cache: _,
+            ack,
+        } => {
+            let reply = match list_manifest(store, reference).await {
+                Ok(entries) => ControlAck::Manifest {
+                    entries: entries
+                        .into_iter()
+                        .map(|entry| ant_control::ManifestEntryInfo {
+                            path: entry.path,
+                            reference: entry.reference.map(hex::encode),
+                            metadata: entry.metadata,
+                            size: entry.size,
+                        })
+                        .collect(),
+                },
+                Err(e) => ControlAck::Error {
+                    message: e.to_string(),
+                },
+            };
+            let _ = ack.send(reply).await;
+        }
+        // ---- feeds: wired for real, unlike the gateway fixture -------
+        ControlCommand::GetFeed { owner, topic, ack } => {
+            // Same resolution path production runs in `ant-p2p`'s
+            // `GetFeed` handler, with the in-memory store standing in
+            // for the `RoutingFetcher`; the ack shape is identical.
+            let feed = Feed {
+                owner,
+                topic,
+                kind: FeedType::Sequence,
+            };
+            let reply = match resolve_sequence_feed_full(store, &feed).await {
+                Ok(resolution) => ControlAck::FeedResolved {
+                    reference: resolution.reference,
+                    index: resolution.index,
+                    signature: resolution.signature,
+                    v2: resolution.v2,
+                    decrypt_key: resolution.decrypt_key,
+                },
+                Err(FeedError::NoUpdates { .. }) => ControlAck::FeedNotFound,
+                Err(e) => ControlAck::Error {
+                    message: format!("feed lookup: {e}"),
+                },
+            };
+            let _ = ack.send(reply);
+        }
+        // ---- node-management commands: fixture-shaped acks ------------
+        ControlCommand::ResetPeerstore { ack } | ControlCommand::Resume { ack } => {
+            let _ = ack.send(ControlAck::Ok {
+                message: "ok".to_string(),
+            });
+        }
+        ControlCommand::RegisterBatch { ack, .. } => {
+            let _ = ack.send(ControlAck::Ok {
+                message: "registered (mem node)".into(),
+            });
+        }
+        ControlCommand::EnablePushsyncSwap { ack, .. } => {
+            let _ = ack.send(ControlAck::Ok {
+                message: "settlement enable ignored (mem node)".into(),
+            });
+        }
+        // Upload* drive `ant-node`'s UploadManager (a filesystem-backed
+        // job pipeline); the gateway never emits them, so reject any
+        // that leak in rather than model the pipeline.
+        ControlCommand::UploadStart { ack, .. }
+        | ControlCommand::UploadList { ack }
+        | ControlCommand::UploadStatus { ack, .. }
+        | ControlCommand::UploadPause { ack, .. }
+        | ControlCommand::UploadResume { ack, .. }
+        | ControlCommand::UploadRepush { ack, .. }
+        | ControlCommand::UploadCancel { ack, .. } => {
+            let _ = ack.send(ControlAck::Error {
+                message: "Upload* not supported by the in-memory node".into(),
+            });
+        }
+        ControlCommand::UploadFollow { ack, .. } => {
+            let _ = ack.try_send(ControlAck::Error {
+                message: "Upload* not supported by the in-memory node".into(),
+            });
+        }
+        // `MemNode` has no stamp issuer; report the "uploads disabled"
+        // default snapshot / empty batch list like a daemon started
+        // without `--postage-batch` (matches the gateway fixture).
+        ControlCommand::PostageStatus { ack } => {
+            let _ = ack.send(ControlAck::PostageStatus(
+                ant_control::PostageStatusView::default(),
+            ));
+        }
+        ControlCommand::PostageList { ack } => {
+            let _ = ack.send(ControlAck::PostageList(Vec::new()));
+        }
+        // `antctl pin` escape hatch: validate + store, same as a disk
+        // cache write would.
+        ControlCommand::PutChunkLocal { wire, ack } => {
+            let reply = if wire.len() < 8 || wire.len() > 8 + 4096 {
+                ControlAck::Error {
+                    message: format!("chunk wire size out of range: {} bytes", wire.len()),
+                }
+            } else {
+                let mut span = [0u8; 8];
+                span.copy_from_slice(&wire[..8]);
+                match ant_crypto::bmt_hash_with_span(&span, &wire[8..]) {
+                    Some(addr) => {
+                        store.insert(addr, wire);
+                        ControlAck::Ok {
+                            message: format!("stored 0x{}", hex::encode(addr)),
+                        }
+                    }
+                    None => ControlAck::Error {
+                        message: "failed to BMT-hash chunk".into(),
+                    },
+                }
+            };
+            let _ = ack.send(reply);
+        }
+        // Read-back propagation checks: the store is the single source,
+        // so report reachability in the production JSON shapes (mirrors
+        // the gateway fixture's stand-ins).
+        ControlCommand::VerifyPropagation {
+            reference,
+            samples: _,
+            probes: _,
+            progress: _,
+            cancel: _,
+            ack,
+        } => {
+            let retrievable = store.get(&reference).is_some();
+            let checked = u64::from(retrievable);
+            let body = serde_json::json!({
+                "reference": format!("0x{}", hex::encode(reference)),
+                "retrievable": retrievable,
+                "total_chunks": 1,
+                "leaf_chunks": 1,
+                "intermediate_chunks": 0,
+                "checked_chunks": checked,
+                "retrievable_chunks": checked,
+                "sampled_leaves": checked,
+                "sources": checked,
+            });
+            let _ = ack.send(ControlAck::Ok {
+                message: body.to_string(),
+            });
+        }
+        ControlCommand::VerifyChunksPresent {
+            addresses,
+            probes: _,
+            include_shallow: _,
+            ack,
+        } => {
+            let missing: Vec<String> = addresses
+                .iter()
+                .filter(|addr| store.get(addr).is_none())
+                .map(|addr| format!("0x{}", hex::encode(addr)))
+                .collect();
+            let body = serde_json::json!({
+                "checked": addresses.len(),
+                "missing": missing,
+            });
+            let _ = ack.send(ControlAck::Ok {
+                message: body.to_string(),
+            });
+        }
+    }
+}
+
+/// `max_bytes` override → joiner byte cap, defaulting like production.
+fn byte_cap(max_bytes: Option<u64>) -> usize {
+    max_bytes.map_or(DEFAULT_MAX_FILE_BYTES, |n| {
+        usize::try_from(n).unwrap_or(usize::MAX)
+    })
+}
+
+/// Streaming dispatcher shared by `StreamBytes` and `StreamBzz`,
+/// mirroring the production node loop (and the gateway test fixture):
+/// `path = None` treats `reference` as a raw `/bytes` data root;
+/// `path = Some(_)` walks the manifest first. Emits the
+/// `BytesStreamStart` / `BzzStreamStart` prologue, then `BytesChunk`
+/// frames, then `StreamDone` / `Error`.
+#[allow(clippy::too_many_arguments)]
+async fn stream_via_store(
+    store: &MemChunkStore,
+    reference: [u8; 32],
+    path: Option<String>,
+    allow_degraded: bool,
+    max_bytes: Option<u64>,
+    range: Option<StreamRange>,
+    head_only: bool,
+    ack: mpsc::Sender<ControlAck>,
+) {
+    let is_bzz = path.is_some();
+    let result = async {
+        let (data_ref, content_type, filename, mutable) = match path {
+            None => (reference, None, None, false),
+            Some(p) => {
+                let lookup = lookup_path(store, reference, &p)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let filename = lookup.metadata.get("Filename").cloned().or_else(|| {
+                    let trimmed = p.trim_matches('/');
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        trimmed
+                            .rsplit('/')
+                            .next()
+                            .map(std::string::ToString::to_string)
+                    }
+                });
+                (
+                    lookup.data_ref,
+                    lookup.content_type,
+                    filename,
+                    lookup.is_feed,
+                )
+            }
+        };
+        let root = store.fetch(data_ref).await.map_err(|e| e.to_string())?;
+        // Mask the redundancy level off the high byte of the span so
+        // the reported total reflects the real file size, matching the
+        // production node loop's `root_span_to_u64_masked`.
+        let mut span_bytes: [u8; 8] = root
+            .get(..8)
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| "root shorter than span".to_string())?;
+        span_bytes[7] = 0;
+        let total = u64::from_le_bytes(span_bytes);
+        let prologue = if is_bzz {
+            ControlAck::BzzStreamStart {
+                total_bytes: total,
+                content_type,
+                filename,
+                mutable,
+            }
+        } else {
+            ControlAck::BytesStreamStart { total_bytes: total }
+        };
+        ack.send(prologue)
+            .await
+            .map_err(|_| "stream closed".to_string())?;
+        if head_only {
+            return Ok::<(), String>(());
+        }
+        let (chunk_tx, mut chunk_rx) = mpsc::channel(8);
+        let opts = JoinOptions {
+            allow_degraded_redundancy: allow_degraded,
+        };
+        let cap = byte_cap(max_bytes);
+        let body_range = range.and_then(|r| ByteRange::clamp(r.start, r.end_inclusive, total));
+        let mut join_fut = Box::pin(join_to_sender_range(
+            store, &root, cap, opts, body_range, chunk_tx,
+        ));
+        let mut join_result = None;
+        loop {
+            tokio::select! {
+                result = &mut join_fut, if join_result.is_none() => {
+                    join_result = Some(result.map_err(|e| e.to_string()));
+                }
+                maybe_chunk = chunk_rx.recv() => {
+                    match maybe_chunk {
+                        Some(data) => {
+                            ack.send(ControlAck::BytesChunk { data })
+                                .await
+                                .map_err(|_| "stream closed".to_string())?;
+                        }
+                        None => return join_result.unwrap_or(Ok(())),
+                    }
+                }
+            }
+        }
+    }
+    .await;
+    let terminal = match result {
+        Ok(()) => ControlAck::StreamDone,
+        Err(e) => ControlAck::Error { message: e },
+    };
+    let _ = ack.send(terminal).await;
+}

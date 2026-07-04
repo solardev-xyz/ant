@@ -125,12 +125,18 @@ dependencies = [
 name = "ant-conformance"
 version = "0.5.33"
 dependencies = [
+ "ant-control",
  "ant-crypto",
+ "ant-gateway",
  "ant-postage",
  "ant-retrieval",
+ "async-trait",
+ "axum",
  "hex",
+ "reqwest",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
