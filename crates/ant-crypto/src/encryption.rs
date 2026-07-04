@@ -1,4 +1,4 @@
-//! Swarm chunk decryption (read path).
+//! Swarm chunk encryption and decryption.
 //!
 //! Swarm encrypts each content chunk under a fresh 32-byte random key
 //! using Keccak-256 in counter mode. An *encrypted reference* is
@@ -6,7 +6,7 @@
 //! encrypted chunk and the key decrypts it. Because a chunk is stored and
 //! addressed by the BMT hash of its **encrypted** bytes, retrieval and
 //! CAC validation are unchanged — only the bytes need decrypting once they
-//! arrive, which is what this module does.
+//! arrive.
 //!
 //! Mirrors `bee/pkg/encryption` and `bee/pkg/encryption/store`:
 //!
@@ -27,8 +27,21 @@
 //!   span exactly as `bee/pkg/file/utils.go::ReferenceCount`
 //!   (`store/decrypt_store.go::DecryptChunkData`).
 //!
-//! Reed–Solomon redundancy (`level != NONE`) is rejected rather than
-//! silently mis-decoded, matching the joiner's existing stance.
+//! [`decrypt_chunk`] handles the redundancy-free (`level == NONE`) case
+//! end-to-end. Encrypted trees that carry a Reed–Solomon level need the
+//! erasure tables to compute the reference-list truncation, which live in
+//! `ant-retrieval` — those callers use [`decrypt_chunk_parts`] and
+//! truncate themselves (mirroring `bee`'s `DecryptChunkData`, which calls
+//! into `file.ReferenceCount`).
+//!
+//! The write path ([`encrypt_chunk_unpadded`]) is the exact inverse:
+//! `bee`'s `chunkEncrypter.EncryptChunk` encrypts the span with
+//! `initCtr = 128` and the payload with `initCtr = 0`, then right-pads
+//! the ciphertext with **random** bytes to `ChunkSize` (the padding is
+//! appended raw, *outside* the keystream — `encryption.go::pad`). Padding
+//! is left to the caller here so deterministic tests/vectors can pad with
+//! zeros while production pads randomly, matching bee's observable
+//! behaviour (decrypt truncates the padding away either way).
 
 use crate::{keccak256, CHUNK_SIZE, SPAN_SIZE};
 use thiserror::Error;
@@ -123,6 +136,59 @@ fn enc_reference_count(span: u64) -> usize {
     shards
 }
 
+/// Encrypt a plaintext chunk (`span(8) ‖ payload(≤4096)`) under `key`,
+/// returning `encSpan(8) ‖ encPayload` with `encPayload` the same length
+/// as the payload — **unpadded**. Bee stores encrypted chunks with the
+/// ciphertext right-padded to [`CHUNK_SIZE`] with random bytes
+/// (`chunk_encryption.go::EncryptChunk` via `Encrypt`'s `padding`
+/// parameter); the caller must resize the result to
+/// `SPAN_SIZE + CHUNK_SIZE`, choosing the pad bytes (random in
+/// production, zeros for deterministic vectors — decryption truncates
+/// them either way, so interoperability is unaffected).
+///
+/// The chunk's stored address is the BMT hash of the **padded** result
+/// (header = the encrypted span), and its encrypted reference is
+/// `address(32) ‖ key(32)`.
+#[must_use]
+pub fn encrypt_chunk_unpadded(plain_wire: &[u8], key: &[u8; KEY_LENGTH]) -> Vec<u8> {
+    debug_assert!(plain_wire.len() >= SPAN_SIZE);
+    debug_assert!(plain_wire.len() <= SPAN_SIZE + CHUNK_SIZE);
+    let mut out = plain_wire.to_vec();
+    transcrypt(&mut out[..SPAN_SIZE], key, SPAN_INIT_CTR);
+    transcrypt(&mut out[SPAN_SIZE..], key, 0);
+    out
+}
+
+/// A fresh random 32-byte chunk encryption key from the OS RNG
+/// (`bee` `encryption.GenerateRandomKey`).
+#[must_use]
+pub fn random_encryption_key() -> [u8; KEY_LENGTH] {
+    let mut key = [0u8; KEY_LENGTH];
+    getrandom::fill(&mut key).expect("OS RNG");
+    key
+}
+
+/// Decrypt a stored, encrypted chunk into its raw parts: the decrypted
+/// 8-byte span (level byte intact) and the **full** decrypted data
+/// (padding included, no truncation). Callers that must handle
+/// Reed–Solomon-level spans use this and compute the truncation with
+/// their own erasure tables (`bee`'s `DecryptChunkData`); everyone else
+/// wants [`decrypt_chunk`].
+pub fn decrypt_chunk_parts(
+    stored_wire: &[u8],
+    key: &[u8; KEY_LENGTH],
+) -> Result<([u8; SPAN_SIZE], Vec<u8>), DecryptError> {
+    if stored_wire.len() < SPAN_SIZE {
+        return Err(DecryptError::TooShort(stored_wire.len()));
+    }
+    let mut span = [0u8; SPAN_SIZE];
+    span.copy_from_slice(&stored_wire[..SPAN_SIZE]);
+    transcrypt(&mut span, key, SPAN_INIT_CTR);
+    let mut data = stored_wire[SPAN_SIZE..].to_vec();
+    transcrypt(&mut data, key, 0);
+    Ok((span, data))
+}
+
 /// Decrypt a stored, encrypted content chunk.
 ///
 /// `stored_wire` is the chunk exactly as fetched / BMT-addressed:
@@ -134,21 +200,12 @@ fn enc_reference_count(span: u64) -> usize {
 /// stripped. The returned span retains its raw decrypted bytes (including
 /// any redundancy-level byte), matching `bee`'s `DecryptChunkData`.
 pub fn decrypt_chunk(stored_wire: &[u8], key: &[u8; KEY_LENGTH]) -> Result<Vec<u8>, DecryptError> {
-    if stored_wire.len() < SPAN_SIZE {
-        return Err(DecryptError::TooShort(stored_wire.len()));
-    }
-
-    let mut span = [0u8; SPAN_SIZE];
-    span.copy_from_slice(&stored_wire[..SPAN_SIZE]);
-    transcrypt(&mut span, key, SPAN_INIT_CTR);
+    let (span, data) = decrypt_chunk_parts(stored_wire, key)?;
 
     let (level, length) = decode_span(span);
     if level != 0 {
         return Err(DecryptError::UnsupportedRedundancy(level));
     }
-
-    let mut data = stored_wire[SPAN_SIZE..].to_vec();
-    transcrypt(&mut data, key, 0);
 
     let content_len = if length <= CHUNK_SIZE as u64 {
         length as usize
@@ -173,26 +230,12 @@ mod tests {
     use super::*;
     use crate::cac_new;
 
-    /// Reference encryptor mirroring `bee`'s write path so the tests can
-    /// build genuine encrypted chunks and prove `decrypt_chunk` inverts
-    /// them. `EncryptChunk` in `bee` generates a random key, encrypts the
-    /// span with `initCtr = 128` and the data (padded to `ChunkSize`) with
-    /// `initCtr = 0`.
+    /// Stored-form encryptor: [`encrypt_chunk_unpadded`] plus the pad to
+    /// `ChunkSize` bee applies (deterministic zeros here rather than
+    /// random; decrypt truncates to the real length so the value is moot).
     fn encrypt_chunk(plain_wire: &[u8], key: &[u8; KEY_LENGTH]) -> Vec<u8> {
-        // span (8 bytes)
-        let mut span = [0u8; SPAN_SIZE];
-        span.copy_from_slice(&plain_wire[..SPAN_SIZE]);
-        transcrypt(&mut span, key, SPAN_INIT_CTR);
-        // data padded to ChunkSize, then encrypted with initCtr 0
-        let mut data = vec![0u8; CHUNK_SIZE];
-        let payload = &plain_wire[SPAN_SIZE..];
-        data[..payload.len()].copy_from_slice(payload);
-        // Padding bytes here are deterministic zeros rather than random;
-        // decrypt truncates to the real length so their value is moot.
-        transcrypt(&mut data, key, 0);
-        let mut out = Vec::with_capacity(SPAN_SIZE + CHUNK_SIZE);
-        out.extend_from_slice(&span);
-        out.extend_from_slice(&data);
+        let mut out = encrypt_chunk_unpadded(plain_wire, key);
+        out.resize(SPAN_SIZE + CHUNK_SIZE, 0);
         out
     }
 

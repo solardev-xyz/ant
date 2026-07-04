@@ -565,7 +565,7 @@ async fn handle_command(store: &MemChunkStore, postage: &MemPostage, cmd: Contro
             ack,
         } => {
             stream_via_store(
-                store, reference, /* path */ None, /* allow_degraded */ true, max_bytes,
+                store, &reference, /* path */ None, /* allow_degraded */ true, max_bytes,
                 range, head_only, ack,
             )
             .await;
@@ -582,7 +582,7 @@ async fn handle_command(store: &MemChunkStore, postage: &MemPostage, cmd: Contro
         } => {
             stream_via_store(
                 store,
-                reference,
+                &reference,
                 Some(path),
                 allow_degraded_redundancy,
                 max_bytes,
@@ -602,16 +602,30 @@ async fn handle_command(store: &MemChunkStore, postage: &MemPostage, cmd: Contro
             ack,
         } => {
             let result = async {
-                let lookup = lookup_path(store, reference, &path)
+                let lookup = lookup_path(store, &reference, &path)
                     .await
                     .map_err(|e| e.to_string())?;
-                let root = ant_retrieval::fetch_root_with_replicas(store, lookup.data_ref)
+                let cap = byte_cap(max_bytes);
+                // Encrypted manifest entry: buffered decrypt-join.
+                if let Ok(enc_ref) =
+                    <[u8; ant_retrieval::ENCRYPTED_REF_SIZE]>::try_from(lookup.data_ref.as_slice())
+                {
+                    let body = ant_retrieval::join_encrypted(store, enc_ref, cap)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    return Ok::<_, String>((body, lookup));
+                }
+                let data_ref: [u8; 32] = lookup
+                    .data_ref
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| "manifest entry has invalid width".to_string())?;
+                let root = ant_retrieval::fetch_root_with_replicas(store, data_ref)
                     .await
                     .map_err(|e| e.to_string())?;
                 let opts = JoinOptions {
                     allow_degraded_redundancy,
                 };
-                let cap = byte_cap(max_bytes);
                 let body = join_with_options(store, &root, cap, opts)
                     .await
                     .map_err(|e| e.to_string())?;
@@ -633,7 +647,7 @@ async fn handle_command(store: &MemChunkStore, postage: &MemPostage, cmd: Contro
             bypass_cache: _,
             ack,
         } => {
-            let reply = match list_manifest(store, reference).await {
+            let reply = match list_manifest(store, &reference).await {
                 Ok(entries) => ControlAck::Manifest {
                     entries: entries
                         .into_iter()
@@ -899,7 +913,7 @@ fn byte_cap(max_bytes: Option<u64>) -> usize {
 #[allow(clippy::too_many_arguments)]
 async fn stream_via_store(
     store: &MemChunkStore,
-    reference: [u8; 32],
+    reference: &[u8],
     path: Option<String>,
     allow_degraded: bool,
     max_bytes: Option<u64>,
@@ -910,7 +924,7 @@ async fn stream_via_store(
     let is_bzz = path.is_some();
     let result = async {
         let (data_ref, content_type, filename, mutable) = match path {
-            None => (reference, None, None, false),
+            None => (reference.to_vec(), None, None, false),
             Some(p) => {
                 let lookup = lookup_path(store, reference, &p)
                     .await
@@ -934,6 +948,29 @@ async fn stream_via_store(
                 )
             }
         };
+        // Encrypted manifest entry (64-byte `address ‖ key`): buffered
+        // decrypt-join, like the production node loop — ciphertext trees
+        // can't be streamed chunkwise.
+        if let Ok(enc_ref) =
+            <[u8; ant_retrieval::ENCRYPTED_REF_SIZE]>::try_from(data_ref.as_slice())
+        {
+            return stream_encrypted_via_store(
+                store,
+                enc_ref,
+                content_type,
+                filename,
+                mutable,
+                max_bytes,
+                range,
+                head_only,
+                &ack,
+            )
+            .await;
+        }
+        let data_ref: [u8; 32] = data_ref
+            .as_slice()
+            .try_into()
+            .map_err(|_| "manifest entry has invalid width".to_string())?;
         // Root fetch with dispersed-replica fallback (bee wraps the root
         // getter of every redundant download in `replicas.NewGetter`).
         let root = ant_retrieval::fetch_root_with_replicas(store, data_ref)
@@ -951,7 +988,7 @@ async fn stream_via_store(
         let prologue = if is_bzz {
             ControlAck::BzzStreamStart {
                 total_bytes: total,
-                reference: data_ref,
+                reference: data_ref.to_vec(),
                 content_type,
                 filename,
                 mutable,
@@ -999,4 +1036,65 @@ async fn stream_via_store(
         Err(e) => ControlAck::Error { message: e },
     };
     let _ = ack.send(terminal).await;
+}
+
+/// Encrypted-body arm of [`stream_via_store`]: emit the `BzzStreamStart`
+/// prologue (size from the decrypted root span), then the decrypt-joined
+/// body as a single `BytesChunk`, applying any range by slicing.
+#[allow(clippy::too_many_arguments)]
+async fn stream_encrypted_via_store(
+    store: &MemChunkStore,
+    enc_ref: [u8; ant_retrieval::ENCRYPTED_REF_SIZE],
+    content_type: Option<String>,
+    filename: Option<String>,
+    mutable: bool,
+    max_bytes: Option<u64>,
+    range: Option<StreamRange>,
+    head_only: bool,
+    ack: &mpsc::Sender<ControlAck>,
+) -> Result<(), String> {
+    let addr: [u8; 32] = enc_ref[..32].try_into().expect("64-byte ref");
+    let key: [u8; 32] = enc_ref[32..].try_into().expect("64-byte ref");
+    let root_wire = store.fetch(addr).await.map_err(|e| e.to_string())?;
+    let (span, _) = ant_crypto::decrypt_chunk_parts(&root_wire, &key).map_err(|e| e.to_string())?;
+    let (_, plain) = ant_retrieval::rs::decode_span(span);
+    let total = u64::from_le_bytes(plain);
+    ack.send(ControlAck::BzzStreamStart {
+        total_bytes: total,
+        reference: enc_ref.to_vec(),
+        content_type,
+        filename,
+        mutable,
+    })
+    .await
+    .map_err(|_| "stream closed".to_string())?;
+    if head_only {
+        return Ok(());
+    }
+    let body_range = range.and_then(|r| ByteRange::clamp(r.start, r.end_inclusive, total));
+    if range.is_some() && body_range.is_none() {
+        return Err("range not satisfiable for resource".to_string());
+    }
+    let body = ant_retrieval::join_encrypted(store, enc_ref, byte_cap(max_bytes))
+        .await
+        .map_err(|e| e.to_string())?;
+    let data = match body_range {
+        Some(r) => {
+            let start = usize::try_from(r.start)
+                .unwrap_or(usize::MAX)
+                .min(body.len());
+            let end = usize::try_from(r.end_inclusive)
+                .unwrap_or(usize::MAX)
+                .saturating_add(1)
+                .min(body.len());
+            body[start..end].to_vec()
+        }
+        None => body,
+    };
+    if !data.is_empty() {
+        ack.send(ControlAck::BytesChunk { data })
+            .await
+            .map_err(|_| "stream closed".to_string())?;
+    }
+    Ok(())
 }

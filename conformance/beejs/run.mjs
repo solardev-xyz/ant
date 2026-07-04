@@ -104,6 +104,28 @@ async function runScenarios(backend, base) {
     record(backend, 'uploadFile(redundancyLevel=1)/downloadFile', false, e.message);
   }
 
+  // 2c. encrypted single file (swarm-encrypt via bee-js
+  // UploadOptions.encrypt): per-chunk keys are random, so the returned
+  // 64-byte reference can never match across backends — this is a
+  // same-backend round-trip only (assert the 128-hex reference shape,
+  // upload, download with the long reference, compare plaintext).
+  try {
+    const encryptedPayload = new TextEncoder().encode('encrypted beejs payload\n'.repeat(300));
+    const up = await bee.uploadFile(BATCH, encryptedPayload, 'secret.bin', {
+      contentType: 'application/octet-stream',
+      encrypt: true,
+    });
+    const refHex = up.reference.toHex();
+    const down = await bee.downloadFile(up.reference);
+    const ok =
+      refHex.length === 128 &&
+      down.name === 'secret.bin' &&
+      Buffer.compare(down.data.toUint8Array(), encryptedPayload) === 0;
+    record(backend, 'uploadFile(encrypt)/downloadFile', ok, `${refHex.slice(0, 16)}… len=${refHex.length}`);
+  } catch (e) {
+    record(backend, 'uploadFile(encrypt)/downloadFile', false, e.message);
+  }
+
   // 3. collection with index document + nested path
   try {
     const indexBytes = new TextEncoder().encode('<h1>index</h1>');

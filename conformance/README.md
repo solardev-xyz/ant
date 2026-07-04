@@ -11,13 +11,20 @@ network or needs credentials.
   checkout** (go.mod `replace ../../../bee`), so every expected value is
   produced by bee's own code: CAC addresses, SOC signatures + addresses,
   feed identifiers, signed feed-update chunks, postage stamp signatures,
-  dispersed-replica addresses, Reed-Solomon parity tables, and complete
-  RS-encoded files (every chunk bee's real pipeline emits at levels
-  1–4).
+  dispersed-replica addresses, Reed-Solomon parity tables (plain *and*
+  encrypted), complete RS-encoded files (every chunk bee's real pipeline
+  emits at levels 1–4), and swarm-encrypt vectors (`encryption.json`):
+  byte-exact chunk-encryption cases with *injected* keys (bee's
+  `pkg/encryption` primitives — the pipeline itself hardwires
+  `crypto/rand`, so whole encrypted trees can't be made deterministic)
+  plus frozen encrypted trees from bee's real pipeline, incl. an
+  encrypted+RS-level-1 composition, that ant's decrypting joiner must
+  reproduce.
 - [`vectors/`](vectors/) — generated JSON, checked in so tests run
   without Go or the bee checkout.
 - Consuming tests: `crates/ant-conformance` (`tests/vectors.rs`,
-  `tests/rs.rs`, `tests/rs_encode.rs`) assert ant is **byte-exact**.
+  `tests/rs.rs`, `tests/rs_encode.rs`, `tests/encryption.rs`) assert ant
+  is **byte-exact**.
 
 ```sh
 cargo test -p ant-conformance            # runs tiers 1 + 2 below
@@ -36,6 +43,10 @@ fields masked):
   `cd conformance/beemock && go build -o beemock .`
 - **subject**: MemNode (`crates/ant-conformance/src/memnode.rs`) — ant's
   production router + retrieval/feed code over an in-memory store.
+- Encrypted uploads (`swarm-encrypt: true`) are compared by *shape*:
+  per-chunk keys are random, so the 128-hex references (and etags that
+  quote them) are masked shape-preserving while decrypted bodies must
+  still be byte-identical.
 - Intentional differences live in [`divergences.json`](divergences.json)
   with explanatory notes; **any unregistered divergence fails the
   test**. When you change gateway behavior, either make it match bee or
@@ -91,11 +102,14 @@ content-addressed and unique per run (timestamped), so runs don't
 collide. Batch health can be checked with
 `antctl postage show --batch-id $SWARM_BATCH_ID`.
 
-Expected result: `12/12 checks passed` (peer warm-up, upload,
-immediate self-read, feed updates 0/1 with immediate latest reads,
-stewardship, envelope, bee ultra-light cross-retrieval of the file and
-feed). Takes ~3–10 minutes depending on network conditions; ant uses
-API port 2733, bee 2833/2834.
+Expected result: `18/18 checks passed` (peer warm-up, upload,
+immediate self-read, encrypted `/bytes` + `/bzz` uploads with 128-hex
+references and self-reads, feed updates 0/1 with immediate latest
+reads, stewardship, envelope, bee ultra-light cross-retrieval of the
+file and feed, and — the real cross-client encryption proof — bee
+decrypting ant's encrypted `/bytes` upload and walking ant's encrypted
+mantaray manifest via `/bzz`). Takes ~3–10 minutes depending on network
+conditions; ant uses API port 2733, bee 2833/2834.
 
 ## Known doc-vs-code drift captured by the vectors
 

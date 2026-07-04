@@ -50,6 +50,7 @@ pub mod accounting;
 pub mod cache;
 pub mod counters;
 pub mod disk_cache;
+pub mod enc_split;
 pub mod feed;
 pub mod fetcher;
 pub mod joiner;
@@ -65,6 +66,9 @@ pub use accounting::{Accounting, DebitGuard, HotHint, OVERDRAFT_REFRESH};
 pub use cache::{InMemoryChunkCache, DEFAULT_CAPACITY as DEFAULT_CACHE_CAPACITY};
 pub use counters::{ChunkSource, RetrievalCounters, RetrievalCountersSnapshot};
 pub use disk_cache::{DiskCacheError, DiskChunkCache, DEFAULT_DISK_CACHE_BYTES};
+pub use enc_split::{
+    split_bytes_encrypted, split_bytes_encrypted_with_keys, EncryptedSplitResult, ENC_REF_SIZE,
+};
 pub use feed::{
     feed_from_metadata, resolve_sequence_feed, resolve_sequence_feed_full, sequence_update_address,
     sequence_update_id, Feed, FeedError, FeedResolution, FeedType, FEED_OWNER_KEY, FEED_TOPIC_KEY,

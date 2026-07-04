@@ -26,8 +26,12 @@
 //! from parities, and [`fetch_root_with_replicas`] used wherever a
 //! bytes/bzz data root is fetched. The *write* side lives in
 //! [`crate::rs_encode`] (redundant splitting + replica SOC minting)
-//! and reuses this module's tables and geometry. The encrypted
-//! (64-byte-reference) RS variant is implemented on neither side.
+//! and reuses this module's tables and geometry. Encrypted trees
+//! (64-byte references) use the separate encrypted erasure tables
+//! ([`get_enc_parities`] / [`max_enc_shards`]); their write side is
+//! [`crate::enc_split`] and their read side [`crate::joiner`]'s
+//! `join_encrypted` (traversal only — parity *recovery* of encrypted
+//! trees is not implemented).
 //!
 //! The Reed-Solomon backend is the `reed-solomon-erasure` crate, which
 //! uses the same Backblaze/klauspost matrix construction as bee's
@@ -85,8 +89,10 @@ const REPLICA_FETCH_FANOUT: usize = 4;
 
 /// Erasure table rows: `(min_shards, parities)`, descending. For `n`
 /// data shards the parity count is the first row with `n >= min_shards`.
-/// These are the *non-encrypted* tables; ant does not read encrypted RS
-/// trees. Pinned against bee in `conformance/vectors/redundancy.json`.
+/// The non-encrypted tables come first, then the encrypted ones
+/// (`encMediumEt` … `encParanoidEt`, appendix F table 6) used when a
+/// tree carries 64-byte encrypted references. All are pinned against
+/// bee in `conformance/vectors/redundancy.json`.
 const MEDIUM_TABLE: &[(usize, usize)] = &[
     (95, 9),
     (69, 8),
@@ -186,6 +192,84 @@ const PARANOID_TABLE: &[(usize, usize)] = &[
     (1, 19),
 ];
 
+const ENC_MEDIUM_TABLE: &[(usize, usize)] =
+    &[(47, 9), (34, 8), (23, 7), (14, 6), (7, 5), (3, 4), (1, 3)];
+const ENC_STRONG_TABLE: &[(usize, usize)] = &[
+    (52, 21),
+    (48, 20),
+    (43, 19),
+    (39, 18),
+    (35, 17),
+    (31, 16),
+    (27, 15),
+    (23, 14),
+    (20, 13),
+    (16, 12),
+    (13, 11),
+    (10, 10),
+    (8, 9),
+    (5, 8),
+    (3, 7),
+    (2, 6),
+    (1, 5),
+];
+const ENC_INSANE_TABLE: &[(usize, usize)] = &[
+    (46, 31),
+    (44, 30),
+    (41, 29),
+    (39, 28),
+    (37, 27),
+    (34, 26),
+    (32, 25),
+    (30, 24),
+    (27, 23),
+    (25, 22),
+    (23, 21),
+    (21, 20),
+    (19, 19),
+    (17, 18),
+    (15, 17),
+    (13, 16),
+    (11, 15),
+    (10, 14),
+    (8, 13),
+    (7, 12),
+    (5, 11),
+    (4, 10),
+    (3, 9),
+    (2, 8),
+    (1, 6),
+];
+const ENC_PARANOID_TABLE: &[(usize, usize)] = &[
+    (18, 87),
+    (17, 84),
+    (16, 81),
+    (15, 78),
+    (14, 75),
+    (13, 71),
+    (12, 68),
+    (11, 65),
+    (10, 61),
+    (9, 58),
+    (8, 54),
+    (7, 50),
+    (6, 47),
+    (5, 43),
+    (4, 38),
+    (3, 34),
+    (2, 29),
+    (1, 23),
+];
+
+fn table_parities(table: &[(usize, usize)], shards: usize) -> usize {
+    for &(min_shards, parities) in table {
+        if shards >= min_shards {
+            return parities;
+        }
+    }
+    0
+}
+
 /// Parity count for `shards` data shards at `level` (bee
 /// `Level.GetParities`). Level 0 (or out-of-range) has no parities.
 #[must_use]
@@ -197,12 +281,21 @@ pub fn get_parities(level: u8, shards: usize) -> usize {
         4 => PARANOID_TABLE,
         _ => return 0,
     };
-    for &(min_shards, parities) in table {
-        if shards >= min_shards {
-            return parities;
-        }
-    }
-    0
+    table_parities(table, shards)
+}
+
+/// Parity count for `shards` *encrypted* data shards at `level` (bee
+/// `Level.GetEncParities`, appendix F table 6). Level 0 → 0.
+#[must_use]
+pub fn get_enc_parities(level: u8, shards: usize) -> usize {
+    let table = match level {
+        1 => ENC_MEDIUM_TABLE,
+        2 => ENC_STRONG_TABLE,
+        3 => ENC_INSANE_TABLE,
+        4 => ENC_PARANOID_TABLE,
+        _ => return 0,
+    };
+    table_parities(table, shards)
 }
 
 /// Maximum number of *data* references in one intermediate chunk at
@@ -211,6 +304,15 @@ pub fn get_parities(level: u8, shards: usize) -> usize {
 #[must_use]
 pub fn max_shards(level: u8) -> usize {
     128 - get_parities(level, 128)
+}
+
+/// Maximum number of encrypted (64-byte) data references in one
+/// intermediate chunk at `level` (bee `Level.GetMaxEncShards`):
+/// `(128 - GetEncParities(64)) / 2` — each data reference occupies two
+/// 32-byte slots, each parity reference one. Level 0 → 64.
+#[must_use]
+pub fn max_enc_shards(level: u8) -> usize {
+    (128 - get_enc_parities(level, 64)) / 2
 }
 
 /// True when the span's top byte carries a redundancy level
@@ -242,7 +344,24 @@ pub const fn decode_span(mut span: [u8; SPAN_SIZE]) -> (u8, [u8; SPAN_SIZE]) {
 /// parity count off the level's erasure table.
 #[must_use]
 pub fn reference_count(span: u64, level: u8) -> (usize, usize) {
-    let branching = max_shards(level) as u64;
+    let data_shards = count_data_shards(span, max_shards(level) as u64);
+    (data_shards, get_parities(level, data_shards))
+}
+
+/// [`reference_count`] for trees carrying 64-byte *encrypted*
+/// references (bee `file.ReferenceCount` with `encryptedChunk = true`):
+/// branching and parities come from the encrypted tables
+/// ([`max_enc_shards`] / [`get_enc_parities`]).
+#[must_use]
+pub fn reference_count_enc(span: u64, level: u8) -> (usize, usize) {
+    let data_shards = count_data_shards(span, max_enc_shards(level) as u64);
+    (data_shards, get_enc_parities(level, data_shards))
+}
+
+/// Shared geometry of `reference_count`(`_enc`): brute-force the BMT
+/// level whose per-reference capacity covers `span`, then count the
+/// references needed on that level.
+fn count_data_shards(span: u64, branching: u64) -> usize {
     let mut branch_size = CHUNK_SIZE as u64;
     let mut branch_level: u32 = 1;
     while branch_size < span {
@@ -263,7 +382,7 @@ pub fn reference_count(span: u64, level: u8) -> (usize, usize) {
         span_offset += reference_size;
         data_shards += 1;
     }
-    (data_shards, get_parities(level, data_shards))
+    data_shards
 }
 
 /// Redundancy metadata of a fetched chunk's wire bytes: `(level, plain

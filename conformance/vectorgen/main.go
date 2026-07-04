@@ -31,8 +31,10 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/ethersphere/bee/v2/pkg/bmtpool"
 	"github.com/ethersphere/bee/v2/pkg/cac"
 	"github.com/ethersphere/bee/v2/pkg/crypto"
+	"github.com/ethersphere/bee/v2/pkg/encryption"
 	"github.com/ethersphere/bee/v2/pkg/feeds"
 	"github.com/ethersphere/bee/v2/pkg/file/pipeline/builder"
 	"github.com/ethersphere/bee/v2/pkg/file/redundancy"
@@ -40,6 +42,7 @@ import (
 	"github.com/ethersphere/bee/v2/pkg/replicas"
 	"github.com/ethersphere/bee/v2/pkg/soc"
 	"github.com/ethersphere/bee/v2/pkg/swarm"
+	"golang.org/x/crypto/sha3"
 )
 
 func main() {
@@ -65,6 +68,7 @@ func run(outDir string) error {
 		"replicas.json":      replicaVectors(),
 		"redundancy.json":    redundancyVectors(),
 		"rs_files.json":      redundantFileVectors(),
+		"encryption.json":    encryptionVectors(),
 	}
 	for name, v := range files {
 		blob, err := json.MarshalIndent(v, "", "  ")
@@ -641,5 +645,164 @@ func redundantFileVectors() any {
 	return map[string]any{
 		"description": "files encoded by bee's real pipeline (builder.NewPipelineBuilder) with swarm-redundancy levels; chunks = every emitted chunk (data+intermediate+parity); span top byte encodes level|0x80 on intermediate nodes; parity count per node from the level's erasure table; rootReplicas = dispersed replica SOCs from replicas.NewPutter",
 		"cases":       cases,
+	}
+}
+
+// --- swarm-encrypt (content encryption) ------------------------------------
+
+type encChunkCase struct {
+	Name string `json:"name"`
+	// Injected 32-byte chunk encryption key. Bee's pipeline draws these
+	// from crypto/rand; the primitive layer (pkg/encryption) takes an
+	// explicit key, which is what makes these vectors deterministic.
+	KeyHex string `json:"keyHex"`
+	// Plaintext chunk payload (no span).
+	PayloadHex string `json:"payloadHex"`
+	// Plaintext 8-byte LE span (encodes payload length for leaves; the
+	// intermediate case carries a subtree byte count instead).
+	PlainSpanHex string `json:"plainSpanHex"`
+	// encryption.NewSpanEncryption(key).Encrypt(span) — initCtr 128.
+	EncSpanHex string `json:"encSpanHex"`
+	// Keystream ciphertext of the payload only (initCtr 0, unpadded).
+	// Bee stores this right-padded to 4096 with *random* bytes;
+	// decryption truncates the pad away, so the padded stored form
+	// below uses zeros to stay deterministic.
+	EncDataHex string `json:"encDataHex"`
+	// encSpan || encData zero-padded to 4104 — a valid stored form.
+	StoredWireHex string `json:"storedWireHex"`
+	// BMT address of the stored form (header = encSpan): the leading
+	// half of the chunk's 64-byte encrypted reference (addr || key).
+	AddressHex string `json:"addressHex"`
+}
+
+func encChunkVector(name, keySeed string, span uint64, payload []byte) encChunkCase {
+	key := encryption.Key(det(keySeed, encryption.KeyLength))
+	spanBytes := make([]byte, 8)
+	binary.LittleEndian.PutUint64(spanBytes, span)
+
+	encSpan, err := encryption.NewSpanEncryption(key).Encrypt(spanBytes)
+	if err != nil {
+		panic(err)
+	}
+	// padding=0 variant of NewDataEncryption: same keystream, no random
+	// pad, so the ciphertext is deterministic and exactly payload-sized.
+	dataEnc := encryption.New(key, 0, 0, sha3.NewLegacyKeccak256)
+	encData, err := dataEnc.Encrypt(payload)
+	if err != nil {
+		panic(err)
+	}
+
+	stored := make([]byte, swarm.SpanSize+swarm.ChunkSize)
+	copy(stored, encSpan)
+	copy(stored[swarm.SpanSize:], encData)
+
+	hasher := bmtpool.Get()
+	hasher.SetHeader(stored[:swarm.SpanSize])
+	if _, err := hasher.Write(stored[swarm.SpanSize:]); err != nil {
+		panic(err)
+	}
+	addr := hasher.Sum(nil)
+	bmtpool.Put(hasher)
+
+	return encChunkCase{
+		Name:          name,
+		KeyHex:        hexs(key),
+		PayloadHex:    hexs(payload),
+		PlainSpanHex:  hexs(spanBytes),
+		EncSpanHex:    hexs(encSpan),
+		EncDataHex:    hexs(encData),
+		StoredWireHex: hexs(stored),
+		AddressHex:    hexs(addr),
+	}
+}
+
+// encTreeCase freezes an encrypted tree produced by bee's *real*
+// pipeline (random keys — nondeterministic at generation time, but
+// fixed once written). Ant's decrypting joiner must reproduce the
+// payload from the 64-byte root reference; this proves ant reads what
+// canonical bee writes, including the encrypted-RS composition.
+type encTreeCase struct {
+	Name     string `json:"name"`
+	Level    int    `json:"level"`
+	FileSize int    `json:"fileSize"`
+	// 64-byte root reference (address || key), 128 hex chars.
+	RootRefHex   string    `json:"rootRefHex"`
+	Chunks       []rsChunk `json:"chunks"`
+	RootReplicas []rsChunk `json:"rootReplicas"`
+}
+
+func encTreeVector(name string, level, size int) encTreeCase {
+	payload := det(fmt.Sprintf("enc/%s", name), size)
+	put := &collectPutter{chunks: make(map[string][]byte)}
+	p := builder.NewPipelineBuilder(context.Background(), put, true, redundancy.Level(level))
+	root, err := builder.FeedPipeline(context.Background(), p, bytes.NewReader(payload))
+	if err != nil {
+		panic(err)
+	}
+	if len(root.Bytes()) != encryption.ReferenceSize {
+		panic("encrypted pipeline must return a 64-byte reference")
+	}
+
+	repPut := &collectPutter{chunks: make(map[string][]byte)}
+	if level > 0 {
+		// Bee replicates the root chunk keyed on its 32-byte address.
+		rootAddr := swarm.NewAddress(root.Bytes()[:swarm.HashSize])
+		rootData, ok := put.chunks[rootAddr.String()]
+		if !ok {
+			panic("encrypted root chunk missing from collected set")
+		}
+		rp := replicas.NewPutter(repPut, redundancy.Level(level))
+		if err := rp.Put(context.Background(), swarm.NewChunk(rootAddr, rootData)); err != nil {
+			panic(err)
+		}
+		delete(repPut.chunks, rootAddr.String())
+	}
+
+	toSorted := func(m map[string][]byte) []rsChunk {
+		keys := make([]string, 0, len(m))
+		for k := range m {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		out := make([]rsChunk, 0, len(keys))
+		for _, k := range keys {
+			out = append(out, rsChunk{AddressHex: k, DataHex: hexs(m[k])})
+		}
+		return out
+	}
+	return encTreeCase{
+		Name:         name,
+		Level:        level,
+		FileSize:     size,
+		RootRefHex:   root.String(),
+		Chunks:       toSorted(put.chunks),
+		RootReplicas: toSorted(repPut.chunks),
+	}
+}
+
+func encryptionVectors() any {
+	chunkCases := []encChunkCase{
+		// leaf, short payload
+		encChunkVector("leaf-short", "enc/key/1", 46, det("enc/data/1", 46)),
+		// leaf, exactly one full chunk (no padding at all)
+		encChunkVector("leaf-full", "enc/key/2", 4096, det("enc/data/2", 4096)),
+		// intermediate: span covers 3 leaves, payload = 3 x 64-byte refs
+		encChunkVector("intermediate-3refs", "enc/key/3", 3*4096, det("enc/refs/3", 3*64)),
+	}
+	treeCases := []encTreeCase{
+		// single encrypted leaf: root ref points straight at the data chunk
+		encTreeVector("l0-tiny", 0, 1000),
+		// one intermediate level (3 leaves < 64 branching)
+		encTreeVector("l0-12k", 0, 12*1024+5),
+		// two intermediate levels (150 leaves > 64 encrypted branching)
+		encTreeVector("l0-600k", 0, 600*1024),
+		// encrypted + RS level 1: 74 leaves > 59 maxEncShards -> two
+		// intermediate nodes with parities + level-encoded spans
+		encTreeVector("medium-300k", 1, 300*1024),
+	}
+	return map[string]any{
+		"description": "swarm content encryption: chunkCases pin bee's pkg/encryption primitives with injected keys and zero ciphertext padding (byte-exact for ant's encryptor); treeCases freeze whole encrypted trees from bee's real pipeline (random keys, frozen once generated) that ant's decrypting joiner must reproduce, incl. one encrypted+RS composition",
+		"chunkCases":  chunkCases,
+		"treeCases":   treeCases,
 	}
 }

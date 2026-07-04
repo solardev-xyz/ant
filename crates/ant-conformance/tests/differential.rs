@@ -81,7 +81,10 @@ async fn spawn_beemock(bin: &PathBuf) -> Beemock {
         serde_json::from_str(hello_line.trim()).expect("parse beemock hello line");
     let base = format!("http://{}", hello.listening);
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_mins(1))
+        .build()
+        .expect("build http client");
     for _ in 0..100 {
         if let Ok(r) = client.get(format!("{base}/health")).send().await {
             if r.status().is_success() {
@@ -120,7 +123,20 @@ struct Step {
     /// length still compare — before the diff. Scoped per step so a
     /// generic key name like `index` can't hide real diffs elsewhere.
     volatile: &'static [&'static str],
+    /// Step-scoped volatile response headers, masked shape-preserving
+    /// like `volatile` (an encrypted upload's `etag` quotes a random
+    /// 128-hex reference: the value differs per backend, the format
+    /// must not).
+    volatile_headers: &'static [&'static str],
+    /// Per-backend dynamic step: computes `(path, body)` from the
+    /// backend's extracted vars, for steps whose *payload* embeds a
+    /// backend-specific value (e.g. a feed update wrapping that
+    /// backend's random encrypted reference). Overrides `path`/`body`.
+    build: Option<StepBuilder>,
 }
+
+/// See [`Step::build`].
+type StepBuilder = fn(&HashMap<String, String>) -> (String, Vec<u8>);
 
 impl Step {
     fn new(name: &'static str, method: &'static str, path: impl Into<String>) -> Self {
@@ -132,6 +148,8 @@ impl Step {
             body: Vec::new(),
             extract: Vec::new(),
             volatile: &[],
+            volatile_headers: &[],
+            build: None,
         }
     }
     fn header(mut self, k: &str, v: impl Into<String>) -> Self {
@@ -148,6 +166,14 @@ impl Step {
     }
     fn volatile(mut self, keys: &'static [&'static str]) -> Self {
         self.volatile = keys;
+        self
+    }
+    fn volatile_headers(mut self, keys: &'static [&'static str]) -> Self {
+        self.volatile_headers = keys;
+        self
+    }
+    fn build(mut self, f: StepBuilder) -> Self {
+        self.build = Some(f);
         self
     }
 }
@@ -240,12 +266,16 @@ fn observe(
     headers: &reqwest::header::HeaderMap,
     body: &[u8],
     step_volatile: &[&str],
+    step_volatile_headers: &[&str],
 ) -> Observation {
     let mut kept = BTreeMap::new();
     for name in COMPARED_HEADERS {
         if let Some(v) = headers.get(*name) {
             let val = if PRESENCE_ONLY_HEADERS.contains(name) {
                 "<present>".to_string()
+            } else if step_volatile_headers.contains(name) {
+                // Shape-preserving mask, like step-volatile JSON keys.
+                format!("<masked {} chars>", v.as_bytes().len())
             } else {
                 v.to_str().unwrap_or("<non-ascii>").to_string()
             };
@@ -311,7 +341,11 @@ fn substitute(template: &str, vars: &HashMap<String, String>) -> String {
 }
 
 async fn run_step(client: &reqwest::Client, backend: &mut Backend, step: &Step) -> Observation {
-    let url = format!("{}{}", backend.base, substitute(&step.path, &backend.vars));
+    let (path, body) = match step.build {
+        Some(f) => f(&backend.vars),
+        None => (substitute(&step.path, &backend.vars), step.body.clone()),
+    };
+    let url = format!("{}{}", backend.base, path);
     let mut req = match step.method {
         "GET" => client.get(&url),
         "HEAD" => client.head(&url),
@@ -324,8 +358,8 @@ async fn run_step(client: &reqwest::Client, backend: &mut Backend, step: &Step) 
     for (k, v) in &step.headers {
         req = req.header(k, substitute(v, &backend.vars));
     }
-    if !step.body.is_empty() {
-        req = req.body(step.body.clone());
+    if !body.is_empty() {
+        req = req.body(body);
     }
     let resp = req
         .send()
@@ -333,7 +367,15 @@ async fn run_step(client: &reqwest::Client, backend: &mut Backend, step: &Step) 
         .unwrap_or_else(|e| panic!("{}: {} {} failed: {e}", backend.name, step.method, url));
     let status = resp.status().as_u16();
     let headers = resp.headers().clone();
-    let body = resp.bytes().await.expect("read body").to_vec();
+    // A backend can violate HTTP by advertising a Content-Length it
+    // never delivers (bee does exactly that on GET /feeds for encrypted
+    // v1 references — see the registered `encryption/feed-latest`
+    // divergence). Surface that as an observable body marker instead of
+    // killing the whole run.
+    let body = match resp.bytes().await {
+        Ok(b) => b.to_vec(),
+        Err(e) => format!("<body read error: {e}>").into_bytes(),
+    };
 
     if !step.extract.is_empty() {
         if let Ok(v) = serde_json::from_slice::<Value>(&body) {
@@ -348,7 +390,13 @@ async fn run_step(client: &reqwest::Client, backend: &mut Backend, step: &Step) 
             }
         }
     }
-    observe(status, &headers, &body, step.volatile)
+    observe(
+        status,
+        &headers,
+        &body,
+        step.volatile,
+        step.volatile_headers,
+    )
 }
 
 struct Diff {
@@ -440,6 +488,52 @@ fn build_tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
     }
     out.extend(std::iter::repeat_n(0u8, 1024));
     out
+}
+
+// --- encrypted-feed helpers ---------------------------------------------------
+
+/// Identity for the encrypted-feed differential steps: the checked-in
+/// conformance key (`det("ant-conformance/key/1")` = one keccak of the
+/// label, mirroring vectorgen) and a scenario-private topic.
+fn enc_feed_identity() -> ([u8; 32], String, [u8; 32]) {
+    let secret = ant_crypto::keccak256(b"ant-conformance/key/1");
+    let sk = k256::ecdsa::SigningKey::from_bytes(&secret.into()).expect("valid secret");
+    let owner = ant_crypto::ethereum_address_from_public_key(sk.verifying_key());
+    let topic = ant_crypto::keccak256(b"differential/enc-feed/topic");
+    (secret, hex::encode(owner), topic)
+}
+
+/// Per-backend feed update 0 wrapping that backend's freshly-extracted
+/// encrypted reference (`enc_feed_ref`): bee's legacy v1 payload
+/// `BE8(timestamp) ‖ ref(64)` — an 80-byte wrapped chunk, the encrypted
+/// shape `classify_payload` / bee's `isV1Length` recognises. Built per
+/// backend because the encrypted reference is random per upload.
+fn enc_feed_update_step(vars: &HashMap<String, String>) -> (String, Vec<u8>) {
+    let (secret, owner_hex, topic) = enc_feed_identity();
+    let enc_ref = hex::decode(
+        vars.get("enc_feed_ref")
+            .expect("enc_feed_ref extracted by the preceding upload step"),
+    )
+    .expect("enc_feed_ref is hex");
+    assert_eq!(enc_ref.len(), 64, "encrypted reference must be 64 bytes");
+
+    let id = ant_retrieval::sequence_update_id(&topic, 0);
+    let mut payload = 1_720_000_000u64.to_be_bytes().to_vec();
+    payload.extend_from_slice(&enc_ref);
+    let (cac_addr, cac_wire) = ant_crypto::cac_new(&payload).expect("payload fits a chunk");
+    let mut digest_input = Vec::with_capacity(64);
+    digest_input.extend_from_slice(&id);
+    digest_input.extend_from_slice(&cac_addr);
+    let digest = ant_crypto::keccak256(&digest_input);
+    let sig = ant_crypto::sign_handshake_data(&secret, &digest).expect("sign feed update");
+    (
+        format!(
+            "/soc/{owner_hex}/{}?sig={}",
+            hex::encode(id),
+            hex::encode(sig)
+        ),
+        cac_wire,
+    )
 }
 
 // --- scenarios --------------------------------------------------------------------
@@ -614,6 +708,110 @@ fn scenarios() -> Vec<Scenario> {
                 Step::new("index", "GET", "/bzz/{dir_ref}/"),
                 Step::new("subpath", "GET", "/bzz/{dir_ref}/sub/data.txt"),
                 Step::new("missing-path", "GET", "/bzz/{dir_ref}/nope.txt"),
+            ],
+        },
+        // `swarm-encrypt: true` end-to-end. Encrypted references are
+        // random per upload, so cross-backend *values* can never match:
+        // the upload responses mask the reference shape-preserving
+        // (both must be 128 hex chars) and the downloads mask the etag
+        // the same way; the decrypted BODIES must still be identical.
+        Scenario {
+            name: "encryption",
+            steps: vec![
+                Step::new("upload-bytes", "POST", "/bytes")
+                    .header("content-type", "application/octet-stream")
+                    .header("swarm-postage-batch-id", batch)
+                    .header("swarm-encrypt", "true")
+                    .body(&b"differential encrypted bytes payload"[..])
+                    .extract("reference", "enc_bytes_ref")
+                    .volatile(&["reference"]),
+                Step::new("download-bytes", "GET", "/bytes/{enc_bytes_ref}")
+                    .volatile_headers(&["etag"]),
+                Step::new("head-bytes", "HEAD", "/bytes/{enc_bytes_ref}"),
+                Step::new("range-bytes", "GET", "/bytes/{enc_bytes_ref}")
+                    .header("range", "bytes=13-21")
+                    .volatile_headers(&["etag"]),
+                // Multi-chunk + explicit redundancy: encryption composes
+                // with RS (encrypted erasure tables, halved branching).
+                Step::new("upload-bytes-redundant", "POST", "/bytes")
+                    .header("content-type", "application/octet-stream")
+                    .header("swarm-postage-batch-id", batch)
+                    .header("swarm-encrypt", "true")
+                    .header("swarm-redundancy-level", "2")
+                    .body(b"encrypted redundant differential payload\n".repeat(600))
+                    .extract("reference", "enc_rs_ref")
+                    .volatile(&["reference"]),
+                Step::new("download-bytes-redundant", "GET", "/bytes/{enc_rs_ref}")
+                    .volatile_headers(&["etag"]),
+                // Encrypted single-file /bzz: the manifest nodes are
+                // themselves encrypted; walking them requires decrypting
+                // every node.
+                Step::new("upload-file", "POST", "/bzz?name=secret.txt")
+                    .header("content-type", "text/plain")
+                    .header("swarm-postage-batch-id", batch)
+                    .header("swarm-encrypt", "true")
+                    .body(&b"hello encrypted differential world\n"[..])
+                    .extract("reference", "enc_file_ref")
+                    .volatile(&["reference"])
+                    .volatile_headers(&["etag"]),
+                Step::new("download-file", "GET", "/bzz/{enc_file_ref}/")
+                    .volatile_headers(&["etag"]),
+                Step::new(
+                    "download-file-by-name",
+                    "GET",
+                    "/bzz/{enc_file_ref}/secret.txt",
+                )
+                .volatile_headers(&["etag"]),
+                Step::new("head-file", "HEAD", "/bzz/{enc_file_ref}/").volatile_headers(&["etag"]),
+                // Encrypted collection (tar) with subpath walk.
+                Step::new("upload-collection", "POST", "/bzz")
+                    .header("content-type", "application/x-tar")
+                    .header("swarm-postage-batch-id", batch)
+                    .header("swarm-collection", "true")
+                    .header("swarm-encrypt", "true")
+                    .header("swarm-index-document", "index.html")
+                    .body(build_tar(&[
+                        ("index.html", b"<h1>secret index</h1>".as_slice()),
+                        ("sub/data.txt", b"nested encrypted data".as_slice()),
+                    ]))
+                    .extract("reference", "enc_dir_ref")
+                    .volatile(&["reference"]),
+                Step::new("collection-index", "GET", "/bzz/{enc_dir_ref}/")
+                    .volatile_headers(&["etag"]),
+                Step::new(
+                    "collection-subpath",
+                    "GET",
+                    "/bzz/{enc_dir_ref}/sub/data.txt",
+                )
+                .volatile_headers(&["etag"]),
+                Step::new("collection-missing", "GET", "/bzz/{enc_dir_ref}/nope.txt"),
+                // Malformed header value: bee's strconv.ParseBool 400.
+                Step::new("bad-encrypt-header", "POST", "/bytes")
+                    .header("content-type", "application/octet-stream")
+                    .header("swarm-postage-batch-id", batch)
+                    .header("swarm-encrypt", "maybe")
+                    .body(&b"x"[..]),
+                // Feed pointing at encrypted content: upload encrypted
+                // bytes, wrap the per-backend 64-byte reference in a
+                // legacy v1 feed update (80-byte payload), then read the
+                // feed — both backends must serve the decrypted content.
+                Step::new("upload-feed-content", "POST", "/bytes")
+                    .header("content-type", "application/octet-stream")
+                    .header("swarm-postage-batch-id", batch)
+                    .header("swarm-encrypt", "true")
+                    .body(&b"encrypted feed content differential"[..])
+                    .extract("reference", "enc_feed_ref")
+                    .volatile(&["reference"]),
+                Step::new("write-enc-feed-update", "POST", "/soc/dynamic")
+                    .header("content-type", "application/octet-stream")
+                    .header("swarm-postage-batch-id", batch)
+                    .build(enc_feed_update_step)
+                    .volatile(&["reference"]),
+                Step::new("feed-latest", "GET", {
+                    let (_, owner_hex, topic) = enc_feed_identity();
+                    format!("/feeds/{owner_hex}/{}", hex::encode(topic))
+                })
+                .volatile_headers(&["etag", "swarm-soc-signature"]),
             ],
         },
         Scenario {
@@ -994,7 +1192,10 @@ async fn differential_ant_vs_bee() {
     let ant_gw =
         ant_conformance::spawn_mem_gateway(ant_conformance::MemGatewayConfig::default()).await;
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_mins(1))
+        .build()
+        .expect("build http client");
     let registry = load_registry();
     let mut known = Vec::new();
     let mut failures = Vec::new();

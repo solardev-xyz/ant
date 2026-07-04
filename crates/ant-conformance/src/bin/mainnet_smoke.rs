@@ -275,6 +275,128 @@ async fn main() {
         .await;
     h.record("immediate self-read of upload", ok, detail);
 
+    // ---- phase 2b: encrypted uploads (swarm-encrypt: true) -------------------
+    // Encrypted references are random per upload, so cross-backend
+    // reference equality can't exist; the proof is the round-trip —
+    // and, in phase 5, canonical bee decrypting ant-encrypted content
+    // fetched from the real network (including ant's encrypted
+    // mantaray manifest on the /bzz path).
+    println!("phase 2b: encrypted uploads via ant + self-reads");
+    let enc_bytes_body = format!("ant mainnet smoke encrypted bytes {run_nonce}\n").repeat(300);
+    let enc_bytes_ref = match h
+        .client
+        .post(format!("{ant}/bytes"))
+        .header("content-type", "application/octet-stream")
+        .header("swarm-postage-batch-id", batch)
+        .header("swarm-encrypt", "true")
+        .body(enc_bytes_body.clone())
+        .send()
+        .await
+    {
+        Ok(r) if r.status() == 201 => {
+            let body = r.bytes().await.expect("upload body");
+            let v: serde_json::Value = serde_json::from_slice(&body).expect("upload json");
+            let reference = v["reference"].as_str().unwrap_or_default().to_string();
+            let ok = reference.len() == 128;
+            h.record(
+                "encrypted bytes upload via ant (128-hex ref)",
+                ok,
+                format!(
+                    "{}… len={}",
+                    &reference[..16.min(reference.len())],
+                    reference.len()
+                ),
+            );
+            ok.then_some(reference)
+        }
+        Ok(r) => {
+            let status = r.status().as_u16();
+            let body = r.text().await.unwrap_or_default();
+            h.record(
+                "encrypted bytes upload via ant (128-hex ref)",
+                false,
+                format!("status {status}: {body}"),
+            );
+            None
+        }
+        Err(e) => {
+            h.record(
+                "encrypted bytes upload via ant (128-hex ref)",
+                false,
+                e.to_string(),
+            );
+            None
+        }
+    };
+    if let Some(r) = &enc_bytes_ref {
+        let (ok, detail) = h
+            .wait_for_body(
+                &format!("{ant}/bytes/{r}"),
+                enc_bytes_body.as_bytes(),
+                Duration::from_secs(15),
+            )
+            .await;
+        h.record("self-read of encrypted bytes", ok, detail);
+    }
+
+    let enc_file_body =
+        format!("ant mainnet smoke encrypted file {run_nonce}\nvia encrypted mantaray manifest\n");
+    let enc_file_ref = match h
+        .client
+        .post(format!("{ant}/bzz?name=smoke-enc-{run_nonce}.txt"))
+        .header("content-type", "text/plain")
+        .header("swarm-postage-batch-id", batch)
+        .header("swarm-encrypt", "true")
+        .body(enc_file_body.clone())
+        .send()
+        .await
+    {
+        Ok(r) if r.status() == 201 => {
+            let body = r.bytes().await.expect("upload body");
+            let v: serde_json::Value = serde_json::from_slice(&body).expect("upload json");
+            let reference = v["reference"].as_str().unwrap_or_default().to_string();
+            let ok = reference.len() == 128;
+            h.record(
+                "encrypted bzz upload via ant (128-hex ref)",
+                ok,
+                format!(
+                    "{}… len={}",
+                    &reference[..16.min(reference.len())],
+                    reference.len()
+                ),
+            );
+            ok.then_some(reference)
+        }
+        Ok(r) => {
+            let status = r.status().as_u16();
+            let body = r.text().await.unwrap_or_default();
+            h.record(
+                "encrypted bzz upload via ant (128-hex ref)",
+                false,
+                format!("status {status}: {body}"),
+            );
+            None
+        }
+        Err(e) => {
+            h.record(
+                "encrypted bzz upload via ant (128-hex ref)",
+                false,
+                e.to_string(),
+            );
+            None
+        }
+    };
+    if let Some(r) = &enc_file_ref {
+        let (ok, detail) = h
+            .wait_for_body(
+                &format!("{ant}/bzz/{r}/"),
+                enc_file_body.as_bytes(),
+                Duration::from_secs(15),
+            )
+            .await;
+        h.record("self-read of encrypted bzz upload", ok, detail);
+    }
+
     // ---- phase 3: live feed flow (the swarm-kit repro) -----------------------
     println!("phase 3: feed write + immediate latest reads (swarm-kit repro)");
     let topic = keccak256(format!("ant-conformance/mainnet-smoke/{run_nonce}").as_bytes());
@@ -440,6 +562,47 @@ async fn main() {
             )
             .await;
         h.record("bee resolves ant's feed (latest == update 1)", ok, detail);
+
+        // Real cross-client encryption proof: canonical bee fetches
+        // ant-encrypted content from the mainnet and decrypts it with
+        // the key carried in the 128-hex reference — including walking
+        // ant's *encrypted mantaray manifest* on the /bzz path.
+        if let Some(r) = &enc_bytes_ref {
+            let (ok, detail) = h
+                .wait_for_body(
+                    &format!("{bee}/bytes/{r}"),
+                    enc_bytes_body.as_bytes(),
+                    Duration::from_mins(3),
+                )
+                .await;
+            h.record("bee decrypts ant's encrypted /bytes upload", ok, detail);
+        } else {
+            h.record(
+                "bee decrypts ant's encrypted /bytes upload",
+                false,
+                "skipped: encrypted bytes upload failed",
+            );
+        }
+        if let Some(r) = &enc_file_ref {
+            let (ok, detail) = h
+                .wait_for_body(
+                    &format!("{bee}/bzz/{r}/"),
+                    enc_file_body.as_bytes(),
+                    Duration::from_mins(3),
+                )
+                .await;
+            h.record(
+                "bee walks ant's encrypted manifest (bzz round-trip)",
+                ok,
+                detail,
+            );
+        } else {
+            h.record(
+                "bee walks ant's encrypted manifest (bzz round-trip)",
+                false,
+                "skipped: encrypted bzz upload failed",
+            );
+        }
 
         // Keep the guard alive until here.
         drop(bee_proc);

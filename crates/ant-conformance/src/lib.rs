@@ -239,3 +239,41 @@ pub struct RedundancyLevel {
     pub parities: Vec<u32>,
     pub enc_parities: Vec<u32>,
 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EncryptionVectors {
+    pub chunk_cases: Vec<EncChunkCase>,
+    pub tree_cases: Vec<EncTreeCase>,
+}
+
+/// One chunk encrypted with bee's `pkg/encryption` primitives under an
+/// **injected** key (zero ciphertext padding) — byte-exact targets for
+/// ant's `encrypt_chunk_unpadded` / `decrypt_chunk`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EncChunkCase {
+    pub name: String,
+    pub key_hex: String,
+    pub payload_hex: String,
+    pub plain_span_hex: String,
+    pub enc_span_hex: String,
+    pub enc_data_hex: String,
+    pub stored_wire_hex: String,
+    pub address_hex: String,
+}
+
+/// One whole encrypted tree frozen from bee's *real* pipeline
+/// (`builder.NewPipelineBuilder` with `encrypt = true`; random keys,
+/// fixed once generated). The payload is `det("enc/<name>", file_size)`.
+/// Ant's `join_encrypted` must reproduce it from `root_ref_hex`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EncTreeCase {
+    pub name: String,
+    pub level: u8,
+    pub file_size: usize,
+    pub root_ref_hex: String,
+    pub chunks: Vec<RsChunkEntry>,
+    pub root_replicas: Vec<RsChunkEntry>,
+}

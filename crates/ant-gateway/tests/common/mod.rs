@@ -387,7 +387,7 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
             ack,
         } => {
             stream_via_fetcher(
-                fetcher, reference, /* path */ None, /* allow_degraded */ true,
+                fetcher, &reference, /* path */ None, /* allow_degraded */ true,
                 max_bytes, range, head_only, ack,
             )
             .await;
@@ -404,7 +404,7 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
         } => {
             stream_via_fetcher(
                 fetcher,
-                reference,
+                &reference,
                 Some(path),
                 allow_degraded_redundancy,
                 max_bytes,
@@ -424,19 +424,31 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
             ack,
         } => {
             let result = async {
-                let lookup = lookup_path(fetcher, reference, &path)
+                let lookup = lookup_path(fetcher, &reference, &path)
                     .await
                     .map_err(|e| e.to_string())?;
-                let root = fetcher
-                    .fetch(lookup.data_ref)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let opts = JoinOptions {
-                    allow_degraded_redundancy,
-                };
                 let cap = max_bytes.map_or(DEFAULT_MAX_FILE_BYTES, |n| {
                     usize::try_from(n).unwrap_or(usize::MAX)
                 });
+                // Encrypted manifest entry: buffered decrypt-join, like
+                // the production node loop.
+                if let Ok(enc_ref) =
+                    <[u8; ant_retrieval::ENCRYPTED_REF_SIZE]>::try_from(lookup.data_ref.as_slice())
+                {
+                    let body = ant_retrieval::join_encrypted(fetcher, enc_ref, cap)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    return Ok::<_, String>((body, lookup));
+                }
+                let data_ref: [u8; 32] = lookup
+                    .data_ref
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| "manifest entry has invalid width".to_string())?;
+                let root = fetcher.fetch(data_ref).await.map_err(|e| e.to_string())?;
+                let opts = JoinOptions {
+                    allow_degraded_redundancy,
+                };
                 let body = join_with_options(fetcher, &root, cap, opts)
                     .await
                     .map_err(|e| e.to_string())?;
@@ -458,7 +470,7 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
             bypass_cache: _,
             ack,
         } => {
-            let reply = match list_manifest(fetcher, reference).await {
+            let reply = match list_manifest(fetcher, &reference).await {
                 Ok(entries) => ControlAck::Manifest {
                     entries: entries
                         .into_iter()
@@ -792,7 +804,7 @@ pub async fn send(router: Router, req: Request<Body>) -> Response<Body> {
 #[allow(clippy::too_many_arguments)]
 async fn stream_via_fetcher(
     fetcher: &DirFetcher,
-    reference: [u8; 32],
+    reference: &[u8],
     path: Option<String>,
     allow_degraded: bool,
     max_bytes: Option<u64>,
@@ -803,7 +815,7 @@ async fn stream_via_fetcher(
     let is_bzz = path.is_some();
     let result = async {
         let (data_ref, content_type, filename, mutable) = match path {
-            None => (reference, None, None, false),
+            None => (reference.to_vec(), None, None, false),
             Some(p) => {
                 let lookup = lookup_path(fetcher, reference, &p)
                     .await
@@ -827,6 +839,12 @@ async fn stream_via_fetcher(
                 )
             }
         };
+        // The dir-fixture loop serves plain fixtures only; encrypted
+        // manifest entries are exercised through the mem gateway.
+        let data_ref: [u8; 32] = data_ref
+            .as_slice()
+            .try_into()
+            .map_err(|_| "encrypted manifest entries not supported by the dir fixture")?;
         let root = fetcher.fetch(data_ref).await.map_err(|e| e.to_string())?;
         // Mask the redundancy level off the high byte of the span so
         // the reported total reflects the real file size, matching the
@@ -840,7 +858,7 @@ async fn stream_via_fetcher(
         let prologue = if is_bzz {
             ControlAck::BzzStreamStart {
                 total_bytes: total,
-                reference: data_ref,
+                reference: data_ref.to_vec(),
                 content_type,
                 filename,
                 mutable,

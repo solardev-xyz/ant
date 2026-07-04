@@ -130,5 +130,35 @@
     "step": "deref-via-bzz",
     "aspect": "header:swarm-feed-resolved-version",
     "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path \u2014 bzz feed-dereference surface of the same race"
+  },
+  {
+    "scenario": "encryption",
+    "step": "feed-latest",
+    "aspect": "status",
+    "note": "encrypted-feed serving: bee's feedGetHandler resolves the 80-byte v1 payload to the 64-byte encrypted reference but then serves it via downloadHandler with the pre-fetched root chunk (joiner.NewJoiner(..., rootCh)), which skips the decrypting store: the still-encrypted span becomes the Content-Length (garbage petabytes) and the response either 500s with net/http's 'seeker can't seek' or 200s and aborts the body mid-stream. ant decrypts (GetBytesEncrypted via join_encrypted) and serves the plaintext with 200 + correct length \u2014 ant is deliberately correct where bee is broken; the smoke + bee-js cover encrypted content via /bytes and /bzz, which bee serves fine"
+  },
+  {
+    "scenario": "encryption",
+    "step": "feed-latest",
+    "aspect": "body",
+    "note": "encrypted-feed serving: bee's feedGetHandler resolves the 80-byte v1 payload to the 64-byte encrypted reference but then serves it via downloadHandler with the pre-fetched root chunk (joiner.NewJoiner(..., rootCh)), which skips the decrypting store: the still-encrypted span becomes the Content-Length (garbage petabytes) and the response either 500s with net/http's 'seeker can't seek' or 200s and aborts the body mid-stream. ant decrypts (GetBytesEncrypted via join_encrypted) and serves the plaintext with 200 + correct length \u2014 ant is deliberately correct where bee is broken; the smoke + bee-js cover encrypted content via /bytes and /bzz, which bee serves fine"
+  },
+  {
+    "scenario": "encryption",
+    "step": "feed-latest",
+    "aspect": "header:content-type",
+    "note": "encrypted-feed serving: bee's feedGetHandler resolves the 80-byte v1 payload to the 64-byte encrypted reference but then serves it via downloadHandler with the pre-fetched root chunk (joiner.NewJoiner(..., rootCh)), which skips the decrypting store: the still-encrypted span becomes the Content-Length (garbage petabytes) and the response either 500s with net/http's 'seeker can't seek' or 200s and aborts the body mid-stream. ant decrypts (GetBytesEncrypted via join_encrypted) and serves the plaintext with 200 + correct length \u2014 ant is deliberately correct where bee is broken; the smoke + bee-js cover encrypted content via /bytes and /bzz, which bee serves fine"
+  },
+  {
+    "scenario": "encryption",
+    "step": "feed-latest",
+    "aspect": "header:etag",
+    "note": "encrypted-feed serving: bee's feedGetHandler resolves the 80-byte v1 payload to the 64-byte encrypted reference but then serves it via downloadHandler with the pre-fetched root chunk (joiner.NewJoiner(..., rootCh)), which skips the decrypting store: the still-encrypted span becomes the Content-Length (garbage petabytes) and the response either 500s with net/http's 'seeker can't seek' or 200s and aborts the body mid-stream. ant decrypts (GetBytesEncrypted via join_encrypted) and serves the plaintext with 200 + correct length \u2014 ant is deliberately correct where bee is broken; the smoke + bee-js cover encrypted content via /bytes and /bzz, which bee serves fine"
+  },
+  {
+    "scenario": "encryption",
+    "step": "feed-latest",
+    "aspect": "header:content-disposition",
+    "note": "encrypted-feed serving: bee's feedGetHandler resolves the 80-byte v1 payload to the 64-byte encrypted reference but then serves it via downloadHandler with the pre-fetched root chunk (joiner.NewJoiner(..., rootCh)), which skips the decrypting store: the still-encrypted span becomes the Content-Length (garbage petabytes) and the response either 500s with net/http's 'seeker can't seek' or 200s and aborts the body mid-stream. ant decrypts (GetBytesEncrypted via join_encrypted) and serves the plaintext with 200 + correct length \u2014 ant is deliberately correct where bee is broken; the smoke + bee-js cover encrypted content via /bytes and /bzz, which bee serves fine"
   }
 ]

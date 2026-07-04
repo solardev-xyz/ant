@@ -368,12 +368,28 @@ fn redundancy_tables_parse_and_match_documented_shape() {
             "max_shards for level {}",
             level.name
         );
+        assert_eq!(
+            ant_retrieval::rs::max_enc_shards(level.level) as u32,
+            level.max_enc_shards,
+            "max_enc_shards for level {}",
+            level.name
+        );
         // parities[n-1] = GetParities(n) for every used-slot count n.
         for (n, expected) in level.parities.iter().enumerate() {
             assert_eq!(
                 ant_retrieval::rs::get_parities(level.level, n + 1) as u32,
                 *expected,
                 "GetParities({}) at level {}",
+                n + 1,
+                level.name
+            );
+        }
+        // enc_parities[n-1] = GetEncParities(n) — the encrypted table.
+        for (n, expected) in level.enc_parities.iter().enumerate() {
+            assert_eq!(
+                ant_retrieval::rs::get_enc_parities(level.level, n + 1) as u32,
+                *expected,
+                "GetEncParities({}) at level {}",
                 n + 1,
                 level.name
             );

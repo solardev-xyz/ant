@@ -289,3 +289,155 @@ async fn feed_round_trip_resolves_v2_update() {
     drop(client);
     gw.shutdown().await;
 }
+
+/// (e) `swarm-encrypt: true` end-to-end over the production gateway:
+/// encrypted `/bytes` and `/bzz` uploads return 128-hex references that
+/// round-trip (including a Range slice and the encrypted mantaray walk
+/// by explicit path), and a feed whose v1 update wraps the 64-byte
+/// encrypted reference serves the *decrypted* content on `GET /feeds`
+/// — the ant-side correctness assertion behind the registered
+/// `encryption/feed-latest` divergence (bee's own handler mis-serves
+/// this case; see conformance/divergences.json).
+#[tokio::test]
+async fn encrypted_uploads_round_trip_and_feed_decrypts() {
+    let gw = spawn_mem_gateway(MemGatewayConfig::default()).await;
+    let client = reqwest::Client::new();
+
+    // Encrypted /bytes (multi-chunk).
+    let bytes_body = b"encrypted memnode bytes payload\n".repeat(400);
+    let resp = client
+        .post(format!("{}/bytes", gw.base_url()))
+        .header("swarm-postage-batch-id", BATCH_ID)
+        .header("swarm-encrypt", "true")
+        .body(bytes_body.clone())
+        .send()
+        .await
+        .expect("POST /bytes");
+    assert_eq!(resp.status().as_u16(), 201);
+    let bytes_ref = reference_from(&resp.bytes().await.expect("body"));
+    assert_eq!(bytes_ref.len(), 128, "encrypted reference must be 128 hex");
+
+    let resp = client
+        .get(format!("{}/bytes/{bytes_ref}", gw.base_url()))
+        .send()
+        .await
+        .expect("GET /bytes");
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(
+        resp.bytes().await.expect("body").as_ref(),
+        bytes_body.as_slice()
+    );
+
+    // Range over encrypted content.
+    let resp = client
+        .get(format!("{}/bytes/{bytes_ref}", gw.base_url()))
+        .header("range", "bytes=10-41")
+        .send()
+        .await
+        .expect("GET /bytes range");
+    assert_eq!(resp.status().as_u16(), 206);
+    assert_eq!(
+        resp.bytes().await.expect("body").as_ref(),
+        &bytes_body[10..=41]
+    );
+
+    // Encrypted /bzz with explicit path + HEAD.
+    let file_body = b"encrypted memnode file body".to_vec();
+    let resp = client
+        .post(format!("{}/bzz?name=enc.txt", gw.base_url()))
+        .header("swarm-postage-batch-id", BATCH_ID)
+        .header("content-type", "text/plain")
+        .header("swarm-encrypt", "true")
+        .body(file_body.clone())
+        .send()
+        .await
+        .expect("POST /bzz");
+    assert_eq!(resp.status().as_u16(), 201);
+    let file_ref = reference_from(&resp.bytes().await.expect("body"));
+    assert_eq!(file_ref.len(), 128);
+
+    for path in ["", "enc.txt"] {
+        let resp = client
+            .get(format!("{}/bzz/{file_ref}/{path}", gw.base_url()))
+            .send()
+            .await
+            .expect("GET /bzz");
+        assert_eq!(resp.status().as_u16(), 200, "path {path:?}");
+        assert_eq!(
+            resp.bytes().await.expect("body").as_ref(),
+            file_body.as_slice(),
+            "path {path:?}"
+        );
+    }
+    let resp = client
+        .head(format!("{}/bzz/{file_ref}/", gw.base_url()))
+        .send()
+        .await
+        .expect("HEAD /bzz");
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok()),
+        Some(file_body.len().to_string().as_str()),
+        "HEAD must report the decrypted length"
+    );
+
+    // Feed wrapping the encrypted /bytes reference (bee's 80-byte v1
+    // payload): GET /feeds must serve the decrypted content.
+    let secret = ant_crypto::keccak256(b"memnode/enc-feed/key");
+    let sk = k256::ecdsa::SigningKey::from_bytes(&secret.into()).expect("valid secret");
+    let owner = ant_crypto::ethereum_address_from_public_key(sk.verifying_key());
+    let topic = ant_crypto::keccak256(b"memnode/enc-feed/topic");
+    let id = ant_retrieval::sequence_update_id(&topic, 0);
+    let mut payload = 1_720_000_000u64.to_be_bytes().to_vec();
+    payload.extend_from_slice(&unhex("bytes_ref", &bytes_ref));
+    let (cac_addr, cac_wire) = ant_crypto::cac_new(&payload).expect("cac");
+    let mut digest_input = Vec::with_capacity(64);
+    digest_input.extend_from_slice(&id);
+    digest_input.extend_from_slice(&cac_addr);
+    let sig = ant_crypto::sign_handshake_data(&secret, &ant_crypto::keccak256(&digest_input))
+        .expect("sign");
+    let resp = client
+        .post(format!(
+            "{}/soc/{}/{}?sig={}",
+            gw.base_url(),
+            hex::encode(owner),
+            hex::encode(id),
+            hex::encode(sig)
+        ))
+        .header("content-type", "application/octet-stream")
+        .header("swarm-postage-batch-id", BATCH_ID)
+        .body(cac_wire)
+        .send()
+        .await
+        .expect("POST /soc");
+    assert_eq!(resp.status().as_u16(), 201);
+
+    let resp = client
+        .get(format!(
+            "{}/feeds/{}/{}",
+            gw.base_url(),
+            hex::encode(owner),
+            hex::encode(topic)
+        ))
+        .send()
+        .await
+        .expect("GET /feeds");
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("swarm-feed-resolved-version")
+            .and_then(|v| v.to_str().ok()),
+        Some("v1"),
+        "80-byte wrapped payload must resolve as legacy v1"
+    );
+    assert_eq!(
+        resp.bytes().await.expect("body").as_ref(),
+        bytes_body.as_slice(),
+        "feed must serve the decrypted content"
+    );
+
+    drop(client);
+    gw.shutdown().await;
+}
