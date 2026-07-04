@@ -456,6 +456,12 @@ pub enum ControlAck {
     /// and a terminal `StreamDone` / `Error`.
     BzzStreamStart {
         total_bytes: u64,
+        /// Resolved **data reference** of the manifest entry being
+        /// served (the reference bee's `downloadHandler` receives from
+        /// `manifestEntry.Reference()`). The gateway quotes it in the
+        /// `ETag` response header, matching bee's
+        /// `w.Header().Set(ETagHeader, fmt.Sprintf("%q", reference))`.
+        reference: [u8; 32],
         content_type: Option<String>,
         filename: Option<String>,
         /// `true` when the resolved reference was a **feed manifest**, so

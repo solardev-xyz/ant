@@ -130,7 +130,20 @@ pub fn build_single_file_manifest(
             data_ref,
         }],
         Some(filename),
+        IndexAnchor::EmptyNode,
     )
+}
+
+/// Shape of the synthetic `/` index-document anchor's child node. Bee
+/// emits different bytes from its two upload code paths, and manifest
+/// references only match bee's if ant mirrors the distinction:
+/// single-file uploads (`bzz.go` file handler) produce a refsize-0
+/// empty node; tar/multipart dir uploads (`dirs.go`) store
+/// `swarm.ZeroAddress`, i.e. a 32-byte zero entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexAnchor {
+    EmptyNode,
+    ZeroEntry,
 }
 
 /// Build a manifest covering many files. `files` is a list of distinct
@@ -152,6 +165,7 @@ pub fn build_single_file_manifest(
 pub fn build_collection_manifest(
     files: &[ManifestFile],
     index_document: Option<&str>,
+    anchor: IndexAnchor,
 ) -> Result<ManifestWriteResult, ManifestWriteError> {
     if files.is_empty() {
         return Err(ManifestWriteError::EmptyPath);
@@ -190,9 +204,21 @@ pub fn build_collection_manifest(
         // to website-index-document, regardless of whether the named
         // file exists in the manifest. If it doesn't, bee returns 404
         // when bzz://<root>/ is hit; we mirror that exactly.
-        let idx_node = TrieNode {
-            value: Some(EmptyValue),
-            ..Default::default()
+        //
+        // The anchor's child node differs between bee's two upload
+        // paths and both must hash to bee's exact bytes: the
+        // single-file handler emits a refsize-0 empty node, while the
+        // dir handler stores swarm.ZeroAddress — a 32-byte zero entry
+        // (dirs.go `manifest.NewEntry(swarm.ZeroAddress, metadata)`).
+        let idx_node = match anchor {
+            IndexAnchor::EmptyNode => TrieNode {
+                value: Some(EmptyValue),
+                ..Default::default()
+            },
+            IndexAnchor::ZeroEntry => TrieNode {
+                own_data_ref: Some([0u8; 32]),
+                ..Default::default()
+            },
         };
         let fork = TrieFork {
             prefix: b"/".to_vec(),
@@ -605,7 +631,11 @@ fn file_metadata(content_type: &str, filename: &str) -> BTreeMap<String, String>
         MANTARAY_CONTENT_TYPE_KEY.to_string(),
         content_type.to_string(),
     );
-    m.insert("Filename".to_string(), filename.to_string());
+    // Bee stores the path BASENAME as Filename (dirs.go uses
+    // fileHeader.FileInfo().Name()); writing the full path changes the
+    // metadata bytes and therefore the manifest reference.
+    let base = filename.rsplit('/').next().unwrap_or(filename);
+    m.insert("Filename".to_string(), base.to_string());
     m
 }
 
@@ -673,12 +703,38 @@ mod tests {
     }
 
     #[test]
+    fn collection_manifest_reference_matches_bee() {
+        let index_split = crate::splitter::split_bytes(b"<h1>index</h1>");
+        let data_split = crate::splitter::split_bytes(b"nested data");
+        let m = build_collection_manifest(
+            &[
+                ManifestFile {
+                    path: "index.html".to_string(),
+                    content_type: Some("text/html; charset=utf-8".to_string()),
+                    data_ref: index_split.root,
+                },
+                ManifestFile {
+                    path: "sub/data.txt".to_string(),
+                    content_type: Some("text/plain; charset=utf-8".to_string()),
+                    data_ref: data_split.root,
+                },
+            ],
+            Some("index.html"),
+            IndexAnchor::ZeroEntry,
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(m.root),
+            "4f37b1abda26f952cbf72b387449d5887314d99c19b3d8cf78e4001b939e4c77",
+        );
+    }
+
+    #[test]
     fn feed_manifest_reference_matches_bee() {
-        let owner: [u8; 20] =
-            hex::decode("ff6316419def87e4ea768e09a04dd56ebb40cb4e")
-                .unwrap()
-                .try_into()
-                .unwrap();
+        let owner: [u8; 20] = hex::decode("ff6316419def87e4ea768e09a04dd56ebb40cb4e")
+            .unwrap()
+            .try_into()
+            .unwrap();
         let topic: [u8; 32] =
             hex::decode("e36165b0d71a05b2330be5a2519c2573d2c9b35c75e94fab874c46a8210641d0")
                 .unwrap()
@@ -782,7 +838,8 @@ mod tests {
             });
         }
         let manifest =
-            build_collection_manifest(&files, Some("index.html")).expect("build manifest");
+            build_collection_manifest(&files, Some("index.html"), IndexAnchor::ZeroEntry)
+                .expect("build manifest");
         for c in &manifest.chunks {
             fetcher.ingest(c);
         }
@@ -819,6 +876,7 @@ mod tests {
                 data_ref: split.root,
             }],
             None,
+            IndexAnchor::ZeroEntry,
         )
         .unwrap();
         let mut fetcher = MapFetcher::new();
@@ -868,7 +926,7 @@ mod tests {
                 data_ref: [0u8; 32],
             })
             .collect();
-        let manifest = build_collection_manifest(&files, None).unwrap();
+        let manifest = build_collection_manifest(&files, None, IndexAnchor::ZeroEntry).unwrap();
         for c in &manifest.chunks {
             assert!(
                 ant_crypto::cac_valid(&c.address, &c.wire),
@@ -908,7 +966,7 @@ mod tests {
                 data_ref: split.root,
             });
         }
-        let manifest = build_collection_manifest(&files, None).unwrap();
+        let manifest = build_collection_manifest(&files, None, IndexAnchor::ZeroEntry).unwrap();
         for c in &manifest.chunks {
             fetcher.ingest(c);
         }
@@ -946,8 +1004,8 @@ mod tests {
         ];
         let reversed: Vec<ManifestFile> = forward.iter().rev().cloned().collect();
 
-        let m1 = build_collection_manifest(&forward, None).unwrap();
-        let m2 = build_collection_manifest(&reversed, None).unwrap();
+        let m1 = build_collection_manifest(&forward, None, IndexAnchor::ZeroEntry).unwrap();
+        let m2 = build_collection_manifest(&reversed, None, IndexAnchor::ZeroEntry).unwrap();
         assert_eq!(m1.root, m2.root);
     }
 
@@ -982,6 +1040,7 @@ mod tests {
                 },
             ],
             None,
+            IndexAnchor::ZeroEntry,
         )
         .unwrap();
         for c in &manifest.chunks {
@@ -1006,7 +1065,8 @@ mod tests {
             content_type: None,
             data_ref: [0u8; 32],
         };
-        let err = build_collection_manifest(&[f.clone(), f], None).unwrap_err();
+        let err =
+            build_collection_manifest(&[f.clone(), f], None, IndexAnchor::ZeroEntry).unwrap_err();
         assert!(matches!(err, ManifestWriteError::EmptyPath));
     }
 
@@ -1142,6 +1202,7 @@ mod tests {
                 data_ref: split.root,
             }],
             Some("index.html"),
+            IndexAnchor::ZeroEntry,
         )
         .unwrap();
         for c in &manifest.chunks {

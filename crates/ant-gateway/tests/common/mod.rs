@@ -95,7 +95,7 @@ impl ChunkFetcher for DirFetcher {
             .get(&addr)
             .cloned()
             .ok_or_else(|| -> Box<dyn StdError + Send + Sync> {
-                format!("fixture missing chunk {}", hex::encode(addr)).into()
+                format!("chunk {} not found (fixture)", hex::encode(addr)).into()
             })
     }
 }
@@ -773,6 +773,7 @@ async fn stream_via_fetcher(
         let prologue = if is_bzz {
             ControlAck::BzzStreamStart {
                 total_bytes: total,
+                reference: data_ref,
                 content_type,
                 filename,
                 mutable,

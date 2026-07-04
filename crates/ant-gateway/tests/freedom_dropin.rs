@@ -83,9 +83,15 @@ async fn post_bytes_returns_reference_and_completed_tag() {
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let tag: Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert!(tag["total"].as_u64().unwrap() >= 1);
-    assert_eq!(tag["synced"], tag["total"]);
-    assert_eq!(tag["split"], tag["total"]);
+    // Bee's tag JSON has no `total`; a synchronous upload reports the
+    // full chunk count in every counter.
+    assert!(
+        tag.get("total").is_none(),
+        "bee tag JSON has no total field"
+    );
+    assert!(tag["split"].as_u64().unwrap() >= 1);
+    assert_eq!(tag["synced"], tag["split"]);
+    assert_eq!(tag["sent"], tag["split"]);
     assert_eq!(tag["address"], reference);
 }
 
@@ -165,10 +171,11 @@ async fn post_feeds_creates_manifest() {
     );
 }
 
-/// `POST /feeds` with `?type=epoch` is rejected 501 (only sequence
-/// feeds are supported, matching the read path).
+/// `POST /feeds` ignores the `?type=` query parameter exactly like
+/// bee's `feedPostHandler` (which never reads it and always writes a
+/// Sequence manifest) — `?type=epoch` still creates the manifest.
 #[tokio::test]
-async fn post_feeds_epoch_is_501() {
+async fn post_feeds_epoch_type_is_ignored_like_bee() {
     let router = handle_with_fixture_node();
     let owner = "0102030405060708090a0b0c0d0e0f1011121314";
     let topic = "2222222222222222222222222222222222222222222222222222222222222222";
@@ -177,11 +184,15 @@ async fn post_feeds_epoch_is_501() {
         Request::builder()
             .method(Method::POST)
             .uri(format!("/feeds/{owner}/{topic}?type=epoch"))
+            .header(
+                "swarm-postage-batch-id",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
             .body(Body::empty())
             .unwrap(),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(resp.status(), StatusCode::CREATED);
 }
 
 /// A configured batch is surfaced by `GET /stamps` as a usable,
