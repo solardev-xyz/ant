@@ -432,6 +432,14 @@ impl CreditLedger {
         }
     }
 
+    /// The beneficiary address accepted cheques must target (our own
+    /// node's EOA). Exposed so the accounting snapshot can render the
+    /// `lastreceived.beneficiary` field of `GET /chequebook/cheque`.
+    #[must_use]
+    pub fn beneficiary(&self) -> [u8; 20] {
+        self.our_beneficiary
+    }
+
     /// Snapshot copy of every chequebook record we know about.
     /// Useful for `antctl swap list` (future) and for the cashout
     /// helper that wants to know the highest cheque per peer.
@@ -517,9 +525,18 @@ impl OutboundLedger {
 
     /// Last cumulative we issued to `beneficiary` (zero if none).
     pub fn cumulative_for(&self, beneficiary: &[u8; 20]) -> U256 {
+        self.recorded_for(beneficiary).unwrap_or(U256::zero())
+    }
+
+    /// Like [`Self::cumulative_for`] but distinguishes "no cheque ever
+    /// issued" (`None`) from a recorded cumulative. The accounting
+    /// snapshot needs the difference: bee's `/settlements/{peer}`
+    /// 404s on a peer with no settlement record rather than reporting
+    /// zero.
+    pub fn recorded_for(&self, beneficiary: &[u8; 20]) -> Option<U256> {
         let key = hex::encode(beneficiary);
         let guard = self.inner.lock().expect("outbound ledger poisoned");
-        guard.get(&key).copied().unwrap_or(U256::zero())
+        guard.get(&key).copied()
     }
 
     /// Set `beneficiary` → `new_cumulative` (typically called after
