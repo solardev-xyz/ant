@@ -506,6 +506,11 @@ fn scenarios() -> Vec<Scenario> {
     let (presigned_addr, presigned_wire) =
         ant_crypto::cac_new(b"presigned stamp round trip payload").expect("payload fits a chunk");
 
+    // Multi-chunk (3 leaves) deterministic body for the redundancy
+    // scenario: redundancy only changes the tree once there is an
+    // intermediate node to erasure-code.
+    let redundant_body: Vec<u8> = (0..10240usize).map(|i| ((i * 7) % 251) as u8).collect();
+
     vec![
         Scenario {
             name: "bytes",
@@ -517,6 +522,20 @@ fn scenarios() -> Vec<Scenario> {
                     .extract("reference", "bytes_ref"),
                 Step::new("download", "GET", "/bytes/{bytes_ref}"),
                 Step::new("head", "HEAD", "/bytes/{bytes_ref}"),
+                // Multi-chunk upload with NO redundancy header: bee
+                // applies DefaultUploadLevel = MEDIUM, so the tree gets
+                // parities + level-encoded spans — the references only
+                // match if ant defaults to MEDIUM too.
+                Step::new("upload-multichunk-default", "POST", "/bytes")
+                    .header("content-type", "application/octet-stream")
+                    .header("swarm-postage-batch-id", batch)
+                    .body(b"default-level differential payload\n".repeat(400))
+                    .extract("reference", "bytes_mc_ref"),
+                Step::new(
+                    "download-multichunk-default",
+                    "GET",
+                    "/bytes/{bytes_mc_ref}",
+                ),
                 Step::new("missing", "GET", format!("/bytes/{missing_ref}")),
                 Step::new("upload-no-batch", "POST", "/bytes")
                     .header("content-type", "application/octet-stream")
@@ -846,6 +865,85 @@ fn scenarios() -> Vec<Scenario> {
         // (settlements), and — deliberately NOT a 404 — 200 with null
         // lastreceived/lastsent for /chequebook/cheque/{peer} (bee's
         // handler tolerates chequebook.ErrNoCheque on both sides).
+        // Redundant uploads (swarm-redundancy-level): byte-identical
+        // references here are the drop-in proof for ant's Reed-Solomon
+        // encoder — the reference is the root of the erasure-coded
+        // tree (parity refs + level-encoded spans included), so it only
+        // matches if ant produced bee's exact pipeline output. Bodies
+        // are multi-chunk (> 4096 B) so redundancy actually reshapes
+        // the tree, and every upload is downloaded back on both
+        // backends. The invalid header values pin bee's two-tier error
+        // shape: Go parse failures keep the map-tag casing
+        // (`Swarm-Redundancy-Level`), the range validator lowercases.
+        Scenario {
+            name: "redundancy",
+            steps: vec![
+                Step::new("upload-bytes-level1", "POST", "/bytes")
+                    .header("content-type", "application/octet-stream")
+                    .header("swarm-postage-batch-id", batch)
+                    .header("swarm-redundancy-level", "1")
+                    .body(redundant_body.clone())
+                    .extract("reference", "rs_bytes1"),
+                Step::new("download-bytes-level1", "GET", "/bytes/{rs_bytes1}"),
+                Step::new("upload-bytes-level4", "POST", "/bytes")
+                    .header("content-type", "application/octet-stream")
+                    .header("swarm-postage-batch-id", batch)
+                    .header("swarm-redundancy-level", "4")
+                    .body(redundant_body.clone())
+                    .extract("reference", "rs_bytes4"),
+                Step::new("download-bytes-level4", "GET", "/bytes/{rs_bytes4}"),
+                Step::new("upload-bzz-level1", "POST", "/bzz?name=redundant.bin")
+                    .header("content-type", "application/octet-stream")
+                    .header("swarm-postage-batch-id", batch)
+                    .header("swarm-redundancy-level", "1")
+                    .body(redundant_body.clone())
+                    .extract("reference", "rs_bzz1"),
+                Step::new("download-bzz-level1", "GET", "/bzz/{rs_bzz1}/"),
+                Step::new("upload-collection-level4", "POST", "/bzz")
+                    .header("content-type", "application/x-tar")
+                    .header("swarm-collection", "true")
+                    .header("swarm-postage-batch-id", batch)
+                    .header("swarm-redundancy-level", "4")
+                    .header("swarm-index-document", "index.html")
+                    .body(build_tar(&[
+                        ("index.html", b"<h1>redundant site</h1>"),
+                        ("big/data.bin", redundant_body.as_slice()),
+                    ]))
+                    .extract("reference", "rs_dir4"),
+                Step::new(
+                    "download-collection-level4",
+                    "GET",
+                    "/bzz/{rs_dir4}/big/data.bin",
+                ),
+                // POST /feeds accepts the header too; a feed manifest
+                // is a single mantaray node, so the reference stays the
+                // level-independent manifest root (bee only adds
+                // dispersed replicas of the node).
+                Step::new(
+                    "create-feed-manifest-level2",
+                    "POST",
+                    format!("/feeds/{}/{}?type=sequence", up0.owner_hex, up0.topic_hex),
+                )
+                .header("swarm-postage-batch-id", batch)
+                .header("swarm-redundancy-level", "2")
+                .extract("reference", "rs_feed_manifest"),
+                Step::new("level-out-of-range", "POST", "/bytes")
+                    .header("content-type", "application/octet-stream")
+                    .header("swarm-postage-batch-id", batch)
+                    .header("swarm-redundancy-level", "9")
+                    .body(&b"x"[..]),
+                Step::new("level-not-a-number", "POST", "/bytes")
+                    .header("content-type", "application/octet-stream")
+                    .header("swarm-postage-batch-id", batch)
+                    .header("swarm-redundancy-level", "abc")
+                    .body(&b"x"[..]),
+                Step::new("level-overflows-uint8", "POST", "/bytes")
+                    .header("content-type", "application/octet-stream")
+                    .header("swarm-postage-batch-id", batch)
+                    .header("swarm-redundancy-level", "256")
+                    .body(&b"x"[..]),
+            ],
+        },
         Scenario {
             name: "settlements",
             steps: vec![

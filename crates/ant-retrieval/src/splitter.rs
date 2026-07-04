@@ -60,6 +60,12 @@ pub struct SplitResult {
 /// `cac_new(b"")` produces. The resulting `root` is the well-known
 /// empty-content reference and the file has zero bytes.
 ///
+/// This is the plain (`swarm-redundancy-level: 0`) splitter. For
+/// erasure-coded trees use
+/// [`crate::rs_encode::split_bytes_with_redundancy`], which produces
+/// bee's exact redundant pipeline output (parity chunks, level-encoded
+/// spans, `max_shards(level)` branching).
+///
 /// # Panics
 ///
 /// Never; all chunk constructions stay within [`CHUNK_SIZE`] by
@@ -133,6 +139,10 @@ pub fn split_bytes(payload: &[u8]) -> SplitResult {
 /// Streaming counterpart of [`split_bytes`]: feed leaves one at a time
 /// and pull the resulting [`SplitChunk`]s as they're produced, never
 /// materialising the whole file (or the whole chunk list) in RAM.
+///
+/// Level-0 only; the redundancy-aware streaming counterpart with the
+/// same push-leaves-then-finish contract is
+/// [`crate::rs_encode::RedundantSplitter`].
 ///
 /// The output is byte-identical to what [`split_bytes`] would have
 /// produced for the same total payload, including the well-known

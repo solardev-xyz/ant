@@ -82,6 +82,28 @@ async function runScenarios(backend, base) {
     record(backend, 'uploadFile/downloadFile', false, e.message);
   }
 
+  // 2b. redundant single file (swarm-redundancy-level via bee-js
+  // UploadOptions.redundancyLevel): multi-chunk payload so the erasure
+  // coding reshapes the tree — the cross-backend reference equality
+  // below is only satisfiable if ant's Reed-Solomon encoder emits
+  // bee's exact redundant pipeline output (parity refs + level-encoded
+  // spans change the root hash).
+  try {
+    const redundantPayload = new TextEncoder().encode('redundant beejs payload\n'.repeat(400));
+    const up = await bee.uploadFile(BATCH, redundantPayload, 'redundant.bin', {
+      contentType: 'application/octet-stream',
+      redundancyLevel: 1,
+    });
+    refs.redundantFile = up.reference.toHex();
+    const down = await bee.downloadFile(up.reference);
+    const ok =
+      down.name === 'redundant.bin' &&
+      Buffer.compare(down.data.toUint8Array(), redundantPayload) === 0;
+    record(backend, 'uploadFile(redundancyLevel=1)/downloadFile', ok, refs.redundantFile);
+  } catch (e) {
+    record(backend, 'uploadFile(redundancyLevel=1)/downloadFile', false, e.message);
+  }
+
   // 3. collection with index document + nested path
   try {
     const indexBytes = new TextEncoder().encode('<h1>index</h1>');
