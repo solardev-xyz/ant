@@ -180,9 +180,19 @@ pub enum ControlCommand {
     /// `batch_id` selects which registered postage batch issues the
     /// stamp; the node loop rejects the push if no issuer is registered
     /// for it (`ControlAck::Error "batch … not usable"`).
+    ///
+    /// `stamp`, when `Some`, carries a **pre-signed** 113-byte postage
+    /// stamp (bee's `swarm-postage-stamp` request header, layout
+    /// `batch_id(32) ‖ index(8) ‖ timestamp(8) ‖ sig(65)`). The node
+    /// then pushes the chunk with *that* stamp instead of issuing one
+    /// from its own registry — no local issuer (or upload runtime) is
+    /// required, mirroring bee's `postage.NewPresignedStamper` path.
+    /// `batch_id` is redundantly the stamp's own leading 32 bytes.
     PushChunk {
         wire: Vec<u8>,
         batch_id: [u8; 32],
+        /// Pre-signed 113-byte stamp; `None` = stamp locally.
+        stamp: Option<Vec<u8>>,
         ack: oneshot::Sender<ControlAck>,
     },
     /// Gateway `POST /soc/{owner}/{id}`: stamp the SOC at `address` and
@@ -191,9 +201,50 @@ pub enum ControlCommand {
     /// `wire` is the SOC's `swarm.Chunk.Data()` form (`id || sig ||
     /// inner_cac`). The node stamps directly at `address` rather than
     /// rederiving via BMT, since SOC addresses are not BMT-addressable.
+    ///
+    /// `stamp` carries an optional pre-signed 113-byte postage stamp —
+    /// see [`ControlCommand::PushChunk`] for the semantics.
     PushSoc {
         address: [u8; 32],
         wire: Vec<u8>,
+        batch_id: [u8; 32],
+        /// Pre-signed 113-byte stamp; `None` = stamp locally.
+        stamp: Option<Vec<u8>>,
+        ack: oneshot::Sender<ControlAck>,
+    },
+    /// Gateway `POST /envelope/{address}`: issue (and persist) a postage
+    /// stamp for a chunk address the caller will upload later — bee's
+    /// `envelopePostHandler` (`stamper.Stamp(address, address)`).
+    /// Consumes a bucket slot on the registered issuer exactly like
+    /// stamping an upload; re-requesting the same address reuses the
+    /// original stamp (the issuer's per-chunk stamp cache). The ack is
+    /// [`ControlAck::Envelope`] carrying the issuer's Ethereum address
+    /// and the full 113-byte stamp.
+    Envelope {
+        address: [u8; 32],
+        batch_id: [u8; 32],
+        ack: oneshot::Sender<ControlAck>,
+    },
+    /// Gateway `GET /stewardship/{address}`: traverse the full content
+    /// tree rooted at `reference` (span trees *and* mantaray manifests,
+    /// bee `pkg/traversal` semantics) and check that every chunk is
+    /// retrievable. The ack is [`ControlAck::Retrievable`]; any
+    /// traversal failure (missing root, unreachable interior node,
+    /// unreachable leaf) reports `retrievable: false` rather than an
+    /// error, matching bee's `steward.IsRetrievable` mapping of
+    /// not-found to `{"isRetrievable": false}`.
+    StewardshipGet {
+        reference: [u8; 32],
+        ack: oneshot::Sender<ControlAck>,
+    },
+    /// Gateway `PUT /stewardship/{address}`: re-upload the content tree
+    /// rooted at `reference` — traverse it, fetch every chunk
+    /// (cache-first via the normal fetcher), stamp each against
+    /// `batch_id`, and pushsync them all (bee `steward.Reupload`). The
+    /// ack is [`ControlAck::Ok`] on success; an unknown batch fails
+    /// with the same "batch … not usable" error `PushChunk` reports.
+    StewardshipPut {
+        reference: [u8; 32],
         batch_id: [u8; 32],
         ack: oneshot::Sender<ControlAck>,
     },
@@ -478,6 +529,19 @@ pub enum ControlAck {
     /// Successful `PushChunk`; reference is lowercase `0x` + 64 nibbles (bee-compatible).
     ChunkUploaded {
         reference: String,
+    },
+    /// Successful `Envelope`: the issuing node's Ethereum address plus
+    /// the full 113-byte stamp (`batch_id(32) ‖ index(8) ‖ timestamp(8)
+    /// ‖ sig(65)`). The gateway slices index/timestamp/signature out of
+    /// the stamp for bee's `postEnvelopeResponse` JSON shape.
+    Envelope {
+        issuer: [u8; 20],
+        stamp: [u8; 113],
+    },
+    /// Terminal ack on `StewardshipGet`: whether every chunk of the
+    /// traversed content tree could be retrieved.
+    Retrievable {
+        retrievable: bool,
     },
     /// Successful `UploadStart`.
     UploadStarted {

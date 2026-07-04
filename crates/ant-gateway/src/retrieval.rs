@@ -97,6 +97,20 @@ const SWARM_TAG_UID: HeaderName = HeaderName::from_static("swarm-tag-uid");
 /// Required: the node selects the matching registered issuer, so a
 /// missing / malformed / unknown batch is a `400` (bee's shape).
 const SWARM_POSTAGE_BATCH_ID: HeaderName = HeaderName::from_static("swarm-postage-batch-id");
+/// Bee request header on `POST /chunks` and `POST /soc/...`: a complete
+/// **pre-signed** 113-byte postage stamp (hex), layout `batch_id(32) ‖
+/// index(8) ‖ timestamp(8) ‖ sig(65)` — bee's `postage.Stamp`
+/// `MarshalBinary` form, typically obtained from `POST /envelope`.
+/// When present, `swarm-postage-batch-id` becomes optional and the
+/// chunk is pushed with *this* stamp instead of one issued locally
+/// (bee's `postage.NewPresignedStamper` path).
+const SWARM_POSTAGE_STAMP: HeaderName = HeaderName::from_static("swarm-postage-stamp");
+
+/// Bee's error body when `POST /chunks` / `POST /soc` carries neither a
+/// batch id nor a pre-signed stamp (`batchIdOrStampSig` in
+/// `bee/pkg/api/api.go`) — verbatim, casing included.
+const BATCH_ID_OR_STAMP_MSG: &str =
+    "Either 'Swarm-Postage-Stamp' or 'Swarm-Postage-Batch-Id' header must be set in the request";
 
 /// Concurrency cap on outbound `PushChunk` commands during a `POST /bzz`
 /// upload. Matched to the daemon-side
@@ -177,12 +191,12 @@ fn set_mutable_cache_headers(resp: &mut Response) {
 /// ant-p2p). 600 s is still a large envelope, but it keeps a wedged
 /// handler from pinning a hyper task indefinitely while allowing the
 /// concurrent media path to complete under normal mainnet latency.
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_mins(10);
+pub(crate) const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_mins(10);
 /// Single-chunk fetches are bounded by `ant-retrieval`'s internal
 /// timeout (20 s) plus the outer retry loop. 60 s leaves room for
 /// retries on a single chunk without inheriting the much larger
 /// multi-chunk envelope.
-const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
+pub(crate) const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Abort a streaming body once it goes this long without delivering any
 /// further bytes — even while the daemon keeps heart-beating `Progress`.
@@ -494,7 +508,7 @@ fn apply_soc_headers(resp: &mut Response, signature: &[u8; 65]) {
 /// this id (an unknown batch fails the push with `"batch … not
 /// usable"`, which the upload handlers map to `400`).
 #[allow(clippy::result_large_err)]
-fn parse_postage_batch_header(headers: &HeaderMap) -> Result<[u8; 32], Response> {
+pub(crate) fn parse_postage_batch_header(headers: &HeaderMap) -> Result<[u8; 32], Response> {
     let raw = headers
         .get(&SWARM_POSTAGE_BATCH_ID)
         .and_then(|v| v.to_str().ok())
@@ -521,6 +535,79 @@ fn parse_postage_batch_header(headers: &HeaderMap) -> Result<[u8; 32], Response>
     }
 }
 
+/// A pre-signed 113-byte postage stamp from the `swarm-postage-stamp`
+/// request header, if the header is present and non-empty.
+///
+/// Bee's shapes, in order: non-hex → `400 invalid header params` with a
+/// Go-style hex reason; valid hex of the wrong length →
+/// `400 "Stamp deserialization failure"` (`postage.Stamp.
+/// UnmarshalBinary` rejecting a non-113-byte blob, message verbatim
+/// from `chunkUploadHandler`/`socUploadHandler`).
+#[allow(clippy::result_large_err)]
+fn parse_postage_stamp_header(headers: &HeaderMap) -> Result<Option<[u8; 113]>, Response> {
+    let Some(raw) = headers
+        .get(&SWARM_POSTAGE_STAMP)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(None);
+    };
+    let mut reasons = Vec::new();
+    match parse_hex_param::<113>(SWARM_POSTAGE_STAMP.as_str(), raw, &mut reasons) {
+        Some(stamp) => Ok(Some(stamp)),
+        None if reasons
+            .iter()
+            .any(|r| r.error.starts_with("invalid length")) =>
+        {
+            // Valid hex, wrong size: bee's mapStructure accepts the
+            // bytes and `Stamp.UnmarshalBinary` then rejects them.
+            Err(json_error(
+                StatusCode::BAD_REQUEST,
+                "Stamp deserialization failure",
+            ))
+        }
+        None => Err(params_error(ParamKind::Header, reasons)),
+    }
+}
+
+/// Resolve the postage source for `POST /chunks` / `POST /soc`:
+/// the pre-signed stamp wins when present; otherwise the batch id
+/// header; neither → bee's `batchIdOrStampSig` 400 (those two
+/// endpoints don't mark the batch header `required`, unlike
+/// `/bytes`/`/bzz`).
+#[allow(clippy::result_large_err)]
+fn parse_stamp_or_batch(headers: &HeaderMap) -> Result<(Option<[u8; 113]>, [u8; 32]), Response> {
+    if let Some(stamp) = parse_postage_stamp_header(headers)? {
+        let batch_id: [u8; 32] = stamp[0..32].try_into().expect("stamp slice");
+        return Ok((Some(stamp), batch_id));
+    }
+    let has_batch = headers
+        .get(&SWARM_POSTAGE_BATCH_ID)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty());
+    if !has_batch {
+        return Err(json_error(StatusCode::BAD_REQUEST, BATCH_ID_OR_STAMP_MSG));
+    }
+    Ok((None, parse_postage_batch_header(headers)?))
+}
+
+/// Verify a pre-signed stamp plausibly covers `addr`: recover the
+/// signer's public key from the stamp signature over bee's stamp digest
+/// (`keccak256(addr ‖ batch ‖ index ‖ ts)`). Recovery failing means the
+/// stamp cannot have been signed over this chunk by anyone. Bee runs
+/// the equivalent check (plus an on-chain owner comparison a light
+/// node can't make) inside `postage.NewPresignedStamper` at Put time.
+fn presigned_stamp_covers(stamp: &[u8; 113], addr: &[u8; 32]) -> bool {
+    let batch: &[u8; 32] = stamp[0..32].try_into().expect("stamp slice");
+    let index: &[u8; 8] = stamp[32..40].try_into().expect("stamp slice");
+    let ts: &[u8; 8] = stamp[40..48].try_into().expect("stamp slice");
+    let sig: &[u8; 65] = stamp[48..113].try_into().expect("stamp slice");
+    let digest = ant_postage::postage_sign_digest(addr, batch, index, ts);
+    ant_crypto::recover_public_key(sig, digest.as_ref()).is_ok()
+}
+
 /// `POST /chunks` — accept a single content-addressed chunk's wire
 /// bytes (`span(8 LE) || payload`), stamp it locally, and pushsync it
 /// to the closest neighbourhood peer. Body cap matches bee:
@@ -543,10 +630,22 @@ pub async fn upload_chunk(
         );
     }
 
-    let batch_id = match parse_postage_batch_header(&headers) {
-        Ok(b) => b,
+    let (stamp, batch_id) = match parse_stamp_or_batch(&headers) {
+        Ok(pair) => pair,
         Err(resp) => return resp,
     };
+
+    // Pre-signed stamp: check the signature actually covers this chunk
+    // before pushing. Bee surfaces the presigned stamper's
+    // `ErrInvalidBatchSignature` as `400 "stamp signature is invalid"`.
+    if let Some(stamp) = &stamp {
+        let mut span = [0u8; 8];
+        span.copy_from_slice(&body[..8]);
+        let addr = ant_crypto::bmt_hash_with_span(&span, &body[8..]);
+        if !addr.is_some_and(|addr| presigned_stamp_covers(stamp, &addr)) {
+            return json_error(StatusCode::BAD_REQUEST, "stamp signature is invalid");
+        }
+    }
 
     let timeout = request_timeout(&headers, CHUNK_REQUEST_TIMEOUT);
 
@@ -558,6 +657,7 @@ pub async fn upload_chunk(
     let cmd = ControlCommand::PushChunk {
         wire: body.to_vec(),
         batch_id,
+        stamp: stamp.map(|s| s.to_vec()),
         ack: ack_tx,
     };
     if handle.commands.send(cmd).await.is_err() {
@@ -710,10 +810,19 @@ pub async fn upload_soc(
         return json_error(StatusCode::UNAUTHORIZED, "invalid chunk");
     }
 
-    let batch_id = match parse_postage_batch_header(&headers) {
-        Ok(b) => b,
+    let (stamp, batch_id) = match parse_stamp_or_batch(&headers) {
+        Ok(pair) => pair,
         Err(resp) => return resp,
     };
+
+    // Pre-signed stamp: check the signature covers the SOC's
+    // owner-bound address. Bee's soc handler surfaces the presigned
+    // stamper's rejection at Put time as `400 "chunk write error"`.
+    if let Some(stamp) = &stamp {
+        if !presigned_stamp_covers(stamp, &address) {
+            return json_error(StatusCode::BAD_REQUEST, "chunk write error");
+        }
+    }
 
     let timeout = request_timeout(&headers, CHUNK_REQUEST_TIMEOUT);
 
@@ -727,6 +836,7 @@ pub async fn upload_soc(
         address,
         wire,
         batch_id,
+        stamp: stamp.map(|s| s.to_vec()),
         ack: ack_tx,
     };
     if handle.commands.send(cmd).await.is_err() {
@@ -1262,6 +1372,7 @@ async fn push_chunks(
             let cmd = ControlCommand::PushChunk {
                 wire: chunk.wire.clone(),
                 batch_id,
+                stamp: None,
                 ack: ack_tx,
             };
             if handle.commands.send(cmd).await.is_err() {
@@ -2237,7 +2348,7 @@ async fn drain_terminal(
 /// `400 {"code":400,"message":"invalid path params","reasons":[{"field":
 /// "address","error":"invalid hex byte: …"}]}`.
 #[allow(clippy::result_large_err)]
-fn parse_reference(s: &str) -> Result<[u8; 32], Response> {
+pub(crate) fn parse_reference(s: &str) -> Result<[u8; 32], Response> {
     let mut reasons = Vec::new();
     parse_hex_param::<32>("address", s, &mut reasons)
         .ok_or_else(|| params_error(ParamKind::Path, reasons))
@@ -2261,7 +2372,7 @@ fn parse_owner_pair(
     }
 }
 
-fn request_timeout(headers: &HeaderMap, default: Duration) -> Duration {
+pub(crate) fn request_timeout(headers: &HeaderMap, default: Duration) -> Duration {
     headers
         .get(&SWARM_CHUNK_RETRIEVAL_TIMEOUT)
         .and_then(|v| v.to_str().ok())
@@ -2491,14 +2602,14 @@ fn parse_single_range(raw: &str, total: u64) -> Result<Option<(u64, u64)>, Range
     Ok(Some((start, end)))
 }
 
-fn node_unavailable() -> Response {
+pub(crate) fn node_unavailable() -> Response {
     json_error(
         StatusCode::SERVICE_UNAVAILABLE,
         "node loop is no longer accepting commands",
     )
 }
 
-fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Response {
+pub(crate) fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Response {
     let body = serde_json::to_vec(value).expect("serialize json response");
     let mut resp = Response::new(Body::from(body));
     *resp.status_mut() = status;

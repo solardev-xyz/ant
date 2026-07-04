@@ -19,7 +19,7 @@ use tracing::Instrument;
 use crate::fallback::not_implemented;
 use crate::handle::GatewayHandle;
 use crate::retrieval::GATEWAY_MAX_UPLOAD_BYTES;
-use crate::{chain, retrieval, stamps, status, tags};
+use crate::{chain, retrieval, stamps, status, stewardship, tags};
 
 const SERVER_HEADER: &str = concat!("ant-gateway/", env!("CARGO_PKG_VERSION"));
 
@@ -72,6 +72,14 @@ pub fn build(handle: GatewayHandle) -> Router {
                 .patch(tags::patch_tag),
         )
         .route("/chunks", post(retrieval::upload_chunk))
+        // Pre-signed postage stamp issuance (bee `envelope.go`) and
+        // content stewardship (bee `stewardship.go` / `pkg/steward`):
+        // retrievability check + re-upload of a whole content tree.
+        .route("/envelope/{address}", post(stewardship::post_envelope))
+        .route(
+            "/stewardship/{address}",
+            get(stewardship::stewardship_get).put(stewardship::stewardship_put),
+        )
         .route("/soc/{owner}/{id}", post(retrieval::upload_soc))
         // Raw byte upload (PLAN.md J.2.5 / C1): bee-js feed payloads and
         // direct data uploads. Returns a `/bytes/<ref>` reference.

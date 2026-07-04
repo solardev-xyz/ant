@@ -659,26 +659,29 @@ async fn load_node(fetcher: &dyn ChunkFetcher, addr: [u8; 32]) -> Result<Node, M
 }
 
 /// In-memory representation of a mantaray node after unmarshalling.
+/// Crate-visible so the chunk-tree traverser in [`crate::traversal`] can
+/// walk raw manifest tries (bee `pkg/traversal` semantics: node chunks
+/// and value entries, *without* feed dereferencing).
 // `node_type` is the on-wire type-tag bitfield (value/edge/with-metadata),
 // not a stuttering field name.
 #[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone)]
-struct Node {
+pub(crate) struct Node {
     /// Bee-side bitfield (value/edge/with-metadata). We parse it for
     /// fidelity with the on-wire format and to keep diagnostics readable;
     /// fork lookup is currently driven by `entry`/`forks` directly.
     #[allow(dead_code)]
     node_type: u8,
-    entry: Vec<u8>,
+    pub(crate) entry: Vec<u8>,
     metadata: HashMap<String, String>,
-    forks: HashMap<u8, Fork>,
+    pub(crate) forks: HashMap<u8, Fork>,
 }
 
 #[derive(Debug, Clone)]
-struct Fork {
+pub(crate) struct Fork {
     node_type: u8,
     prefix: Vec<u8>,
-    child_ref: [u8; 32],
+    pub(crate) child_ref: [u8; 32],
     metadata: HashMap<String, String>,
 }
 
@@ -686,7 +689,7 @@ impl Node {
     /// Parse a fully-joined manifest node. The first 32 bytes are the
     /// obfuscation key (treated literally), the rest is `XORed` with that
     /// key as a 32-byte rolling pad before parsing.
-    fn unmarshal(input: &[u8]) -> Result<Self, ManifestError> {
+    pub(crate) fn unmarshal(input: &[u8]) -> Result<Self, ManifestError> {
         if input.len() < NODE_HEADER_SIZE {
             return Err(ManifestError::TooShort(format!(
                 "{} bytes < header {}",
