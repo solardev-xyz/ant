@@ -188,7 +188,7 @@ pub fn run_collection(socket: &Path, args: PinCollectionArgs, json: bool) -> Res
         manifest_files.push(ManifestFile {
             path: manifest_path,
             content_type: Some(content_type.clone()),
-            data_ref,
+            data_ref: data_ref.to_vec(),
         });
     }
 
@@ -234,7 +234,7 @@ pub fn run_collection(socket: &Path, args: PinCollectionArgs, json: bool) -> Res
             .map(|f| {
                 serde_json::json!({
                     "path": f.path,
-                    "data_ref": format!("0x{}", hex::encode(f.data_ref)),
+                    "data_ref": format!("0x{}", hex::encode(&f.data_ref)),
                     "content_type": f.content_type,
                 })
             })
@@ -261,7 +261,7 @@ pub fn run_collection(socket: &Path, args: PinCollectionArgs, json: bool) -> Res
         }
         println!("  entries:");
         for f in &manifest_files {
-            println!("    /{}  ->  0x{}", f.path, hex::encode(f.data_ref));
+            println!("    /{}  ->  0x{}", f.path, hex::encode(&f.data_ref));
         }
     }
     Ok(())

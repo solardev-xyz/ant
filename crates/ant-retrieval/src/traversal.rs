@@ -182,8 +182,14 @@ async fn traverse_manifest(
         }
 
         for fork in node.forks.values() {
-            if fork.child_ref != [0u8; 32] {
-                stack.push(fork.child_ref);
+            // Encrypted manifests (64-byte fork refs) can't reach this
+            // walker: their node chunks are ciphertext, so `unmarshal`
+            // above already fails for them. Only plain 32-byte children
+            // are traversable.
+            if let Ok(child) = <[u8; 32]>::try_from(fork.child_ref.as_slice()) {
+                if child != [0u8; 32] {
+                    stack.push(child);
+                }
             }
         }
     }

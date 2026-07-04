@@ -10,7 +10,10 @@ mod error;
 pub mod soc;
 
 pub use bmt::{bmt_hash_with_span, bmt_root, cac_new, cac_valid, CHUNK_SIZE, SPAN_SIZE};
-pub use encryption::{decrypt_chunk, DecryptError, KEY_LENGTH, REFERENCE_SIZE};
+pub use encryption::{
+    decrypt_chunk, decrypt_chunk_parts, encrypt_chunk_unpadded, random_encryption_key,
+    DecryptError, KEY_LENGTH, REFERENCE_SIZE,
+};
 pub use error::CryptoError;
 pub use soc::{soc_valid, SOC_HEADER_SIZE, SOC_ID_SIZE, SOC_MIN_CHUNK_SIZE, SOC_SIG_SIZE};
 

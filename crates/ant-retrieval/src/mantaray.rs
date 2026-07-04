@@ -22,8 +22,10 @@
 //! [32..63]  31-byte version hash
 //!           - "mantaray:0.2" → 5768b3...28f7b   (current)
 //!           - "mantaray:0.1" → 025184...a9b7   (legacy, also handled)
-//! [63]      ref-bytes-size (32 = unencrypted, 64 = encrypted; we only
-//!           accept 32)
+//! [63]      ref-bytes-size (32 = unencrypted, 64 = encrypted — entry
+//!           and fork references are `address ‖ decryption key` and the
+//!           node chunks themselves are stored encrypted; the
+//!           obfuscation key is random rather than all-zero)
 //! [64..64+R] entry: data reference for *this* node (zeroed if no entry)
 //! [+0..+32] forks index — 256-bit bitmap, bit `b` set ⇒ a fork starts on
 //!           input byte `b`
@@ -49,7 +51,8 @@
 //! `website-index-document`, we treat that as the path. This matches what
 //! `bee/pkg/api/bzz.go` does when serving `bzz://<ref>/`.
 
-use crate::feed::{feed_from_metadata, resolve_sequence_feed, FeedError, FeedType};
+use crate::feed::{feed_from_metadata, resolve_sequence_feed_full, FeedError, FeedType};
+use crate::joiner::{join_encrypted, ENCRYPTED_REF_SIZE};
 use crate::ChunkFetcher;
 use crate::{cac_valid, join, JoinError, DEFAULT_MAX_FILE_BYTES};
 use futures::stream::{self, StreamExt};
@@ -96,9 +99,6 @@ pub enum ManifestError {
     /// Version hash on the node is neither mantaray:0.1 nor mantaray:0.2.
     #[error("unsupported manifest version: {0}")]
     UnsupportedVersion(String),
-    /// Reference size is 64 (encrypted manifest); we only handle 32.
-    #[error("encrypted manifests not supported")]
-    UnsupportedEncryption,
     /// Ref length is something other than 0, 32, or 64.
     #[error("invalid manifest reference length: {0}")]
     InvalidRefLength(u8),
@@ -128,9 +128,11 @@ pub enum ManifestError {
 /// One match in the manifest trie.
 #[derive(Debug, Clone)]
 pub struct LookupResult {
-    /// 32-byte reference to the file data — feed this to [`crate::join`]
-    /// (after fetching the chunk it points to) to read the file contents.
-    pub data_ref: [u8; 32],
+    /// Reference to the file data: 32 bytes for a plain manifest entry
+    /// (feed it to [`crate::join`] after fetching the chunk it points
+    /// at) or 64 bytes (`address ‖ decryption key`) for an entry in an
+    /// encrypted manifest (feed it to [`crate::join_encrypted`]).
+    pub data_ref: Vec<u8>,
     /// `Content-Type` metadata at the matched value node, if present.
     pub content_type: Option<String>,
     /// All metadata at the matched value node. Caller may inspect for
@@ -149,10 +151,11 @@ pub struct LookupResult {
 pub struct ManifestEntry {
     /// Path prefix represented by this manifest entry.
     pub path: String,
-    /// File data reference for value entries. `None` means the entry only
-    /// carries metadata, e.g. the synthetic `/` fork with
+    /// File data reference for value entries (32 bytes, or 64 in an
+    /// encrypted manifest). `None` means the entry only carries
+    /// metadata, e.g. the synthetic `/` fork with
     /// `website-index-document`.
-    pub reference: Option<[u8; 32]>,
+    pub reference: Option<Vec<u8>>,
     /// Metadata attached to this entry or fork.
     pub metadata: BTreeMap<String, String>,
     /// Total file size in bytes, derived from the 8-byte BMT span on the
@@ -176,21 +179,24 @@ pub struct ManifestEntry {
 /// usual lookup against the returned address, so the rest of the
 /// manifest decoder doesn't need to know feeds exist.
 /// Returns `(effective_root, is_feed)`: `is_feed` is `true` when
-/// `root_addr` was a feed manifest (so the resolved content is mutable at
-/// the stable manifest reference and must not be cached immutably).
+/// `root_ref` was a feed manifest (so the resolved content is mutable at
+/// the stable manifest reference and must not be cached immutably). The
+/// returned reference is 32 bytes, or 64 when the feed points at
+/// encrypted content (bee's 80-byte v1 payload) — the subsequent
+/// manifest load decrypts transparently.
 pub async fn resolve_feed_root(
     fetcher: &dyn ChunkFetcher,
-    root_addr: [u8; 32],
-) -> Result<([u8; 32], bool), ManifestError> {
-    let root_node = load_node(fetcher, root_addr).await?;
+    root_ref: &[u8],
+) -> Result<(Vec<u8>, bool), ManifestError> {
+    let root_node = load_node_ref(fetcher, root_ref).await?;
     // The feed metadata lives on the `/` fork's metadata blob; on the
     // root node itself there is none. Look there first; if it isn't
     // present, this isn't a feed manifest.
     let Some(slash_fork) = root_node.forks.get(&b'/') else {
-        return Ok((root_addr, false));
+        return Ok((root_ref.to_vec(), false));
     };
     let Some(feed) = feed_from_metadata(&slash_fork.metadata)? else {
-        return Ok((root_addr, false));
+        return Ok((root_ref.to_vec(), false));
     };
     debug!(
         target: "ant_retrieval::mantaray",
@@ -199,37 +205,46 @@ pub async fn resolve_feed_root(
         "feed manifest detected; dereferencing",
     );
     match feed.kind {
-        FeedType::Sequence => Ok((resolve_sequence_feed(fetcher, &feed).await?, true)),
+        FeedType::Sequence => {
+            let resolution = resolve_sequence_feed_full(fetcher, &feed).await?;
+            let mut resolved = resolution.reference.to_vec();
+            if let Some(key) = resolution.decrypt_key {
+                resolved.extend_from_slice(&key);
+            }
+            Ok((resolved, true))
+        }
     }
 }
 
 /// Walk a mantaray manifest and resolve `path` to the file it points at.
 ///
-/// `fetcher` is used to load every node in the trie. `root_addr` is the
-/// chunk reference the user gave us (usually a bzz reference). `path` is
-/// what comes after the reference in `bzz://<ref>/<path>` — leading slash
-/// optional. An empty path triggers the `website-index-document` lookup
-/// stored on the manifest's "/" fork (this is what `swarm-cli upload <file>`
-/// produces and what bee's `bzzDownloadHandler` looks up; see
-/// `bee/pkg/api/bzz.go`).
+/// `fetcher` is used to load every node in the trie. `root_ref` is the
+/// reference the user gave us (usually a bzz reference): 32 bytes for a
+/// plain manifest, or 64 (`address ‖ decryption key`) for an encrypted
+/// one — encrypted nodes are decrypted transparently while walking.
+/// `path` is what comes after the reference in `bzz://<ref>/<path>` —
+/// leading slash optional. An empty path triggers the
+/// `website-index-document` lookup stored on the manifest's "/" fork
+/// (this is what `swarm-cli upload <file>` produces and what bee's
+/// `bzzDownloadHandler` looks up; see `bee/pkg/api/bzz.go`).
 ///
-/// If `root_addr` is a feed manifest, the lookup transparently
+/// If `root_ref` is a feed manifest, the lookup transparently
 /// dereferences it once before walking, exactly like bee's
 /// `bzzDownloadHandler` does — callers don't need to know whether
 /// they're looking at a static manifest or a feed.
 pub async fn lookup_path(
     fetcher: &dyn ChunkFetcher,
-    root_addr: [u8; 32],
+    root_ref: &[u8],
     path: &str,
 ) -> Result<LookupResult, ManifestError> {
     let path = path.trim_start_matches('/');
 
-    let (effective_root, is_feed) = resolve_feed_root(fetcher, root_addr).await?;
-    let root_node = load_node(fetcher, effective_root).await?;
+    let (effective_root, is_feed) = resolve_feed_root(fetcher, root_ref).await?;
+    let root_node = load_node_ref(fetcher, &effective_root).await?;
     debug!(
         target: "ant_retrieval::mantaray",
-        root = %hex::encode(root_addr),
-        effective_root = %hex::encode(effective_root),
+        root = %hex::encode(root_ref),
+        effective_root = %hex::encode(&effective_root),
         forks = root_node.forks.len(),
         "loaded mantaray root",
     );
@@ -364,9 +379,9 @@ const MANIFEST_SIZE_FANOUT: usize = 16;
 /// sizes, [`list_manifest_paths`] skips the per-entry round trips.
 pub async fn list_manifest(
     fetcher: &dyn ChunkFetcher,
-    root_addr: [u8; 32],
+    root_ref: &[u8],
 ) -> Result<Vec<ManifestEntry>, ManifestError> {
-    let mut entries = list_manifest_paths(fetcher, root_addr).await?;
+    let mut entries = list_manifest_paths(fetcher, root_ref).await?;
     populate_sizes(fetcher, &mut entries).await;
     Ok(entries)
 }
@@ -377,10 +392,10 @@ pub async fn list_manifest(
 /// that just wants to know whether a given path is in the manifest).
 pub async fn list_manifest_paths(
     fetcher: &dyn ChunkFetcher,
-    root_addr: [u8; 32],
+    root_ref: &[u8],
 ) -> Result<Vec<ManifestEntry>, ManifestError> {
-    let (effective_root, _is_feed) = resolve_feed_root(fetcher, root_addr).await?;
-    let root_node = load_node(fetcher, effective_root).await?;
+    let (effective_root, _is_feed) = resolve_feed_root(fetcher, root_ref).await?;
+    let root_node = load_node_ref(fetcher, &effective_root).await?;
     let mut entries = Vec::new();
     let mut visited = HashSet::from([effective_root]);
     collect_entries(
@@ -402,24 +417,14 @@ pub async fn list_manifest_paths(
 /// without failing the listing. Skips entries with no `reference`
 /// (metadata-only forks like `website-index-document`).
 async fn populate_sizes(fetcher: &dyn ChunkFetcher, entries: &mut [ManifestEntry]) {
-    let to_fetch: Vec<(usize, [u8; 32])> = entries
+    let to_fetch: Vec<(usize, Vec<u8>)> = entries
         .iter()
         .enumerate()
-        .filter_map(|(i, e)| e.reference.map(|r| (i, r)))
+        .filter_map(|(i, e)| e.reference.clone().map(|r| (i, r)))
         .collect();
 
     let results: Vec<(usize, Option<u64>)> = stream::iter(to_fetch)
-        .map(|(idx, addr)| async move {
-            let size = match fetcher.fetch(addr).await {
-                Ok(wire) if wire.len() >= 8 => {
-                    let mut span = [0u8; 8];
-                    span.copy_from_slice(&wire[..8]);
-                    Some(u64::from_le_bytes(span))
-                }
-                _ => None,
-            };
-            (idx, size)
-        })
+        .map(|(idx, reference)| async move { (idx, reference_span(fetcher, &reference).await) })
         .buffer_unordered(MANIFEST_SIZE_FANOUT)
         .collect()
         .await;
@@ -429,6 +434,22 @@ async fn populate_sizes(fetcher: &dyn ChunkFetcher, entries: &mut [ManifestEntry
             entry.size = size;
         }
     }
+}
+
+/// Best-effort file size behind a 32- or 64-byte data reference: the
+/// (decrypted, for 64-byte refs) 8-byte LE span of the data root chunk,
+/// with any redundancy-level top byte masked off.
+async fn reference_span(fetcher: &dyn ChunkFetcher, reference: &[u8]) -> Option<u64> {
+    let addr: [u8; 32] = reference.get(..32)?.try_into().ok()?;
+    let wire = fetcher.fetch(addr).await.ok()?;
+    let mut span = *wire.first_chunk::<8>()?;
+    if reference.len() == ENCRYPTED_REF_SIZE {
+        let key: [u8; 32] = reference[32..].try_into().ok()?;
+        let (dec_span, _) = ant_crypto::decrypt_chunk_parts(&wire, &key).ok()?;
+        span = dec_span;
+    }
+    let (_, plain) = crate::rs::decode_span(span);
+    Some(u64::from_le_bytes(plain))
 }
 
 /// Recursive walker. Loads nodes lazily from `fetcher` as it descends.
@@ -447,15 +468,14 @@ fn walk<'a>(
     Box::pin(async move {
         if remaining.is_empty() {
             // Land on this node. The data reference is the node's `entry`
-            // (must be 32 bytes, non-zero); the file's metadata
-            // (Content-Type, Filename) was already merged in by the
-            // caller from the fork that pointed here.
-            if node.entry.len() != 32 {
+            // (32 bytes, or 64 in an encrypted manifest; non-zero); the
+            // file's metadata (Content-Type, Filename) was already merged
+            // in by the caller from the fork that pointed here.
+            if node.entry.len() != 32 && node.entry.len() != ENCRYPTED_REF_SIZE {
                 return Err(ManifestError::InvalidRefLength(node.entry.len() as u8));
             }
-            let mut data_ref = [0u8; 32];
-            data_ref.copy_from_slice(&node.entry);
-            if data_ref == [0u8; 32] {
+            let data_ref = node.entry.clone();
+            if data_ref.iter().all(|&b| b == 0) {
                 // A zero entry is bee's "no value here" sentinel — used
                 // on the synthetic "/" fork that holds website metadata
                 // but not a file. Calling `Lookup("/")` on a real bee
@@ -498,10 +518,10 @@ fn walk<'a>(
         trace!(
             target: "ant_retrieval::mantaray",
             consumed = %String::from_utf8_lossy(&fork.prefix),
-            child_ref = %hex::encode(fork.child_ref),
+            child_ref = %hex::encode(&fork.child_ref),
             "descending into fork",
         );
-        let mut child_node = load_node(fetcher, fork.child_ref).await?;
+        let mut child_node = load_node_ref(fetcher, &fork.child_ref).await?;
         // Merge fork-level metadata onto the child. In bee's wire format
         // (mantaray 0.2) per-file Content-Type / Filename are stored on
         // the parent fork, not on the child node's own bytes — yet bee's
@@ -523,7 +543,7 @@ fn collect_entries<'a>(
     node: Node,
     path: String,
     entries: &'a mut Vec<ManifestEntry>,
-    visited: &'a mut HashSet<[u8; 32]>,
+    visited: &'a mut HashSet<Vec<u8>>,
     depth: usize,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ManifestError>> + Send + 'a>> {
     Box::pin(async move {
@@ -531,11 +551,11 @@ fn collect_entries<'a>(
             return Ok(());
         }
 
-        let node_has_value = node.entry.len() == 32 && node.entry.iter().any(|&b| b != 0);
+        let node_has_value = (node.entry.len() == 32 || node.entry.len() == ENCRYPTED_REF_SIZE)
+            && node.entry.iter().any(|&b| b != 0);
         let node_metadata = node.metadata.clone();
         if node_has_value {
-            let mut reference = [0u8; 32];
-            reference.copy_from_slice(&node.entry);
+            let reference = node.entry.clone();
             entries.push(ManifestEntry {
                 path: if path.is_empty() {
                     "/".to_string()
@@ -571,7 +591,7 @@ fn collect_entries<'a>(
             }
 
             let fork_path = format!("{path}{}", String::from_utf8_lossy(&fork.prefix));
-            if fork.child_ref == [0u8; 32] {
+            if fork.child_ref.iter().all(|&b| b == 0) {
                 if !fork.metadata.is_empty() {
                     entries.push(ManifestEntry {
                         path: if fork_path.is_empty() {
@@ -587,7 +607,7 @@ fn collect_entries<'a>(
                 continue;
             }
 
-            if !visited.insert(fork.child_ref) {
+            if !visited.insert(fork.child_ref.clone()) {
                 entries.push(ManifestEntry {
                     path: if fork_path.is_empty() {
                         "/".to_string()
@@ -601,7 +621,7 @@ fn collect_entries<'a>(
                 continue;
             }
 
-            match load_node(fetcher, fork.child_ref).await {
+            match load_node_ref(fetcher, &fork.child_ref).await {
                 Ok(mut child_node) => {
                     let child_path = child_listing_path(&fork_path, fork.node_type);
                     for (k, v) in fork.metadata {
@@ -635,8 +655,18 @@ fn child_listing_path(path: &str, node_type: u8) -> String {
         path.to_string()
     }
 }
-/// Fetch a manifest node by reference and unmarshal it.
-async fn load_node(fetcher: &dyn ChunkFetcher, addr: [u8; 32]) -> Result<Node, ManifestError> {
+/// Fetch a manifest node by a 32-byte (plain) or 64-byte (encrypted)
+/// reference and unmarshal it. Encrypted nodes go through the
+/// decrypting joiner; plain nodes fetch the root chunk and join.
+async fn load_node_ref(fetcher: &dyn ChunkFetcher, node_ref: &[u8]) -> Result<Node, ManifestError> {
+    if node_ref.len() == ENCRYPTED_REF_SIZE {
+        let enc_ref: [u8; ENCRYPTED_REF_SIZE] = node_ref.try_into().expect("length checked");
+        let bytes = join_encrypted(fetcher, enc_ref, DEFAULT_MAX_FILE_BYTES).await?;
+        return Node::unmarshal(&bytes);
+    }
+    let Ok(addr) = <[u8; 32]>::try_from(node_ref) else {
+        return Err(ManifestError::InvalidRefLength(node_ref.len() as u8));
+    };
     // The node is itself a Swarm file: fetch the root chunk, then join.
     // For tiny manifests (< 4 KiB) the root chunk's payload is already
     // the entire serialised node.
@@ -681,7 +711,8 @@ pub(crate) struct Node {
 pub(crate) struct Fork {
     node_type: u8,
     prefix: Vec<u8>,
-    pub(crate) child_ref: [u8; 32],
+    /// 32 bytes, or 64 (`address ‖ key`) in an encrypted manifest.
+    pub(crate) child_ref: Vec<u8>,
     metadata: HashMap<String, String>,
 }
 
@@ -734,10 +765,7 @@ impl Node {
             return Err(ManifestError::NotAManifest);
         }
         let ref_size = data[OBFUSCATION_KEY_SIZE + VERSION_HASH_SIZE];
-        if ref_size == 64 {
-            return Err(ManifestError::UnsupportedEncryption);
-        }
-        if ref_size != 32 && ref_size != 0 {
+        if ref_size != 32 && ref_size != 64 && ref_size != 0 {
             return Err(ManifestError::InvalidRefLength(ref_size));
         }
         let ref_size = ref_size as usize;
@@ -802,10 +830,9 @@ impl Node {
                     )));
                 }
                 let prefix = data[offset + 2..offset + 2 + prefix_len].to_vec();
-                let mut child_ref = [0u8; 32];
-                child_ref.copy_from_slice(
-                    &data[offset + FORK_PRE_REF_SIZE..offset + FORK_PRE_REF_SIZE + ref_size],
-                );
+                let child_ref = data
+                    [offset + FORK_PRE_REF_SIZE..offset + FORK_PRE_REF_SIZE + ref_size]
+                    .to_vec();
                 forks.insert(
                     b,
                     Fork {
@@ -849,10 +876,9 @@ impl Node {
                     )));
                 }
                 let prefix = data[offset + 2..offset + 2 + prefix_len].to_vec();
-                let mut child_ref = [0u8; 32];
-                child_ref.copy_from_slice(
-                    &data[offset + FORK_PRE_REF_SIZE..offset + FORK_PRE_REF_SIZE + ref_size],
-                );
+                let child_ref = data
+                    [offset + FORK_PRE_REF_SIZE..offset + FORK_PRE_REF_SIZE + ref_size]
+                    .to_vec();
                 let mut fork_meta = HashMap::new();
                 if has_meta && meta_size > 0 {
                     let meta_start =
@@ -1108,7 +1134,7 @@ mod tests {
     async fn lookup_empty_path_uses_index_document() {
         let fetcher = gateway_fetcher();
         let root = decode_addr(ROOT_ADDR_HEX);
-        let res = lookup_path(&fetcher, root, "").await.unwrap();
+        let res = lookup_path(&fetcher, &root, "").await.unwrap();
         assert_eq!(hex::encode(res.data_ref), FILE_DATA_REF_HEX);
         assert_eq!(
             res.content_type.as_deref(),
@@ -1141,7 +1167,7 @@ mod tests {
             files.push(ManifestFile {
                 path: (*p).to_string(),
                 content_type: Some("text/html".to_string()),
-                data_ref: split.root,
+                data_ref: split.root.to_vec(),
             });
         }
         let manifest =
@@ -1171,7 +1197,7 @@ mod tests {
             ("developer/deep/", "developer/deep/index.html"),
             ("developer/deep", "developer/deep/index.html"),
         ] {
-            let res = lookup_path(&fetcher, root, req).await.unwrap();
+            let res = lookup_path(&fetcher, &root, req).await.unwrap();
             assert_eq!(res.data_ref, refs[want], "request {req:?}");
         }
     }
@@ -1184,7 +1210,7 @@ mod tests {
     async fn lookup_missing_directory_still_not_found() {
         let (fetcher, root, _refs) = website_fetcher(&["index.html", "developer/index.html"]);
         for req in ["nonexistent/", "missing/index.html"] {
-            let err = lookup_path(&fetcher, root, req).await.unwrap_err();
+            let err = lookup_path(&fetcher, &root, req).await.unwrap_err();
             assert!(
                 matches!(err, ManifestError::NotFound { .. }),
                 "request {req:?}: expected NotFound, got {err:?}",
@@ -1213,7 +1239,7 @@ mod tests {
     async fn lookup_explicit_path() {
         let fetcher = gateway_fetcher();
         let root = decode_addr(ROOT_ADDR_HEX);
-        let res = lookup_path(&fetcher, root, "hello.txt").await.unwrap();
+        let res = lookup_path(&fetcher, &root, "hello.txt").await.unwrap();
         assert_eq!(hex::encode(res.data_ref), FILE_DATA_REF_HEX);
         assert_eq!(
             res.content_type.as_deref(),
@@ -1226,7 +1252,7 @@ mod tests {
     async fn lookup_unknown_path_not_found() {
         let fetcher = gateway_fetcher();
         let root = decode_addr(ROOT_ADDR_HEX);
-        let err = lookup_path(&fetcher, root, "missing.txt")
+        let err = lookup_path(&fetcher, &root, "missing.txt")
             .await
             .unwrap_err();
         assert!(matches!(err, ManifestError::NotFound { .. }));
@@ -1243,7 +1269,7 @@ mod tests {
         let (addr, wire) = ant_crypto::cac_new(&payload).unwrap();
         let mut fetcher = MapFetcher::new();
         fetcher.insert(addr, wire);
-        let err = lookup_path(&fetcher, addr, "anything").await.unwrap_err();
+        let err = lookup_path(&fetcher, &addr, "anything").await.unwrap_err();
         assert!(
             matches!(err, ManifestError::NotAManifest),
             "expected NotAManifest, got {err:?}",
@@ -1328,7 +1354,7 @@ mod tests {
         fetcher.insert(root_addr, root_wire);
         fetcher.insert(s_addr, s_wire);
 
-        let err = lookup_path(&fetcher, root_addr, "search")
+        let err = lookup_path(&fetcher, &root_addr, "search")
             .await
             .unwrap_err();
         // The directory-index fallback descended into the real
@@ -1367,7 +1393,7 @@ mod tests {
         let e = node.forks.get(&b'e').unwrap();
         assert_eq!(e.prefix, b"earch/index.html");
         assert_eq!(
-            hex::encode(e.child_ref),
+            hex::encode(&e.child_ref),
             "14c3a451758dcac5dc003b131c20df4d012898f304c492d0264db0d6d1552bcc"
         );
     }
@@ -1403,7 +1429,7 @@ mod tests {
         let slash = node.forks.get(&b'/').expect("/ fork");
         assert_eq!(slash.prefix, b"/");
         assert_eq!(
-            hex::encode(slash.child_ref),
+            hex::encode(&slash.child_ref),
             "0cc878d32c96126d47f63fbe391114ee1438cd521146fc975dea1546d302b6c0",
         );
         assert_eq!(
@@ -1417,7 +1443,7 @@ mod tests {
         let s_fork = node.forks.get(&b's').expect("s fork");
         assert_eq!(s_fork.prefix, b"s");
         assert_eq!(
-            hex::encode(s_fork.child_ref),
+            hex::encode(&s_fork.child_ref),
             "e8aa9151a4c271bc7099cd1de086aa563b6b2e5ad8191e5208ad55fdaccb4484",
         );
         assert!(s_fork.metadata.is_empty());
@@ -1425,7 +1451,7 @@ mod tests {
         let z_fork = node.forks.get(&b'z').expect("z fork");
         assert_eq!(z_fork.prefix, b"zh/");
         assert_eq!(
-            hex::encode(z_fork.child_ref),
+            hex::encode(&z_fork.child_ref),
             "69892465cd55cbd6cce1e3fcca4b24566355dfa05fdbfadb80341181e60b640b",
         );
     }

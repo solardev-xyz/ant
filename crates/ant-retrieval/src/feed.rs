@@ -265,14 +265,15 @@ pub struct FeedResolution {
 
 /// Resolve a feed to its current content-root reference.
 ///
-/// Thin wrapper over [`resolve_sequence_feed_full`] for callers (e.g. the
-/// mantaray manifest walk) that only need the 32-byte reference. If the
-/// resolved update points at an **encrypted** reference the 32-byte-only
-/// return type can't represent the decryption key, so this surfaces
-/// [`FeedError::EncryptedReference`] rather than handing back an address
-/// the plaintext joiner would mis-decode into garbage. Use
-/// [`resolve_sequence_feed_full`] (which carries `decrypt_key`) on paths
-/// that can serve encrypted content.
+/// Thin wrapper over [`resolve_sequence_feed_full`] for callers that
+/// only need a plain 32-byte reference. If the resolved update points
+/// at an **encrypted** reference the 32-byte-only return type can't
+/// represent the decryption key, so this surfaces
+/// [`FeedError::EncryptedReference`] rather than handing back an
+/// address the plaintext joiner would mis-decode into garbage. All
+/// production paths (the mantaray manifest walk included) use
+/// [`resolve_sequence_feed_full`], which carries `decrypt_key` and can
+/// serve encrypted content.
 pub async fn resolve_sequence_feed(
     fetcher: &dyn ChunkFetcher,
     feed: &Feed,

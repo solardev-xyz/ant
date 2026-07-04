@@ -110,7 +110,7 @@ async fn replays_mainnet_bzz_fixture() {
     let fetcher = DirFetcher::from_dir(&fixture_dir()).expect("load fixture chunks");
     let root = decode_root();
 
-    let lookup = lookup_path(&fetcher, root, MANIFEST_PATH)
+    let lookup = lookup_path(&fetcher, &root, MANIFEST_PATH)
         .await
         .expect("manifest lookup");
 
@@ -124,14 +124,20 @@ async fn replays_mainnet_bzz_fixture() {
     // mantaray walk path; carrying its hex into the test gives the
     // assertion a fingerprint independent of the joiner's output.
     assert_eq!(
-        hex::encode(lookup.data_ref),
+        hex::encode(&lookup.data_ref),
         "285e4c1564cce481fcb21039208795b86ef42042cc0bb45b9d7f16d638d3c296",
         "data ref drifted; either the manifest changed on chain or \
          the lookup walker took a different fork",
     );
 
     let root_chunk = fetcher
-        .fetch(lookup.data_ref)
+        .fetch(
+            lookup
+                .data_ref
+                .as_slice()
+                .try_into()
+                .expect("32-byte data ref"),
+        )
         .await
         .expect("fetch data root from fixture");
 

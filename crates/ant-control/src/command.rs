@@ -121,11 +121,11 @@ pub enum ControlCommand {
     },
     /// Gateway-only: join the **encrypted** chunk tree rooted at the
     /// encrypted reference `reference ‖ key` and ack with the decrypted
-    /// file bytes ([`ControlAck::Bytes`]). Backs encrypted feed content
-    /// (bee's 80-byte v1 payload), which ant resolves but does not stream:
-    /// the body is buffered (bounded by `max_bytes`) and the gateway
-    /// applies any HTTP Range by slicing the buffer. Not exposed on the
-    /// JSON control socket.
+    /// file bytes ([`ControlAck::Bytes`]). Backs `GET /bytes/{128-hex}`
+    /// and encrypted feed content (bee's 80-byte v1 payload). Encrypted
+    /// content is not streamed: the body is buffered (bounded by
+    /// `max_bytes`) and the gateway applies any HTTP Range by slicing
+    /// the buffer. Not exposed on the JSON control socket.
     GetBytesEncrypted {
         reference: [u8; 32],
         key: [u8; 32],
@@ -166,8 +166,13 @@ pub enum ControlCommand {
     /// `head_only` is what backs `HEAD /bzz/{ref}/{path}`: the daemon
     /// resolves the manifest, fetches the data root chunk to learn
     /// the size, returns metadata + total span, and never joins.
+    ///
+    /// `reference` is 32 bytes for a plain manifest root or 64
+    /// (`address ‖ decryption key`) for an **encrypted** one
+    /// (`GET /bzz/{128-hex}/…`); the node loop walks encrypted
+    /// manifests transparently and serves their bodies buffered.
     StreamBzz {
-        reference: [u8; 32],
+        reference: Vec<u8>,
         path: String,
         allow_degraded_redundancy: bool,
         bypass_cache: bool,
@@ -518,10 +523,11 @@ pub enum ControlAck {
         total_bytes: u64,
         /// Resolved **data reference** of the manifest entry being
         /// served (the reference bee's `downloadHandler` receives from
-        /// `manifestEntry.Reference()`). The gateway quotes it in the
-        /// `ETag` response header, matching bee's
+        /// `manifestEntry.Reference()`): 32 bytes, or 64 for an entry in
+        /// an encrypted manifest. The gateway quotes it in the `ETag`
+        /// response header, matching bee's
         /// `w.Header().Set(ETagHeader, fmt.Sprintf("%q", reference))`.
-        reference: [u8; 32],
+        reference: Vec<u8>,
         content_type: Option<String>,
         filename: Option<String>,
         /// `true` when the resolved reference was a **feed manifest**, so

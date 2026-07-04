@@ -271,7 +271,7 @@ async fn head_request(
     loop {
         let (ack_tx, mut ack_rx) = mpsc::channel::<ControlAck>(8);
         let cmd = ControlCommand::StreamBzz {
-            reference,
+            reference: reference.to_vec(),
             path: path.clone(),
             allow_degraded_redundancy: true,
             bypass_cache: false,
@@ -338,7 +338,7 @@ async fn range_request(
     loop {
         let (ack_tx, mut ack_rx) = mpsc::channel::<ControlAck>(64);
         let cmd = ControlCommand::StreamBzz {
-            reference,
+            reference: reference.to_vec(),
             path: path.clone(),
             allow_degraded_redundancy: true,
             bypass_cache: false,
@@ -433,7 +433,7 @@ async fn range_pull(
     loop {
         let (ack_tx, mut ack_rx) = mpsc::channel::<ControlAck>(64);
         let cmd = ControlCommand::StreamBzz {
-            reference,
+            reference: reference.to_vec(),
             path: path.clone(),
             allow_degraded_redundancy: true,
             bypass_cache: false,

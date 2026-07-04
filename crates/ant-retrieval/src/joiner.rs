@@ -1098,27 +1098,6 @@ const fn subtrie_section(refs: usize, subtree_span: u64, branching: u64) -> u64 
     }
 }
 
-/// Encrypted-tree variant of [`subtrie_section`]. Identical formula, but
-/// the branching factor is `ChunkSize / 64 = 64` because each child
-/// reference in an encrypted intermediate chunk is 64 bytes
-/// (`address ‖ key`) rather than 32. Mirrors bee's joiner, which sizes
-/// subtries off `swarm.EncryptedBranches` when the reference length is 64.
-const fn subtrie_section_enc(refs: usize, subtree_span: u64) -> u64 {
-    let refs = refs as u64;
-    let branching = (CHUNK_SIZE / ENCRYPTED_REF_SIZE) as u64;
-    let mut branch_size = CHUNK_SIZE as u64;
-    loop {
-        let whats_left = subtree_span.saturating_sub(branch_size * refs.saturating_sub(1));
-        if whats_left <= branch_size {
-            return branch_size;
-        }
-        if branch_size > u64::MAX / branching {
-            return branch_size;
-        }
-        branch_size *= branching;
-    }
-}
-
 /// Reconstruct a file from a 64-byte **encrypted** root reference
 /// (`address(32) ‖ key(32)`) into a single buffer.
 ///
@@ -1128,13 +1107,20 @@ const fn subtrie_section_enc(refs: usize, subtree_span: u64) -> u64 {
 /// reference that pointed to it, then either appended as leaf data or
 /// expanded into its list of 64-byte child references. Child decryption
 /// keys come from those child references, so the whole subtree is
-/// self-describing once the root key is known.
+/// self-describing once the root key is known. Redundancy-encoded spans
+/// (`level | 0x80` in the top byte) are handled like bee's
+/// `DecryptChunkData`: the intermediate's payload is `shards` 64-byte
+/// data references followed by `parities` 32-byte parity references
+/// (encrypted-erasure-table geometry); the data references are followed
+/// and the parity references skipped. Parity *recovery* of encrypted
+/// trees — reconstructing a missing data child from parities — is not
+/// implemented; a missing chunk fails the join.
 ///
 /// Unlike [`join`] this is a buffered, in-order full download — no range
-/// or streaming. It exists to serve **encrypted feed content**, the only
-/// encrypted path ant resolves today; the volume is small (a feed payload)
-/// and `max_bytes` bounds it. Range requests over encrypted content fall
-/// back to a full fetch at the gateway.
+/// or streaming. It backs encrypted feed content and the gateway's
+/// `/bytes`+`/bzz` reads of 128-hex references; `max_bytes` bounds the
+/// allocation and range requests over encrypted content fall back to a
+/// full fetch at the gateway.
 pub async fn join_encrypted(
     fetcher: &dyn ChunkFetcher,
     root_ref: [u8; ENCRYPTED_REF_SIZE],
@@ -1166,27 +1152,27 @@ fn join_encrypted_into<'a>(
                 addr: hex::encode(addr),
                 source,
             })?;
-        let decrypted =
-            ant_crypto::decrypt_chunk(&stored, &key).map_err(|e| JoinError::MalformedChunk {
+        let (span_raw, payload) = ant_crypto::decrypt_chunk_parts(&stored, &key).map_err(|e| {
+            JoinError::MalformedChunk {
                 offset: out.len() as u64,
                 detail: format!("decrypt chunk {}: {e}", hex::encode(addr)),
-            })?;
+            }
+        })?;
 
-        // decrypted = span(8 LE) ‖ payload. `decrypt_chunk` only returns
-        // level-NONE chunks, so the span is the plain byte count.
-        let mut span_bytes = [0u8; 8];
-        span_bytes.copy_from_slice(&decrypted[..8]);
-        let span = u64::from_le_bytes(span_bytes);
+        // The decrypted span may carry a redundancy level in its top byte
+        // (bee `redundancy.DecodeSpan`); the rest is the plain byte count.
+        let (level, plain_span) = crate::rs::decode_span(span_raw);
+        let span = u64::from_le_bytes(plain_span);
         if span > max_bytes as u64 {
             return Err(JoinError::TooLarge {
                 span,
                 cap: max_bytes,
             });
         }
-        let payload = &decrypted[8..];
 
         // Leaf: any subtree of at most one chunk is stored as a single
-        // data chunk whose payload is exactly the file bytes.
+        // data chunk whose payload is exactly the file bytes (the rest of
+        // the fixed 4096-byte encrypted payload is padding).
         if span <= CHUNK_SIZE as u64 {
             let n = span as usize;
             if n > payload.len() {
@@ -1205,23 +1191,24 @@ fn join_encrypted_into<'a>(
             return Ok(());
         }
 
-        // Intermediate: payload is a list of 64-byte child references.
-        if payload.is_empty() || payload.len() % ENCRYPTED_REF_SIZE != 0 {
+        // Intermediate: `shards` 64-byte data references, then `parities`
+        // 32-byte parity references (level 0 has none), then padding —
+        // bee `DecryptChunkData` + `file.ReferenceCount(_, _, encrypted)`.
+        let (shards, parities) = crate::rs::reference_count_enc(span, level);
+        let needed = shards * ENCRYPTED_REF_SIZE + parities * 32;
+        if needed > payload.len() {
             return Err(JoinError::MalformedChunk {
                 offset: out.len() as u64,
                 detail: format!(
-                    "intermediate payload {} not a multiple of {ENCRYPTED_REF_SIZE}",
+                    "intermediate needs {needed} reference bytes, payload has {}",
                     payload.len()
                 ),
             });
         }
-        let refs = payload.len() / ENCRYPTED_REF_SIZE;
-        let branch_size = subtrie_section_enc(refs, span);
+        let branching = crate::rs::max_enc_shards(level) as u64;
+        let branch_size = subtrie_section(shards, span, branching);
         let mut remaining = span;
-        for i in 0..refs {
-            // Trailing zero-padded references (a partially-filled
-            // intermediate chunk) carry no more subtree once the span is
-            // exhausted — stop rather than fetching the zero address.
+        for i in 0..shards {
             if remaining == 0 {
                 break;
             }
