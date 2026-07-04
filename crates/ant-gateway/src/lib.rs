@@ -44,6 +44,8 @@ mod retrieval;
 #[cfg(feature = "http-api")]
 mod router;
 #[cfg(feature = "http-api")]
+mod settlements;
+#[cfg(feature = "http-api")]
 mod stamps;
 #[cfg(feature = "http-api")]
 mod status;

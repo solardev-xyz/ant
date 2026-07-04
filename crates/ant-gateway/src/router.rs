@@ -19,7 +19,7 @@ use tracing::Instrument;
 use crate::fallback::not_implemented;
 use crate::handle::GatewayHandle;
 use crate::retrieval::GATEWAY_MAX_UPLOAD_BYTES;
-use crate::{chain, retrieval, stamps, status, stewardship, tags};
+use crate::{chain, retrieval, settlements, stamps, status, stewardship, tags};
 
 const SERVER_HEADER: &str = concat!("ant-gateway/", env!("CARGO_PKG_VERSION"));
 
@@ -56,6 +56,21 @@ pub fn build(handle: GatewayHandle) -> Router {
         .route("/stamps/dilute/{id}/{depth}", patch(chain::dilute_stamp))
         .route("/chequebook/address", get(chain::chequebook_address))
         .route("/chequebook/balance", get(chain::chequebook_balance))
+        // Read-only settlement/balance mirror (bee `balances.go`,
+        // `settlements.go`, `chequebook.go` last-cheque handlers). All
+        // served from one node-side `AccountingSnapshot` command.
+        .route("/balances", get(settlements::balances))
+        .route("/balances/{peer}", get(settlements::peer_balance))
+        .route("/consumed", get(settlements::consumed))
+        .route("/consumed/{peer}", get(settlements::peer_consumed))
+        .route("/settlements", get(settlements::settlements))
+        .route("/settlements/{peer}", get(settlements::peer_settlements))
+        .route("/timesettlements", get(settlements::timesettlements))
+        .route("/chequebook/cheque", get(settlements::chequebook_cheque))
+        .route(
+            "/chequebook/cheque/{peer}",
+            get(settlements::chequebook_cheque_peer),
+        )
         // Chequebook funding (PLAN.md J.5 D3): transfer xBZZ into the
         // chequebook. `501` without a funded wallet key.
         .route("/chequebook/deposit", post(chain::chequebook_deposit))
