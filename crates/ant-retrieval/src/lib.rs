@@ -56,6 +56,7 @@ pub mod joiner;
 pub mod manifest_writer;
 pub mod mantaray;
 pub mod progress;
+pub mod rs;
 pub mod splitter;
 pub mod traversal;
 
@@ -85,6 +86,7 @@ pub use mantaray::{
 pub use progress::{estimate_total_chunks, ProgressSample, ProgressTracker};
 pub use push_skip_cache::{PushSkipCache, DEFAULT_SKIP_TTL};
 pub use pushsync_settlement::{peer_chunk_price, PushsyncSettlement};
+pub use rs::{fetch_root_with_replicas, replica_addresses, REPLICAS_OWNER, REPLICA_COUNTS};
 pub use splitter::{split_bytes, SplitChunk, SplitResult, StreamingSplitter, BRANCHES};
 pub use traversal::{traverse_chunk_addresses, TraversalError};
 
@@ -118,6 +120,15 @@ pub trait ChunkFetcher: Send + Sync {
     /// peers if needed; the joiner / mantaray code treats a single
     /// failure here as a fatal error for the file.
     async fn fetch(&self, addr: [u8; 32]) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>>;
+
+    /// Offer a chunk that was *reconstructed locally* (Reed-Solomon
+    /// recovery of a missing data shard, or a root rebuilt from a
+    /// dispersed replica) so the implementation can store it exactly
+    /// like a fetched chunk — bee likewise `Put`s recovered shards into
+    /// its local store (`pkg/file/redundancy/getter::save`). The wire
+    /// bytes are already CAC-validated against `addr` by the caller.
+    /// Default is a no-op for map-backed test fetchers.
+    async fn put_recovered(&self, _addr: [u8; 32], _wire: &[u8]) {}
 }
 
 /// Bee `pkg/retrieval` protocol id. Unchanged between bee 2.7.x and

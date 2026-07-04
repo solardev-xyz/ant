@@ -134,12 +134,10 @@ Examples:
         /// `website-index-document`.
         #[arg(long, requires = "bzz")]
         bzz_path: Option<String>,
-        /// Decode bzz files whose root span carries a non-zero
-        /// Reed-Solomon redundancy level. The daemon masks the level
-        /// byte off and walks the chunk tree without RS recovery, so
-        /// every data chunk must still be reachable. Default: off
-        /// (the daemon errors with `redundancy / erasure coding not
-        /// supported`).
+        /// Deprecated no-op, kept for compatibility. Files uploaded
+        /// with a Reed-Solomon redundancy level (1-4) are now always
+        /// decoded with parity-aware geometry, and missing data chunks
+        /// are recovered from the parities automatically.
         #[arg(long)]
         allow_degraded_redundancy: bool,
         /// Before issuing the request, poll `antctl status` until the
