@@ -19,6 +19,8 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -26,12 +28,16 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"sync"
 
 	"github.com/ethersphere/bee/v2/pkg/cac"
 	"github.com/ethersphere/bee/v2/pkg/crypto"
 	"github.com/ethersphere/bee/v2/pkg/feeds"
+	"github.com/ethersphere/bee/v2/pkg/file/pipeline/builder"
 	"github.com/ethersphere/bee/v2/pkg/file/redundancy"
 	"github.com/ethersphere/bee/v2/pkg/postage"
+	"github.com/ethersphere/bee/v2/pkg/replicas"
 	"github.com/ethersphere/bee/v2/pkg/soc"
 	"github.com/ethersphere/bee/v2/pkg/swarm"
 )
@@ -58,6 +64,7 @@ func run(outDir string) error {
 		"stamps.json":        stampVectors(),
 		"replicas.json":      replicaVectors(),
 		"redundancy.json":    redundancyVectors(),
+		"rs_files.json":      redundantFileVectors(),
 	}
 	for name, v := range files {
 		blob, err := json.MarshalIndent(v, "", "  ")
@@ -539,5 +546,100 @@ func redundancyVectors() any {
 	return map[string]any{
 		"description": "bee pkg/file/redundancy parity tables: parities[n-1] = GetParities(n) for n used slots per intermediate node",
 		"levels":      levels,
+	}
+}
+
+// --- redundancy-encoded files (Reed-Solomon fixtures) -------------------------
+
+type rsChunk struct {
+	AddressHex string `json:"addressHex"`
+	DataHex    string `json:"dataHex"`
+}
+
+type rsCase struct {
+	Name     string `json:"name"`
+	Level    int    `json:"level"`
+	FileSize int    `json:"fileSize"`
+	RootHex  string `json:"rootHex"`
+	// Every chunk bee's pipeline emitted (data + intermediate + parity),
+	// keyed by address; a decoder test deletes some data chunks and must
+	// recover them from the parities.
+	Chunks []rsChunk `json:"chunks"`
+	// Dispersed replicas of the root chunk (soc wires), as bee's
+	// replicas.NewPutter would upload for this level.
+	RootReplicas []rsChunk `json:"rootReplicas"`
+}
+
+type collectPutter struct {
+	mu     sync.Mutex
+	chunks map[string][]byte
+}
+
+func (c *collectPutter) Put(_ context.Context, ch swarm.Chunk) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.chunks[ch.Address().String()] = append([]byte(nil), ch.Data()...)
+	return nil
+}
+
+func rsFileCase(name string, level int, size int) rsCase {
+	payload := det(fmt.Sprintf("rs/%s", name), size)
+	put := &collectPutter{chunks: make(map[string][]byte)}
+	p := builder.NewPipelineBuilder(context.Background(), put, false, redundancy.Level(level))
+	root, err := builder.FeedPipeline(context.Background(), p, bytes.NewReader(payload))
+	if err != nil {
+		panic(err)
+	}
+
+	// replicate the root like bee's upload path does for redundant files
+	repPut := &collectPutter{chunks: make(map[string][]byte)}
+	rp := replicas.NewPutter(repPut, redundancy.Level(level))
+	rootData, ok := put.chunks[root.String()]
+	if !ok {
+		panic("root chunk missing from collected set")
+	}
+	if err := rp.Put(context.Background(), swarm.NewChunk(root, rootData)); err != nil {
+		panic(err)
+	}
+
+	toSorted := func(m map[string][]byte) []rsChunk {
+		keys := make([]string, 0, len(m))
+		for k := range m {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		out := make([]rsChunk, 0, len(keys))
+		for _, k := range keys {
+			out = append(out, rsChunk{AddressHex: k, DataHex: hexs(m[k])})
+		}
+		return out
+	}
+	// replicas putter also re-puts the root itself; drop it from the
+	// replica list so the field holds only the SOC replicas
+	delete(repPut.chunks, root.String())
+
+	return rsCase{
+		Name:         name,
+		Level:        level,
+		FileSize:     size,
+		RootHex:      root.String(),
+		Chunks:       toSorted(put.chunks),
+		RootReplicas: toSorted(repPut.chunks),
+	}
+}
+
+func redundantFileVectors() any {
+	cases := []rsCase{
+		// single intermediate level (< maxShards data chunks per level)
+		rsFileCase("medium-150k", 1, 150*1024),
+		rsFileCase("strong-150k", 2, 150*1024),
+		rsFileCase("insane-150k", 3, 150*1024),
+		rsFileCase("paranoid-50k", 4, 50*1024),
+		// two intermediate nodes at level 1 (147 data chunks > 119 max shards)
+		rsFileCase("medium-600k", 1, 600*1024),
+	}
+	return map[string]any{
+		"description": "files encoded by bee's real pipeline (builder.NewPipelineBuilder) with swarm-redundancy levels; chunks = every emitted chunk (data+intermediate+parity); span top byte encodes level|0x80 on intermediate nodes; parity count per node from the level's erasure table; rootReplicas = dispersed replica SOCs from replicas.NewPutter",
+		"cases":       cases,
 	}
 }
