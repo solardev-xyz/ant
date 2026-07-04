@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/ant-chain",
+  "crates/ant-conformance",
   "crates/ant-control",
   "crates/ant-crypto",
   "crates/ant-ffi",

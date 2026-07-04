@@ -1,0 +1,68 @@
+{
+  "cases": [
+    {
+      "start": "0",
+      "level": 0,
+      "indexBytesHex": "ad315e209dd62516ab8c7d1c2d8c3c206525501ebef91d12c34431f9ea255371",
+      "topicHex": "e36165b0d71a05b2330be5a2519c2573d2c9b35c75e94fab874c46a8210641d0",
+      "idHex": "0e5bfb1d7ca32e28420141361a94d183c6c75c9ba12ebd4c481664f652c2478d",
+      "ownerHex": "ff6316419def87e4ea768e09a04dd56ebb40cb4e",
+      "socAddressHex": "37e90164fc01e518bcbe356ff46ec4e29c27e7d0d9fd9424fa1cd960b54c3c0f"
+    },
+    {
+      "start": "0",
+      "level": 25,
+      "indexBytesHex": "d525baa258d5c5ebf58c6c4fce27dae3ddfeda76b7e89f29864d7eefa385b037",
+      "topicHex": "e36165b0d71a05b2330be5a2519c2573d2c9b35c75e94fab874c46a8210641d0",
+      "idHex": "d6769392e8139e77544aeafa17ea6d0f1c98fd4548e77560a62f041e70010cc4",
+      "ownerHex": "ff6316419def87e4ea768e09a04dd56ebb40cb4e",
+      "socAddressHex": "ffa133582c9ecf4c182b79f7e3a76ef3aedb488374e04d7f110871627a628ab8"
+    },
+    {
+      "start": "0",
+      "level": 32,
+      "indexBytesHex": "2a28926b78c626adb7a249a23e9769bf038b52447e60543086a797f9b3061c70",
+      "topicHex": "e36165b0d71a05b2330be5a2519c2573d2c9b35c75e94fab874c46a8210641d0",
+      "idHex": "458b62059b526ed6038d83cfdc3f4a7f74fa5b600aea2a7d0183bf88c21600ee",
+      "ownerHex": "ff6316419def87e4ea768e09a04dd56ebb40cb4e",
+      "socAddressHex": "648ab58ef0e85837225e5ee4594cba9ae2e5198f4bda71789a000380cff3b981"
+    },
+    {
+      "start": "1",
+      "level": 0,
+      "indexBytesHex": "4ca50a38e76ab659f435e61e6b5aaf81ce1b52eb5330ec73caddf64f28162253",
+      "topicHex": "e36165b0d71a05b2330be5a2519c2573d2c9b35c75e94fab874c46a8210641d0",
+      "idHex": "eafb1f52974a729fc2b7e87479c63607f209f8e5a584b89f6b4dc73af2622dcf",
+      "ownerHex": "ff6316419def87e4ea768e09a04dd56ebb40cb4e",
+      "socAddressHex": "935a34c840cdca9270369265c0a03f4c2fadafbf64fa777bb08777ac41aa1747"
+    },
+    {
+      "start": "1145373120",
+      "level": 0,
+      "indexBytesHex": "0a714201acd639842c8c88b533bf210c8cd86acf2ecc273259c0dd578398a4cb",
+      "topicHex": "e36165b0d71a05b2330be5a2519c2573d2c9b35c75e94fab874c46a8210641d0",
+      "idHex": "87f5fb333d45b47c1d1efd0854cd930d60adc15fa00d62cf5e93733f5c55aedf",
+      "ownerHex": "ff6316419def87e4ea768e09a04dd56ebb40cb4e",
+      "socAddressHex": "8d1fc9e8c869dfccab297deb4836d7a3af4e1c5ab74056a72fde697593151edb"
+    },
+    {
+      "start": "1145373120",
+      "level": 25,
+      "indexBytesHex": "cc9eb703f730068b3ad4a854298ff3bbe2ccca5543c383c519425476465e0d0c",
+      "topicHex": "e36165b0d71a05b2330be5a2519c2573d2c9b35c75e94fab874c46a8210641d0",
+      "idHex": "33db218f49c4dd98c012d37334d7b4937c837f8a4ae34916fd765776ad9d8508",
+      "ownerHex": "ff6316419def87e4ea768e09a04dd56ebb40cb4e",
+      "socAddressHex": "c394f9be4655483a9bbd1caa315cfe9af61aa5c6586421c72645290e3206700a"
+    },
+    {
+      "start": "9223372036854775807",
+      "level": 31,
+      "indexBytesHex": "12cab1a9c06a6fa5f25ba61e651e516b805286e09e0236caff70d7e345a6f934",
+      "topicHex": "e36165b0d71a05b2330be5a2519c2573d2c9b35c75e94fab874c46a8210641d0",
+      "idHex": "009e4532eb2a2339d9fb5ccbd4af26fcfcd734ee1cf70872a2c4f620b8da7cc0",
+      "ownerHex": "ff6316419def87e4ea768e09a04dd56ebb40cb4e",
+      "socAddressHex": "e18b8f4e8e3cb0322a51f2244b4b6abb0ff4e3a869b4668f4faafc01fd34629a"
+    }
+  ],
+  "description": "epoch feed ids: index bytes = keccak256(BE8(start) || level) (bee pkg/feeds/epochs/epoch.go:35), id = keccak256(topic || indexBytes)"
+}

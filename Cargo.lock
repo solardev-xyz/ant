@@ -122,6 +122,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ant-conformance"
+version = "0.5.33"
+dependencies = [
+ "ant-crypto",
+ "ant-postage",
+ "ant-retrieval",
+ "hex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ant-control"
 version = "0.5.33"
 dependencies = [
