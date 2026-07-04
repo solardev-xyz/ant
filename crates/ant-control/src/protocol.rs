@@ -404,6 +404,71 @@ pub struct PostageStatusView {
     pub worst_case_remaining_chunks: u64,
 }
 
+/// Point-in-time snapshot of the node's settlement/balance mirror,
+/// acked by `ControlCommand::AccountingSnapshot` and rendered by the
+/// gateway's bee-parity read-only endpoints (`/balances`, `/consumed`,
+/// `/settlements`, `/timesettlements`, `/chequebook/cheque`).
+///
+/// Ant is a light client: its accounting state is a *mirror* of what
+/// connected bee peers believe, not bee's bidirectional store. The
+/// snapshot therefore only carries rows for peers the node can still
+/// attribute (connected peers with a known overlay); persisted
+/// outbound-cheque totals for peers that are gone are omitted rather
+/// than invented.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AccountingSnapshotView {
+    pub peers: Vec<PeerAccountingView>,
+}
+
+/// Per-peer settlement/balance row. All amounts are non-negative
+/// decimal strings in PLUR (bee's accounting unit); `None` means "no
+/// record exists" — bee's stores distinguish a missing entry (404 on
+/// the per-peer endpoints) from a zero-valued one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PeerAccountingView {
+    /// Peer overlay address, 64 lowercase hex chars (no `0x`) — the
+    /// key bee's balances/settlements endpoints use.
+    pub peer: String,
+    /// Our outstanding retrieval debt toward the peer (what the peer's
+    /// accounting believes we owe it). Ant's mirror is one-directional
+    /// — the gateway renders bee's sign convention (positive = peer
+    /// owes us) by negating this. `None` = no accounting entry.
+    #[serde(default)]
+    pub debt_to_peer: Option<String>,
+    /// Cumulative SWAP (cheque) amount settled *to* the peer — the
+    /// outbound ledger's cumulative payout for the peer's beneficiary.
+    #[serde(default)]
+    pub swap_sent: Option<String>,
+    /// Cumulative SWAP amount settled *by* the peer (cheques we
+    /// accepted from its chequebook).
+    #[serde(default)]
+    pub swap_received: Option<String>,
+    /// Cumulative pseudosettle (time-based) amount the peer accepted
+    /// from our refreshes. Ant never accepts inbound refreshes (its
+    /// inbound handler acks zero), so there is no `time_received`.
+    #[serde(default)]
+    pub time_sent: Option<String>,
+    /// Last cheque we issued to the peer (beneficiary = the peer's
+    /// EOA, chequebook = ours, payout = cumulative).
+    #[serde(default)]
+    pub cheque_sent: Option<LastChequeView>,
+    /// Last cheque we accepted from the peer (beneficiary = ours,
+    /// chequebook = the peer's, payout = highest accepted cumulative).
+    #[serde(default)]
+    pub cheque_received: Option<LastChequeView>,
+}
+
+/// Cheque rendering data for `/chequebook/cheque`. Addresses are 40
+/// lowercase hex chars (no `0x`); the gateway EIP-55-checksums them
+/// the way Go's `common.Address.String()` does.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LastChequeView {
+    pub beneficiary: String,
+    pub chequebook: String,
+    /// Cumulative payout, decimal string.
+    pub payout: String,
+}
+
 /// One streaming progress sample for an in-flight `Get*` request.
 ///
 /// All counters are cumulative since the request started. Spans of `0`

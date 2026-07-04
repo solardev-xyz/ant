@@ -23,10 +23,11 @@ pub use command::{
     streaming_ack_channel, ControlAck, ControlCommand, ManifestEntryInfo, StreamRange,
 };
 pub use protocol::{
-    CacheInfo, DiskCacheInfo, ExternalAddressInfo, GatewayRequestInfo, GatewayRequestKind,
-    GetProgress, HandshakeReport, IdentityInfo, PeerConnectionInfo, PeerConnectionState, PeerInfo,
-    PeerPipelineEntry, PostageStatusView, ProtocolError, Request, Response, RetrievalInfo,
-    RoutingInfo, StatusSnapshot, UploadJobView, VersionInfo, PROTOCOL_VERSION,
+    AccountingSnapshotView, CacheInfo, DiskCacheInfo, ExternalAddressInfo, GatewayRequestInfo,
+    GatewayRequestKind, GetProgress, HandshakeReport, IdentityInfo, LastChequeView,
+    PeerAccountingView, PeerConnectionInfo, PeerConnectionState, PeerInfo, PeerPipelineEntry,
+    PostageStatusView, ProtocolError, Request, Response, RetrievalInfo, RoutingInfo,
+    StatusSnapshot, UploadJobView, VersionInfo, PROTOCOL_VERSION,
 };
 
 #[cfg(unix)]

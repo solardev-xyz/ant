@@ -10,9 +10,10 @@ use crate::peerstore::PeerStore;
 use crate::routing::{KnownPeers, Overlay, RoutingTable};
 use crate::sinks;
 use ant_control::{
-    CacheInfo, ControlAck, ControlCommand, DiskCacheInfo, ExternalAddressInfo, GatewayActivity,
-    GetProgress, HandshakeReport, PeerConnectionInfo, PeerConnectionState, PeerPipelineEntry,
-    RetrievalInfo, RoutingInfo, StatusSnapshot, StreamRange,
+    AccountingSnapshotView, CacheInfo, ControlAck, ControlCommand, DiskCacheInfo,
+    ExternalAddressInfo, GatewayActivity, GetProgress, HandshakeReport, LastChequeView,
+    PeerAccountingView, PeerConnectionInfo, PeerConnectionState, PeerPipelineEntry, RetrievalInfo,
+    RoutingInfo, StatusSnapshot, StreamRange,
 };
 use ant_crypto::HandshakeWireVersion;
 use ant_crypto::{
@@ -821,6 +822,15 @@ struct SwarmState {
     /// legacy "push without settlement" behaviour for ultra-light
     /// reads + tests.
     pushsync_swap: Option<Arc<crate::PushsyncSwap>>,
+    /// Inbound SWAP credit ledger (cheques peers paid us), shared with
+    /// the swap sink task spawned by `sinks::spawn`. Retained here so
+    /// [`ControlCommand::AccountingSnapshot`] can render the
+    /// `swap_received` / `cheque_received` side of the gateway's
+    /// `/settlements` and `/chequebook/cheque` endpoints. `None` when
+    /// the operator didn't configure inbound SWAP (no beneficiary),
+    /// in which case every received-side field is absent — honest:
+    /// without a ledger we accept no cheques.
+    credit_ledger: Option<Arc<crate::swap::CreditLedger>>,
     /// Process-wide push-side peer skip cache. Cloned into every
     /// `RoutingFetcher` built for `PushChunk` / `PushSoc` so a peer
     /// that just bounced a pushsync on chunk N is excluded from
@@ -906,6 +916,7 @@ impl SwarmState {
             external_addresses_order: Vec::new(),
             peer_eth,
             pushsync_swap: None,
+            credit_ledger: None,
             push_skip: ant_retrieval::PushSkipCache::new(),
             hot_hint: None,
             known_dialable: HashMap::new(),
@@ -1290,6 +1301,10 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     // every cheque we receive (no on-chain identity to credit
     // against).
     let swap_wiring = build_swap_wiring(&cfg);
+    // Keep a handle on the inbound credit ledger for the accounting
+    // snapshot (gateway `/settlements` received side) before the
+    // wiring moves into the sink task.
+    let credit_ledger = swap_wiring.as_ref().map(|w| w.ledger.clone());
     sinks::spawn(registrations, swap_wiring);
 
     let target_peers = if cfg.target_peers == 0 {
@@ -1311,6 +1326,7 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
         cfg.disk_cache.clone(),
         cfg.peer_eth.clone(),
     );
+    state.credit_ledger = credit_ledger;
 
     // Advertise any user-supplied external addresses so bee's peerstore sees
     // a public multiaddr for us. Without this bee's inbound handshake handler
@@ -2749,7 +2765,100 @@ fn handle_control_command(
                 let _ = ack.send(reply);
             });
         }
+        ControlCommand::AccountingSnapshot { ack } => {
+            let _ = ack.send(ControlAck::Accounting(build_accounting_snapshot(state)));
+        }
     }
+}
+
+/// Assemble the per-peer settlement/balance snapshot for
+/// [`ControlCommand::AccountingSnapshot`]. Purely synchronous reads of
+/// swarm-loop state (each source takes its own short-lived lock).
+///
+/// Rows are keyed by the peer's overlay (bee's peer identifier), so
+/// only currently-connected peers — the routing table's snapshot — can
+/// be rendered. That matches the lifetime of the accounting mirror
+/// itself (reset per connection, like bee's `notifyPeerConnect`), but
+/// it does mean persisted outbound-cheque cumulative amounts for peers
+/// that are *not* connected right now are omitted: without the peer's
+/// handshake we no longer know which overlay/EOA they belong to.
+fn build_accounting_snapshot(state: &SwarmState) -> AccountingSnapshotView {
+    let balances: HashMap<PeerId, (u64, u64)> = state
+        .accounting
+        .as_ref()
+        .map(|a| {
+            a.settlement_snapshot()
+                .into_iter()
+                .map(|(peer, balance, time_settled)| (peer, (balance, time_settled)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let credits = state
+        .credit_ledger
+        .as_ref()
+        .map(|l| (l.beneficiary(), l.snapshot()));
+
+    let mut rows = Vec::new();
+    for (peer, overlay) in state.routing.snapshot() {
+        let (debt, time_settled) = match balances.get(&peer) {
+            Some(&(balance, time_settled)) => (Some(balance), time_settled),
+            None => (None, 0),
+        };
+        let eth = state.peer_eth.get(&peer);
+        // Outbound: cumulative cheque payout to the peer's beneficiary.
+        let swap_sent = match (eth, state.pushsync_swap.as_ref()) {
+            (Some(e), Some(svc)) => svc.outbound_ledger().recorded_for(&e),
+            _ => None,
+        };
+        let cheque_sent = match (eth, swap_sent, state.pushsync_swap.as_ref()) {
+            (Some(e), Some(cumulative), Some(svc)) => Some(LastChequeView {
+                beneficiary: hex::encode(e),
+                chequebook: hex::encode(svc.chequebook()),
+                payout: cumulative.to_string(),
+            }),
+            _ => None,
+        };
+        // Inbound: the credit-ledger record whose pinned issuer EOA is
+        // this peer's handshake EOA (cheques are signed by the same
+        // key the overlay is derived from).
+        let cheque_received = match (&credits, eth) {
+            (Some((our_beneficiary, records)), Some(e)) => {
+                let eth_hex = hex::encode(e);
+                records
+                    .iter()
+                    .find(|(_, credit)| credit.issuer_eoa_hex == eth_hex)
+                    .map(|(chequebook_hex, credit)| LastChequeView {
+                        beneficiary: hex::encode(our_beneficiary),
+                        chequebook: chequebook_hex.clone(),
+                        payout: credit.cumulative_payout_dec.clone(),
+                    })
+            }
+            _ => None,
+        };
+        let swap_received = cheque_received.as_ref().map(|c| c.payout.clone());
+
+        let row = PeerAccountingView {
+            peer: hex::encode(overlay),
+            debt_to_peer: debt.map(|b| b.to_string()),
+            swap_sent: swap_sent.map(|u| u.to_string()),
+            swap_received,
+            time_sent: (time_settled > 0).then(|| time_settled.to_string()),
+            cheque_sent,
+            cheque_received,
+        };
+        // Peers with no record anywhere are omitted — bee's stores
+        // have no entry for them either (its per-peer endpoints 404).
+        if row.debt_to_peer.is_some()
+            || row.swap_sent.is_some()
+            || row.swap_received.is_some()
+            || row.time_sent.is_some()
+        {
+            rows.push(row);
+        }
+    }
+    // Stable order so repeated snapshots render identically.
+    rows.sort_by(|a, b| a.peer.cmp(&b.peer));
+    AccountingSnapshotView { peers: rows }
 }
 
 /// Cap on how many bytes any single file span inside a stewardship

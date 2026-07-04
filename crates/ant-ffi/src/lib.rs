@@ -763,6 +763,7 @@ async fn attempt_download(
                 | ControlAck::UploadProgress(_)
                 | ControlAck::PostageStatus(_)
                 | ControlAck::PostageList(_)
+                | ControlAck::Accounting(_)
                 | ControlAck::FeedResolved { .. }
                 | ControlAck::FeedNotFound
                 | ControlAck::Envelope { .. }

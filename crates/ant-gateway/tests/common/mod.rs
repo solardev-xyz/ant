@@ -722,6 +722,13 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
                 message: body.to_string(),
             });
         }
+        ControlCommand::AccountingSnapshot { ack } => {
+            // The fixture has no peers: an empty snapshot renders the
+            // settlement endpoints' empty-collection shapes.
+            let _ = ack.send(ControlAck::Accounting(
+                ant_control::AccountingSnapshotView::default(),
+            ));
+        }
     }
 }
 

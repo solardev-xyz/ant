@@ -187,7 +187,7 @@ pub fn parse_hex_param<const N: usize>(
 
 /// Format an invalid hex byte like Go's `fmt.Sprintf("invalid hex
 /// byte: %#U", b)` — e.g. `invalid hex byte: U+007A 'z'`.
-fn go_invalid_hex_byte(c: char) -> String {
+pub(crate) fn go_invalid_hex_byte(c: char) -> String {
     format!("invalid hex byte: U+{:04X} '{}'", c as u32, c)
 }
 
