@@ -462,6 +462,13 @@ fn ack_to_response(ack: ControlAck) -> Response {
             message: "stream complete".to_string(),
         },
         ControlAck::ChunkUploaded { reference } => Response::ChunkUploaded { reference },
+        // Envelope issuance and stewardship checks are HTTP-gateway
+        // surfaces (`POST /envelope`, `GET|PUT /stewardship`); the
+        // Unix-socket protocol doesn't expose the commands, so an ack
+        // leaking here means a wiring bug — surface it clearly.
+        ControlAck::Envelope { .. } | ControlAck::Retrievable { .. } => Response::Error {
+            message: "envelope/stewardship are only supported by ant-gateway".to_string(),
+        },
         ControlAck::UploadStarted { job_id } => Response::UploadStarted { job_id },
         ControlAck::UploadJob(view) => Response::UploadJob(view),
         ControlAck::UploadList(views) => Response::UploadList { jobs: views },
