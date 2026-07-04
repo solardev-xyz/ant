@@ -66,6 +66,20 @@ use crate::handle::GatewayHandle;
 /// channel is deferred (PLAN.md D.2.3 explicitly allows this scope).
 const SWARM_CHUNK_RETRIEVAL_TIMEOUT: HeaderName =
     HeaderName::from_static("swarm-chunk-retrieval-timeout");
+/// Bee download headers selecting the redundancy prefetch strategy
+/// (`NONE`/`DATA`/`PROX`/`RACE`) and whether weaker strategies may be
+/// tried as fallback. **Accepted and ignored** (never an error): ant's
+/// fetch model has one fixed behavior that is the practical equivalent
+/// of bee's `DATA` strategy with recovery fallback — data chunks are
+/// fetched directly and a miss triggers a Reed-Solomon recovery sweep
+/// over the node's remaining shards + parities (`ant_retrieval::rs`).
+/// There is no PROX/RACE machinery to select, so the headers carry no
+/// information for us; we still parse them so bee clients that always
+/// send them (bee-js does) get identical responses.
+const SWARM_REDUNDANCY_STRATEGY: HeaderName = HeaderName::from_static("swarm-redundancy-strategy");
+/// See [`SWARM_REDUNDANCY_STRATEGY`].
+const SWARM_REDUNDANCY_FALLBACK_MODE: HeaderName =
+    HeaderName::from_static("swarm-redundancy-fallback-mode");
 /// Bee request header: when `true`, treat the body as a tar archive and
 /// build a multi-file manifest. Default `false` (single-file upload).
 const SWARM_COLLECTION: HeaderName = HeaderName::from_static("swarm-collection");
@@ -1499,6 +1513,7 @@ pub async fn bytes(
         .and_then(|v| v.to_str().ok())
         .map(String::from);
     let timeout = request_timeout(&headers, DEFAULT_REQUEST_TIMEOUT);
+    note_redundancy_headers(&headers);
     let head_only = method == Method::HEAD;
 
     let activity_guard = Some(
@@ -1695,6 +1710,7 @@ async fn bzz_inner(
         .and_then(|v| v.to_str().ok())
         .map(String::from);
     let timeout = request_timeout(&headers, DEFAULT_REQUEST_TIMEOUT);
+    note_redundancy_headers(&headers);
     let head_only = method == Method::HEAD;
 
     let activity_label = if path.is_empty() {
@@ -2378,6 +2394,24 @@ pub(crate) fn request_timeout(headers: &HeaderMap, default: Duration) -> Duratio
         .and_then(|v| v.to_str().ok())
         .and_then(humantime::parse_duration_lite)
         .unwrap_or(default)
+}
+
+/// Parse-and-ignore bee's download-side redundancy headers (see the
+/// constants' doc comment for why they are no-ops here). Any value —
+/// including ones bee would reject — is accepted: the read path always
+/// runs the same DATA-equivalent strategy with RS recovery, so
+/// rejecting a strategy we won't use would only break clients.
+fn note_redundancy_headers(headers: &HeaderMap) {
+    for name in [&SWARM_REDUNDANCY_STRATEGY, &SWARM_REDUNDANCY_FALLBACK_MODE] {
+        if let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) {
+            tracing::trace!(
+                target: "ant_gateway",
+                header = %name,
+                value,
+                "redundancy header accepted and ignored (ant always fetches data shards and RS-recovers on miss)",
+            );
+        }
+    }
 }
 
 /// Build a `200 OK` (or empty `200 OK` for `HEAD`) response for a full

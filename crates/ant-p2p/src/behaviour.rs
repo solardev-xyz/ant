@@ -19,7 +19,7 @@ use ant_crypto::{
     ethereum_address_from_public_key, overlay_from_ethereum_address, OVERLAY_NONCE_LEN,
     SECP256K1_SECRET_LEN,
 };
-use ant_retrieval::{ProgressTracker, RetrievalCounters, DEFAULT_CACHE_CAPACITY};
+use ant_retrieval::{ChunkFetcher, ProgressTracker, RetrievalCounters, DEFAULT_CACHE_CAPACITY};
 use futures::StreamExt;
 use k256::ecdsa::{SigningKey, VerifyingKey};
 use libp2p::core::connection::ConnectedPoint;
@@ -1653,7 +1653,6 @@ fn handle_control_command(
             let disk_cache = state.disk_cache_for_request(false);
             let control = control.clone();
             tokio::spawn(async move {
-                use ant_retrieval::ChunkFetcher;
                 let mut builder =
                     ant_retrieval::RoutingFetcher::new(control, peers_rx).with_cache(cache);
                 if let Some(disk) = disk_cache {
@@ -2146,7 +2145,6 @@ fn handle_control_command(
             let disk_cache = state.disk_cache_for_request(false);
             let control = control.clone();
             tokio::spawn(async move {
-                use ant_retrieval::ChunkFetcher;
                 let mut builder =
                     ant_retrieval::RoutingFetcher::new(control, peers_rx).with_cache(cache);
                 if let Some(disk) = disk_cache {
@@ -2965,8 +2963,6 @@ async fn stewardship_is_retrievable(
     fetcher: &ant_retrieval::RoutingFetcher,
     reference: [u8; 32],
 ) -> bool {
-    use ant_retrieval::ChunkFetcher;
-
     let addrs = match ant_retrieval::traverse_chunk_addresses(
         fetcher,
         reference,
@@ -3000,8 +2996,6 @@ async fn stewardship_reupload(
     batch_id: [u8; 32],
     reference: [u8; 32],
 ) -> ControlAck {
-    use ant_retrieval::ChunkFetcher;
-
     let addrs = match ant_retrieval::traverse_chunk_addresses(
         read_fetcher,
         reference,
@@ -3106,8 +3100,6 @@ async fn run_stream_bytes(
     head_only: bool,
     ack: mpsc::Sender<ControlAck>,
 ) {
-    use ant_retrieval::ChunkFetcher;
-
     let mut builder = ant_retrieval::RoutingFetcher::new(control, peers_rx)
         .with_cache(cache)
         .with_record_dir(record_dir)
@@ -3126,7 +3118,10 @@ async fn run_stream_bytes(
     }
     let fetcher = builder;
 
-    let root = match fetcher.fetch(reference).await {
+    // Root fetch with dispersed-replica fallback: files uploaded with a
+    // swarm-redundancy-level carry 2^level SOC replicas of their root at
+    // addresses derivable from the root address alone.
+    let root = match ant_retrieval::fetch_root_with_replicas(&fetcher, reference).await {
         Ok(root) => root,
         Err(e) => {
             let _ = ack
@@ -3137,11 +3132,10 @@ async fn run_stream_bytes(
             return;
         }
     };
-    // `/bytes` does not pass `allow_degraded_redundancy`; if the root
-    // span carries an RS level the joiner will reject the file later.
-    // We still mask before reporting `total_bytes` so the gateway's
-    // `Content-Length` reflects the real file size when (eventually) we
-    // wire RS recovery in.
+    // Mask the RS level byte off the span before reporting
+    // `total_bytes` so the gateway's `Content-Length` reflects the real
+    // file size; the joiner itself decodes the level per node and
+    // recovers missing data chunks from parities.
     let Some(total_bytes) = root_span_to_u64_masked(&root) else {
         let _ = ack
             .send(ControlAck::Error {
@@ -3196,7 +3190,7 @@ async fn run_stream_bzz(
     head_only: bool,
     ack: mpsc::Sender<ControlAck>,
 ) {
-    use ant_retrieval::{lookup_path, ChunkFetcher, ManifestError};
+    use ant_retrieval::{lookup_path, ManifestError};
 
     // Reuse the same retry envelope as `run_get_bzz` for the manifest
     // walk. Once the data root has landed and we've emitted
@@ -3281,7 +3275,9 @@ async fn run_stream_bzz(
             "stream_bzz manifest resolved",
         );
 
-        let root = match fetcher.fetch(data_ref).await {
+        // Data-root fetch with dispersed-replica fallback (see
+        // `run_stream_bytes`).
+        let root = match ant_retrieval::fetch_root_with_replicas(&fetcher, data_ref).await {
             Ok(r) => r,
             Err(e)
                 if attempt < MAX_FETCH_ATTEMPTS
@@ -3721,11 +3717,13 @@ async fn try_get_bytes(
     reference: [u8; 32],
     max_bytes: Option<u64>,
 ) -> Result<Vec<u8>, AttemptError> {
-    use ant_retrieval::{join, ChunkFetcher};
+    use ant_retrieval::join;
 
-    let root = fetcher.fetch(reference).await.map_err(|e| {
-        AttemptError::Transient(format!("fetch root chunk {}: {e}", hex::encode(reference)))
-    })?;
+    let root = ant_retrieval::fetch_root_with_replicas(fetcher, reference)
+        .await
+        .map_err(|e| {
+            AttemptError::Transient(format!("fetch root chunk {}: {e}", hex::encode(reference)))
+        })?;
     // The root chunk's span is the total file size (in bytes) of the
     // BMT-built tree below it, so we can finalize the progress totals
     // as soon as the root lands and the rest of the joiner can drive
@@ -3855,8 +3853,8 @@ fn root_span_to_u64(wire: &[u8]) -> Option<u64> {
 /// Like [`root_span_to_u64`] but masks the redundancy level byte off the
 /// span before decoding. Bee stores the RS level in the high byte of the
 /// chunk's 8-byte span (top of the range, since a real file's span fits
-/// in 56 bits / 72 PB). Reads that go through the joiner with
-/// `allow_degraded_redundancy` set already mask, but the streaming path
+/// in 56 bits / 72 PB). Reads that go through the joiner already decode
+/// and mask the level per node, but the streaming path
 /// also reports the file's total span over the wire (`BytesStreamStart`,
 /// `BzzStreamStart`), so we need the masked value there too — otherwise
 /// the gateway emits a `Content-Length` of `0x82_<...>` instead of the
@@ -4055,7 +4053,6 @@ async fn verify_chunks_present(
     fetcher: &ant_retrieval::RoutingFetcher,
     addresses: &[[u8; 32]],
 ) -> Vec<[u8; 32]> {
-    use ant_retrieval::ChunkFetcher;
     use futures::stream::StreamExt;
 
     const CONCURRENCY: usize = 16;
@@ -4676,7 +4673,7 @@ async fn try_get_bzz(
     allow_degraded_redundancy: bool,
     max_bytes: Option<u64>,
 ) -> Result<(Vec<u8>, Option<String>, Option<String>), AttemptError> {
-    use ant_retrieval::{join_with_options, lookup_path, ChunkFetcher, JoinOptions, ManifestError};
+    use ant_retrieval::{join_with_options, lookup_path, JoinOptions, ManifestError};
 
     let lookup = match lookup_path(fetcher, reference, path).await {
         Ok(r) => r,
@@ -4706,10 +4703,13 @@ async fn try_get_bzz(
     );
 
     // Reuse the same fetcher so the blacklist / peer ordering carries
-    // over from the manifest walk into the file-body fetch.
-    let root = fetcher.fetch(data_ref).await.map_err(|e| {
-        AttemptError::Transient(format!("fetch data root {}: {e}", hex::encode(data_ref)))
-    })?;
+    // over from the manifest walk into the file-body fetch. Data-root
+    // fetch falls back to the dispersed replicas of redundant uploads.
+    let root = ant_retrieval::fetch_root_with_replicas(fetcher, data_ref)
+        .await
+        .map_err(|e| {
+            AttemptError::Transient(format!("fetch data root {}: {e}", hex::encode(data_ref)))
+        })?;
     // Manifest chunks already showed up in the tracker as raw bytes;
     // we only learn the *file*'s size once the data root lands. Set
     // it now so the client's progress bar gets a real denominator

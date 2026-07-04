@@ -69,12 +69,10 @@ pub enum Request {
     /// then joins the resulting chunk tree into the file's raw bytes.
     /// Daemon answers with [`Response::BzzBytes`].
     ///
-    /// `allow_degraded_redundancy`: opt in to decoding files whose root
-    /// chunk carries a non-zero Reed-Solomon redundancy level. The
-    /// daemon masks the level byte and walks the chunk tree without
-    /// running RS recovery — bytes come back if every data chunk is
-    /// reachable, otherwise the request fails as it would today.
-    /// Defaults to `false` so the normal path remains strict.
+    /// `allow_degraded_redundancy`: legacy no-op, kept for protocol
+    /// compatibility. Redundancy-encoded files (Reed-Solomon levels
+    /// 1–4) are now always decoded with parity-aware geometry and
+    /// missing data chunks are recovered from parities automatically.
     /// See [`Request::Get`] for `bypass_cache` and `progress`.
     GetBzz {
         reference: String,
