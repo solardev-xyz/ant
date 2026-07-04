@@ -765,6 +765,8 @@ async fn attempt_download(
                 | ControlAck::PostageList(_)
                 | ControlAck::FeedResolved { .. }
                 | ControlAck::FeedNotFound
+                | ControlAck::Envelope { .. }
+                | ControlAck::Retrievable { .. }
                 | ControlAck::NotReady { .. },
             )) => {}
             Ok(None) => {

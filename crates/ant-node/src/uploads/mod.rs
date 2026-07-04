@@ -439,6 +439,7 @@ async fn push_attempt(
         .send(ControlCommand::PushChunk {
             wire,
             batch_id,
+            stamp: None,
             ack: ack_tx,
         })
         .await

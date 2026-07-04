@@ -1795,15 +1795,9 @@ fn handle_control_command(
         ControlCommand::PushChunk {
             wire,
             batch_id,
+            stamp,
             ack,
         } => {
-            let Some(upload) = upload.clone() else {
-                let _ = ack.send(ControlAck::Error {
-                    message: "uploads not configured: node cannot stamp (set a blockchain-rpc-endpoint or pass --postage-batch at startup)".into(),
-                });
-                return;
-            };
-
             // Validate wire bytes locally before paying for a stamp,
             // so a malformed `POST /chunks` body is rejected up-front
             // instead of burning a postage slot and then being told to
@@ -1820,6 +1814,30 @@ fn handle_control_command(
             let Some(addr) = ant_crypto::bmt::bmt_hash_with_span(&span, &payload) else {
                 let _ = ack.send(ControlAck::Error {
                     message: "failed to BMT-hash chunk".into(),
+                });
+                return;
+            };
+
+            // Pre-signed stamp (bee's `swarm-postage-stamp` header):
+            // push with the caller's stamp instead of issuing one. No
+            // upload runtime is needed — the stamp's own signature is
+            // the postage proof, mirroring bee's presigned-stamper path
+            // where any node can forward a foreign-batch chunk.
+            if let Some(pre) = stamp {
+                let stamp = match validate_presigned_stamp(&pre, &addr) {
+                    Ok(s) => s,
+                    Err(message) => {
+                        let _ = ack.send(ControlAck::Error { message });
+                        return;
+                    }
+                };
+                push_with_stamp(state, control, network_id, addr, wire, stamp, ack);
+                return;
+            }
+
+            let Some(upload) = upload.clone() else {
+                let _ = ack.send(ControlAck::Error {
+                    message: "uploads not configured: node cannot stamp (set a blockchain-rpc-endpoint or pass --postage-batch at startup)".into(),
                 });
                 return;
             };
@@ -1900,76 +1918,15 @@ fn handle_control_command(
                 }
             };
 
-            let peers_rx = state.peers_watch.subscribe();
-            if peers_rx.borrow().is_empty() {
-                let _ = ack.send(ControlAck::Error {
-                    message: "no peers available; wait for handshakes to complete".into(),
-                });
-                return;
-            }
-            let control = control.clone();
-            let pushsync_swap = state.pushsync_swap.clone();
-            let push_skip = state.push_skip.clone();
-            let disk_cache = state.disk_cache.clone();
-            let mem_cache = state.chunk_cache.clone();
-            let neighborhood_dial = state.neighborhood_dial_tx.clone();
-            tokio::spawn(async move {
-                // Land the chunk in our own local store *before* pushsync,
-                // mirroring bee's store-then-push upload model. Without
-                // this a node can't retrieve content it just uploaded:
-                // the chunk only exists on whatever neighbourhood storer
-                // accepted the push, and fresh content is not reliably
-                // retrievable from the network for the first few seconds
-                // (the gateway / AntDrive then "hits an unretrievable
-                // chunk" and the read truncates). Keeping a local copy
-                // makes our own uploads retrievable immediately and
-                // survives a slow/partial network push.
-                if let Some(mem) = &mem_cache {
-                    mem.put(addr, wire.clone());
-                }
-                if let Some(disk) = &disk_cache {
-                    if let Err(e) = disk.put(addr, wire.clone()).await {
-                        warn!(
-                            target: "ant_p2p",
-                            addr = %hex::encode(addr),
-                            "failed to cache uploaded chunk locally: {e}",
-                        );
-                    }
-                }
-                let mut fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx)
-                    .with_push_skip(push_skip)
-                    .with_network_id(network_id);
-                if let Some(tx) = neighborhood_dial {
-                    fetcher = fetcher.with_neighborhood_dialer(tx);
-                }
-                if let Some(svc) = pushsync_swap {
-                    let s: Arc<dyn ant_retrieval::PushsyncSettlement> = svc;
-                    fetcher = fetcher.with_pushsync_settlement(s);
-                }
-                let reply = match fetcher.push_stamped_chunk(addr, wire, stamp).await {
-                    Ok(()) => ControlAck::ChunkUploaded {
-                        reference: format!("0x{}", hex::encode(addr)),
-                    },
-                    Err(e) => ControlAck::Error {
-                        message: format!("pushsync: {e}"),
-                    },
-                };
-                let _ = ack.send(reply);
-            });
+            push_with_stamp(state, control, network_id, addr, wire, stamp, ack);
         }
         ControlCommand::PushSoc {
             address,
             wire,
             batch_id,
+            stamp,
             ack,
         } => {
-            let Some(upload) = upload.clone() else {
-                let _ = ack.send(ControlAck::NotReady {
-                    message: "uploads not configured: node cannot stamp (set a blockchain-rpc-endpoint or pass --postage-batch at startup)".into(),
-                });
-                return;
-            };
-
             // Re-check the wire layout locally even though the gateway
             // has already validated `soc_valid(&address, &wire)`: a
             // misbehaving gateway must not be able to coerce us into
@@ -1982,6 +1939,27 @@ fn handle_control_command(
                 });
                 return;
             }
+
+            // Pre-signed stamp: push with the caller's stamp — no local
+            // issuer needed. See the matching branch in `PushChunk`.
+            if let Some(pre) = stamp {
+                let stamp = match validate_presigned_stamp(&pre, &address) {
+                    Ok(s) => s,
+                    Err(message) => {
+                        let _ = ack.send(ControlAck::Error { message });
+                        return;
+                    }
+                };
+                push_soc_with_stamp(state, control, network_id, address, wire, stamp, ack);
+                return;
+            }
+
+            let Some(upload) = upload.clone() else {
+                let _ = ack.send(ControlAck::NotReady {
+                    message: "uploads not configured: node cannot stamp (set a blockchain-rpc-endpoint or pass --postage-batch at startup)".into(),
+                });
+                return;
+            };
 
             // Stamp under the issuer mutex so concurrent pushes can't
             // collide on the same bucket index, matching the PushChunk
@@ -2014,85 +1992,143 @@ fn handle_control_command(
                 }
             };
 
+            push_soc_with_stamp(state, control, network_id, address, wire, stamp, ack);
+        }
+        ControlCommand::Envelope {
+            address,
+            batch_id,
+            ack,
+        } => {
+            // Bee's `envelopePostHandler`: issue (and persist) a stamp
+            // for a chunk address the caller will upload later, via
+            // `stamper.Stamp(address, address)`. Consumes a bucket slot
+            // exactly like stamping an upload; re-requesting the same
+            // address reuses the cached stamp (issuer idempotence).
+            let Some(upload) = upload.clone() else {
+                let _ = ack.send(ControlAck::Error {
+                    message: "uploads not configured: node cannot stamp (set a blockchain-rpc-endpoint or pass --postage-batch at startup)".into(),
+                });
+                return;
+            };
+            let reply = {
+                let mut issuers = match upload.issuers.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                match issuers.get_mut(&batch_id) {
+                    None => ControlAck::Error {
+                        message: format!("batch 0x{} not usable", hex::encode(batch_id)),
+                    },
+                    Some(issuer) => {
+                        match ant_postage::sign_stamp_bytes(&upload.stamp_key, issuer, &address) {
+                            Ok(stamp) => ControlAck::Envelope {
+                                issuer: upload.batch_owner,
+                                stamp,
+                            },
+                            Err(ant_postage::PostageError::BucketFull) => ControlAck::Error {
+                                // Keyword the gateway maps to bee's
+                                // `402 "batch is overissued"`.
+                                message: "batch is overissued".into(),
+                            },
+                            Err(e) => ControlAck::Error {
+                                message: format!("stamp issue failed: {e}"),
+                            },
+                        }
+                    }
+                }
+            };
+            let _ = ack.send(reply);
+        }
+        ControlCommand::StewardshipGet { reference, ack } => {
+            // Bee's `steward.IsRetrievable`: traverse the whole content
+            // tree (span trees + mantaray manifests) and probe every
+            // chunk. Any failure — missing root, unreachable interior
+            // node, unreachable leaf — reports `retrievable: false`
+            // rather than an error, matching bee's not-found mapping.
+            // The fetcher is the normal cache-aware one: a light node's
+            // own uploads are held locally, and a cached copy is by
+            // definition retrievable through this node's gateway.
+            let peers_rx = state.peers_watch.subscribe();
+            let cache = state.cache_for_request(false);
+            let disk_cache = state.disk_cache_for_request(false);
+            let control = control.clone();
+            tokio::spawn(async move {
+                let mut fetcher =
+                    ant_retrieval::RoutingFetcher::new(control, peers_rx).with_cache(cache);
+                if let Some(disk) = disk_cache {
+                    fetcher = fetcher.with_disk_cache(disk);
+                }
+                let retrievable = stewardship_is_retrievable(&fetcher, reference).await;
+                let _ = ack.send(ControlAck::Retrievable { retrievable });
+            });
+        }
+        ControlCommand::StewardshipPut {
+            reference,
+            batch_id,
+            ack,
+        } => {
+            // Bee's `steward.Reupload`: traverse the tree, fetch every
+            // chunk (cache-first — a light node holds its own uploads
+            // locally), stamp each against `batch_id`, pushsync all.
+            let Some(upload) = upload.clone() else {
+                let _ = ack.send(ControlAck::Error {
+                    message: "uploads not configured: node cannot stamp (set a blockchain-rpc-endpoint or pass --postage-batch at startup)".into(),
+                });
+                return;
+            };
+            {
+                // Cheap up-front registry check so an unknown batch is
+                // rejected before any traversal work, mirroring bee's
+                // `getStamper` failing before `Reupload` starts.
+                let issuers = match upload.issuers.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                if !issuers.contains_key(&batch_id) {
+                    let _ = ack.send(ControlAck::Error {
+                        message: format!("batch 0x{} not usable", hex::encode(batch_id)),
+                    });
+                    return;
+                }
+            }
             let peers_rx = state.peers_watch.subscribe();
             if peers_rx.borrow().is_empty() {
-                let _ = ack.send(ControlAck::NotReady {
+                let _ = ack.send(ControlAck::Error {
                     message: "no peers available; wait for handshakes to complete".into(),
                 });
                 return;
             }
+            let cache = state.cache_for_request(false);
+            let disk_cache = state.disk_cache_for_request(false);
             let control = control.clone();
             let pushsync_swap = state.pushsync_swap.clone();
             let push_skip = state.push_skip.clone();
-            let disk_cache = state.disk_cache.clone();
-            let mem_cache = state.chunk_cache.clone();
             let neighborhood_dial = state.neighborhood_dial_tx.clone();
             tokio::spawn(async move {
-                // Keep a local copy of our own upload before pushsync, so
-                // the node can serve the SOC it just stamped without
-                // waiting for network propagation. See the matching note
-                // in the `PushChunk` handler.
-                if let Some(mem) = &mem_cache {
-                    mem.put(address, wire.clone());
+                let mut read_fetcher =
+                    ant_retrieval::RoutingFetcher::new(control.clone(), peers_rx.clone())
+                        .with_cache(cache);
+                if let Some(disk) = disk_cache {
+                    read_fetcher = read_fetcher.with_disk_cache(disk);
                 }
-                if let Some(disk) = &disk_cache {
-                    if let Err(e) = disk.put(address, wire.clone()).await {
-                        warn!(
-                            target: "ant_p2p",
-                            addr = %hex::encode(address),
-                            "failed to cache uploaded soc locally: {e}",
-                        );
-                    }
-                }
-                // Also cache the wrapped CAC carried inside the SOC. The SOC
-                // wire is `id(32) ‖ sig(65) ‖ span(8) ‖ payload`; everything
-                // after the 97-byte header is a content-addressed chunk
-                // (`span ‖ payload`). For a single-chunk (v2) feed update that
-                // wrapped CAC *is* the content root the feed points at, and
-                // bee-js never uploads it as a standalone chunk — so without
-                // this a feed `latest` read (GetFeed resolves the SOC, then
-                // GetBytes the resolved reference) can't serve our own write
-                // until pushsync propagates, and read-after-own-write returns
-                // `feed_empty`. Caching it under its own CAC address closes
-                // that gap, mirroring the SOC cache above (content-addressed,
-                // so it's a no-op-correct extra entry for non-feed SOCs too).
-                let inner = &wire[SOC_HEADER..];
-                if let Ok(inner_span) = <[u8; 8]>::try_from(&inner[..8]) {
-                    if let Some(inner_addr) =
-                        ant_crypto::bmt::bmt_hash_with_span(&inner_span, &inner[8..])
-                    {
-                        if let Some(mem) = &mem_cache {
-                            mem.put(inner_addr, inner.to_vec());
-                        }
-                        if let Some(disk) = &disk_cache {
-                            if let Err(e) = disk.put(inner_addr, inner.to_vec()).await {
-                                warn!(
-                                    target: "ant_p2p",
-                                    addr = %hex::encode(inner_addr),
-                                    "failed to cache wrapped feed CAC locally: {e}",
-                                );
-                            }
-                        }
-                    }
-                }
-                let mut fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx)
+                let mut push_fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx)
                     .with_push_skip(push_skip)
                     .with_network_id(network_id);
                 if let Some(tx) = neighborhood_dial {
-                    fetcher = fetcher.with_neighborhood_dialer(tx);
+                    push_fetcher = push_fetcher.with_neighborhood_dialer(tx);
                 }
                 if let Some(svc) = pushsync_swap {
                     let s: Arc<dyn ant_retrieval::PushsyncSettlement> = svc;
-                    fetcher = fetcher.with_pushsync_settlement(s);
+                    push_fetcher = push_fetcher.with_pushsync_settlement(s);
                 }
-                let reply = match fetcher.push_stamped_chunk(address, wire, stamp).await {
-                    Ok(()) => ControlAck::ChunkUploaded {
-                        reference: format!("0x{}", hex::encode(address)),
-                    },
-                    Err(e) => ControlAck::Error {
-                        message: format!("pushsync: {e}"),
-                    },
-                };
+                let reply = stewardship_reupload(
+                    &read_fetcher,
+                    &push_fetcher,
+                    &upload,
+                    batch_id,
+                    reference,
+                )
+                .await;
                 let _ = ack.send(reply);
             });
         }
@@ -2715,6 +2751,305 @@ fn handle_control_command(
                 let _ = ack.send(reply);
             });
         }
+    }
+}
+
+/// Cap on how many bytes any single file span inside a stewardship
+/// traversal may declare. Matches the gateway's serving ceiling rather
+/// than the conservative CLI joiner default, so stewardship works on
+/// real multi-GiB bzz content.
+const STEWARDSHIP_MAX_FILE_BYTES: usize = 16 * 1024 * 1024 * 1024;
+
+/// Concurrent chunk probes / pushes during a stewardship check or
+/// re-upload. Same bound the upload pipeline uses for `PushChunk`
+/// fan-out (`MAX_PUSH_CONCURRENCY` in `ant-node`/`ant-gateway`).
+const STEWARDSHIP_CONCURRENCY: usize = 32;
+
+/// Validate a caller-supplied pre-signed 113-byte postage stamp against
+/// the chunk address it claims to cover: shape, then signature recovery
+/// over bee's stamp digest (`keccak256(addr ‖ batch ‖ index ‖ ts)`).
+/// Recovery succeeding means the stamp was really signed over *this*
+/// chunk by *some* batch owner — the strongest check a light node
+/// without a batchstore can make (bee additionally compares the
+/// recovered owner against the on-chain batch owner).
+fn validate_presigned_stamp(
+    pre: &[u8],
+    addr: &[u8; 32],
+) -> Result<[u8; ant_postage::STAMP_SIZE], String> {
+    let stamp: [u8; ant_postage::STAMP_SIZE] = pre.try_into().map_err(|_| {
+        format!(
+            "presigned stamp must be {} bytes, got {}",
+            ant_postage::STAMP_SIZE,
+            pre.len()
+        )
+    })?;
+    let batch: &[u8; 32] = stamp[0..32].try_into().expect("slice length");
+    let index: &[u8; 8] = stamp[32..40].try_into().expect("slice length");
+    let ts: &[u8; 8] = stamp[40..48].try_into().expect("slice length");
+    let sig: &[u8; 65] = stamp[48..113].try_into().expect("slice length");
+    let digest = ant_postage::postage_sign_digest(addr, batch, index, ts);
+    ant_crypto::recover_public_key(sig, digest.as_ref())
+        .map_err(|e| format!("presigned stamp signature invalid: {e}"))?;
+    Ok(stamp)
+}
+
+/// Shared `PushChunk` tail: cache the chunk locally (store-then-push),
+/// then pushsync it with `stamp` and ack. Used by both the local-issuer
+/// and the presigned-stamp paths.
+fn push_with_stamp(
+    state: &SwarmState,
+    control: &Control,
+    network_id: u64,
+    addr: [u8; 32],
+    wire: Vec<u8>,
+    stamp: [u8; ant_postage::STAMP_SIZE],
+    ack: oneshot::Sender<ControlAck>,
+) {
+    let peers_rx = state.peers_watch.subscribe();
+    if peers_rx.borrow().is_empty() {
+        let _ = ack.send(ControlAck::Error {
+            message: "no peers available; wait for handshakes to complete".into(),
+        });
+        return;
+    }
+    let control = control.clone();
+    let pushsync_swap = state.pushsync_swap.clone();
+    let push_skip = state.push_skip.clone();
+    let disk_cache = state.disk_cache.clone();
+    let mem_cache = state.chunk_cache.clone();
+    let neighborhood_dial = state.neighborhood_dial_tx.clone();
+    tokio::spawn(async move {
+        // Land the chunk in our own local store *before* pushsync,
+        // mirroring bee's store-then-push upload model. Without
+        // this a node can't retrieve content it just uploaded:
+        // the chunk only exists on whatever neighbourhood storer
+        // accepted the push, and fresh content is not reliably
+        // retrievable from the network for the first few seconds
+        // (the gateway / AntDrive then "hits an unretrievable
+        // chunk" and the read truncates). Keeping a local copy
+        // makes our own uploads retrievable immediately and
+        // survives a slow/partial network push.
+        if let Some(mem) = &mem_cache {
+            mem.put(addr, wire.clone());
+        }
+        if let Some(disk) = &disk_cache {
+            if let Err(e) = disk.put(addr, wire.clone()).await {
+                warn!(
+                    target: "ant_p2p",
+                    addr = %hex::encode(addr),
+                    "failed to cache uploaded chunk locally: {e}",
+                );
+            }
+        }
+        let mut fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx)
+            .with_push_skip(push_skip)
+            .with_network_id(network_id);
+        if let Some(tx) = neighborhood_dial {
+            fetcher = fetcher.with_neighborhood_dialer(tx);
+        }
+        if let Some(svc) = pushsync_swap {
+            let s: Arc<dyn ant_retrieval::PushsyncSettlement> = svc;
+            fetcher = fetcher.with_pushsync_settlement(s);
+        }
+        let reply = match fetcher.push_stamped_chunk(addr, wire, stamp).await {
+            Ok(()) => ControlAck::ChunkUploaded {
+                reference: format!("0x{}", hex::encode(addr)),
+            },
+            Err(e) => ControlAck::Error {
+                message: format!("pushsync: {e}"),
+            },
+        };
+        let _ = ack.send(reply);
+    });
+}
+
+/// Shared `PushSoc` tail: cache the SOC (and its wrapped CAC) locally,
+/// then pushsync with `stamp` and ack. Used by both the local-issuer
+/// and the presigned-stamp paths.
+fn push_soc_with_stamp(
+    state: &SwarmState,
+    control: &Control,
+    network_id: u64,
+    address: [u8; 32],
+    wire: Vec<u8>,
+    stamp: [u8; ant_postage::STAMP_SIZE],
+    ack: oneshot::Sender<ControlAck>,
+) {
+    const SOC_HEADER: usize = 32 + 65;
+    let peers_rx = state.peers_watch.subscribe();
+    if peers_rx.borrow().is_empty() {
+        let _ = ack.send(ControlAck::NotReady {
+            message: "no peers available; wait for handshakes to complete".into(),
+        });
+        return;
+    }
+    let control = control.clone();
+    let pushsync_swap = state.pushsync_swap.clone();
+    let push_skip = state.push_skip.clone();
+    let disk_cache = state.disk_cache.clone();
+    let mem_cache = state.chunk_cache.clone();
+    let neighborhood_dial = state.neighborhood_dial_tx.clone();
+    tokio::spawn(async move {
+        // Keep a local copy of our own upload before pushsync, so
+        // the node can serve the SOC it just stamped without
+        // waiting for network propagation. See the matching note
+        // in `push_with_stamp`.
+        if let Some(mem) = &mem_cache {
+            mem.put(address, wire.clone());
+        }
+        if let Some(disk) = &disk_cache {
+            if let Err(e) = disk.put(address, wire.clone()).await {
+                warn!(
+                    target: "ant_p2p",
+                    addr = %hex::encode(address),
+                    "failed to cache uploaded soc locally: {e}",
+                );
+            }
+        }
+        // Also cache the wrapped CAC carried inside the SOC. The SOC
+        // wire is `id(32) ‖ sig(65) ‖ span(8) ‖ payload`; everything
+        // after the 97-byte header is a content-addressed chunk
+        // (`span ‖ payload`). For a single-chunk (v2) feed update that
+        // wrapped CAC *is* the content root the feed points at, and
+        // bee-js never uploads it as a standalone chunk — so without
+        // this a feed `latest` read (GetFeed resolves the SOC, then
+        // GetBytes the resolved reference) can't serve our own write
+        // until pushsync propagates, and read-after-own-write returns
+        // `feed_empty`. Caching it under its own CAC address closes
+        // that gap, mirroring the SOC cache above (content-addressed,
+        // so it's a no-op-correct extra entry for non-feed SOCs too).
+        let inner = &wire[SOC_HEADER..];
+        if let Ok(inner_span) = <[u8; 8]>::try_from(&inner[..8]) {
+            if let Some(inner_addr) = ant_crypto::bmt::bmt_hash_with_span(&inner_span, &inner[8..])
+            {
+                if let Some(mem) = &mem_cache {
+                    mem.put(inner_addr, inner.to_vec());
+                }
+                if let Some(disk) = &disk_cache {
+                    if let Err(e) = disk.put(inner_addr, inner.to_vec()).await {
+                        warn!(
+                            target: "ant_p2p",
+                            addr = %hex::encode(inner_addr),
+                            "failed to cache wrapped feed CAC locally: {e}",
+                        );
+                    }
+                }
+            }
+        }
+        let mut fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx)
+            .with_push_skip(push_skip)
+            .with_network_id(network_id);
+        if let Some(tx) = neighborhood_dial {
+            fetcher = fetcher.with_neighborhood_dialer(tx);
+        }
+        if let Some(svc) = pushsync_swap {
+            let s: Arc<dyn ant_retrieval::PushsyncSettlement> = svc;
+            fetcher = fetcher.with_pushsync_settlement(s);
+        }
+        let reply = match fetcher.push_stamped_chunk(address, wire, stamp).await {
+            Ok(()) => ControlAck::ChunkUploaded {
+                reference: format!("0x{}", hex::encode(address)),
+            },
+            Err(e) => ControlAck::Error {
+                message: format!("pushsync: {e}"),
+            },
+        };
+        let _ = ack.send(reply);
+    });
+}
+
+/// Traverse the content tree at `reference` and probe every chunk.
+/// `false` on any traversal or fetch failure — bee's `IsRetrievable`
+/// maps a not-found anywhere in the tree to `{"isRetrievable": false}`.
+async fn stewardship_is_retrievable(
+    fetcher: &ant_retrieval::RoutingFetcher,
+    reference: [u8; 32],
+) -> bool {
+    use ant_retrieval::ChunkFetcher;
+
+    let addrs = match ant_retrieval::traverse_chunk_addresses(
+        fetcher,
+        reference,
+        STEWARDSHIP_MAX_FILE_BYTES,
+    )
+    .await
+    {
+        Ok(addrs) => addrs,
+        Err(e) => {
+            debug!(target: "ant_p2p", reference = %hex::encode(reference), "stewardship traversal failed: {e}");
+            return false;
+        }
+    };
+    // The traversal already proved interior/manifest nodes retrievable
+    // (it had to fetch them — now cache-hot); this pass covers the data
+    // leaves. Short-circuits on the first miss.
+    futures::stream::iter(addrs)
+        .map(|addr| async move { fetcher.fetch(addr).await.is_ok() })
+        .buffer_unordered(STEWARDSHIP_CONCURRENCY)
+        .all(|ok| async move { ok })
+        .await
+}
+
+/// Traverse the content tree at `reference`, then fetch + stamp +
+/// pushsync every chunk (bee's `steward.Reupload`). Fails on the first
+/// chunk that can't be fetched or pushed.
+async fn stewardship_reupload(
+    read_fetcher: &ant_retrieval::RoutingFetcher,
+    push_fetcher: &ant_retrieval::RoutingFetcher,
+    upload: &Arc<UploadRuntime>,
+    batch_id: [u8; 32],
+    reference: [u8; 32],
+) -> ControlAck {
+    use ant_retrieval::ChunkFetcher;
+
+    let addrs = match ant_retrieval::traverse_chunk_addresses(
+        read_fetcher,
+        reference,
+        STEWARDSHIP_MAX_FILE_BYTES,
+    )
+    .await
+    {
+        Ok(addrs) => addrs,
+        Err(e) => {
+            return ControlAck::Error {
+                message: format!("re-upload traversal failed: {e}"),
+            };
+        }
+    };
+    let total = addrs.len();
+    let result: Result<(), String> = futures::stream::iter(addrs)
+        .map(|addr| async move {
+            let wire = read_fetcher
+                .fetch(addr)
+                .await
+                .map_err(|e| format!("fetch {}: {e}", hex::encode(addr)))?;
+            // Stamp under the issuer mutex like `PushChunk`; the
+            // per-chunk stamp cache makes a re-upload of chunks this
+            // node already stamped free of new bucket slots.
+            let stamp = {
+                let mut issuers = match upload.issuers.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                let issuer = issuers
+                    .get_mut(&batch_id)
+                    .ok_or_else(|| format!("batch 0x{} not usable", hex::encode(batch_id)))?;
+                ant_postage::sign_stamp_bytes(&upload.stamp_key, issuer, &addr)
+                    .map_err(|e| format!("stamp issue failed: {e}"))?
+            };
+            push_fetcher
+                .push_stamped_chunk(addr, wire, stamp)
+                .await
+                .map_err(|e| format!("pushsync {}: {e}", hex::encode(addr)))
+        })
+        .buffer_unordered(STEWARDSHIP_CONCURRENCY)
+        .fold(Ok(()), |acc, item| async move { acc.and(item) })
+        .await;
+    match result {
+        Ok(()) => ControlAck::Ok {
+            message: format!("re-uploaded {total} chunks"),
+        },
+        Err(message) => ControlAck::Error { message },
     }
 }
 

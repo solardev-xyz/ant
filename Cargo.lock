@@ -177,6 +177,7 @@ dependencies = [
  "ant-chain",
  "ant-control",
  "ant-crypto",
+ "ant-postage",
  "ant-retrieval",
  "anyhow",
  "async-trait",
