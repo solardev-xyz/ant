@@ -3291,7 +3291,7 @@ async fn run_stream_bzz(
     accounting: Option<Arc<ant_retrieval::accounting::Accounting>>,
     counters: Arc<RetrievalCounters>,
     tracker: Arc<ProgressTracker>,
-    reference: [u8; 32],
+    reference: Vec<u8>,
     path: String,
     allow_degraded_redundancy: bool,
     max_bytes: Option<u64>,
@@ -3335,14 +3335,14 @@ async fn run_stream_bzz(
         }
         let fetcher = builder;
 
-        let lookup = match lookup_path(&fetcher, reference, &path).await {
+        let lookup = match lookup_path(&fetcher, &reference, &path).await {
             Ok(r) => r,
             Err(ManifestError::NotAManifest) => {
                 let _ = ack
                     .send(ControlAck::Error {
                         message: format!(
                             "{} is not a mantaray manifest; try /bytes",
-                            hex::encode(reference)
+                            hex::encode(&reference)
                         ),
                     })
                     .await;
@@ -3374,15 +3374,49 @@ async fn run_stream_bzz(
             }
         };
 
-        let data_ref = lookup.data_ref;
         debug!(
             target: "ant_p2p",
-            manifest = %hex::encode(reference),
+            manifest = %hex::encode(&reference),
             path = %path,
-            data_ref = %hex::encode(data_ref),
+            data_ref = %hex::encode(&lookup.data_ref),
             content_type = ?lookup.content_type,
             "stream_bzz manifest resolved",
         );
+
+        // Encrypted manifest entry (64-byte `address ‖ key`): the body
+        // can't be streamed chunkwise (each chunk needs its parent's
+        // key), so decrypt-join buffered and emit the same stream shape
+        // from memory — mirroring the gateway's encrypted-feed path.
+        if let Ok(enc_ref) =
+            <[u8; ant_retrieval::ENCRYPTED_REF_SIZE]>::try_from(lookup.data_ref.as_slice())
+        {
+            let filename = lookup
+                .metadata
+                .get("Filename")
+                .cloned()
+                .or_else(|| derive_filename_from_path(&path));
+            stream_encrypted_body(
+                &fetcher,
+                enc_ref,
+                lookup.content_type.clone(),
+                filename,
+                lookup.is_feed,
+                max_bytes,
+                range,
+                head_only,
+                ack,
+            )
+            .await;
+            return;
+        }
+        let Ok(data_ref) = <[u8; 32]>::try_from(lookup.data_ref.as_slice()) else {
+            let _ = ack
+                .send(ControlAck::Error {
+                    message: "manifest entry has invalid width".to_string(),
+                })
+                .await;
+            return;
+        };
 
         // Data-root fetch with dispersed-replica fallback (see
         // `run_stream_bytes`).
@@ -3431,7 +3465,7 @@ async fn run_stream_bzz(
         if ack
             .send(ControlAck::BzzStreamStart {
                 total_bytes,
-                reference: data_ref,
+                reference: data_ref.to_vec(),
                 content_type: lookup.content_type,
                 filename,
                 mutable: lookup.is_feed,
@@ -3472,6 +3506,115 @@ async fn run_stream_bzz(
             message: last_error.unwrap_or_else(|| "stream_bzz exhausted retries".to_string()),
         })
         .await;
+}
+
+/// Serve an **encrypted** bzz body (64-byte `address ‖ key` data
+/// reference) over the streaming ack protocol. Encrypted trees can't be
+/// streamed chunkwise — every chunk's key arrives with its parent — so
+/// the body is decrypt-joined into memory (bounded by `max_bytes`) and
+/// emitted as one `BytesChunk`, with any range applied by slicing.
+/// `HEAD` requests only decrypt the root chunk's span.
+#[allow(clippy::too_many_arguments)]
+async fn stream_encrypted_body(
+    fetcher: &ant_retrieval::RoutingFetcher,
+    enc_ref: [u8; ant_retrieval::ENCRYPTED_REF_SIZE],
+    content_type: Option<String>,
+    filename: Option<String>,
+    mutable: bool,
+    max_bytes: Option<u64>,
+    range: Option<StreamRange>,
+    head_only: bool,
+    ack: mpsc::Sender<ControlAck>,
+) {
+    let addr: [u8; 32] = enc_ref[..32].try_into().expect("64-byte ref");
+    let key: [u8; 32] = enc_ref[32..].try_into().expect("64-byte ref");
+
+    // Total size from the (decrypted) root span — needed for the stream
+    // prologue and for HEAD without joining the whole tree.
+    let root_wire = match fetcher.fetch(addr).await {
+        Ok(w) => w,
+        Err(e) => {
+            let _ = ack
+                .send(ControlAck::Error {
+                    message: format!("fetch encrypted data root {}: {e}", hex::encode(addr)),
+                })
+                .await;
+            return;
+        }
+    };
+    let total_bytes = match ant_crypto::decrypt_chunk_parts(&root_wire, &key) {
+        Ok((span, _)) => {
+            let (_, plain) = ant_retrieval::rs::decode_span(span);
+            u64::from_le_bytes(plain)
+        }
+        Err(e) => {
+            let _ = ack
+                .send(ControlAck::Error {
+                    message: format!("decrypt data root {}: {e}", hex::encode(addr)),
+                })
+                .await;
+            return;
+        }
+    };
+
+    if ack
+        .send(ControlAck::BzzStreamStart {
+            total_bytes,
+            reference: enc_ref.to_vec(),
+            content_type,
+            filename,
+            mutable,
+        })
+        .await
+        .is_err()
+    {
+        return;
+    }
+    if head_only {
+        let _ = ack.send(ControlAck::StreamDone).await;
+        return;
+    }
+
+    let body_range =
+        range.and_then(|r| ant_retrieval::ByteRange::clamp(r.start, r.end_inclusive, total_bytes));
+    if range.is_some() && body_range.is_none() {
+        let _ = ack
+            .send(ControlAck::Error {
+                message: "range not satisfiable for resource".to_string(),
+            })
+            .await;
+        return;
+    }
+
+    let cap = clamp_max_bytes(max_bytes);
+    let body = match ant_retrieval::join_encrypted(fetcher, enc_ref, cap).await {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = ack
+                .send(ControlAck::Error {
+                    message: format!("join encrypted {}: {e}", hex::encode(enc_ref)),
+                })
+                .await;
+            return;
+        }
+    };
+    let data = match body_range {
+        Some(r) => {
+            let start = usize::try_from(r.start)
+                .unwrap_or(usize::MAX)
+                .min(body.len());
+            let end = usize::try_from(r.end_inclusive)
+                .unwrap_or(usize::MAX)
+                .saturating_add(1)
+                .min(body.len());
+            body[start..end].to_vec()
+        }
+        None => body,
+    };
+    if !data.is_empty() && ack.send(ControlAck::BytesChunk { data }).await.is_err() {
+        return;
+    }
+    let _ = ack.send(ControlAck::StreamDone).await;
 }
 
 /// Drive a streaming joiner from an already-fetched root chunk and emit
@@ -4011,7 +4154,7 @@ async fn run_list_bzz(
     }
     let fetcher = builder;
 
-    match ant_retrieval::list_manifest(&fetcher, reference).await {
+    match ant_retrieval::list_manifest(&fetcher, &reference).await {
         Ok(entries) => ControlAck::Manifest {
             entries: entries
                 .into_iter()
@@ -4477,9 +4620,16 @@ async fn verify_propagation_deep(
     let fetcher = net.fetcher(control.clone(), peers_rx);
 
     // Resolve the manifest to its data root; a non-manifest reference is
-    // treated as a raw `/bytes/` data root.
-    let data_ref = match lookup_path(&fetcher, reference, "").await {
-        Ok(r) => r.data_ref,
+    // treated as a raw `/bytes/` data root. Encrypted entries are not
+    // verifiable here (their chunk tree needs the decryption keys to
+    // enumerate) — report that instead of a bogus verdict.
+    let data_ref: [u8; 32] = match lookup_path(&fetcher, &reference, "").await {
+        Ok(r) => match r.data_ref.as_slice().try_into() {
+            Ok(a) => a,
+            Err(_) => {
+                return err_body("encrypted manifest entries are not supported here".to_string())
+            }
+        },
         Err(ManifestError::NotAManifest) => reference,
         Err(e) => return err_body(format!("manifest resolve: {e}")),
     };
@@ -4784,7 +4934,7 @@ async fn try_get_bzz(
 ) -> Result<(Vec<u8>, Option<String>, Option<String>), AttemptError> {
     use ant_retrieval::{join_with_options, lookup_path, JoinOptions, ManifestError};
 
-    let lookup = match lookup_path(fetcher, reference, path).await {
+    let lookup = match lookup_path(fetcher, &reference, path).await {
         Ok(r) => r,
         Err(ManifestError::NotAManifest) => {
             return Err(AttemptError::Permanent(format!(
@@ -4801,15 +4951,43 @@ async fn try_get_bzz(
             });
         }
     };
-    let data_ref = lookup.data_ref;
     debug!(
         target: "ant_p2p",
         manifest = %hex::encode(reference),
         path = %path,
-        data_ref = %hex::encode(data_ref),
+        data_ref = %hex::encode(&lookup.data_ref),
         content_type = ?lookup.content_type,
         "manifest resolved",
     );
+    let filename = lookup
+        .metadata
+        .get("Filename")
+        .cloned()
+        .or_else(|| derive_filename_from_path(path));
+    let cap = clamp_max_bytes(max_bytes);
+
+    // Encrypted manifest entry (64-byte `address ‖ key`): the body is
+    // decrypt-joined in one buffered pass.
+    if let Ok(enc_ref) =
+        <[u8; ant_retrieval::ENCRYPTED_REF_SIZE]>::try_from(lookup.data_ref.as_slice())
+    {
+        let data = ant_retrieval::join_encrypted(fetcher, enc_ref, cap)
+            .await
+            .map_err(|e| {
+                let message = format!("join encrypted data {}: {e}", hex::encode(enc_ref));
+                if is_join_transient(&e) {
+                    AttemptError::Transient(message)
+                } else {
+                    AttemptError::Permanent(message)
+                }
+            })?;
+        return Ok((data, lookup.content_type, filename));
+    }
+    let data_ref: [u8; 32] = lookup
+        .data_ref
+        .as_slice()
+        .try_into()
+        .map_err(|_| AttemptError::Permanent("manifest entry has invalid width".to_string()))?;
 
     // Reuse the same fetcher so the blacklist / peer ordering carries
     // over from the manifest walk into the file-body fetch. Data-root
@@ -4829,7 +5007,6 @@ async fn try_get_bzz(
     let join_options = JoinOptions {
         allow_degraded_redundancy,
     };
-    let cap = clamp_max_bytes(max_bytes);
     let data = join_with_options(fetcher, &root, cap, join_options)
         .await
         .map_err(|e| {
@@ -4840,12 +5017,6 @@ async fn try_get_bzz(
                 AttemptError::Permanent(message)
             }
         })?;
-
-    let filename = lookup
-        .metadata
-        .get("Filename")
-        .cloned()
-        .or_else(|| derive_filename_from_path(path));
     Ok((data, lookup.content_type, filename))
 }
 

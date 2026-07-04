@@ -99,6 +99,11 @@ const DEFAULT_UPLOAD_REDUNDANCY_LEVEL: u8 = 1;
 /// Bee request header: when `true`, treat the body as a tar archive and
 /// build a multi-file manifest. Default `false` (single-file upload).
 const SWARM_COLLECTION: HeaderName = HeaderName::from_static("swarm-collection");
+/// Bee request header on `POST /bytes` and `POST /bzz` (file and
+/// collection): when true, the upload is content-encrypted — every
+/// chunk under a fresh random key, 64-byte references, and a 128-hex
+/// `reference` in the response (bee `SwarmEncryptHeader`).
+const SWARM_ENCRYPT: HeaderName = HeaderName::from_static("swarm-encrypt");
 /// Bee request header: name of the manifest entry that should resolve
 /// when the user requests `bzz://<root>/` (no path). Mirrored on the
 /// root manifest's `/` fork as `website-index-document` metadata.
@@ -194,8 +199,8 @@ fn set_immutable_cache_headers(resp: &mut Response) {
 /// Bee sets it via `fmt.Sprintf("%q", reference)` on `POST /bzz`
 /// responses and on every `downloadHandler`-served body (`/bytes`,
 /// `/bzz`, `/soc`, `/feeds`).
-fn set_etag(resp: &mut Response, reference: [u8; 32]) {
-    if let Ok(v) = HeaderValue::from_str(&format!("\"{}\"", hex::encode(reference))) {
+fn set_etag(resp: &mut Response, reference: impl AsRef<[u8]>) {
+    if let Ok(v) = HeaderValue::from_str(&format!("\"{}\"", hex::encode(reference.as_ref()))) {
         resp.headers_mut().insert(header::ETAG, v);
     }
 }
@@ -388,7 +393,7 @@ pub async fn download_soc(
 
     let guard = handle.activity.begin(
         GatewayRequestKind::Soc,
-        short_reference(&hex::encode(reference)),
+        short_reference(&hex::encode(reference.as_ref())),
     );
 
     let timeout = request_timeout(&headers, CHUNK_REQUEST_TIMEOUT);
@@ -1021,6 +1026,10 @@ pub async fn upload_bzz(
         .get(SWARM_COLLECTION)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"));
+    let encrypt = match parse_encrypt_header(&headers) {
+        Ok(e) => e,
+        Err(resp) => return resp,
+    };
 
     let timeout = request_timeout(&headers, DEFAULT_REQUEST_TIMEOUT);
 
@@ -1033,7 +1042,7 @@ pub async fn upload_bzz(
         .activity
         .begin(GatewayRequestKind::Bzz, activity_label);
 
-    let assembled = match assemble_bzz(&query, &headers, &body, collection, level) {
+    let assembled = match assemble_bzz(&query, &headers, &body, collection, level, encrypt) {
         Ok(a) => a,
         Err(resp) => return resp,
     };
@@ -1045,7 +1054,7 @@ pub async fn upload_bzz(
         chunks = assembled.chunks.len(),
         replicas = assembled.replicas.len(),
         redundancy_level = level,
-        manifest_root = %hex::encode(assembled.root),
+        manifest_root = %hex::encode(&assembled.root),
         "bzz upload assembled"
     );
     guard.update(0, total_chunks as u64, total_chunks as u32, 0);
@@ -1059,7 +1068,7 @@ pub async fn upload_bzz(
         return err_resp;
     }
 
-    let reference_hex = hex::encode(assembled.root);
+    let reference_hex = hex::encode(&assembled.root);
     let mut resp = json_response(
         StatusCode::CREATED,
         &serde_json::json!({ "reference": reference_hex }),
@@ -1069,13 +1078,18 @@ pub async fn upload_bzz(
     // as a quoted `ETag` (`bzzUploadHandler`); its collection path
     // (`dirUploadHandler`) sets none.
     if !collection {
-        set_etag(&mut resp, assembled.root);
+        set_etag(&mut resp, &assembled.root);
     }
+    // Tags key on the root chunk's 32-byte address (the leading half of
+    // an encrypted reference).
+    let root_address: [u8; 32] = assembled.root[..32]
+        .try_into()
+        .expect("assembled root is at least 32 bytes");
     finalize_upload_tag(
         &handle,
         &headers,
         total_chunks as u64,
-        assembled.root,
+        root_address,
         &mut resp,
     );
     resp
@@ -1159,11 +1173,60 @@ pub async fn upload_bytes(
         Ok(l) => l,
         Err(resp) => return resp,
     };
+    let encrypt = match parse_encrypt_header(&headers) {
+        Ok(e) => e,
+        Err(resp) => return resp,
+    };
 
     let timeout = request_timeout(&headers, DEFAULT_REQUEST_TIMEOUT);
     let guard = handle
         .activity
         .begin(GatewayRequestKind::Bytes, "upload-bytes".to_string());
+
+    if encrypt {
+        // `swarm-encrypt: true` — bee's encryption pipeline: fresh
+        // random key per chunk, 64-byte references, halved branching,
+        // parities (at level > 0) computed over the ciphertext, and a
+        // 128-hex reference in the response. Dispersed replicas key on
+        // the root's 32-byte *address*; the decryption key travels only
+        // in the returned reference.
+        let split = ant_retrieval::split_bytes_encrypted(&body, level);
+        let root_address = split.root_address();
+        let replicas = replica_chunks(&root_address, &split.root_wire, level);
+        let total_chunks = split.chunks.len() + replicas.len();
+        debug!(
+            target: "ant_gateway",
+            body_len = body.len(),
+            chunks = split.chunks.len(),
+            replicas = replicas.len(),
+            redundancy_level = level,
+            data_root = %hex::encode(root_address),
+            "encrypted bytes upload assembled"
+        );
+        guard.update(0, total_chunks as u64, total_chunks as u32, 0);
+
+        if let Err(err_resp) = push_chunks(&handle, &split.chunks, batch_id, timeout, &guard).await
+        {
+            return err_resp;
+        }
+        if let Err(err_resp) = push_replica_socs(&handle, &replicas, batch_id, timeout).await {
+            return err_resp;
+        }
+
+        let mut resp = json_response(
+            StatusCode::CREATED,
+            &serde_json::json!({ "reference": hex::encode(split.root_ref) }),
+        );
+        set_immutable_cache_headers(&mut resp);
+        finalize_upload_tag(
+            &handle,
+            &headers,
+            total_chunks as u64,
+            root_address,
+            &mut resp,
+        );
+        return resp;
+    }
 
     let split = split_bytes_with_redundancy(&body, level);
     // Redundant uploads also carry 2^level dispersed replica SOCs of
@@ -1282,7 +1345,9 @@ pub async fn create_feed(
 /// intermediate join chunks + parity chunks + manifest chunks), plus
 /// the dispersed replica SOCs a redundant upload carries.
 struct AssembledUpload {
-    root: [u8; 32],
+    /// Manifest root reference: 32 bytes plain, 64 (`address ‖ key`)
+    /// when the upload is encrypted.
+    root: Vec<u8>,
     chunks: Vec<SplitChunk>,
     /// Replica SOCs to push via `PushSoc` when the redundancy level
     /// is nonzero. Bee mints 2^level replicas of **every pipeline
@@ -1299,6 +1364,7 @@ fn assemble_bzz(
     body: &Bytes,
     collection: bool,
     level: u8,
+    encrypt: bool,
 ) -> Result<AssembledUpload, Response> {
     if collection {
         let index_doc = headers
@@ -1306,7 +1372,7 @@ fn assemble_bzz(
             .and_then(|v| v.to_str().ok())
             .map(|s| s.trim().trim_start_matches('/').to_string())
             .filter(|s| !s.is_empty());
-        assemble_collection(body, index_doc.as_deref(), level)
+        assemble_collection(body, index_doc.as_deref(), level, encrypt)
     } else {
         let filename = query
             .name()
@@ -1326,7 +1392,7 @@ fn assemble_bzz(
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty() && s != "application/octet-stream");
 
-        assemble_single_file(body, &filename, content_type.as_deref(), level)
+        assemble_single_file(body, &filename, content_type.as_deref(), level, encrypt)
     }
 }
 
@@ -1336,7 +1402,35 @@ fn assemble_single_file(
     filename: &str,
     content_type: Option<&str>,
     level: u8,
+    encrypt: bool,
 ) -> Result<AssembledUpload, Response> {
+    if encrypt {
+        // Encrypted upload: encrypt-split the file, then wrap its
+        // 64-byte reference in an encrypted mantaray manifest (nodes
+        // themselves stored encrypted, random obfuscation keys) — bee's
+        // `fileUploadHandler` with an encrypting pipeline + loadsave.
+        let split = ant_retrieval::split_bytes_encrypted(body, level);
+        let manifest = match ant_retrieval::manifest_writer::build_single_file_manifest_encrypted(
+            filename,
+            content_type,
+            &split.root_ref,
+            level,
+        ) {
+            Ok(m) => m,
+            Err(e) => return Err(map_manifest_error(e)),
+        };
+        let mut replicas = replica_chunks(&split.root_address(), &split.root_wire, level);
+        for (addr, wire) in &manifest.node_roots {
+            replicas.extend(replica_chunks(addr, wire, level));
+        }
+        let mut chunks = split.chunks;
+        chunks.extend(manifest.chunks);
+        return Ok(AssembledUpload {
+            root: manifest.root_ref.to_vec(),
+            chunks,
+            replicas,
+        });
+    }
     let split = split_bytes_with_redundancy(body, level);
     let manifest = match build_single_file_manifest(filename, content_type, split.root) {
         Ok(m) => m,
@@ -1349,7 +1443,7 @@ fn assemble_single_file(
     let mut chunks = split.chunks;
     chunks.extend(manifest.chunks);
     Ok(AssembledUpload {
-        root: manifest.root,
+        root: manifest.root.to_vec(),
         chunks,
         replicas,
     })
@@ -1360,6 +1454,7 @@ fn assemble_collection(
     body: &Bytes,
     index_doc: Option<&str>,
     level: u8,
+    encrypt: bool,
 ) -> Result<AssembledUpload, Response> {
     let mut archive = tar::Archive::new(std::io::Cursor::new(body.as_ref()));
     let mut files: Vec<ManifestFile> = Vec::new();
@@ -1423,14 +1518,26 @@ fn assemble_collection(
                 format!("tar entry {path_str}: read failed: {e}"),
             ));
         }
-        let split = split_bytes_with_redundancy(&buf, level);
-        replicas.extend(replica_chunks(&split.root, &split.root_wire, level));
-        data_chunks.extend(split.chunks);
         let ct = content_type_from_extension(&path_str).map(std::string::ToString::to_string);
+        let data_ref = if encrypt {
+            let split = ant_retrieval::split_bytes_encrypted(&buf, level);
+            replicas.extend(replica_chunks(
+                &split.root_address(),
+                &split.root_wire,
+                level,
+            ));
+            data_chunks.extend(split.chunks);
+            split.root_ref.to_vec()
+        } else {
+            let split = split_bytes_with_redundancy(&buf, level);
+            replicas.extend(replica_chunks(&split.root, &split.root_wire, level));
+            data_chunks.extend(split.chunks);
+            split.root.to_vec()
+        };
         files.push(ManifestFile {
             path: path_str,
             content_type: ct,
-            data_ref: split.root,
+            data_ref,
         });
     }
     if files.is_empty() {
@@ -1448,6 +1555,27 @@ fn assemble_collection(
             .find(|f| f.path == "index.html")
             .map(|f| f.path.clone())
     });
+    if encrypt {
+        let manifest = match ant_retrieval::manifest_writer::build_collection_manifest_encrypted(
+            &files,
+            resolved_index.as_deref(),
+            IndexAnchor::ZeroEntry,
+            level,
+        ) {
+            Ok(m) => m,
+            Err(e) => return Err(map_manifest_error(e)),
+        };
+        for (addr, wire) in &manifest.node_roots {
+            replicas.extend(replica_chunks(addr, wire, level));
+        }
+        let mut chunks = data_chunks;
+        chunks.extend(manifest.chunks);
+        return Ok(AssembledUpload {
+            root: manifest.root_ref.to_vec(),
+            chunks,
+            replicas,
+        });
+    }
     let manifest = match build_collection_manifest(
         &files,
         resolved_index.as_deref(),
@@ -1463,7 +1591,7 @@ fn assemble_collection(
     let mut chunks = data_chunks;
     chunks.extend(manifest.chunks);
     Ok(AssembledUpload {
-        root: manifest.root,
+        root: manifest.root.to_vec(),
         chunks,
         replicas,
     })
@@ -1478,6 +1606,11 @@ fn map_manifest_error(e: ant_retrieval::manifest_writer::ManifestWriteError) -> 
         }
         ManifestWriteError::ManifestTooBig { .. } => {
             json_error(StatusCode::PAYLOAD_TOO_LARGE, e.to_string())
+        }
+        // Internal invariant: the gateway always hands the builder
+        // references of the width it asked for.
+        ManifestWriteError::RefWidth { .. } => {
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         }
     }
 }
@@ -1690,7 +1823,7 @@ pub async fn bytes(
     method: Method,
     headers: HeaderMap,
 ) -> Response {
-    let reference = match parse_reference(&addr) {
+    let any_reference = match parse_any_reference(&addr) {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -1708,6 +1841,28 @@ pub async fn bytes(
             .activity
             .begin(GatewayRequestKind::Bytes, short_reference(&addr)),
     );
+
+    // 64-byte (128-hex) encrypted reference: the node decrypt-joins the
+    // tree into a buffer (bee's decrypting store under the joiner); the
+    // gateway serves it in one shot, slicing for any Range.
+    if let Ok(enc_ref) =
+        <[u8; ant_retrieval::ENCRYPTED_REF_SIZE]>::try_from(any_reference.as_slice())
+    {
+        let _guard = activity_guard;
+        return serve_encrypted_bytes(
+            &handle,
+            enc_ref,
+            query.filename(),
+            head_only,
+            raw_range.as_deref(),
+            timeout,
+        )
+        .await;
+    }
+    let reference: [u8; 32] = any_reference
+        .as_slice()
+        .try_into()
+        .expect("parse_any_reference returns 32 or 64 bytes");
 
     // Phase 1: dispatch with head_only=true if the caller is HEAD;
     // for GET we go straight to the streaming dispatcher.
@@ -1826,6 +1981,122 @@ pub async fn bytes(
     resp
 }
 
+/// Serve `GET|HEAD /bytes/{128-hex}`: ask the node to decrypt-join the
+/// tree behind `address ‖ key` into a buffer, then answer with the
+/// usual bee-shaped headers, applying any `Range` by slicing. Encrypted
+/// content is never streamed chunkwise (each chunk's key arrives with
+/// its parent), matching the encrypted-feed serving path.
+async fn serve_encrypted_bytes(
+    handle: &GatewayHandle,
+    enc_ref: [u8; ant_retrieval::ENCRYPTED_REF_SIZE],
+    filename: Option<&str>,
+    head_only: bool,
+    raw_range: Option<&str>,
+    timeout: Duration,
+) -> Response {
+    let reference: [u8; 32] = enc_ref[..32].try_into().expect("64-byte ref");
+    let key: [u8; 32] = enc_ref[32..].try_into().expect("64-byte ref");
+
+    let (ack_tx, mut ack_rx) = mpsc::channel::<ControlAck>(1);
+    let cmd = ControlCommand::GetBytesEncrypted {
+        reference,
+        key,
+        bypass_cache: false,
+        max_bytes: Some(GATEWAY_MAX_FILE_BYTES),
+        ack: ack_tx,
+    };
+    if handle.commands.send(cmd).await.is_err() {
+        return node_unavailable();
+    }
+    let ack = match tokio::time::timeout(timeout, ack_rx.recv()).await {
+        Ok(Some(ack)) => ack,
+        Ok(None) => return node_unavailable(),
+        Err(_) => {
+            return json_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("retrieval timed out after {}s", timeout.as_secs()),
+            );
+        }
+    };
+    let data = match ack {
+        ControlAck::Bytes { data } => data,
+        ControlAck::NotReady { message } => {
+            return json_error(StatusCode::SERVICE_UNAVAILABLE, message);
+        }
+        ControlAck::Error { message } => {
+            return map_retrieval_error(message);
+        }
+        other => {
+            warn!(target: "ant_gateway", ?other, "unexpected ack from GetBytesEncrypted");
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "unexpected node ack");
+        }
+    };
+    let total = data.len() as u64;
+
+    let parsed_range = match raw_range {
+        None => None,
+        Some(raw) => match parse_single_range(raw, total) {
+            Ok(r) => r,
+            Err(RangeError::Multi) => {
+                return json_error(
+                    StatusCode::RANGE_NOT_SATISFIABLE,
+                    "multi-range requests not supported",
+                );
+            }
+            Err(RangeError::Unsatisfiable) => {
+                let mut resp = json_error(
+                    StatusCode::RANGE_NOT_SATISFIABLE,
+                    "range not satisfiable for this resource",
+                );
+                if let Ok(v) = HeaderValue::from_str(&format!("bytes */{total}")) {
+                    resp.headers_mut().insert(header::CONTENT_RANGE, v);
+                }
+                return resp;
+            }
+            Err(RangeError::Malformed) => {
+                return json_error(StatusCode::BAD_REQUEST, "malformed Range header");
+            }
+        },
+    };
+
+    match parsed_range {
+        None => {
+            let content_type = sniff_content_type(&data, filename);
+            let body = Body::from(data);
+            let mut resp = streaming_response(head_only, total, body, content_type, filename);
+            if !head_only {
+                set_etag(&mut resp, enc_ref);
+            }
+            resp
+        }
+        Some((start, end)) => {
+            let content_type = if start == 0 {
+                sniff_content_type(&data, filename)
+            } else {
+                filename
+                    .and_then(content_type_from_extension)
+                    .unwrap_or("application/octet-stream")
+            };
+            let body_len = end - start + 1;
+            let slice = data[start as usize..=end as usize].to_vec();
+            let mut resp = partial_content_response(
+                head_only,
+                total,
+                start,
+                end,
+                body_len,
+                Body::from(slice),
+                content_type,
+                filename,
+            );
+            if !head_only {
+                set_etag(&mut resp, enc_ref);
+            }
+            resp
+        }
+    }
+}
+
 /// `GET /bzz/{addr}` and `HEAD /bzz/{addr}`. Empty path resolves to
 /// the manifest's `website-index-document` metadata; our `lookup_path`
 /// already implements that fallback.
@@ -1887,7 +2158,9 @@ async fn bzz_inner(
     method: Method,
     headers: HeaderMap,
 ) -> Response {
-    let reference = match parse_reference(&addr) {
+    // 32-byte plain or 64-byte encrypted manifest root; the node loop
+    // walks encrypted manifests transparently (`StreamBzz` takes both).
+    let reference = match parse_any_reference(&addr) {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -1913,7 +2186,7 @@ async fn bzz_inner(
 
     let mut started = match dispatch_stream_bzz(
         &handle,
-        reference,
+        reference.clone(),
         path.clone(),
         timeout,
         None,
@@ -1964,7 +2237,7 @@ async fn bzz_inner(
     let filename = started.filename.clone();
     // Resolved data reference for the quoted `ETag` (bee's
     // `downloadHandler` sets it on GET and HEAD alike).
-    let data_ref = started.reference;
+    let data_ref = started.reference.clone();
     // Feed-backed bzz references resolve to mutable content at a stable
     // URL; serving them immutably (as `streaming_response` does by
     // default) makes browsers/proxies pin a stale resolution and never
@@ -2099,7 +2372,7 @@ struct Started {
     filename: Option<String>,
     /// Resolved data reference of the served manifest entry — only
     /// populated for `StreamBzz`. Bee quotes it in the `ETag` header.
-    reference: Option<[u8; 32]>,
+    reference: Option<Vec<u8>>,
     /// `true` when the bzz reference resolved through a feed manifest, so
     /// the response is mutable and must be served `no-cache`. Always
     /// `false` for `StreamBytes`.
@@ -2279,7 +2552,7 @@ async fn dispatch_stream_bytes(
 #[allow(clippy::result_large_err)]
 async fn dispatch_stream_bzz(
     handle: &GatewayHandle,
-    reference: [u8; 32],
+    reference: Vec<u8>,
     path: String,
     timeout: Duration,
     range: Option<StreamRange>,
@@ -2555,6 +2828,47 @@ pub(crate) fn parse_reference(s: &str) -> Result<[u8; 32], Response> {
     let mut reasons = Vec::new();
     parse_hex_param::<32>("address", s, &mut reasons)
         .ok_or_else(|| params_error(ParamKind::Path, reasons))
+}
+
+/// [`parse_reference`] that also accepts a 64-byte (128-hex)
+/// **encrypted** reference — `address(32) ‖ decryption key(32)` — the
+/// way bee's `swarm.ParseHexAddress` does on `/bytes` and `/bzz`
+/// downloads. Returns the raw 32- or 64-byte reference.
+#[allow(clippy::result_large_err)]
+fn parse_any_reference(s: &str) -> Result<Vec<u8>, Response> {
+    let mut reasons = Vec::new();
+    if s.len() == 2 * ant_retrieval::ENCRYPTED_REF_SIZE {
+        return parse_hex_param::<{ ant_retrieval::ENCRYPTED_REF_SIZE }>(
+            "address",
+            s,
+            &mut reasons,
+        )
+        .map(|r| r.to_vec())
+        .ok_or_else(|| params_error(ParamKind::Path, reasons));
+    }
+    parse_reference(s).map(|r| r.to_vec())
+}
+
+/// Parse bee's `Swarm-Encrypt` request header (absent → `false`).
+/// Bee's `mapStructure` uses `strconv.ParseBool`, which accepts
+/// `1/t/T/true/TRUE/True` and `0/f/F/false/FALSE/False` and rejects
+/// everything else with `400 invalid header params`.
+#[allow(clippy::result_large_err)]
+fn parse_encrypt_header(headers: &HeaderMap) -> Result<bool, Response> {
+    let Some(raw) = headers.get(&SWARM_ENCRYPT) else {
+        return Ok(false);
+    };
+    match raw.to_str().map(str::trim) {
+        Ok("1" | "t" | "T" | "true" | "TRUE" | "True") => Ok(true),
+        Ok("0" | "f" | "F" | "false" | "FALSE" | "False") => Ok(false),
+        _ => Err(params_error(
+            ParamKind::Header,
+            vec![Reason {
+                field: "Swarm-Encrypt".to_string(),
+                error: "invalid syntax".to_string(),
+            }],
+        )),
+    }
 }
 
 /// Parse the `{owner}` + `{id|topic}` path pair of `/soc` and `/feeds`
@@ -3269,7 +3583,7 @@ fn apply_feed_headers(
         HeaderValue::from_static(if v2 { "v2" } else { "v1" }),
     );
     if etag {
-        if let Ok(v) = HeaderValue::from_str(&format!("\"{}\"", hex::encode(reference))) {
+        if let Ok(v) = HeaderValue::from_str(&format!("\"{}\"", hex::encode(reference.as_ref()))) {
             h.insert(header::ETAG, v);
         }
     }

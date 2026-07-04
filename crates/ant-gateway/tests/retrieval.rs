@@ -148,7 +148,7 @@ async fn gateway_raises_joiner_max_bytes_above_cli_default() {
                     let _ = ack
                         .send(ControlAck::BzzStreamStart {
                             total_bytes: 4,
-                            reference: [0u8; 32],
+                            reference: vec![0u8; 32],
                             content_type: Some("text/plain".to_string()),
                             filename: None,
                             mutable: false,
@@ -405,7 +405,7 @@ async fn head_dispatches_head_only_flag() {
                 let _ = ack
                     .send(ControlAck::BzzStreamStart {
                         total_bytes: 1024,
-                        reference: [0u8; 32],
+                        reference: vec![0u8; 32],
                         content_type: Some("video/mp4".to_string()),
                         filename: Some("clip.mp4".to_string()),
                         mutable: false,
@@ -812,15 +812,26 @@ async fn post_bzz_single_file_returns_manifest_reference() {
     let router = router_with_dispatcher(move |cmd| {
         let pushed = pushed.clone();
         async move {
-            if let ControlCommand::PushChunk { wire, ack, .. } = cmd {
-                let mut span = [0u8; 8];
-                span.copy_from_slice(&wire[..8]);
-                let payload = &wire[8..];
-                let addr = ant_crypto::bmt::bmt_hash_with_span(&span, payload).unwrap();
-                pushed.lock().await.push(addr);
-                let _ = ack.send(ControlAck::ChunkUploaded {
-                    reference: format!("0x{}", hex::encode(addr)),
-                });
+            match cmd {
+                ControlCommand::PushChunk { wire, ack, .. } => {
+                    let mut span = [0u8; 8];
+                    span.copy_from_slice(&wire[..8]);
+                    let payload = &wire[8..];
+                    let addr = ant_crypto::bmt::bmt_hash_with_span(&span, payload).unwrap();
+                    pushed.lock().await.push(addr);
+                    let _ = ack.send(ControlAck::ChunkUploaded {
+                        reference: format!("0x{}", hex::encode(addr)),
+                    });
+                }
+                // Default redundancy level 1 also mints dispersed
+                // replica SOCs; ack them so the upload can finish (they
+                // aren't counted among the pushed CAC chunks).
+                ControlCommand::PushSoc { address, ack, .. } => {
+                    let _ = ack.send(ControlAck::ChunkUploaded {
+                        reference: format!("0x{}", hex::encode(address)),
+                    });
+                }
+                _ => {}
             }
         }
     });
@@ -895,15 +906,26 @@ async fn post_bzz_collection_uploads_tar_archive() {
     let router = router_with_dispatcher(move |cmd| {
         let pushed = pushed.clone();
         async move {
-            if let ControlCommand::PushChunk { wire, ack, .. } = cmd {
-                let mut span = [0u8; 8];
-                span.copy_from_slice(&wire[..8]);
-                let payload = &wire[8..];
-                let addr = ant_crypto::bmt::bmt_hash_with_span(&span, payload).unwrap();
-                pushed.lock().await.push(addr);
-                let _ = ack.send(ControlAck::ChunkUploaded {
-                    reference: format!("0x{}", hex::encode(addr)),
-                });
+            match cmd {
+                ControlCommand::PushChunk { wire, ack, .. } => {
+                    let mut span = [0u8; 8];
+                    span.copy_from_slice(&wire[..8]);
+                    let payload = &wire[8..];
+                    let addr = ant_crypto::bmt::bmt_hash_with_span(&span, payload).unwrap();
+                    pushed.lock().await.push(addr);
+                    let _ = ack.send(ControlAck::ChunkUploaded {
+                        reference: format!("0x{}", hex::encode(addr)),
+                    });
+                }
+                // Default redundancy level 1 also mints dispersed
+                // replica SOCs; ack them so the upload can finish (they
+                // aren't counted among the pushed CAC chunks).
+                ControlCommand::PushSoc { address, ack, .. } => {
+                    let _ = ack.send(ControlAck::ChunkUploaded {
+                        reference: format!("0x{}", hex::encode(address)),
+                    });
+                }
+                _ => {}
             }
         }
     });

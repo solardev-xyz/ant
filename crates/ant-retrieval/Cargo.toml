@@ -10,6 +10,9 @@ ant-postage = { path = "../ant-postage" }
 async-trait = "0.1.89"
 crossbeam-channel = "0.5"
 futures = "0.3.31"
+# OS randomness for encrypted-upload ciphertext padding (bee pads the
+# ciphertext tail with crypto/rand bytes; keys come from ant-crypto).
+getrandom = "0.3.2"
 hex.workspace = true
 libp2p.workspace = true
 libp2p-stream = "0.4.0-alpha"

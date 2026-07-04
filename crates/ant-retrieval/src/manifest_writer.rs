@@ -45,6 +45,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use ant_crypto::{cac_new, CHUNK_SIZE};
 use thiserror::Error;
 
+use crate::enc_split::{split_bytes_encrypted, ENC_REF_SIZE};
+
+/// Store one serialized manifest node, appending its chunks to the
+/// output; returns the node's reference (32 bytes plain / 64 encrypted).
+type NodeSaver<'a> =
+    &'a mut dyn FnMut(&[u8], &mut Vec<SplitChunk>) -> Result<Vec<u8>, ManifestWriteError>;
 use crate::splitter::SplitChunk;
 use crate::{ChunkAddr, MANTARAY_CONTENT_TYPE_KEY, MANTARAY_INDEX_DOC_KEY};
 
@@ -76,9 +82,12 @@ pub struct ManifestFile {
     /// MIME type written into the file fork's metadata. `None` falls
     /// back to `application/octet-stream`, matching bee's default.
     pub content_type: Option<String>,
-    /// Address of the file's root chunk — usually
-    /// [`crate::splitter::SplitResult::root`].
-    pub data_ref: ChunkAddr,
+    /// Reference to the file's data root: the 32-byte root chunk
+    /// address (usually [`crate::splitter::SplitResult::root`]) for
+    /// plain manifests, or the 64-byte `address ‖ key` encrypted
+    /// reference ([`crate::enc_split::EncryptedSplitResult::root_ref`])
+    /// for encrypted ones. Width must match the builder used.
+    pub data_ref: Vec<u8>,
 }
 
 /// Result of building a manifest: the manifest root reference, plus
@@ -104,9 +113,15 @@ pub enum ManifestWriteError {
     /// The serialised root manifest exceeds [`CHUNK_SIZE`]. Today this
     /// happens only for collections with very many or very long names;
     /// the proper fix is to split the manifest itself across an
-    /// intermediate join chunk, which is future work.
+    /// intermediate join chunk, which is future work. (Encrypted
+    /// manifests don't hit this: their nodes go through the splitter
+    /// and may span multiple chunks.)
     #[error("manifest root payload {size} bytes exceeds chunk capacity {cap}; multi-chunk manifests not yet supported")]
     ManifestTooBig { size: usize, cap: usize },
+    /// A file's `data_ref` width doesn't match the builder (32 for
+    /// plain manifests, 64 for encrypted ones).
+    #[error("data reference is {have} bytes; this builder needs {want}")]
+    RefWidth { have: usize, want: usize },
 }
 
 /// Build a single-file manifest with a `website-index-document` pointing
@@ -127,10 +142,36 @@ pub fn build_single_file_manifest(
         &[ManifestFile {
             path: filename.to_string(),
             content_type: content_type.map(str::to_string),
-            data_ref,
+            data_ref: data_ref.to_vec(),
         }],
         Some(filename),
         IndexAnchor::EmptyNode,
+    )
+}
+
+/// [`build_single_file_manifest`] for an **encrypted** upload
+/// (`swarm-encrypt: true` on `POST /bzz`): the file's data reference is
+/// the 64-byte `address ‖ key`, every manifest node is itself stored
+/// encrypted (via [`crate::enc_split`], at redundancy `level` like bee's
+/// `loadsave` with an encrypting pipeline factory), fork/entry
+/// references are 64 bytes wide and each node gets a fresh random
+/// obfuscation key (bee generates one whenever the manifest is built
+/// with `encrypted = true`).
+pub fn build_single_file_manifest_encrypted(
+    filename: &str,
+    content_type: Option<&str>,
+    data_ref: &[u8; ENC_REF_SIZE],
+    level: u8,
+) -> Result<EncryptedManifestWriteResult, ManifestWriteError> {
+    build_collection_manifest_encrypted(
+        &[ManifestFile {
+            path: filename.to_string(),
+            content_type: content_type.map(str::to_string),
+            data_ref: data_ref.to_vec(),
+        }],
+        Some(filename),
+        IndexAnchor::EmptyNode,
+        level,
     )
 }
 
@@ -167,6 +208,109 @@ pub fn build_collection_manifest(
     index_document: Option<&str>,
     anchor: IndexAnchor,
 ) -> Result<ManifestWriteResult, ManifestWriteError> {
+    let root = build_collection_trie(files, index_document, anchor, 32)?;
+    // Serialize bottom-up. Plain nodes must each fit one CAC chunk.
+    let mut chunks: Vec<SplitChunk> = Vec::new();
+    let mut saver =
+        |payload: &[u8], out: &mut Vec<SplitChunk>| -> Result<Vec<u8>, ManifestWriteError> {
+            if payload.len() > CHUNK_SIZE {
+                return Err(ManifestWriteError::ManifestTooBig {
+                    size: payload.len(),
+                    cap: CHUNK_SIZE,
+                });
+            }
+            let (addr, wire) = cac_payload(payload);
+            out.push(SplitChunk {
+                address: addr,
+                wire,
+            });
+            Ok(addr.to_vec())
+        };
+    let root_ref = serialize_node(&root, &mut chunks, &mut saver)?;
+    let root_addr: ChunkAddr = root_ref
+        .as_slice()
+        .try_into()
+        .expect("plain saver returns 32-byte refs");
+    Ok(ManifestWriteResult {
+        root: root_addr,
+        chunks,
+    })
+}
+
+/// Result of building an **encrypted** manifest: the 64-byte root
+/// reference, the root node chunk's stored (encrypted) wire bytes for
+/// dispersed replicas, and every chunk to push.
+#[derive(Debug, Clone)]
+pub struct EncryptedManifestWriteResult {
+    pub root_ref: [u8; ENC_REF_SIZE],
+    pub root_wire: Vec<u8>,
+    pub chunks: Vec<SplitChunk>,
+    /// `(address, stored wire)` of every node's pipeline root — each
+    /// manifest node is saved through its own mini-pipeline (bee
+    /// loadsave), so each counts as a root for dispersed replicas at
+    /// redundancy level > 0. The manifest root itself is the last
+    /// entry.
+    pub node_roots: Vec<(ChunkAddr, Vec<u8>)>,
+}
+
+impl EncryptedManifestWriteResult {
+    /// The manifest root chunk's 32-byte stored address.
+    #[must_use]
+    pub fn root_address(&self) -> ChunkAddr {
+        self.root_ref[..32].try_into().expect("64-byte root ref")
+    }
+}
+
+/// [`build_collection_manifest`] for an encrypted upload: 64-byte
+/// `data_ref`s, 64-byte fork/entry slots, random per-node obfuscation
+/// keys, and every node stored through the encrypted splitter at
+/// redundancy `level` (mirroring bee's `loadsave` with an encrypting
+/// pipeline factory). Encrypted manifests are inherently nondeterministic
+/// (random chunk keys *and* random obfuscation keys), exactly like
+/// bee's.
+pub fn build_collection_manifest_encrypted(
+    files: &[ManifestFile],
+    index_document: Option<&str>,
+    anchor: IndexAnchor,
+    level: u8,
+) -> Result<EncryptedManifestWriteResult, ManifestWriteError> {
+    let root = build_collection_trie(files, index_document, anchor, ENC_REF_SIZE)?;
+    let mut chunks: Vec<SplitChunk> = Vec::new();
+    let mut node_roots: Vec<(ChunkAddr, Vec<u8>)> = Vec::new();
+    let mut saver =
+        |payload: &[u8], out: &mut Vec<SplitChunk>| -> Result<Vec<u8>, ManifestWriteError> {
+            let split = split_bytes_encrypted(payload, level);
+            node_roots.push((split.root_address(), split.root_wire));
+            out.extend(split.chunks);
+            Ok(split.root_ref.to_vec())
+        };
+    let root_ref_vec = serialize_node(&root, &mut chunks, &mut saver)?;
+    let root_ref: [u8; ENC_REF_SIZE] = root_ref_vec
+        .as_slice()
+        .try_into()
+        .expect("encrypted saver returns 64-byte refs");
+    // Nodes serialize bottom-up, so the root's pipeline is the last.
+    let root_wire = node_roots
+        .last()
+        .map(|(_, wire)| wire.clone())
+        .expect("at least the root node was saved");
+    Ok(EncryptedManifestWriteResult {
+        root_ref,
+        root_wire,
+        chunks,
+        node_roots,
+    })
+}
+
+/// Shared trie construction for the plain and encrypted builders.
+/// `ref_size` (32 or 64) sets the width of the zero-entry anchor and is
+/// validated against every file's `data_ref`.
+fn build_collection_trie(
+    files: &[ManifestFile],
+    index_document: Option<&str>,
+    anchor: IndexAnchor,
+    ref_size: usize,
+) -> Result<TrieNode, ManifestWriteError> {
     if files.is_empty() {
         return Err(ManifestWriteError::EmptyPath);
     }
@@ -181,6 +325,12 @@ pub fn build_collection_manifest(
             // at the same logical location.
             return Err(ManifestWriteError::EmptyPath);
         }
+        if f.data_ref.len() != ref_size {
+            return Err(ManifestWriteError::RefWidth {
+                have: f.data_ref.len(),
+                want: ref_size,
+            });
+        }
     }
 
     // Build the in-memory trie.
@@ -193,7 +343,7 @@ pub fn build_collection_manifest(
         trie_insert(
             &mut root,
             f.path.as_bytes(),
-            f.data_ref,
+            f.data_ref.clone(),
             file_metadata(&ct, &f.path),
         )?;
     }
@@ -208,7 +358,7 @@ pub fn build_collection_manifest(
         // The anchor's child node differs between bee's two upload
         // paths and both must hash to bee's exact bytes: the
         // single-file handler emits a refsize-0 empty node, while the
-        // dir handler stores swarm.ZeroAddress — a 32-byte zero entry
+        // dir handler stores swarm.ZeroAddress — a ref-width zero entry
         // (dirs.go `manifest.NewEntry(swarm.ZeroAddress, metadata)`).
         let idx_node = match anchor {
             IndexAnchor::EmptyNode => TrieNode {
@@ -216,7 +366,7 @@ pub fn build_collection_manifest(
                 ..Default::default()
             },
             IndexAnchor::ZeroEntry => TrieNode {
-                own_data_ref: Some([0u8; 32]),
+                own_data_ref: Some(vec![0u8; ref_size]),
                 ..Default::default()
             },
         };
@@ -231,14 +381,7 @@ pub fn build_collection_manifest(
         };
         root.forks.insert(b'/', fork);
     }
-
-    // Serialize bottom-up.
-    let mut chunks: Vec<SplitChunk> = Vec::new();
-    let root_addr = serialize_node(&root, &mut chunks)?;
-    Ok(ManifestWriteResult {
-        root: root_addr,
-        chunks,
-    })
+    Ok(root)
 }
 
 /// Build a **feed manifest**: a mantaray manifest whose single `/` fork
@@ -272,7 +415,7 @@ pub fn build_feed_manifest(
     // empty node. The distinction changes the child node bytes and
     // therefore the feed-manifest reference (must match bee's).
     let leaf = TrieNode {
-        own_data_ref: Some([0u8; 32]),
+        own_data_ref: Some(vec![0u8; 32]),
         ..Default::default()
     };
     root.forks.insert(
@@ -289,7 +432,26 @@ pub fn build_feed_manifest(
     );
 
     let mut chunks: Vec<SplitChunk> = Vec::new();
-    let root_addr = serialize_node(&root, &mut chunks)?;
+    let mut saver =
+        |payload: &[u8], out: &mut Vec<SplitChunk>| -> Result<Vec<u8>, ManifestWriteError> {
+            if payload.len() > CHUNK_SIZE {
+                return Err(ManifestWriteError::ManifestTooBig {
+                    size: payload.len(),
+                    cap: CHUNK_SIZE,
+                });
+            }
+            let (addr, wire) = cac_payload(payload);
+            out.push(SplitChunk {
+                address: addr,
+                wire,
+            });
+            Ok(addr.to_vec())
+        };
+    let root_ref = serialize_node(&root, &mut chunks, &mut saver)?;
+    let root_addr: ChunkAddr = root_ref
+        .as_slice()
+        .try_into()
+        .expect("plain saver returns 32-byte refs");
     Ok(ManifestWriteResult {
         root: root_addr,
         chunks,
@@ -305,10 +467,11 @@ struct EmptyValue;
 
 #[derive(Default)]
 struct TrieNode {
-    /// File path that ends exactly at this node, if any. The data ref
-    /// will be written to the node's `entry` slot at serialization
-    /// time; the matching metadata lives on the parent fork.
-    own_data_ref: Option<ChunkAddr>,
+    /// File path that ends exactly at this node, if any (32 or 64
+    /// bytes, per the builder). The data ref will be written to the
+    /// node's `entry` slot at serialization time; the matching metadata
+    /// lives on the parent fork.
+    own_data_ref: Option<Vec<u8>>,
     own_metadata: BTreeMap<String, String>,
     /// Marker present iff this node represents the empty-stub fork
     /// for the website-index-document anchor. Distinct from
@@ -350,7 +513,7 @@ fn bee_path_separator(path: &[u8]) -> bool {
 fn trie_insert(
     node: &mut TrieNode,
     path: &[u8],
-    data_ref: ChunkAddr,
+    data_ref: Vec<u8>,
     metadata: BTreeMap<String, String>,
 ) -> Result<(), ManifestWriteError> {
     if path.is_empty() {
@@ -452,50 +615,63 @@ fn trie_insert(
 
 // --- serialization ---
 
-/// Recursively serialize `node` and all descendants. Returns the
-/// node's CAC address; appends every produced chunk to `out` in
-/// post-order (children before parents) so callers that push chunks
-/// sequentially can rely on dependents already being on the
-/// network when each chunk is pushed. The caller still needs to push
-/// the *entire* slice — bee's pushsync doesn't backtrack.
+/// Recursively serialize `node` and all descendants. Each serialized
+/// node is handed to `saver`, which stores it (plain CAC chunk, or the
+/// encrypted splitter) and returns its reference — the reference width
+/// (32/64) flows into the parent's fork slots and refsize byte.
+/// Chunks are appended to `out` in post-order (children before parents)
+/// so callers that push chunks sequentially can rely on dependents
+/// already being on the network when each chunk is pushed. The caller
+/// still needs to push the *entire* slice — bee's pushsync doesn't
+/// backtrack.
 fn serialize_node(
     node: &TrieNode,
     out: &mut Vec<SplitChunk>,
-) -> Result<ChunkAddr, ManifestWriteError> {
-    // Resolve each fork's child address first.
-    let mut child_refs: BTreeMap<u8, ChunkAddr> = BTreeMap::new();
+    saver: NodeSaver<'_>,
+) -> Result<Vec<u8>, ManifestWriteError> {
+    // Resolve each fork's child reference first.
+    let mut child_refs: BTreeMap<u8, Vec<u8>> = BTreeMap::new();
     for (&k, fork) in &node.forks {
-        let child_addr = serialize_node(&fork.child, out)?;
-        child_refs.insert(k, child_addr);
+        let child_ref = serialize_node(&fork.child, out, saver)?;
+        child_refs.insert(k, child_ref);
     }
 
     let payload = serialize_node_payload(node, &child_refs)?;
-    let (addr, wire) = cac_payload(&payload);
-    out.push(SplitChunk {
-        address: addr,
-        wire,
-    });
-    Ok(addr)
+    saver(&payload, out)
 }
 
-/// Serialize one node into its on-wire bytes (de-obfuscated).
+/// Serialize one node into its on-wire bytes. Plain nodes carry the
+/// all-zero obfuscation key (XOR identity); when any reference in the
+/// node is 64 bytes wide (encrypted manifest) a fresh random
+/// obfuscation key is generated and the body past byte 32 is `XORed`
+/// with it, exactly like bee's `MarshalBinary` for a node whose
+/// obfuscation key was left unset by `NewMantarayManifest(_, true)`.
 fn serialize_node_payload(
     node: &TrieNode,
-    child_refs: &BTreeMap<u8, ChunkAddr>,
+    child_refs: &BTreeMap<u8, Vec<u8>>,
 ) -> Result<Vec<u8>, ManifestWriteError> {
+    // Reference width for this node: its own entry or any child ref.
+    // (Within one manifest all refs share a width by construction.)
+    let ref_size = node
+        .own_data_ref
+        .as_ref()
+        .map(Vec::len)
+        .or_else(|| child_refs.values().next().map(Vec::len))
+        .unwrap_or(0);
+    let encrypted = ref_size == ENC_REF_SIZE;
+
     let mut p = Vec::with_capacity(128);
-    p.extend_from_slice(&[0u8; 32]); // obf key
+    p.extend_from_slice(&[0u8; 32]); // obf key (filled below if encrypted)
     p.extend_from_slice(&VERSION_HASH_31);
 
-    // refsize: 0x20 if the node has any forks (forks store 32-byte
-    // child refs) or its own data_ref; 0x00 only for the empty
-    // index-doc placeholder leaf.
+    // refsize: the reference width if the node has any forks or its own
+    // data_ref; 0x00 only for the empty index-doc placeholder leaf.
     let needs_ref = node.own_data_ref.is_some() || !node.forks.is_empty();
     if needs_ref {
-        p.push(0x20);
+        p.push(ref_size as u8);
         match node.own_data_ref {
             Some(ref a) => p.extend_from_slice(a),
-            None => p.extend_from_slice(&[0u8; 32]),
+            None => p.extend(std::iter::repeat_n(0u8, ref_size)),
         }
     } else {
         p.push(0x00);
@@ -521,25 +697,32 @@ fn serialize_node_payload(
         } else {
             BTreeMap::new()
         };
-        let child_ref = *child_refs
+        let child_ref = child_refs
             .get(k)
             .expect("child_refs populated for every fork above");
-        let bytes = serialize_fork_to_bytes(&fork.prefix, &child_ref, &meta, fork.path_separator)?;
+        let bytes = serialize_fork_to_bytes(&fork.prefix, child_ref, &meta, fork.path_separator)?;
         p.extend_from_slice(&bytes);
     }
 
-    if p.len() > CHUNK_SIZE {
-        return Err(ManifestWriteError::ManifestTooBig {
-            size: p.len(),
-            cap: CHUNK_SIZE,
-        });
+    if encrypted {
+        // Bee: `NewMantarayManifest(ls, encrypted=true)` leaves the
+        // obfuscation key empty, so `MarshalBinary` draws a random one
+        // per node and XORs everything past the key with it.
+        let mut obf = [0u8; 32];
+        getrandom::fill(&mut obf).expect("OS RNG");
+        p[..32].copy_from_slice(&obf);
+        for chunk in p[32..].chunks_mut(32) {
+            for (i, b) in chunk.iter_mut().enumerate() {
+                *b ^= obf[i];
+            }
+        }
     }
     Ok(p)
 }
 
 fn serialize_fork_to_bytes(
     prefix: &[u8],
-    child_ref: &ChunkAddr,
+    child_ref: &[u8],
     metadata: &BTreeMap<String, String>,
     path_separator: bool,
 ) -> Result<Vec<u8>, ManifestWriteError> {
@@ -711,12 +894,12 @@ mod tests {
                 ManifestFile {
                     path: "index.html".to_string(),
                     content_type: Some("text/html; charset=utf-8".to_string()),
-                    data_ref: index_split.root,
+                    data_ref: index_split.root.to_vec(),
                 },
                 ManifestFile {
                     path: "sub/data.txt".to_string(),
                     content_type: Some("text/plain; charset=utf-8".to_string()),
-                    data_ref: data_split.root,
+                    data_ref: data_split.root.to_vec(),
                 },
             ],
             Some("index.html"),
@@ -774,6 +957,98 @@ mod tests {
         }
     }
 
+    /// End-to-end **encrypted**: encrypt-split a file, build an
+    /// encrypted manifest around its 64-byte ref, walk it with the
+    /// reader (which must decrypt every node), and decrypt-join the
+    /// resolved data ref back to the plaintext — the exact shape of
+    /// `POST /bzz` + `GET /bzz/{128-hex}/{path}` with `swarm-encrypt`.
+    #[tokio::test]
+    async fn encrypted_manifest_round_trips_through_reader() {
+        use crate::enc_split::split_bytes_encrypted;
+        use crate::joiner::join_encrypted;
+
+        let payload = b"secret website payload".repeat(300); // multi-chunk
+        for level in [0u8, 1u8] {
+            let split = split_bytes_encrypted(&payload, level);
+            let manifest = build_single_file_manifest_encrypted(
+                "hello.txt",
+                Some("text/plain"),
+                &split.root_ref,
+                level,
+            )
+            .unwrap();
+
+            let mut fetcher = MapFetcher::new();
+            for c in split.chunks.iter().chain(&manifest.chunks) {
+                fetcher.ingest(c);
+            }
+            assert_eq!(manifest.root_address().as_slice(), &manifest.root_ref[..32]);
+
+            for path in ["hello.txt", ""] {
+                let lookup = lookup_path(&fetcher, &manifest.root_ref, path)
+                    .await
+                    .unwrap_or_else(|e| panic!("level {level} path {path:?}: {e}"));
+                assert_eq!(lookup.data_ref, split.root_ref.to_vec());
+                assert_eq!(lookup.content_type.as_deref(), Some("text/plain"));
+                let enc_ref: [u8; 64] = lookup.data_ref.as_slice().try_into().unwrap();
+                let back = join_encrypted(&fetcher, enc_ref, 1 << 30).await.unwrap();
+                assert_eq!(back, payload, "level {level} path {path:?}");
+            }
+        }
+    }
+
+    /// Encrypted collection: multiple paths, index document, listing.
+    #[tokio::test]
+    async fn encrypted_collection_manifest_walks() {
+        use crate::enc_split::split_bytes_encrypted;
+
+        let a = split_bytes_encrypted(b"file a", 0);
+        let b = split_bytes_encrypted(&b"file b".repeat(1000), 0);
+        let manifest = build_collection_manifest_encrypted(
+            &[
+                ManifestFile {
+                    path: "index.html".into(),
+                    content_type: Some("text/html".into()),
+                    data_ref: a.root_ref.to_vec(),
+                },
+                ManifestFile {
+                    path: "assets/site.css".into(),
+                    content_type: Some("text/css".into()),
+                    data_ref: b.root_ref.to_vec(),
+                },
+            ],
+            Some("index.html"),
+            IndexAnchor::ZeroEntry,
+            0,
+        )
+        .unwrap();
+
+        let mut fetcher = MapFetcher::new();
+        for c in a.chunks.iter().chain(&b.chunks).chain(&manifest.chunks) {
+            fetcher.ingest(c);
+        }
+
+        let css = lookup_path(&fetcher, &manifest.root_ref, "assets/site.css")
+            .await
+            .unwrap();
+        assert_eq!(css.data_ref, b.root_ref.to_vec());
+        let idx = lookup_path(&fetcher, &manifest.root_ref, "").await.unwrap();
+        assert_eq!(idx.data_ref, a.root_ref.to_vec());
+
+        let listing = list_manifest(&fetcher, &manifest.root_ref).await.unwrap();
+        let css_entry = listing
+            .iter()
+            .find(|e| e.reference == Some(b.root_ref.to_vec()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "listing has the css file; got paths {:?}",
+                    listing.iter().map(|e| &e.path).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(css_entry.reference, Some(b.root_ref.to_vec()));
+        assert_eq!(css_entry.size, Some(b"file b".repeat(1000).len() as u64));
+    }
+
     /// End-to-end: split + manifest a small text file, walk the
     /// manifest with the existing reader, expect to recover the file's
     /// data ref + content-type. This is the same shape the gateway
@@ -795,7 +1070,7 @@ mod tests {
         }
 
         // /bzz/<root>/hello.txt → should resolve to the file body's data ref.
-        let lookup = lookup_path(&fetcher, manifest.root, "hello.txt")
+        let lookup = lookup_path(&fetcher, &manifest.root, "hello.txt")
             .await
             .unwrap();
         assert_eq!(lookup.data_ref, split.root);
@@ -809,7 +1084,7 @@ mod tests {
         );
 
         // Index-document fallback: bare /bzz/<root>/ resolves to the same.
-        let idx = lookup_path(&fetcher, manifest.root, "").await.unwrap();
+        let idx = lookup_path(&fetcher, &manifest.root, "").await.unwrap();
         assert_eq!(idx.data_ref, split.root);
     }
 
@@ -834,7 +1109,7 @@ mod tests {
             files.push(ManifestFile {
                 path: name.to_string(),
                 content_type: Some(ct.to_string()),
-                data_ref: split.root,
+                data_ref: split.root.to_vec(),
             });
         }
         let manifest =
@@ -845,17 +1120,17 @@ mod tests {
         }
 
         for (name, ct, _body) in &bodies {
-            let r = lookup_path(&fetcher, manifest.root, name).await.unwrap();
+            let r = lookup_path(&fetcher, &manifest.root, name).await.unwrap();
             assert_eq!(&r.data_ref, data_refs.get(name).unwrap(), "name {name}");
             assert_eq!(r.content_type.as_deref(), Some(*ct));
         }
         // Index-document fallback returns the index file's data.
-        let r = lookup_path(&fetcher, manifest.root, "").await.unwrap();
+        let r = lookup_path(&fetcher, &manifest.root, "").await.unwrap();
         assert_eq!(r.data_ref, *data_refs.get("index.html").unwrap());
 
         // Listing should surface every path (note: list_manifest returns
         // metadata-only entries too — index-document fork shows up).
-        let listing = list_manifest(&fetcher, manifest.root).await.unwrap();
+        let listing = list_manifest(&fetcher, &manifest.root).await.unwrap();
         let paths: BTreeSet<&str> = listing.iter().map(|e| e.path.as_str()).collect();
         assert!(paths.contains("index.html"));
         assert!(paths.contains("style.css"));
@@ -873,7 +1148,7 @@ mod tests {
             &[ManifestFile {
                 path: "blog/post".to_string(),
                 content_type: Some("text/html".to_string()),
-                data_ref: split.root,
+                data_ref: split.root.to_vec(),
             }],
             None,
             IndexAnchor::ZeroEntry,
@@ -886,7 +1161,7 @@ mod tests {
         for c in &manifest.chunks {
             fetcher.ingest(c);
         }
-        let r = lookup_path(&fetcher, manifest.root, "blog/post")
+        let r = lookup_path(&fetcher, &manifest.root, "blog/post")
             .await
             .unwrap();
         assert_eq!(r.data_ref, split.root);
@@ -908,7 +1183,7 @@ mod tests {
         for c in &manifest.chunks {
             fetcher.ingest(c);
         }
-        let r = lookup_path(&fetcher, manifest.root, &long).await.unwrap();
+        let r = lookup_path(&fetcher, &manifest.root, &long).await.unwrap();
         assert_eq!(r.data_ref, split.root);
         assert_eq!(r.content_type.as_deref(), Some("text/plain"));
     }
@@ -923,7 +1198,7 @@ mod tests {
             .map(|p| ManifestFile {
                 path: (*p).to_string(),
                 content_type: Some("text/plain".to_string()),
-                data_ref: [0u8; 32],
+                data_ref: vec![0u8; 32],
             })
             .collect();
         let manifest = build_collection_manifest(&files, None, IndexAnchor::ZeroEntry).unwrap();
@@ -963,7 +1238,7 @@ mod tests {
             files.push(ManifestFile {
                 path,
                 content_type: Some("text/plain".to_string()),
-                data_ref: split.root,
+                data_ref: split.root.to_vec(),
             });
         }
         let manifest = build_collection_manifest(&files, None, IndexAnchor::ZeroEntry).unwrap();
@@ -980,7 +1255,7 @@ mod tests {
 
         // Every file path resolves to its own data ref.
         for (path, want_ref) in &data_refs {
-            let r = lookup_path(&fetcher, manifest.root, path).await.unwrap();
+            let r = lookup_path(&fetcher, &manifest.root, path).await.unwrap();
             assert_eq!(&r.data_ref, want_ref, "path {path}");
         }
     }
@@ -993,7 +1268,7 @@ mod tests {
         let make_file = |name: &str, ref_byte: u8| ManifestFile {
             path: name.to_string(),
             content_type: Some("text/plain".to_string()),
-            data_ref: [ref_byte; 32],
+            data_ref: [ref_byte; 32].to_vec(),
         };
         let forward = vec![
             make_file("apple", 1),
@@ -1031,12 +1306,12 @@ mod tests {
                 ManifestFile {
                     path: "abc".to_string(),
                     content_type: Some("text/plain".to_string()),
-                    data_ref: split_a.root,
+                    data_ref: split_a.root.to_vec(),
                 },
                 ManifestFile {
                     path: "abc/d".to_string(),
                     content_type: Some("text/html".to_string()),
-                    data_ref: split_b.root,
+                    data_ref: split_b.root.to_vec(),
                 },
             ],
             None,
@@ -1047,10 +1322,12 @@ mod tests {
             fetcher.ingest(c);
         }
 
-        let ra = lookup_path(&fetcher, manifest.root, "abc").await.unwrap();
+        let ra = lookup_path(&fetcher, &manifest.root, "abc").await.unwrap();
         assert_eq!(ra.data_ref, split_a.root);
         assert_eq!(ra.content_type.as_deref(), Some("text/plain"));
-        let rb = lookup_path(&fetcher, manifest.root, "abc/d").await.unwrap();
+        let rb = lookup_path(&fetcher, &manifest.root, "abc/d")
+            .await
+            .unwrap();
         assert_eq!(rb.data_ref, split_b.root);
         assert_eq!(rb.content_type.as_deref(), Some("text/html"));
     }
@@ -1063,7 +1340,7 @@ mod tests {
         let f = ManifestFile {
             path: "dup.txt".to_string(),
             content_type: None,
-            data_ref: [0u8; 32],
+            data_ref: vec![0u8; 32],
         };
         let err =
             build_collection_manifest(&[f.clone(), f], None, IndexAnchor::ZeroEntry).unwrap_err();
@@ -1096,7 +1373,7 @@ mod tests {
 
         // Detected as a feed → tries to resolve → no updates staged →
         // Err. A plain content manifest would return Ok(root) instead.
-        let resolved = resolve_feed_root(&fetcher, manifest.root).await;
+        let resolved = resolve_feed_root(&fetcher, &manifest.root).await;
         assert!(
             resolved.is_err(),
             "feed manifest should be detected and attempt dereference, got {resolved:?}",
@@ -1123,7 +1400,7 @@ mod tests {
             trie_insert(
                 &mut root,
                 f.path.as_bytes(),
-                f.data_ref,
+                f.data_ref.clone(),
                 file_metadata(&ct, &f.path),
             )
             .unwrap();
@@ -1144,11 +1421,20 @@ mod tests {
             },
         );
         let mut chunks = Vec::new();
-        let root_addr = serialize_node(&root, &mut chunks).unwrap();
+        let mut saver =
+            |payload: &[u8], out: &mut Vec<SplitChunk>| -> Result<Vec<u8>, ManifestWriteError> {
+                let (addr, wire) = cac_payload(payload);
+                out.push(SplitChunk {
+                    address: addr,
+                    wire,
+                });
+                Ok(addr.to_vec())
+            };
+        let root_ref = serialize_node(&root, &mut chunks, &mut saver).unwrap();
         for c in &chunks {
             fetcher.ingest(c);
         }
-        root_addr
+        root_ref.as_slice().try_into().unwrap()
     }
 
     /// Bee-compat `website-error-document` fallback: an otherwise-404 path
@@ -1169,19 +1455,21 @@ mod tests {
             files.push(ManifestFile {
                 path: name.to_string(),
                 content_type: Some("text/html".to_string()),
-                data_ref: split.root,
+                data_ref: split.root.to_vec(),
             });
         }
         let root = build_manifest_with_error_doc(&mut fetcher, &files, "index.html", "error.html");
 
         // A genuine miss falls back to the error document.
-        let miss = lookup_path(&fetcher, root, "does/not/exist").await.unwrap();
+        let miss = lookup_path(&fetcher, &root, "does/not/exist")
+            .await
+            .unwrap();
         assert_eq!(miss.data_ref, data_refs["error.html"]);
 
         // Explicit existing paths and the bare root are unaffected.
-        let explicit = lookup_path(&fetcher, root, "index.html").await.unwrap();
+        let explicit = lookup_path(&fetcher, &root, "index.html").await.unwrap();
         assert_eq!(explicit.data_ref, data_refs["index.html"]);
-        let bare = lookup_path(&fetcher, root, "").await.unwrap();
+        let bare = lookup_path(&fetcher, &root, "").await.unwrap();
         assert_eq!(bare.data_ref, data_refs["index.html"]);
     }
 
@@ -1199,7 +1487,7 @@ mod tests {
             &[ManifestFile {
                 path: "index.html".to_string(),
                 content_type: Some("text/html".to_string()),
-                data_ref: split.root,
+                data_ref: split.root.to_vec(),
             }],
             Some("index.html"),
             IndexAnchor::ZeroEntry,
@@ -1208,7 +1496,7 @@ mod tests {
         for c in &manifest.chunks {
             fetcher.ingest(c);
         }
-        let err = lookup_path(&fetcher, manifest.root, "does/not/exist")
+        let err = lookup_path(&fetcher, &manifest.root, "does/not/exist")
             .await
             .unwrap_err();
         assert!(matches!(err, ManifestError::NotFound { .. }), "got {err:?}");
