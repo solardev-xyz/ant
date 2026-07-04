@@ -15,6 +15,10 @@ libp2p.workspace = true
 libp2p-stream = "0.4.0-alpha"
 lru = "0.17.0"
 prost.workspace = true
+# Reed-Solomon erasure decoding for swarm-redundancy-level reads. Same
+# Backblaze/klauspost GF(2^8) construction bee uses; byte-compatibility
+# with bee-generated parities is proven by ant-conformance's rs tests.
+reed-solomon-erasure = "6.0.0"
 rusqlite = { version = "0.39.0", features = ["bundled"] }
 thiserror.workspace = true
 tokio.workspace = true

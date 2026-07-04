@@ -316,9 +316,10 @@ fn stamp_signing_matches_bee() {
 
 #[test]
 fn replica_addresses_match_bee() {
-    // ant does not implement dispersed replicas yet; pin the address
-    // derivation — id = chunk address with id[0] = entropy, soc address
-    // = keccak256(id || ReplicasOwner) — for the future implementation.
+    // Pin the raw address derivation — id = chunk address with
+    // id[0] = entropy, soc address = keccak256(id || ReplicasOwner).
+    // The production implementation (`ant_retrieval::rs`) is exercised
+    // against bee's actual replica uploads in tests/rs.rs.
     let vectors: ant_conformance::ReplicaVectors = load("replicas.json");
     assert!(!vectors.cases.is_empty());
     assert_eq!(vectors.replica_counts, vec![0, 2, 4, 8, 16]);
@@ -346,9 +347,9 @@ fn replica_addresses_match_bee() {
 
 #[test]
 fn redundancy_tables_parse_and_match_documented_shape() {
-    // ant does not implement Reed-Solomon recovery yet; these pins keep
-    // the bee parity tables available and assert the documented level
-    // parameters so a future decoder tests against the same numbers.
+    // These pins keep the bee parity tables available and assert both
+    // the documented level parameters and that the production decoder
+    // tables (`ant_retrieval::rs`) reproduce bee's exact values.
     let vectors: ant_conformance::RedundancyVectors = load("redundancy.json");
     assert_eq!(vectors.levels.len(), 5);
     // PARANOID is 39 data shards in bee's code (GetParities(128) == 89),
@@ -361,5 +362,21 @@ fn redundancy_tables_parse_and_match_documented_shape() {
     for level in &vectors.levels {
         assert_eq!(level.parities.len(), 128, "level {}", level.name);
         assert_eq!(level.enc_parities.len(), 64, "level {}", level.name);
+        assert_eq!(
+            ant_retrieval::rs::max_shards(level.level) as u32,
+            level.max_shards,
+            "max_shards for level {}",
+            level.name
+        );
+        // parities[n-1] = GetParities(n) for every used-slot count n.
+        for (n, expected) in level.parities.iter().enumerate() {
+            assert_eq!(
+                ant_retrieval::rs::get_parities(level.level, n + 1) as u32,
+                *expected,
+                "GetParities({}) at level {}",
+                n + 1,
+                level.name
+            );
+        }
     }
 }

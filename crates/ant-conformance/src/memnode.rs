@@ -101,6 +101,13 @@ impl ChunkFetcher for MemChunkStore {
                 format!("chunk {} not found", hex::encode(addr)).into()
             })
     }
+
+    /// Store RS-recovered / replica-recovered chunks like the production
+    /// fetcher stores them in its caches, so conformance tests can also
+    /// assert the recovered bytes landed intact.
+    async fn put_recovered(&self, addr: [u8; 32], wire: &[u8]) {
+        self.insert(addr, wire.to_vec());
+    }
 }
 
 /// In-memory postage runtime backing the `MemNode`'s `Envelope` /
@@ -508,7 +515,13 @@ async fn handle_command(store: &MemChunkStore, postage: &MemPostage, cmd: Contro
             ack,
         } => {
             let result = async {
-                let root = store.fetch(reference).await.map_err(|e| e.to_string())?;
+                // Root fetch with dispersed-replica fallback, like the
+                // production node loop: a redundant upload's root may be
+                // recoverable from its SOC replicas even when the CAC
+                // itself is gone.
+                let root = ant_retrieval::fetch_root_with_replicas(store, reference)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 let opts = JoinOptions {
                     allow_degraded_redundancy: true,
                 };
@@ -592,8 +605,7 @@ async fn handle_command(store: &MemChunkStore, postage: &MemPostage, cmd: Contro
                 let lookup = lookup_path(store, reference, &path)
                     .await
                     .map_err(|e| e.to_string())?;
-                let root = store
-                    .fetch(lookup.data_ref)
+                let root = ant_retrieval::fetch_root_with_replicas(store, lookup.data_ref)
                     .await
                     .map_err(|e| e.to_string())?;
                 let opts = JoinOptions {
@@ -912,7 +924,11 @@ async fn stream_via_store(
                 )
             }
         };
-        let root = store.fetch(data_ref).await.map_err(|e| e.to_string())?;
+        // Root fetch with dispersed-replica fallback (bee wraps the root
+        // getter of every redundant download in `replicas.NewGetter`).
+        let root = ant_retrieval::fetch_root_with_replicas(store, data_ref)
+            .await
+            .map_err(|e| e.to_string())?;
         // Mask the redundancy level off the high byte of the span so
         // the reported total reflects the real file size, matching the
         // production node loop's `root_span_to_u64_masked`.

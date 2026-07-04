@@ -1,0 +1,687 @@
+//! Reed-Solomon erasure recovery and dispersed-replica root fallback.
+//!
+//! Bee protects uploads made with `swarm-redundancy-level` 1–4 in two
+//! complementary ways (`pkg/file/redundancy`, `pkg/replicas`):
+//!
+//! 1. **Erasure coding of intermediate nodes.** Every intermediate chunk
+//!    of the file tree carries `shardCnt` data references followed by
+//!    `parityCnt` parity references. The parity chunks are Reed-Solomon
+//!    (GF(2^8), klauspost/Backblaze construction) encodings of the *full
+//!    wire bytes* (`span(8 LE) ‖ payload`) of the data children, each
+//!    shard zero-padded to `CHUNK_WITH_SPAN_SIZE` (4104) bytes. Any
+//!    `shardCnt` of the `shardCnt + parityCnt` children reconstruct the
+//!    missing data children byte-for-byte. The redundancy level itself
+//!    is carried in the top byte of the intermediate chunk's span
+//!    (`level | 0x80`, see [`decode_span`]).
+//!
+//! 2. **Dispersed replicas of the root chunk.** The root's span can't
+//!    tell a downloader anything if the root itself is unretrievable, so
+//!    bee additionally uploads 2^level single-owner-chunk copies of the
+//!    root whose addresses are *derivable from the root address alone*:
+//!    `id = root_addr with id[0] = entropy`, `owner = ReplicasOwner`,
+//!    `soc_addr = keccak256(id ‖ owner)` (see [`replica_addresses`]).
+//!
+//! This module implements the *read* side of both: the per-node
+//! [`RsDecoder`] used by the joiner to recover missing data children
+//! from parities, and [`fetch_root_with_replicas`] used wherever a
+//! bytes/bzz data root is fetched. Upload-side RS encoding is not
+//! implemented (ant uploads at level 0); neither is the encrypted
+//! (64-byte-reference) RS variant, which ant's read paths never produce.
+//!
+//! The Reed-Solomon backend is the `reed-solomon-erasure` crate, which
+//! uses the same Backblaze/klauspost matrix construction as bee's
+//! `github.com/klauspost/reedsolomon`; byte-compatibility is proven
+//! against bee-generated parities by `crates/ant-conformance/tests/rs.rs`
+//! (vectors in `conformance/vectors/rs_files.json`).
+
+use crate::ChunkFetcher;
+use ant_crypto::{cac_valid, keccak256, soc_valid, CHUNK_SIZE, SOC_HEADER_SIZE, SPAN_SIZE};
+use futures::stream::{self, StreamExt};
+use tokio::sync::Mutex;
+
+/// Full RS shard size: a chunk's wire bytes (`span ‖ payload`) padded to
+/// the maximum. Mirrors bee's `swarm.ChunkWithSpanSize`.
+pub const CHUNK_WITH_SPAN_SIZE: usize = CHUNK_SIZE + SPAN_SIZE;
+
+/// Highest defined redundancy level (bee `redundancy.PARANOID`).
+pub const MAX_LEVEL: u8 = 4;
+
+/// Dispersed replica counts per level (bee `redundancy.GetReplicaCounts`).
+pub const REPLICA_COUNTS: [usize; 5] = [0, 2, 4, 8, 16];
+
+/// Owner address of every dispersed replica SOC: the Ethereum address of
+/// the well-known private key `0x01 ‖ [0u8; 31]` (bee
+/// `swarm.ReplicasOwner`).
+pub const REPLICAS_OWNER: [u8; 20] = [
+    0xdc, 0x5b, 0x20, 0x84, 0x7f, 0x43, 0xd6, 0x79, 0x28, 0xf4, 0x9c, 0xd4, 0xf8, 0x5d, 0x69, 0x6b,
+    0x5a, 0x76, 0x17, 0xb5,
+];
+
+/// How many sibling shard fetches a recovery sweep keeps in flight at
+/// once. The sweep touches at most 128 chunks; 16 matches the joiner's
+/// own subtree fanout so a recovery doesn't hog the process-wide
+/// retrieval semaphore.
+const RECOVERY_FETCH_FANOUT: usize = 16;
+
+/// How many replica candidates [`fetch_root_with_replicas`] keeps in
+/// flight at once. Ordered (`buffered`, not `buffer_unordered`) so the
+/// dispersal order stays the preference order, like bee's batched
+/// replica getter (2, then 4, then 8 … per `RetryInterval`).
+const REPLICA_FETCH_FANOUT: usize = 4;
+
+// --- redundancy level tables (bee pkg/file/redundancy/level.go) ---------
+
+/// Erasure table rows: `(min_shards, parities)`, descending. For `n`
+/// data shards the parity count is the first row with `n >= min_shards`.
+/// These are the *non-encrypted* tables; ant does not read encrypted RS
+/// trees. Pinned against bee in `conformance/vectors/redundancy.json`.
+const MEDIUM_TABLE: &[(usize, usize)] = &[
+    (95, 9),
+    (69, 8),
+    (47, 7),
+    (29, 6),
+    (15, 5),
+    (6, 4),
+    (2, 3),
+    (1, 2),
+];
+const STRONG_TABLE: &[(usize, usize)] = &[
+    (105, 21),
+    (96, 20),
+    (87, 19),
+    (78, 18),
+    (70, 17),
+    (62, 16),
+    (54, 15),
+    (47, 14),
+    (40, 13),
+    (33, 12),
+    (27, 11),
+    (21, 10),
+    (16, 9),
+    (11, 8),
+    (7, 7),
+    (4, 6),
+    (2, 5),
+    (1, 4),
+];
+const INSANE_TABLE: &[(usize, usize)] = &[
+    (93, 31),
+    (88, 30),
+    (83, 29),
+    (78, 28),
+    (74, 27),
+    (69, 26),
+    (64, 25),
+    (60, 24),
+    (55, 23),
+    (51, 22),
+    (46, 21),
+    (42, 20),
+    (38, 19),
+    (34, 18),
+    (30, 17),
+    (27, 16),
+    (23, 15),
+    (20, 14),
+    (17, 13),
+    (14, 12),
+    (11, 11),
+    (9, 10),
+    (6, 9),
+    (4, 8),
+    (3, 7),
+    (2, 6),
+    (1, 5),
+];
+const PARANOID_TABLE: &[(usize, usize)] = &[
+    (37, 89),
+    (36, 87),
+    (35, 86),
+    (34, 84),
+    (33, 83),
+    (32, 81),
+    (31, 80),
+    (30, 78),
+    (29, 76),
+    (28, 75),
+    (27, 73),
+    (26, 71),
+    (25, 70),
+    (24, 68),
+    (23, 66),
+    (22, 65),
+    (21, 63),
+    (20, 61),
+    (19, 59),
+    (18, 58),
+    (17, 56),
+    (16, 54),
+    (15, 52),
+    (14, 50),
+    (13, 48),
+    (12, 47),
+    (11, 45),
+    (10, 43),
+    (9, 40),
+    (8, 38),
+    (7, 36),
+    (6, 34),
+    (5, 31),
+    (4, 29),
+    (3, 26),
+    (2, 23),
+    (1, 19),
+];
+
+/// Parity count for `shards` data shards at `level` (bee
+/// `Level.GetParities`). Level 0 (or out-of-range) has no parities.
+#[must_use]
+pub fn get_parities(level: u8, shards: usize) -> usize {
+    let table = match level {
+        1 => MEDIUM_TABLE,
+        2 => STRONG_TABLE,
+        3 => INSANE_TABLE,
+        4 => PARANOID_TABLE,
+        _ => return 0,
+    };
+    for &(min_shards, parities) in table {
+        if shards >= min_shards {
+            return parities;
+        }
+    }
+    0
+}
+
+/// Maximum number of *data* references in one intermediate chunk at
+/// `level` (bee `Level.GetMaxShards`): 128 slots minus the parities a
+/// full chunk carries. Level 0 → 128.
+#[must_use]
+pub fn max_shards(level: u8) -> usize {
+    128 - get_parities(level, 128)
+}
+
+/// True when the span's top byte carries a redundancy level
+/// (bee `redundancy.IsLevelEncoded`: strictly greater than 128 — a top
+/// byte of 1..=128 is just an implausibly-huge plain span).
+#[must_use]
+pub const fn is_level_encoded(span: &[u8; SPAN_SIZE]) -> bool {
+    span[SPAN_SIZE - 1] > 128
+}
+
+/// Split a chunk span into `(redundancy level, plain span bytes)`
+/// (bee `redundancy.DecodeSpan`). Non-encoded spans return level 0
+/// unchanged.
+#[must_use]
+pub const fn decode_span(mut span: [u8; SPAN_SIZE]) -> (u8, [u8; SPAN_SIZE]) {
+    if !is_level_encoded(&span) {
+        return (0, span);
+    }
+    let level = span[SPAN_SIZE - 1] & 0x7f;
+    span[SPAN_SIZE - 1] = 0;
+    (level, span)
+}
+
+/// Data-shard and parity count of the intermediate chunk that roots a
+/// subtree of `span` bytes at `level` (bee `file.ReferenceCount`,
+/// non-encrypted). Assumes `span > CHUNK_SIZE` (the chunk is an
+/// intermediate node); brute-forces the BMT level whose per-reference
+/// capacity covers `span`, counts the references needed, and reads the
+/// parity count off the level's erasure table.
+#[must_use]
+pub fn reference_count(span: u64, level: u8) -> (usize, usize) {
+    let branching = max_shards(level) as u64;
+    let mut branch_size = CHUNK_SIZE as u64;
+    let mut branch_level: u32 = 1;
+    while branch_size < span {
+        branch_size *= branching;
+        branch_level += 1;
+    }
+    // Capacity of one reference at this node's level:
+    // CHUNK_SIZE * branching^(branch_level - 2).
+    let mut reference_size = CHUNK_SIZE as u64;
+    let mut i = 1;
+    while i + 1 < branch_level {
+        reference_size *= branching;
+        i += 1;
+    }
+    let mut data_shards = 1usize;
+    let mut span_offset = reference_size;
+    while span_offset < span {
+        span_offset += reference_size;
+        data_shards += 1;
+    }
+    (data_shards, get_parities(level, data_shards))
+}
+
+/// Redundancy metadata of a fetched chunk's wire bytes: `(level, plain
+/// span value, parity count)`. Leaf chunks (span ≤ one chunk) never
+/// carry parities; intermediate chunks derive theirs from their own
+/// decoded span + level, exactly like bee's joiner does per child.
+#[must_use]
+pub fn chunk_meta(wire: &[u8]) -> Option<(u8, u64, usize)> {
+    let span_bytes: [u8; SPAN_SIZE] = wire.get(..SPAN_SIZE)?.try_into().ok()?;
+    let (level, plain) = decode_span(span_bytes);
+    let span = u64::from_le_bytes(plain);
+    let parity = if level != 0 && span > CHUNK_SIZE as u64 {
+        reference_count(span, level).1
+    } else {
+        0
+    };
+    Some((level, span, parity))
+}
+
+/// True wire length of a *recovered* RS data shard. Reconstruction
+/// yields the zero-padded 4104-byte shard; only the span tells us where
+/// the real chunk ends (bee sidesteps this with `lastLen`, recorded off
+/// a fetched sibling — we recompute instead so recovery of the last
+/// shard works even when it was never fetched):
+///
+/// - span ≤ 4096 → leaf → `8 + span`;
+/// - span > 4096 → intermediate → `8 + 32 * (shards + parities)` from
+///   [`reference_count`] on the shard's own decoded span.
+fn recovered_wire_len(shard: &[u8]) -> Option<usize> {
+    let span_bytes: [u8; SPAN_SIZE] = shard.get(..SPAN_SIZE)?.try_into().ok()?;
+    let (level, plain) = decode_span(span_bytes);
+    let span = u64::from_le_bytes(plain);
+    if span <= CHUNK_SIZE as u64 {
+        return Some(SPAN_SIZE + span as usize);
+    }
+    let (shards, parities) = reference_count(span, level);
+    let refs = shards + parities;
+    if refs * 32 > CHUNK_SIZE {
+        return None;
+    }
+    Some(SPAN_SIZE + refs * 32)
+}
+
+/// Per-intermediate-node erasure decoder: the read-path equivalent of
+/// bee's `pkg/file/redundancy/getter` with the `DATA` strategy — serve
+/// data children from the network, and on the first miss sweep *all*
+/// siblings (data + parity, bounded concurrency) and Reed-Solomon
+/// reconstruct the missing data shards.
+///
+/// One decoder is created per redundant intermediate node and shared by
+/// that node's child fetches; the recovery sweep runs at most once and
+/// its outcome (all data shard wires, or a terminal error) is cached, so
+/// concurrent child misses coalesce and repeated fetches of recovered
+/// chunks are served from memory. Recovered chunks are CAC-validated
+/// against their parent references (a mismatch would mean an RS matrix
+/// incompatibility or corrupted parities — never silently returned) and
+/// handed to [`ChunkFetcher::put_recovered`] so they land in the same
+/// caches a network fetch would.
+pub struct RsDecoder {
+    /// All child references of the node: `shard_cnt` data refs followed
+    /// by parity refs.
+    addrs: Vec<[u8; 32]>,
+    shard_cnt: usize,
+    /// `None` until the recovery sweep runs; then the terminal outcome.
+    recovered: Mutex<Option<Result<Vec<Vec<u8>>, String>>>,
+}
+
+impl RsDecoder {
+    /// `addrs` is the node's full reference list (data shards first,
+    /// then parities); `shard_cnt` how many of them are data.
+    #[must_use]
+    pub fn new(addrs: Vec<[u8; 32]>, shard_cnt: usize) -> Self {
+        debug_assert!(shard_cnt >= 1 && shard_cnt < addrs.len());
+        Self {
+            addrs,
+            shard_cnt,
+            recovered: Mutex::new(None),
+        }
+    }
+
+    /// Fetch data shard `index` (< `shard_cnt`), recovering it from the
+    /// node's parities when the direct fetch fails. Returns the exact
+    /// wire bytes (`span ‖ payload`) the chunk was uploaded with.
+    pub async fn fetch_data_shard(
+        &self,
+        fetcher: &dyn ChunkFetcher,
+        index: usize,
+    ) -> Result<Vec<u8>, String> {
+        {
+            let cached = self.recovered.lock().await;
+            if let Some(outcome) = cached.as_ref() {
+                return match outcome {
+                    Ok(shards) => Ok(shards[index].clone()),
+                    Err(e) => Err(e.clone()),
+                };
+            }
+        }
+        match fetcher.fetch(self.addrs[index]).await {
+            Ok(wire) => Ok(wire),
+            Err(fetch_err) => {
+                let shards = self.recover(fetcher, &fetch_err.to_string()).await?;
+                Ok(shards[index].clone())
+            }
+        }
+    }
+
+    /// Run (or join) the recovery sweep and return every data shard.
+    async fn recover(
+        &self,
+        fetcher: &dyn ChunkFetcher,
+        trigger: &str,
+    ) -> Result<Vec<Vec<u8>>, String> {
+        let mut guard = self.recovered.lock().await;
+        if let Some(outcome) = guard.as_ref() {
+            return outcome.clone();
+        }
+        let outcome = self.recover_inner(fetcher, trigger).await;
+        *guard = Some(outcome.clone());
+        outcome
+    }
+
+    async fn recover_inner(
+        &self,
+        fetcher: &dyn ChunkFetcher,
+        trigger: &str,
+    ) -> Result<Vec<Vec<u8>>, String> {
+        let total = self.addrs.len();
+        let parity_cnt = total - self.shard_cnt;
+
+        // Sweep every sibling (the one that just failed included — the
+        // fetcher may reach a different peer this time), bounded.
+        let mut wires: Vec<Option<Vec<u8>>> = vec![None; total];
+        let fetched: Vec<(usize, Option<Vec<u8>>)> = stream::iter(
+            self.addrs
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(i, addr)| async move { (i, fetcher.fetch(addr).await.ok()) }),
+        )
+        .buffer_unordered(RECOVERY_FETCH_FANOUT)
+        .collect()
+        .await;
+        for (i, wire) in fetched {
+            if let Some(w) = wire {
+                if w.len() <= CHUNK_WITH_SPAN_SIZE {
+                    wires[i] = Some(w);
+                }
+            }
+        }
+
+        let present = wires.iter().filter(|w| w.is_some()).count();
+        if present < self.shard_cnt {
+            return Err(format!(
+                "erasure recovery impossible: {present} of {total} shards retrievable, \
+                 need {} ({} data + {parity_cnt} parity refs); trigger: {trigger}",
+                self.shard_cnt, self.shard_cnt,
+            ));
+        }
+
+        let missing: Vec<usize> = (0..self.shard_cnt)
+            .filter(|&i| wires[i].is_none())
+            .collect();
+        if !missing.is_empty() {
+            let mut shards: Vec<Option<Vec<u8>>> = wires
+                .iter()
+                .map(|w| {
+                    w.as_ref().map(|wire| {
+                        let mut padded = wire.clone();
+                        padded.resize(CHUNK_WITH_SPAN_SIZE, 0);
+                        padded
+                    })
+                })
+                .collect();
+            let rs = reed_solomon_erasure::galois_8::ReedSolomon::new(self.shard_cnt, parity_cnt)
+                .map_err(|e| {
+                format!("reed-solomon init ({}+{parity_cnt}): {e}", self.shard_cnt)
+            })?;
+            rs.reconstruct_data(&mut shards)
+                .map_err(|e| format!("reed-solomon reconstruct: {e}"))?;
+
+            for &i in &missing {
+                let mut wire = shards[i]
+                    .take()
+                    .ok_or("reconstruct left a data shard empty")?;
+                let len = recovered_wire_len(&wire)
+                    .ok_or_else(|| format!("recovered shard {i} has an undecodable span"))?;
+                if len > wire.len() {
+                    return Err(format!("recovered shard {i} shorter than its span implies"));
+                }
+                wire.truncate(len);
+                if !cac_valid(&self.addrs[i], &wire) {
+                    return Err(format!(
+                        "recovered shard {i} failed CAC validation against {} \
+                         (RS output does not match bee's encoding)",
+                        hex::encode(self.addrs[i]),
+                    ));
+                }
+                fetcher.put_recovered(self.addrs[i], &wire).await;
+                tracing::debug!(
+                    target: "ant_retrieval::rs",
+                    chunk = %hex::encode(self.addrs[i]),
+                    "recovered data chunk from parities",
+                );
+                wires[i] = Some(wire);
+            }
+        }
+
+        Ok(wires
+            .into_iter()
+            .take(self.shard_cnt)
+            .map(|w| w.expect("all data shards present after reconstruct"))
+            .collect())
+    }
+}
+
+// --- dispersed replicas (bee pkg/replicas) -------------------------------
+
+/// SOC addresses of the dispersed replicas of `addr` at `level`, in
+/// bee's dispersal order (`pkg/replicas/replicas.go::replicator`): the
+/// first 2 candidates cover distinct 1-bit address prefixes, the next 2
+/// complete the 2-bit prefixes, then 4 for 3-bit, then 8 for 4-bit —
+/// so any prefix of the list is maximally spread over the address space.
+#[must_use]
+pub fn replica_addresses(addr: &[u8; 32], level: u8) -> Vec<[u8; 32]> {
+    let level = level.min(MAX_LEVEL);
+    let count = REPLICA_COUNTS[level as usize];
+    if count == 0 {
+        return Vec::new();
+    }
+
+    // `exist` maps the 1..4-bit prefixes of a replica's first address
+    // byte per level; `sizes` are the insertion cursors of each level's
+    // queue block (level ℓ block starts at REPLICA_COUNTS[ℓ-1]).
+    let mut exist = [false; 30];
+    let mut sizes = [0usize, 2, 4, 8];
+    const BASES: [usize; 4] = [0, 2, 6, 14];
+    let mut queue: [Option<[u8; 32]>; 16] = [None; 16];
+
+    let mut inserted = 0usize;
+    let mut entropy: u16 = 0;
+    while inserted < count && entropy < 255 {
+        let mut id = *addr;
+        id[0] = entropy as u8;
+        let mut input = [0u8; 52];
+        input[..32].copy_from_slice(&id);
+        input[32..].copy_from_slice(&REPLICAS_OWNER);
+        let soc_addr = keccak256(&input);
+        entropy += 1;
+
+        // bee's recursive `replicator.add`, iteratively: walk from the
+        // deepest prefix down; a duplicate at the top level rejects the
+        // candidate, otherwise mark each new prefix and insert into the
+        // block of the level just above the first already-seen prefix
+        // (or level 1 if every prefix is new).
+        let mut insert_level = None;
+        for l in (1..=level).rev() {
+            let nh = BASES[(l - 1) as usize] + (soc_addr[0] >> (8 - l)) as usize;
+            if exist[nh] {
+                if l == level {
+                    insert_level = None;
+                } else {
+                    insert_level = Some(l + 1);
+                }
+                break;
+            }
+            exist[nh] = true;
+            insert_level = Some(1);
+        }
+        if let Some(l) = insert_level {
+            let d = (l - 1) as usize;
+            queue[sizes[d]] = Some(soc_addr);
+            sizes[d] += 1;
+            inserted += 1;
+        }
+    }
+
+    queue.iter().take(count).filter_map(|q| *q).collect()
+}
+
+/// Fetch the chunk at `addr`, falling back to its dispersed replicas
+/// when the direct fetch fails.
+///
+/// This is the read-path mirror of bee's `replicas.NewGetter` wrapped
+/// around the root-chunk fetch of every bytes/bzz download: the replica
+/// SOC addresses are derived from `addr` alone, tried in dispersal
+/// order with bounded concurrency, SOC-validated, unwrapped, and the
+/// inner content CAC-validated against `addr` before being returned as
+/// the chunk's wire bytes. Since the uploader's redundancy level isn't
+/// knowable before the root is read, candidates for every level are
+/// tried (PARANOID's 16 first, then the lower levels' orderings,
+/// deduplicated — bee instead takes the level from a request header and
+/// defaults to PARANOID for downloads). A found root is stored via
+/// [`ChunkFetcher::put_recovered`] so later fetches hit the cache.
+///
+/// On total failure the *original* fetch error is returned, so callers'
+/// error messages still describe the direct root miss.
+pub async fn fetch_root_with_replicas(
+    fetcher: &dyn ChunkFetcher,
+    addr: [u8; 32],
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let direct_err = match fetcher.fetch(addr).await {
+        Ok(wire) => return Ok(wire),
+        Err(e) => e,
+    };
+
+    let mut candidates: Vec<[u8; 32]> = Vec::with_capacity(REPLICA_COUNTS[4]);
+    for level in (1..=MAX_LEVEL).rev() {
+        for soc_addr in replica_addresses(&addr, level) {
+            if !candidates.contains(&soc_addr) {
+                candidates.push(soc_addr);
+            }
+        }
+    }
+
+    tracing::debug!(
+        target: "ant_retrieval::rs",
+        chunk = %hex::encode(addr),
+        candidates = candidates.len(),
+        "root fetch failed; trying dispersed replicas",
+    );
+
+    let mut attempts = stream::iter(candidates.into_iter().map(|soc_addr| async move {
+        let wire = fetcher.fetch(soc_addr).await.ok()?;
+        if !soc_valid(&soc_addr, &wire) || wire.len() <= SOC_HEADER_SIZE {
+            return None;
+        }
+        // The replica's wrapped CAC *is* the original chunk: same wire
+        // bytes, and its BMT address is the address we were asked for.
+        let inner = wire[SOC_HEADER_SIZE..].to_vec();
+        if !cac_valid(&addr, &inner) {
+            return None;
+        }
+        Some(inner)
+    }))
+    .buffered(REPLICA_FETCH_FANOUT);
+
+    while let Some(outcome) = attempts.next().await {
+        if let Some(inner) = outcome {
+            fetcher.put_recovered(addr, &inner).await;
+            tracing::debug!(
+                target: "ant_retrieval::rs",
+                chunk = %hex::encode(addr),
+                "recovered root chunk from a dispersed replica",
+            );
+            return Ok(inner);
+        }
+    }
+    Err(direct_err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Level tables agree with bee's documented shape: parities for a
+    /// full 128-slot chunk, and the derived max data shard counts.
+    #[test]
+    fn parity_tables_match_bee_constants() {
+        assert_eq!(get_parities(1, 128), 9);
+        assert_eq!(get_parities(2, 128), 21);
+        assert_eq!(get_parities(3, 128), 31);
+        assert_eq!(get_parities(4, 128), 89);
+        assert_eq!(max_shards(0), 128);
+        assert_eq!(max_shards(1), 119);
+        assert_eq!(max_shards(2), 107);
+        assert_eq!(max_shards(3), 97);
+        assert_eq!(max_shards(4), 39);
+        // Below the smallest table row there are no parities.
+        assert_eq!(get_parities(1, 0), 0);
+    }
+
+    /// Span level encoding: bee sets `level | 0x80` in the top byte and
+    /// only bytes strictly greater than 128 decode as levels.
+    #[test]
+    fn span_level_encoding_round_trip() {
+        for level in 1..=MAX_LEVEL {
+            let mut span = 153_600u64.to_le_bytes();
+            span[7] = level | 0x80;
+            assert!(is_level_encoded(&span));
+            let (l, plain) = decode_span(span);
+            assert_eq!(l, level);
+            assert_eq!(u64::from_le_bytes(plain), 153_600);
+        }
+        // Plain span, and the >128 boundary.
+        let span = 4096u64.to_le_bytes();
+        assert_eq!(decode_span(span), (0, span));
+        let mut top128 = [0u8; 8];
+        top128[7] = 128;
+        assert!(!is_level_encoded(&top128));
+    }
+
+    /// `reference_count` against values derived from the `rs_files`
+    /// vectors (medium-150k root: 38 data + 6 parity refs; medium-600k
+    /// root: 2 + 3; paranoid-50k root: 13 + 48).
+    #[test]
+    fn reference_count_matches_vector_geometry() {
+        assert_eq!(reference_count(153_600, 1), (38, 6));
+        assert_eq!(reference_count(153_600, 2), (38, 12));
+        assert_eq!(reference_count(153_600, 3), (38, 19));
+        assert_eq!(reference_count(51_200, 4), (13, 48));
+        assert_eq!(reference_count(614_400, 1), (2, 3));
+        // Exactly one full branch.
+        assert_eq!(reference_count(4096 * 119, 1), (119, 9));
+    }
+
+    /// Replica derivation matches the pinned bee vector for the base
+    /// address in `conformance/vectors/replicas.json` (entropy 0's SOC
+    /// address; full-set equality is asserted by the conformance tests).
+    #[test]
+    fn replica_address_derivation() {
+        let base: [u8; 32] =
+            hex::decode("72c604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let expected0: [u8; 32] =
+            hex::decode("c096a4fd9a7ca8b765b4ee2b5f00857e2ae1a5c9c2dad5f1d2ba91343bc6568d")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        for level in 1..=MAX_LEVEL {
+            let addrs = replica_addresses(&base, level);
+            assert_eq!(addrs.len(), REPLICA_COUNTS[level as usize]);
+            // Entropy 0 is always accepted first, so every level's list
+            // starts with its SOC address.
+            assert_eq!(addrs[0], expected0);
+            // Dispersal property: the first two replicas differ in the
+            // top bit of their first address byte.
+            assert_ne!(addrs[0][0] >> 7, addrs[1][0] >> 7);
+        }
+        assert!(replica_addresses(&base, 0).is_empty());
+    }
+}

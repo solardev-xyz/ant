@@ -194,6 +194,36 @@ pub struct ReplicaCase {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RsFileVectors {
+    pub cases: Vec<RsFileCase>,
+}
+
+/// One file encoded by bee's real pipeline (`builder.NewPipelineBuilder`)
+/// at a `swarm-redundancy-level`. `chunks` holds **every** chunk the
+/// pipeline emitted — data, intermediate and parity — and
+/// `root_replicas` the dispersed replica SOC wires `replicas.NewPutter`
+/// would upload for the root. The file payload is `det("rs/<name>",
+/// file_size)` (see `conformance/vectorgen/main.go`).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RsFileCase {
+    pub name: String,
+    pub level: u8,
+    pub file_size: usize,
+    pub root_hex: String,
+    pub chunks: Vec<RsChunkEntry>,
+    pub root_replicas: Vec<RsChunkEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RsChunkEntry {
+    pub address_hex: String,
+    pub data_hex: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RedundancyVectors {
     pub levels: Vec<RedundancyLevel>,
 }

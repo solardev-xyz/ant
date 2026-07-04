@@ -80,9 +80,9 @@ pub enum ControlCommand {
     /// Walk the manifest at `reference`, resolve `path`, then join the
     /// resulting chunk tree into a single `Vec<u8>`. Acks with
     /// [`ControlAck::BzzBytes`] including any `Content-Type` metadata
-    /// recovered from the manifest. When `allow_degraded_redundancy`
-    /// is set the joiner masks any non-zero RS level byte off the
-    /// file's root span and decodes without RS recovery.
+    /// recovered from the manifest. `allow_degraded_redundancy` is a
+    /// legacy no-op (RS-aware decoding with parity recovery is always
+    /// on), retained for protocol compatibility.
     /// `bypass_cache` swaps the daemon's shared chunk cache for a
     /// fresh per-request one (intra-request retries still benefit
     /// from caching). `progress` opts the request into streaming
