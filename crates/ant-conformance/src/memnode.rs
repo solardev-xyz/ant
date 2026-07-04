@@ -851,6 +851,16 @@ async fn handle_command(store: &MemChunkStore, postage: &MemPostage, cmd: Contro
                 message: body.to_string(),
             });
         }
+        ControlCommand::AccountingSnapshot { ack } => {
+            // MemNode has no peers, so the settlement/balance mirror is
+            // empty — exactly what beemock's empty accounting/swap
+            // mocks report, letting the differential pin the empty
+            // collection shapes of `/balances`, `/settlements`,
+            // `/timesettlements`, and `/chequebook/cheque`.
+            let _ = ack.send(ControlAck::Accounting(
+                ant_control::AccountingSnapshotView::default(),
+            ));
+        }
         ControlCommand::VerifyChunksPresent {
             addresses,
             probes: _,

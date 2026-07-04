@@ -177,6 +177,14 @@ struct PeerBalance {
     reserved: u64,
     last_refresh: Option<Instant>,
     last_used: Instant,
+    /// Cumulative pseudosettle amount this peer has accepted from our
+    /// refreshes since the connection was established (bee's
+    /// `SettlementsSent` counterpart for the time-based settlement).
+    /// Only ever grows via [`Accounting::credit`]; dropped with the
+    /// rest of the entry on disconnect (`forget`), matching the
+    /// mirror's connection-scoped lifetime — unlike bee, which
+    /// persists totals in its statestore.
+    time_settled: u64,
 }
 
 impl Default for PeerBalance {
@@ -186,6 +194,7 @@ impl Default for PeerBalance {
             reserved: 0,
             last_refresh: None,
             last_used: Instant::now(),
+            time_settled: 0,
         }
     }
 }
@@ -277,10 +286,8 @@ impl Accounting {
         let mut peers = self.peers.lock().ok()?;
         let now = Instant::now();
         let entry = peers.entry(peer).or_insert_with(|| PeerBalance {
-            balance: 0,
-            reserved: 0,
-            last_refresh: None,
             last_used: now,
+            ..PeerBalance::default()
         });
 
         // Mirror bee's `min(timeNow().Unix() - refreshReceivedTimestamp, 1)`
@@ -329,6 +336,7 @@ impl Accounting {
         };
         let entry = peers.entry(peer).or_default();
         entry.balance = entry.balance.saturating_sub(accepted);
+        entry.time_settled = entry.time_settled.saturating_add(accepted);
         entry.last_refresh = Some(Instant::now());
     }
 
@@ -350,6 +358,23 @@ impl Accounting {
     pub fn debug_snapshot(&self, peer: &PeerId) -> Option<(u64, u64)> {
         let peers = self.peers.lock().ok()?;
         peers.get(peer).map(|b| (b.balance, b.reserved))
+    }
+
+    /// Enumerate every tracked peer as `(peer, balance,
+    /// time_settled)` — the outstanding debt we owe the peer and the
+    /// cumulative pseudosettle amount it has accepted from us. Backs
+    /// the gateway's `/balances`, `/consumed`, and `/timesettlements`
+    /// endpoints via `ControlCommand::AccountingSnapshot`. Cheap
+    /// (single lock acquisition, one row per connected peer).
+    #[must_use]
+    pub fn settlement_snapshot(&self) -> Vec<(PeerId, u64, u64)> {
+        let Ok(peers) = self.peers.lock() else {
+            return Vec::new();
+        };
+        peers
+            .iter()
+            .map(|(peer, b)| (*peer, b.balance, b.time_settled))
+            .collect()
     }
 }
 

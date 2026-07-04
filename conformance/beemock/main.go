@@ -21,6 +21,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	mockac "github.com/ethersphere/bee/v2/pkg/accesscontrol/mock"
+	"github.com/ethersphere/bee/v2/pkg/accounting"
 	accountingmock "github.com/ethersphere/bee/v2/pkg/accounting/mock"
 	"github.com/ethersphere/bee/v2/pkg/api"
 	"github.com/ethersphere/bee/v2/pkg/crypto"
@@ -32,10 +33,13 @@ import (
 	mockpost "github.com/ethersphere/bee/v2/pkg/postage/mock"
 	"github.com/ethersphere/bee/v2/pkg/pusher"
 	resolverMock "github.com/ethersphere/bee/v2/pkg/resolver/mock"
+	settlementpkg "github.com/ethersphere/bee/v2/pkg/settlement"
 	"github.com/ethersphere/bee/v2/pkg/settlement/pseudosettle"
+	"github.com/ethersphere/bee/v2/pkg/settlement/swap/chequebook"
 	chequebookmock "github.com/ethersphere/bee/v2/pkg/settlement/swap/chequebook/mock"
 	erc20mock "github.com/ethersphere/bee/v2/pkg/settlement/swap/erc20/mock"
 	swapmock "github.com/ethersphere/bee/v2/pkg/settlement/swap/mock"
+	"github.com/ethersphere/bee/v2/pkg/soc"
 	statestore "github.com/ethersphere/bee/v2/pkg/statestore/mock"
 	"github.com/ethersphere/bee/v2/pkg/steward"
 	"github.com/ethersphere/bee/v2/pkg/storage"
@@ -89,15 +93,41 @@ func (lr *localRetriever) RetrieveChunk(ctx context.Context, addr, _ swarm.Addre
 // this oracle's stand-in for the network. Without this, e.g. feed updates
 // posted via /soc (which defaults to direct upload) would never be found by
 // GET /feeds.
-func drainPusherFeed(cc <-chan *pusher.Op, store storage.Putter, quit <-chan struct{}) {
+func drainPusherFeed(cc <-chan *pusher.Op, store *inmemchunkstore.ChunkStore, quit <-chan struct{}) {
 	for {
 		select {
 		case op := <-cc:
-			op.Err <- store.Put(context.Background(), op.Chunk)
+			op.Err <- persistPushed(store, op.Chunk)
 		case <-quit:
 			return
 		}
 	}
+}
+
+// persistPushed stores one pushed chunk with the real reserve's
+// single-owner-chunk semantics (pkg/storer/internal/reserve/reserve.go
+// Put): a SOC whose address already exists REPLACES the stored payload
+// — SOCs are mutable, and the reserve calls ChunkStore().Replace for a
+// same-address put with a newer stamp timestamp (an older-or-equal
+// timestamp is rejected as storage.ErrOverwriteNewerChunk; the mock
+// stamper's timestamps are monotonic wall-clock nanos, so a later
+// upload always qualifies). A bare inmemchunkstore.Put would instead
+// keep the OLD payload for a duplicate address (it only bumps the
+// refcount) — a mock artifact real bee never exhibits. CAC puts keep
+// Put's keep-first behaviour: content-addressed chunks are immutable,
+// identical by construction.
+func persistPushed(store *inmemchunkstore.ChunkStore, ch swarm.Chunk) error {
+	ctx := context.Background()
+	if soc.Valid(ch) {
+		has, err := store.Has(ctx, ch.Address())
+		if err != nil {
+			return err
+		}
+		if has {
+			return store.Replace(ctx, ch, false)
+		}
+	}
+	return store.Put(ctx, ch)
 }
 
 func main() {
@@ -162,8 +192,37 @@ func main() {
 
 	// Remaining mocks, mirroring newTestServer defaults.
 	topologyDriver := topologymock.NewTopologyDriver()
-	acc := accountingmock.NewAccounting()
-	settlement := swapmock.New()
+	// The default accounting/swap mocks return (0, nil) or (nil, nil) for
+	// peers they have never seen, but real bee's accounting store returns
+	// ErrPeerNoBalance (-> 404 "No balance for peer"), real swap returns
+	// ErrPeerNoSettlements (-> 404 "no settlements for peer") and
+	// chequebook.ErrNoCheque (-> 200 with null lastreceived/lastsent).
+	// The default LastSentCheque (nil, nil) would even make the real
+	// chequebookLastPeerHandler dereference a nil cheque. This oracle has no
+	// peers, so wire the unknown-peer answers real bee gives — mock
+	// artifacts real bee never exhibits, exactly like WithBatch above.
+	acc := accountingmock.NewAccounting(
+		accountingmock.WithBalanceFunc(func(swarm.Address) (*big.Int, error) {
+			return nil, accounting.ErrPeerNoBalance
+		}),
+		accountingmock.WithCompensatedBalanceFunc(func(swarm.Address) (*big.Int, error) {
+			return nil, accounting.ErrPeerNoBalance
+		}),
+	)
+	settlement := swapmock.New(
+		swapmock.WithSettlementSentFunc(func(swarm.Address) (*big.Int, error) {
+			return nil, settlementpkg.ErrPeerNoSettlements
+		}),
+		swapmock.WithSettlementRecvFunc(func(swarm.Address) (*big.Int, error) {
+			return nil, settlementpkg.ErrPeerNoSettlements
+		}),
+		swapmock.WithLastSentChequeFunc(func(swarm.Address) (*chequebook.SignedCheque, error) {
+			return nil, chequebook.ErrNoCheque
+		}),
+		swapmock.WithLastReceivedChequeFunc(func(swarm.Address) (*chequebook.SignedCheque, error) {
+			return nil, chequebook.ErrNoCheque
+		}),
+	)
 	chequebook := chequebookmock.NewChequebook()
 	ln := lightnode.NewContainer(overlay)
 	transactionSvc := transactionmock.New()

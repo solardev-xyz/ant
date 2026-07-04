@@ -8,7 +8,7 @@
 //! module, which is `#[cfg(unix)]`-gated; Windows builds get the types
 //! without the socket I/O.
 
-use crate::protocol::{GetProgress, PostageStatusView, UploadJobView};
+use crate::protocol::{AccountingSnapshotView, GetProgress, PostageStatusView, UploadJobView};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -462,6 +462,15 @@ pub enum ControlCommand {
         topic: [u8; 32],
         ack: oneshot::Sender<ControlAck>,
     },
+    /// Gateway read-only settlement/balance endpoints (`GET /balances`,
+    /// `/consumed`, `/settlements`, `/timesettlements`,
+    /// `/chequebook/cheque` and their `/{peer}` variants): snapshot the
+    /// node's per-peer accounting mirror, swap ledgers, and
+    /// pseudosettle totals in one ack so a single command serves every
+    /// endpoint. The ack is [`ControlAck::Accounting`]; a node with no
+    /// peers (or none of the subsystems configured) acks an empty
+    /// snapshot, which the gateway renders as bee's empty list shapes.
+    AccountingSnapshot { ack: oneshot::Sender<ControlAck> },
 }
 
 /// Inclusive byte range used by [`ControlCommand::StreamBytes`] and
@@ -561,6 +570,9 @@ pub enum ControlAck {
     /// Snapshot of every registered postage batch. Terminal ack on
     /// `PostageList`.
     PostageList(Vec<PostageStatusView>),
+    /// Per-peer settlement/balance snapshot. Terminal ack on
+    /// `AccountingSnapshot`.
+    Accounting(AccountingSnapshotView),
     /// Successful feed resolution: the reference the latest update points
     /// at, the sequence index it lived at, the SOC signature of that
     /// update chunk, and whether it resolved as v2 (the wrapped CAC is

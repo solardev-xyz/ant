@@ -475,6 +475,29 @@ fn scenarios() -> Vec<Scenario> {
 
     let batch = "{batch}";
     let missing_ref = "00000000000000000000000000000000000000000000000000000000000000ff";
+    // Any well-formed 32-byte overlay no backend has ever seen: pins the
+    // unknown-peer shapes of the settlement/balance endpoints.
+    let unknown_peer = "abababababababababababababababababababababababababababababababab";
+
+    // Duplicate SOC write (swarm-kit Provider Test Center follow-up):
+    // same owner/id as the `soc` scenario's upload but a DIFFERENT
+    // wrapped payload, with a correspondingly valid signature minted
+    // here from the vector's secret. Digest = keccak256(id ‖
+    // cac_addr(new_payload)), signed with bee's Ethereum message
+    // prefix (`sign_handshake_data`) — the exact pattern
+    // tests/vectors.rs pins against bee's own vectors.
+    let (dup_sig_hex, dup_body) = {
+        let secret = ant_conformance::unhex_arr::<32>("secretHex", &soc_case.secret_hex);
+        let id = ant_conformance::unhex_arr::<32>("idHex", &soc_case.id_hex);
+        let (cac_addr, cac_wire) =
+            ant_crypto::cac_new(b"duplicate soc write: a different payload").expect("cac_new");
+        let mut digest_input = Vec::with_capacity(64);
+        digest_input.extend_from_slice(&id);
+        digest_input.extend_from_slice(&cac_addr);
+        let digest = ant_crypto::keccak256(&digest_input);
+        let sig = ant_crypto::sign_handshake_data(&secret, &digest).expect("sign duplicate soc");
+        (hex::encode(sig), cac_wire)
+    };
 
     // Chunk for the presigned-stamp round trip: `POST /envelope` needs
     // the address *before* the upload, so compute it client-side from a
@@ -625,6 +648,35 @@ fn scenarios() -> Vec<Scenario> {
                 .header("content-type", "application/octet-stream")
                 .header("swarm-postage-batch-id", batch)
                 .body(soc_body.clone()),
+                // Duplicate-write semantics: same SOC (owner/id), new
+                // payload, valid new signature. Bee ACCEPTS the write
+                // (201, same reference) — SOCs are mutable — and the
+                // reserve's SOC put REPLACES the stored payload when
+                // the new stamp timestamp is newer
+                // (pkg/storer/internal/reserve reserve.go: `ChunkStore().
+                // Replace` for ChunkTypeSingleOwner), so the LAST write
+                // wins on read. swarm-kit's expectation that a
+                // duplicate feed-index write FAILS does not hold for
+                // bee at the HTTP level.
+                Step::new(
+                    "upload-duplicate",
+                    "POST",
+                    format!(
+                        "/soc/{}/{}?sig={}",
+                        soc_case.owner_hex, soc_case.id_hex, dup_sig_hex
+                    ),
+                )
+                .header("content-type", "application/octet-stream")
+                .header("swarm-postage-batch-id", batch)
+                .body(dup_body),
+                // Pins which payload wins after the duplicate write
+                // (body AND swarm-soc-signature header must both flip
+                // to the second write's values).
+                Step::new(
+                    "download-after-duplicate",
+                    "GET",
+                    format!("/soc/{}/{}", soc_case.owner_hex, soc_case.id_hex),
+                ),
             ],
         },
         // The swarm-kit Provider Test Center repro: write update 0,
@@ -783,6 +835,44 @@ fn scenarios() -> Vec<Scenario> {
                     "presigned-download",
                     "GET",
                     format!("/chunks/{}", hex::encode(presigned_addr)),
+                ),
+            ],
+        },
+        // Read-only settlement/balance endpoints (bee balances.go /
+        // settlements.go / chequebook.go last-cheque handlers). Both
+        // backends are peerless here, so this pins the empty-collection
+        // shapes plus each unknown-peer response: 404 "No balance for
+        // peer" (balances/consumed), 404 "no settlements for peer"
+        // (settlements), and — deliberately NOT a 404 — 200 with null
+        // lastreceived/lastsent for /chequebook/cheque/{peer} (bee's
+        // handler tolerates chequebook.ErrNoCheque on both sides).
+        Scenario {
+            name: "settlements",
+            steps: vec![
+                Step::new("balances", "GET", "/balances"),
+                Step::new(
+                    "balances-unknown-peer",
+                    "GET",
+                    format!("/balances/{unknown_peer}"),
+                ),
+                Step::new("consumed", "GET", "/consumed"),
+                Step::new(
+                    "consumed-unknown-peer",
+                    "GET",
+                    format!("/consumed/{unknown_peer}"),
+                ),
+                Step::new("settlements", "GET", "/settlements"),
+                Step::new(
+                    "settlements-unknown-peer",
+                    "GET",
+                    format!("/settlements/{unknown_peer}"),
+                ),
+                Step::new("timesettlements", "GET", "/timesettlements"),
+                Step::new("cheque-list", "GET", "/chequebook/cheque"),
+                Step::new(
+                    "cheque-unknown-peer",
+                    "GET",
+                    format!("/chequebook/cheque/{unknown_peer}"),
                 ),
             ],
         },

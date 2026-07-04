@@ -33,7 +33,7 @@ use crate::retrieval::{
 /// envelope `issuer` field: `0x` + 40 hex nibbles where each alphabetic
 /// nibble is uppercased iff the corresponding nibble of
 /// `keccak256(lowercase_hex_without_prefix)` is ≥ 8.
-fn eip55_address(addr: &[u8; 20]) -> String {
+pub(crate) fn eip55_address(addr: &[u8; 20]) -> String {
     let lower = hex::encode(addr);
     let hash = ant_crypto::keccak256(lower.as_bytes());
     let mut out = String::with_capacity(42);

@@ -480,6 +480,12 @@ fn ack_to_response(ack: ControlAck) -> Response {
         ControlAck::PostageList(_) => Response::Error {
             message: "postage batch listing is only supported by ant-gateway".to_string(),
         },
+        // The settlement/balance snapshot backs the gateway's bee-parity
+        // `/balances` / `/settlements` / `/chequebook/cheque` family;
+        // the Unix-socket protocol doesn't expose the command.
+        ControlAck::Accounting(_) => Response::Error {
+            message: "accounting snapshots are only supported by ant-gateway".to_string(),
+        },
         // The Unix-socket protocol used by `antctl` doesn't expose feed
         // reads today; the control surface is just for renderers and
         // ops tooling, and feed lookup lives on the gateway HTTP API.
