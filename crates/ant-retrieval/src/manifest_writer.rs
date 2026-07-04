@@ -198,7 +198,10 @@ pub fn build_collection_manifest(
             prefix: b"/".to_vec(),
             child: Box::new(idx_node),
             metadata_override: Some(index_doc_metadata(idx)),
-            path_separator: true,
+            // A lone "/" prefix does NOT get the path-separator flag
+            // under bee's index>0 rule; setting it flips one bit in
+            // the fork type byte and changes the manifest reference.
+            path_separator: bee_path_separator(b"/"),
         };
         root.forks.insert(b'/', fork);
     }
@@ -237,8 +240,13 @@ pub fn build_feed_manifest(
     );
 
     let mut root = TrieNode::default();
+    // Bee's feedManifestEntry carries a zero (32-byte) address as the
+    // entry — refBytesSize 0x20 with an all-zero entry — unlike the
+    // website-index-document anchor, whose child is the refsize-0
+    // empty node. The distinction changes the child node bytes and
+    // therefore the feed-manifest reference (must match bee's).
     let leaf = TrieNode {
-        value: Some(EmptyValue),
+        own_data_ref: Some([0u8; 32]),
         ..Default::default()
     };
     root.forks.insert(
@@ -247,7 +255,10 @@ pub fn build_feed_manifest(
             prefix: b"/".to_vec(),
             child: Box::new(leaf),
             metadata_override: Some(meta),
-            path_separator: true,
+            // Same index>0 rule as the index-document fork: bee does
+            // not flag a lone "/" prefix, and the feed-manifest
+            // reference must match bee's byte-for-byte.
+            path_separator: bee_path_separator(b"/"),
         },
     );
 
@@ -296,6 +307,17 @@ struct TrieFork {
     path_separator: bool,
 }
 
+/// Bee's mantaray path-separator rule
+/// (`pkg/manifest/mantaray/node.go::updateIsWithPathSeparator`): the
+/// fork-type flag is set only when `/` occurs at index **> 0** of the
+/// path being inserted at that trie level — a *leading* separator does
+/// not count. Getting this bit wrong changes the node bytes and
+/// therefore the content-addressed manifest reference, so ant and bee
+/// would compute different `/bzz` references for identical uploads.
+fn bee_path_separator(path: &[u8]) -> bool {
+    path.iter().position(|&b| b == b'/').is_some_and(|i| i > 0)
+}
+
 /// Insert `path → data_ref` into `node`. Splits or extends forks as
 /// needed and chains 30-byte forks for paths whose remaining suffix
 /// exceeds the per-fork prefix cap.
@@ -317,7 +339,10 @@ fn trie_insert(
         let lcp = longest_common_prefix([fork.prefix.as_slice(), path].iter().copied());
         if lcp.len() == fork.prefix.len() {
             // Whole existing prefix matches; descend with the
-            // remaining tail.
+            // remaining tail. Bee recomputes the child's separator
+            // flag from the *full* path being inserted at this level
+            // on every descend (node.go:254), so mirror that.
+            fork.path_separator = bee_path_separator(path);
             trie_insert(&mut fork.child, &path[lcp.len()..], data_ref, metadata)?;
             node.forks.insert(first, fork);
         } else {
@@ -331,7 +356,9 @@ fn trie_insert(
             // because fork.metadata_override is only set for the
             // index-doc placeholder which we never split, this is
             // None and we keep it None on the intermediate fork too.
-            let old_path_sep = old_suffix.contains(&b'/');
+            // Bee recomputes the moved-down old child's flag from the
+            // prefix tail it keeps (node.go:245 `f.updateIsWithPathSeparator(rest)`).
+            let old_path_sep = bee_path_separator(&old_suffix);
             intermediate.forks.insert(
                 old_suffix[0],
                 TrieFork {
@@ -344,7 +371,9 @@ fn trie_insert(
             // Insert the new tail into the intermediate.
             trie_insert(&mut intermediate, &path[lcp.len()..], data_ref, metadata)?;
             // Replace the original fork with one truncated to LCP.
-            let lcp_path_sep = lcp.contains(&b'/');
+            // Bee sets the intermediate's flag from the full incoming
+            // path at this level, not from the LCP (node.go:254).
+            let lcp_path_sep = bee_path_separator(path);
             node.forks.insert(
                 first,
                 TrieFork {
@@ -373,7 +402,7 @@ fn trie_insert(
                     prefix: head.to_vec(),
                     child: Box::new(leaf),
                     metadata_override: None,
-                    path_separator: head.contains(&b'/'),
+                    path_separator: bee_path_separator(head),
                 },
             );
         } else {
@@ -387,7 +416,7 @@ fn trie_insert(
                     prefix: head.to_vec(),
                     child: Box::new(intermediate),
                     metadata_override: None,
-                    path_separator: head.contains(&b'/'),
+                    path_separator: bee_path_separator(head),
                 },
             );
         }
@@ -621,6 +650,46 @@ mod tests {
     use async_trait::async_trait;
     use std::collections::HashMap;
     use std::error::Error;
+
+    /// Golden references produced by bee itself (via the beemock
+    /// conformance oracle) for identical inputs. If these drift, ant's
+    /// manifests are no longer byte-compatible with bee's and the same
+    /// upload yields a different /bzz reference on each client. The
+    /// historical bug here was the path-separator fork flag: bee only
+    /// sets it for '/' at index > 0, so the synthetic "/" fork must
+    /// stay unflagged (caught by the differential conformance runner).
+    #[test]
+    fn single_file_manifest_reference_matches_bee() {
+        let split = crate::splitter::split_bytes(b"hello differential world\n");
+        assert_eq!(
+            hex::encode(split.root),
+            "ba0692eb77950120fead8d5d50b8fa49799228029b8f1ee9cb039a7d0397425d",
+        );
+        let m = build_single_file_manifest("hello.txt", Some("text/plain"), split.root).unwrap();
+        assert_eq!(
+            hex::encode(m.root),
+            "143b41f878de114a9240a1d3278ac20a7a0e7786106d19a492a250a318a5f68a",
+        );
+    }
+
+    #[test]
+    fn feed_manifest_reference_matches_bee() {
+        let owner: [u8; 20] =
+            hex::decode("ff6316419def87e4ea768e09a04dd56ebb40cb4e")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let topic: [u8; 32] =
+            hex::decode("e36165b0d71a05b2330be5a2519c2573d2c9b35c75e94fab874c46a8210641d0")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let m = build_feed_manifest(&owner, &topic).unwrap();
+        assert_eq!(
+            hex::encode(m.root),
+            "b04fab6986a2ee96857a3ecfef12b90fb51233b05f1f627a7f82d901081904a2",
+        );
+    }
 
     struct MapFetcher {
         chunks: HashMap<[u8; 32], Vec<u8>>,
