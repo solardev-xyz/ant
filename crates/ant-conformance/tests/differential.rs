@@ -47,8 +47,7 @@ fn beemock_bin() -> Option<PathBuf> {
         let p = PathBuf::from(p);
         return p.exists().then_some(p);
     }
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../conformance/beemock/beemock");
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../conformance/beemock/beemock");
     p.exists().then_some(p)
 }
 
@@ -95,6 +94,9 @@ async fn spawn_beemock(bin: &PathBuf) -> Beemock {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    // Reap the child before failing so the panic path leaves no zombie.
+    let _ = child.kill();
+    let _ = child.wait();
     panic!("beemock did not become healthy at {base}");
 }
 
@@ -246,8 +248,7 @@ struct DivergenceEntry {
 }
 
 fn load_registry() -> Vec<DivergenceEntry> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../conformance/divergences.json");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../conformance/divergences.json");
     let blob = std::fs::read(&path)
         .unwrap_or_else(|e| panic!("read divergence registry {}: {e}", path.display()));
     serde_json::from_slice(&blob).expect("parse divergences.json")
@@ -286,9 +287,10 @@ async fn run_step(client: &reqwest::Client, backend: &mut Backend, step: &Step) 
     if !step.body.is_empty() {
         req = req.body(step.body.clone());
     }
-    let resp = req.send().await.unwrap_or_else(|e| {
-        panic!("{}: {} {} failed: {e}", backend.name, step.method, url)
-    });
+    let resp = req
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("{}: {} {} failed: {e}", backend.name, step.method, url));
     let status = resp.status().as_u16();
     let headers = resp.headers().clone();
     let body = resp.bytes().await.expect("read body").to_vec();
@@ -315,7 +317,12 @@ struct Diff {
     bee: String,
 }
 
-fn compare(scenario: &'static str, step: &'static str, ant: &Observation, bee: &Observation) -> Vec<Diff> {
+fn compare(
+    scenario: &'static str,
+    step: &'static str,
+    ant: &Observation,
+    bee: &Observation,
+) -> Vec<Diff> {
     let mut diffs = Vec::new();
     if ant.status != bee.status {
         diffs.push(Diff {
@@ -602,11 +609,7 @@ fn scenarios() -> Vec<Scenario> {
                     "GET",
                     format!("/feeds/{}/{}", up0.owner_hex, up0.topic_hex),
                 ),
-                Step::new(
-                    "deref-via-bzz",
-                    "GET",
-                    "/bzz/{feed_manifest}/",
-                ),
+                Step::new("deref-via-bzz", "GET", "/bzz/{feed_manifest}/"),
                 Step::new(
                     "epoch-type",
                     "GET",
@@ -658,8 +661,8 @@ async fn differential_ant_vs_bee() {
     };
 
     let bee = spawn_beemock(&bin).await;
-    let ant_gw = ant_conformance::spawn_mem_gateway(ant_conformance::MemGatewayConfig::default())
-        .await;
+    let ant_gw =
+        ant_conformance::spawn_mem_gateway(ant_conformance::MemGatewayConfig::default()).await;
 
     let client = reqwest::Client::new();
     let registry = load_registry();
@@ -686,9 +689,9 @@ async fn differential_ant_vs_bee() {
                 ok_count += 1;
             }
             for d in diffs {
-                let is_known = registry.iter().any(|e| {
-                    e.scenario == d.scenario && e.step == d.step && e.aspect == d.aspect
-                });
+                let is_known = registry
+                    .iter()
+                    .any(|e| e.scenario == d.scenario && e.step == d.step && e.aspect == d.aspect);
                 if is_known {
                     known.push(d);
                 } else {

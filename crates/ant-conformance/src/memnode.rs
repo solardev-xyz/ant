@@ -748,6 +748,7 @@ async fn stream_via_store(
         let prologue = if is_bzz {
             ControlAck::BzzStreamStart {
                 total_bytes: total,
+                reference: data_ref,
                 content_type,
                 filename,
                 mutable,

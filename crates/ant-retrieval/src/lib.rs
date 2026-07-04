@@ -74,8 +74,8 @@ pub use joiner::{
     DURABILITY_MAX_FILE_BYTES, ENCRYPTED_REF_SIZE,
 };
 pub use manifest_writer::{
-    build_collection_manifest, build_feed_manifest, build_single_file_manifest, ManifestFile,
-    ManifestWriteError, ManifestWriteResult, MAX_FILENAME_BYTES,
+    build_collection_manifest, build_feed_manifest, build_single_file_manifest, IndexAnchor,
+    ManifestFile, ManifestWriteError, ManifestWriteResult, MAX_FILENAME_BYTES,
 };
 pub use mantaray::{
     list_manifest, lookup_path, resolve_feed_root, LookupResult, ManifestEntry, ManifestError,

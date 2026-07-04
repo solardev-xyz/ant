@@ -1,1 +1,170 @@
-[]
+[
+  {
+    "scenario": "tags",
+    "step": "list",
+    "aspect": "body",
+    "note": "beemock's mockstorer lists sessions from a Go map (random order) with all-zero counters; ant lists creation-ordered tags with real synced counters — mock artifact, not an API divergence"
+  },
+  {
+    "scenario": "stewardship-envelope",
+    "step": "stewardship-check",
+    "aspect": "status",
+    "note": "/stewardship not implemented in ant yet — separate task"
+  },
+  {
+    "scenario": "stewardship-envelope",
+    "step": "stewardship-check",
+    "aspect": "body",
+    "note": "/stewardship not implemented in ant yet — separate task"
+  },
+  {
+    "scenario": "stewardship-envelope",
+    "step": "stewardship-reupload",
+    "aspect": "status",
+    "note": "/stewardship not implemented in ant yet — separate task"
+  },
+  {
+    "scenario": "stewardship-envelope",
+    "step": "stewardship-reupload",
+    "aspect": "body",
+    "note": "/stewardship not implemented in ant yet — separate task"
+  },
+  {
+    "scenario": "stewardship-envelope",
+    "step": "envelope",
+    "aspect": "status",
+    "note": "/envelope not implemented in ant yet — separate task"
+  },
+  {
+    "scenario": "stewardship-envelope",
+    "step": "envelope",
+    "aspect": "body",
+    "note": "/envelope not implemented in ant yet — separate task"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "latest-after-1",
+    "aspect": "status",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "latest-after-1",
+    "aspect": "header:content-type",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "latest-after-1",
+    "aspect": "header:etag",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "latest-after-1",
+    "aspect": "header:swarm-feed-index",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "latest-after-1",
+    "aspect": "header:swarm-feed-index-next",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "latest-after-1",
+    "aspect": "header:swarm-feed-resolved-version",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "latest-after-1",
+    "aspect": "header:swarm-soc-signature",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "latest-after-1",
+    "aspect": "body",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "epoch-type",
+    "aspect": "status",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "epoch-type",
+    "aspect": "header:content-type",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "epoch-type",
+    "aspect": "header:etag",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "epoch-type",
+    "aspect": "header:swarm-feed-index",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "epoch-type",
+    "aspect": "header:swarm-feed-index-next",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "epoch-type",
+    "aspect": "header:swarm-feed-resolved-version",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "epoch-type",
+    "aspect": "header:swarm-soc-signature",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "epoch-type",
+    "aspect": "body",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "deref-via-bzz",
+    "aspect": "status",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path — bzz feed-dereference surface of the same race"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "deref-via-bzz",
+    "aspect": "header:content-type",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path — bzz feed-dereference surface of the same race"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "deref-via-bzz",
+    "aspect": "body",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path — bzz feed-dereference surface of the same race"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "deref-via-bzz",
+    "aspect": "header:swarm-feed-index",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path — bzz feed-dereference surface of the same race"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "deref-via-bzz",
+    "aspect": "header:swarm-feed-resolved-version",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path — bzz feed-dereference surface of the same race"
+  }
+]

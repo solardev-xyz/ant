@@ -60,10 +60,17 @@ pub fn build(handle: GatewayHandle) -> Router {
         // chequebook. `501` without a funded wallet key.
         .route("/chequebook/deposit", post(chain::chequebook_deposit))
         // Upload-progress tags (PLAN.md J.2.4 / C3). `POST /tags`
-        // creates a tag; `GET /tags/{uid}` polls it. Uploads also
-        // auto-create a tag and echo its uid in `Swarm-Tag-Uid`.
-        .route("/tags", post(tags::create_tag))
-        .route("/tags/{uid}", get(tags::get_tag))
+        // creates a tag; `GET /tags` lists them; `GET /tags/{uid}`
+        // polls one; `DELETE` drops it; `PATCH` marks the "done split"
+        // (bee's `doneSplitHandler`). Uploads also auto-create a tag
+        // and echo its uid in `Swarm-Tag` (+ legacy `Swarm-Tag-Uid`).
+        .route("/tags", get(tags::list_tags).post(tags::create_tag))
+        .route(
+            "/tags/{uid}",
+            get(tags::get_tag)
+                .delete(tags::delete_tag)
+                .patch(tags::patch_tag),
+        )
         .route("/chunks", post(retrieval::upload_chunk))
         .route("/soc/{owner}/{id}", post(retrieval::upload_soc))
         // Raw byte upload (PLAN.md J.2.5 / C1): bee-js feed payloads and
@@ -139,6 +146,20 @@ async fn request_span(req: Request, next: Next) -> Response {
         axum::http::header::SERVER,
         HeaderValue::from_static(SERVER_HEADER),
     );
+    // Bee's `jsonhttp.Respond` stamps `application/json; charset=utf-8`
+    // on every JSON body; axum's `Json` writes the bare media type.
+    // Normalize here so every handler (and any future one) matches bee
+    // without each call site needing to remember the charset.
+    if resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .is_some_and(|ct| ct.as_bytes() == b"application/json")
+    {
+        resp.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            crate::error::JSON_CONTENT_TYPE,
+        );
+    }
     if resp.status() == StatusCode::INTERNAL_SERVER_ERROR
         || resp.status() == StatusCode::SERVICE_UNAVAILABLE
         || resp.status() == StatusCode::GATEWAY_TIMEOUT

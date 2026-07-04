@@ -124,7 +124,9 @@ async fn chunks_round_trip_matches_bee_vectors() {
 /// (c) `POST /soc/{owner}/{id}?sig=…` + `GET /soc/{owner}/{id}`
 /// round-trip using bee-signed SOCs from the vector file. The POST body
 /// is the inner CAC (`chunkDataHex` minus the 32-byte id and 65-byte
-/// signature prefix); the GET must return the full SOC wire.
+/// signature prefix); the GET must return the **unwrapped payload**
+/// (bee's `socGetHandler` serves the wrapped chunk's content) with the
+/// SOC signature echoed in `swarm-soc-signature`.
 #[tokio::test]
 async fn soc_round_trip_with_bee_signed_vectors() {
     let vectors: SocVectors = load("soc.json");
@@ -144,7 +146,7 @@ async fn soc_round_trip_with_bee_signed_vectors() {
                 case.signature_hex
             ))
             .header("swarm-postage-batch-id", BATCH_ID)
-            .body(inner_cac)
+            .body(inner_cac.clone())
             .send()
             .await
             .expect("POST /soc");
@@ -177,11 +179,26 @@ async fn soc_round_trip_with_bee_signed_vectors() {
             "GET /soc 200 for case {}",
             case.name
         );
+        let sig_header = resp
+            .headers()
+            .get("swarm-soc-signature")
+            .expect("swarm-soc-signature header present")
+            .to_str()
+            .expect("ascii signature")
+            .to_string();
+        assert_eq!(
+            sig_header,
+            case.signature_hex.trim_start_matches("0x"),
+            "swarm-soc-signature must echo the SOC signature for case {}",
+            case.name
+        );
         let got = resp.bytes().await.expect("read GET /soc body");
+        // Bee serves the wrapped chunk's *content*: the inner CAC minus
+        // its 8-byte span (single-chunk payloads in the vector file).
         assert_eq!(
             got.as_ref(),
-            wire.as_slice(),
-            "SOC wire round-trip mismatch for case {}",
+            &inner_cac[8..],
+            "SOC payload round-trip mismatch for case {}",
             case.name
         );
     }

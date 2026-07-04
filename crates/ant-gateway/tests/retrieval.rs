@@ -148,6 +148,7 @@ async fn gateway_raises_joiner_max_bytes_above_cli_default() {
                     let _ = ack
                         .send(ControlAck::BzzStreamStart {
                             total_bytes: 4,
+                            reference: [0u8; 32],
                             content_type: Some("text/plain".to_string()),
                             filename: None,
                             mutable: false,
@@ -266,9 +267,12 @@ async fn bytes_returns_fixture_payload() {
         resp.headers().get(header::CONTENT_TYPE).unwrap(),
         "image/png"
     );
+    // Bee never invents a Content-Disposition for `/bytes` …
+    assert!(resp.headers().get(header::CONTENT_DISPOSITION).is_none());
+    // … but does stamp the quoted reference as ETag on GET.
     assert_eq!(
-        resp.headers().get(header::CONTENT_DISPOSITION).unwrap(),
-        format!("inline; filename=\"{DATA_REF}.png\"").as_str(),
+        resp.headers().get(header::ETAG).unwrap(),
+        format!("\"{DATA_REF}\"").as_str(),
     );
     let bytes = body_bytes(resp).await;
     assert_eq!(bytes.len(), BODY_LEN);
@@ -318,9 +322,10 @@ async fn chunks_returns_wire_bytes() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
+    // Bee's chunkGetHandler writes the quirky `binary/octet-stream`.
     assert_eq!(
         resp.headers().get(header::CONTENT_TYPE).unwrap(),
-        "application/octet-stream",
+        "binary/octet-stream",
     );
     let bytes = body_bytes(resp).await;
     let expected =
@@ -346,10 +351,8 @@ async fn bytes_rejects_short_reference_with_400() {
     let body = body_bytes(resp).await;
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["code"], 400);
-    assert!(json["message"]
-        .as_str()
-        .unwrap()
-        .contains("reference must be 32 bytes"));
+    assert_eq!(json["message"], "invalid path params");
+    assert_eq!(json["reasons"][0]["field"], "address");
 }
 
 /// `HEAD /bytes/{addr}` mirrors `HEAD /bzz/...`: it must return
@@ -402,6 +405,7 @@ async fn head_dispatches_head_only_flag() {
                 let _ = ack
                     .send(ControlAck::BzzStreamStart {
                         total_bytes: 1024,
+                        reference: [0u8; 32],
                         content_type: Some("video/mp4".to_string()),
                         filename: Some("clip.mp4".to_string()),
                         mutable: false,
@@ -791,11 +795,7 @@ async fn post_chunks_rejects_oversized_body() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
     assert_eq!(json["code"], 400);
-    assert!(
-        json["message"].as_str().unwrap().contains("out of range"),
-        "expected size error message, got {}",
-        json["message"],
-    );
+    assert_eq!(json["message"], "chunk data exceeds required length");
 }
 
 /// `POST /bzz?name=hello.txt` chunks the request body, builds a
@@ -1033,7 +1033,7 @@ fn router_serving_soc(fixture: &SocFixture) -> axum::Router {
 }
 
 #[tokio::test]
-async fn get_soc_returns_wire_bytes_for_known_address() {
+async fn get_soc_returns_unwrapped_payload_with_signature_header() {
     let fixture = signed_soc([0x11; 32], [0xa1; 32], b"hello soc");
     let router = router_serving_soc(&fixture);
     let uri = format!(
@@ -1055,8 +1055,21 @@ async fn get_soc_returns_wire_bytes_for_known_address() {
         resp.headers().get(header::CONTENT_TYPE).unwrap(),
         "application/octet-stream",
     );
+    // Bee's socGetHandler serves the wrapped chunk's *content* and
+    // echoes the SOC signature + a quoted ETag of the wrapped address.
+    assert_eq!(
+        resp.headers().get("swarm-soc-signature").unwrap(),
+        hex::encode(fixture.signature).as_str(),
+    );
+    assert!(resp
+        .headers()
+        .get(header::ETAG)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with('"'));
     let bytes = body_bytes(resp).await;
-    assert_eq!(bytes, fixture.wire);
+    assert_eq!(bytes, b"hello soc");
 }
 
 #[tokio::test]
@@ -1078,7 +1091,7 @@ async fn get_soc_accepts_0x_prefixed_hex() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(body_bytes(resp).await, fixture.wire);
+    assert_eq!(body_bytes(resp).await, b"0x-prefixed");
 }
 
 #[tokio::test]
@@ -1099,7 +1112,8 @@ async fn get_soc_rejects_bad_owner_hex() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
     assert_eq!(json["code"], 400);
-    assert!(json["message"].as_str().unwrap().contains("bad owner"));
+    assert_eq!(json["message"], "invalid path params");
+    assert_eq!(json["reasons"][0]["field"], "owner");
 }
 
 #[tokio::test]
@@ -1119,7 +1133,12 @@ async fn get_soc_rejects_bad_id_hex() {
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert!(json["message"].as_str().unwrap().contains("bad id"));
+    assert_eq!(json["message"], "invalid path params");
+    assert_eq!(json["reasons"][0]["field"], "id");
+    assert!(json["reasons"][0]["error"]
+        .as_str()
+        .unwrap()
+        .starts_with("invalid hex byte"));
 }
 
 #[tokio::test]
@@ -1164,7 +1183,8 @@ async fn head_soc_returns_200_no_body() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
-    let expected_len = fixture.wire.len().to_string();
+    // Content-Length reflects the unwrapped payload bee serves.
+    let expected_len = (fixture.inner_cac_wire.len() - 8).to_string();
     assert_eq!(
         resp.headers().get(header::CONTENT_LENGTH).unwrap(),
         expected_len.as_str(),
@@ -1215,10 +1235,10 @@ async fn get_soc_does_not_set_immutable_cache_control() {
 }
 
 #[tokio::test]
-async fn get_soc_returns_full_soc_wire_not_inner_cac() {
-    // The body must be `id(32) || sig(65) || inner_cac_wire`, not just
-    // the inner CAC. Pin the length bookkeeping so a refactor that
-    // accidentally peels the SOC header before responding fails loudly.
+async fn get_soc_root_chunk_returns_wrapped_wire() {
+    // With `Swarm-Only-Root-Chunk: true` bee writes the wrapped
+    // chunk's wire data (`span(8 LE) || payload`) verbatim — not the
+    // SOC header, and not the bare payload — with no ETag.
     let fixture = signed_soc([0x18; 32], [0xa8; 32], b"layout pin");
     let router = router_serving_soc(&fixture);
     let uri = format!(
@@ -1231,15 +1251,19 @@ async fn get_soc_returns_full_soc_wire_not_inner_cac() {
         Request::builder()
             .method(Method::GET)
             .uri(&uri)
+            .header("swarm-only-root-chunk", "true")
             .body(Body::empty())
             .unwrap(),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("swarm-soc-signature").unwrap(),
+        hex::encode(fixture.signature).as_str(),
+    );
+    assert!(resp.headers().get(header::ETAG).is_none());
     let bytes = body_bytes(resp).await;
-    assert_eq!(bytes.len(), 32 + 65 + fixture.inner_cac_wire.len());
-    assert_eq!(&bytes[..32], &fixture.id);
-    assert_eq!(&bytes[32 + 65..], fixture.inner_cac_wire.as_slice());
+    assert_eq!(bytes, fixture.inner_cac_wire);
 }
 
 /// Oversized body must be rejected with 413 before chunking begins.
@@ -1759,45 +1783,31 @@ async fn get_feed_explicit_type_sequence_accepted() {
 }
 
 #[tokio::test]
-async fn get_feed_type_epoch_returns_501() {
-    let scenario = FeedScenario::new(0x27, 0xb7);
-    let router = scenario.router(&[]);
-    let uri = format!(
-        "/feeds/{}/{}?type=epoch",
-        hex::encode(scenario.owner),
-        hex::encode(scenario.topic),
-    );
-    let resp = send(
-        router,
-        Request::builder()
-            .method(Method::GET)
-            .uri(&uri)
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
-}
-
-#[tokio::test]
-async fn get_feed_unknown_type_returns_400() {
-    let scenario = FeedScenario::new(0x28, 0xb8);
-    let router = scenario.router(&[]);
-    let uri = format!(
-        "/feeds/{}/{}?type=bogus",
-        hex::encode(scenario.owner),
-        hex::encode(scenario.topic),
-    );
-    let resp = send(
-        router,
-        Request::builder()
-            .method(Method::GET)
-            .uri(&uri)
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+async fn get_feed_type_param_is_ignored_like_bee() {
+    // Bee's feedGetHandler never reads `?type=` — `epoch`, `bogus`,
+    // anything runs the normal sequence lookup. On an empty feed that
+    // is bee's `404 "no update found"`.
+    for kind in ["epoch", "bogus"] {
+        let scenario = FeedScenario::new(0x27, 0xb7);
+        let router = scenario.router(&[]);
+        let uri = format!(
+            "/feeds/{}/{}?type={kind}",
+            hex::encode(scenario.owner),
+            hex::encode(scenario.topic),
+        );
+        let resp = send(
+            router,
+            Request::builder()
+                .method(Method::GET)
+                .uri(&uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(json["message"], "no update found");
+    }
 }
 
 #[tokio::test]
@@ -1837,7 +1847,8 @@ async fn get_feed_rejects_bad_owner_hex() {
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert!(json["message"].as_str().unwrap().contains("bad owner"));
+    assert_eq!(json["message"], "invalid path params");
+    assert_eq!(json["reasons"][0]["field"], "owner");
 }
 
 #[tokio::test]
@@ -1856,7 +1867,8 @@ async fn get_feed_rejects_bad_topic_hex() {
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert!(json["message"].as_str().unwrap().contains("bad topic"));
+    assert_eq!(json["message"], "invalid path params");
+    assert_eq!(json["reasons"][0]["field"], "topic");
 }
 
 #[tokio::test]
@@ -2115,7 +2127,7 @@ async fn post_soc_omits_immutable_cache_control() {
 }
 
 /// Owner path component must decode to exactly 20 bytes; anything else
-/// is a 400 with a `bad owner:` message and never reaches the channel.
+/// is bee's `400 invalid path params` and never reaches the channel.
 #[tokio::test]
 async fn post_soc_rejects_bad_owner_hex() {
     let id = [0u8; 32];
@@ -2142,11 +2154,8 @@ async fn post_soc_rejects_bad_owner_hex() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
     assert_eq!(json["code"], 400);
-    assert!(
-        json["message"].as_str().unwrap().starts_with("bad owner:"),
-        "expected `bad owner:` prefix, got {}",
-        json["message"],
-    );
+    assert_eq!(json["message"], "invalid path params");
+    assert_eq!(json["reasons"][0]["field"], "owner");
     assert!(
         !*captured.lock().await,
         "validation must fail before the command channel is touched",
@@ -2154,7 +2163,7 @@ async fn post_soc_rejects_bad_owner_hex() {
 }
 
 /// Id path component must decode to exactly 32 bytes; anything else is
-/// a 400 with a `bad id:` message.
+/// bee's `400 invalid path params`.
 #[tokio::test]
 async fn post_soc_rejects_bad_id_hex() {
     let owner = [0u8; 20];
@@ -2171,11 +2180,8 @@ async fn post_soc_rejects_bad_id_hex() {
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert!(
-        json["message"].as_str().unwrap().starts_with("bad id:"),
-        "expected `bad id:` prefix, got {}",
-        json["message"],
-    );
+    assert_eq!(json["message"], "invalid path params");
+    assert_eq!(json["reasons"][0]["field"], "id");
 }
 
 /// A request with neither the `swarm-soc-signature` header nor the
@@ -2197,10 +2203,10 @@ async fn post_soc_rejects_missing_signature_header() {
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(
-        json["message"].as_str().unwrap(),
-        "missing soc signature: provide swarm-soc-signature header or ?sig=… query param",
-    );
+    // Bee: the required `?sig=` query parameter is missing.
+    assert_eq!(json["message"], "invalid query params");
+    assert_eq!(json["reasons"][0]["field"], "sig");
+    assert_eq!(json["reasons"][0]["error"], "want required:");
 }
 
 /// Non-ASCII bytes in the signature header are caught by `to_str()`
@@ -2225,14 +2231,12 @@ async fn post_soc_rejects_non_ascii_signature_header() {
     let resp = send(router, req).await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(
-        json["message"].as_str().unwrap(),
-        "swarm-soc-signature must be ascii hex",
-    );
+    assert_eq!(json["message"], "invalid header params");
+    assert_eq!(json["reasons"][0]["field"], "swarm-soc-signature");
 }
 
 /// A signature header that's the wrong length, or contains non-hex
-/// characters, surfaces as `bad swarm-soc-signature: …`.
+/// characters, surfaces as a bee-shaped header-params error.
 #[tokio::test]
 async fn post_soc_rejects_malformed_signature_hex() {
     let owner = [0u8; 20];
@@ -2250,14 +2254,8 @@ async fn post_soc_rejects_malformed_signature_hex() {
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert!(
-        json["message"]
-            .as_str()
-            .unwrap()
-            .starts_with("bad soc signature:"),
-        "expected `bad soc signature:` prefix, got {}",
-        json["message"],
-    );
+    assert_eq!(json["message"], "invalid header params");
+    assert_eq!(json["reasons"][0]["field"], "swarm-soc-signature");
 }
 
 /// Bodies smaller than the inner-CAC span (8 bytes) and larger than
@@ -2284,23 +2282,24 @@ async fn post_soc_rejects_body_size_out_of_range() {
                 .unwrap(),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{label}");
+        // Bee: `400 "short chunk data"` below the span size,
+        // `413 "payload too large"` above the CAC wire cap.
+        let json_status = resp.status();
         let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-        assert!(
-            json["message"]
-                .as_str()
-                .unwrap()
-                .starts_with("soc inner cac size out of range:"),
-            "{label}: expected size error, got {}",
-            json["message"],
-        );
+        if label == "under-span" {
+            assert_eq!(json_status, StatusCode::BAD_REQUEST, "{label}");
+            assert_eq!(json["message"], "short chunk data", "{label}");
+        } else {
+            assert_eq!(json_status, StatusCode::PAYLOAD_TOO_LARGE, "{label}");
+            assert_eq!(json["message"], "payload too large", "{label}");
+        }
     }
 }
 
 /// `soc_valid` rejection (signature recovers a different owner than
-/// the path claims) maps to 400 with a self-binding error message.
-/// Constructed by signing with `secret` but submitting under another
-/// secret's owner address.
+/// the path claims) maps to bee's `401 "invalid chunk"`. Constructed
+/// by signing with `secret` but submitting under another secret's
+/// owner address.
 #[tokio::test]
 async fn post_soc_rejects_self_binding_mismatch() {
     let real_secret = [0x01u8; 32];
@@ -2323,12 +2322,10 @@ async fn post_soc_rejects_self_binding_mismatch() {
             .unwrap(),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(
-        json["message"].as_str().unwrap(),
-        "soc signature does not recover the supplied owner",
-    );
+    assert_eq!(json["code"], 401);
+    assert_eq!(json["message"], "invalid chunk");
 }
 
 /// A node-side readiness signal (`uploads not configured`, "no peers

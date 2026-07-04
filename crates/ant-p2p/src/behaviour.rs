@@ -2991,6 +2991,7 @@ async fn run_stream_bzz(
         if ack
             .send(ControlAck::BzzStreamStart {
                 total_bytes,
+                reference: data_ref,
                 content_type: lookup.content_type,
                 filename,
                 mutable: lookup.is_feed,

@@ -40,7 +40,8 @@ use ant_control::{
     ActiveRequestGuard, ControlAck, ControlCommand, GatewayRequestKind, StreamRange,
 };
 use ant_retrieval::{
-    build_collection_manifest, build_single_file_manifest, split_bytes, ManifestFile, SplitChunk,
+    build_collection_manifest, build_single_file_manifest, split_bytes, IndexAnchor, ManifestFile,
+    SplitChunk,
 };
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -53,7 +54,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
-use crate::error::json_error;
+use crate::error::{
+    json_error, params_error, parse_hex_param, status_text_error, ParamKind, Reason,
+    JSON_CONTENT_TYPE,
+};
 use crate::handle::GatewayHandle;
 
 /// Bee-shaped per-request override for the per-chunk retrieval timeout.
@@ -142,6 +146,16 @@ fn set_immutable_cache_headers(resp: &mut Response) {
         .headers_mut()
         .insert(header::CACHE_CONTROL, IMMUTABLE_CACHE_CONTROL);
 }
+/// Stamp bee's quoted `ETag` header: `ETag: "<64-hex reference>"`.
+/// Bee sets it via `fmt.Sprintf("%q", reference)` on `POST /bzz`
+/// responses and on every `downloadHandler`-served body (`/bytes`,
+/// `/bzz`, `/soc`, `/feeds`).
+fn set_etag(resp: &mut Response, reference: [u8; 32]) {
+    if let Ok(v) = HeaderValue::from_str(&format!("\"{}\"", hex::encode(reference))) {
+        resp.headers_mut().insert(header::ETAG, v);
+    }
+}
+
 /// Override a response's `Cache-Control` with `no-cache`, for content
 /// that is *mutable* at its URL — feed-backed bzz references resolve to
 /// rolling content at a stable reference, so the immutable cache the
@@ -231,7 +245,7 @@ pub async fn chunk(
 ) -> Response {
     let reference = match parse_reference(&addr) {
         Ok(r) => r,
-        Err(e) => return json_error(StatusCode::BAD_REQUEST, e),
+        Err(resp) => return resp,
     };
 
     // Register the request with the live gateway-activity registry so
@@ -276,7 +290,13 @@ pub async fn chunk(
             return json_error(StatusCode::SERVICE_UNAVAILABLE, message);
         }
         ControlAck::Error { message } => {
-            return json_error(StatusCode::NOT_FOUND, message);
+            // Bee: a miss is `404 "chunk not found"`; anything else is
+            // its generic `"read chunk failed"`. Detail goes to the log.
+            debug!(target: "ant_gateway", %message, "chunk fetch failed");
+            if message.contains("not found") {
+                return json_error(StatusCode::NOT_FOUND, "chunk not found");
+            }
+            return json_error(StatusCode::BAD_GATEWAY, "read chunk failed");
         }
         other => {
             warn!(target: "ant_gateway", ?other, "unexpected ack from GetChunkRaw");
@@ -292,32 +312,29 @@ pub async fn chunk(
 /// single-owner-chunk by `(owner, id)`. The path carries the 20-byte
 /// owner Ethereum address and the 32-byte id, both hex-encoded with
 /// optional `0x` / `0X` prefix. The gateway derives
-/// `address = keccak256(id || owner)` and dispatches the same
-/// retrieval path used by `/chunks/{addr}`; `ant_retrieval::retrieve_chunk`
-/// validates the response via `soc_valid`, so no further crypto is
-/// done here.
+/// `address = keccak256(id || owner)` and fetches the SOC wire via the
+/// same retrieval path `/chunks/{addr}` uses.
 ///
-/// Returns the SOC's **wire bytes** (`id(32) || sig(65) || inner_cac`)
-/// with `Content-Type: application/octet-stream`. Cache-Control is
-/// `no-cache` because the same address is mutable: a later
-/// `POST /soc/{owner}/{id}` by the same owner replaces the payload at
-/// the same URL.
-///
-/// Bee's HTTP API exposes the same shape on `GET /soc/{owner}/{id}`,
-/// see `bee/pkg/api/soc.go`.
+/// Response shape mirrors bee's `socGetHandler` (`bee/pkg/api/soc.go`):
+/// the body is the **unwrapped content** the SOC carries (the joined
+/// chunk tree rooted at the wrapped CAC), served as
+/// `application/octet-stream` with the SOC's 65-byte signature in the
+/// `swarm-soc-signature` header and a quoted `ETag` of the wrapped
+/// chunk's address. With `Swarm-Only-Root-Chunk: true` the body is the
+/// wrapped chunk's wire data (`span(8 LE) ‖ payload`) instead, with no
+/// `ETag` (bee's only-root-chunk branch bypasses `downloadHandler`).
+/// Cache-Control is `no-cache` because the same address is mutable: a
+/// later `POST /soc/{owner}/{id}` by the same owner replaces the
+/// payload at the same URL.
 pub async fn download_soc(
     State(handle): State<GatewayHandle>,
     Path((owner_hex, id_hex)): Path<(String, String)>,
     method: Method,
     headers: HeaderMap,
 ) -> Response {
-    let owner = match parse_hex_fixed::<20>(&owner_hex) {
-        Ok(o) => o,
-        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("bad owner: {e}")),
-    };
-    let id = match parse_hex_fixed::<32>(&id_hex) {
-        Ok(i) => i,
-        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("bad id: {e}")),
+    let (owner, id) = match parse_owner_pair(&owner_hex, "id", &id_hex) {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
     };
 
     let mut addr_input = [0u8; 32 + 20];
@@ -353,31 +370,93 @@ pub async fn download_soc(
         }
     };
 
-    let bytes = match ack {
+    let wire = match ack {
         ControlAck::Bytes { data } => data,
         ControlAck::NotReady { message } => {
             return json_error(StatusCode::SERVICE_UNAVAILABLE, message);
         }
         ControlAck::Error { message } => {
-            return json_error(StatusCode::NOT_FOUND, message);
+            // Bee: `"requested chunk cannot be retrieved"` for any SOC
+            // fetch failure. Detail goes to the log.
+            debug!(target: "ant_gateway", %message, "soc fetch failed");
+            return json_error(StatusCode::NOT_FOUND, "requested chunk cannot be retrieved");
         }
         other => {
             warn!(target: "ant_gateway", ?other, "unexpected ack from GetChunkRaw (soc)");
             return json_error(StatusCode::INTERNAL_SERVER_ERROR, "unexpected node ack");
         }
     };
-    let len = bytes.len() as u64;
-    guard.update(1, 1, 0, len);
-    soc_response(method, bytes)
+    guard.update(1, 1, 0, wire.len() as u64);
+
+    // SOC wire: id(32) ‖ sig(65) ‖ wrapped_cac(span(8 LE) ‖ payload).
+    if wire.len() < 32 + 65 + 8 {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "chunk is not a single owner chunk",
+        );
+    }
+    let mut signature = [0u8; 65];
+    signature.copy_from_slice(&wire[32..32 + 65]);
+    let wrapped = &wire[32 + 65..];
+    let mut span_bytes = [0u8; 8];
+    span_bytes.copy_from_slice(&wrapped[..8]);
+    let Some(wrapped_addr) = ant_crypto::bmt_hash_with_span(&span_bytes, &wrapped[8..]) else {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "chunk is not a single owner chunk",
+        );
+    };
+
+    let head_only = method == Method::HEAD;
+    if header_is_true(&headers, &SWARM_ONLY_ROOT_CHUNK) {
+        // Bee writes the wrapped chunk's wire data verbatim, without
+        // the ETag `downloadHandler` would add.
+        let mut resp = soc_body_response(head_only, wrapped.to_vec());
+        apply_soc_headers(&mut resp, &signature);
+        return resp;
+    }
+
+    // Default: serve the wrapped chunk's *content* like bee's
+    // `downloadHandler(..., wc.Address(), ..., rootCh: wc)`. A
+    // single-chunk span is already in hand — serve the payload
+    // directly; a larger span means the wrapped CAC is an intermediate
+    // root, so join the tree it references via the byte streamer.
+    let mut span_masked = span_bytes;
+    span_masked[7] = 0;
+    let span = u64::from_le_bytes(span_masked);
+    if span as usize == wrapped.len() - 8 {
+        let mut resp = soc_body_response(head_only, wrapped[8..].to_vec());
+        apply_soc_headers(&mut resp, &signature);
+        set_etag(&mut resp, wrapped_addr);
+        return resp;
+    }
+
+    let stream_timeout = request_timeout(&headers, DEFAULT_REQUEST_TIMEOUT);
+    let started =
+        match dispatch_stream_bytes(&handle, wrapped_addr, stream_timeout, None, head_only, None)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+    let total = started.total_bytes;
+    let mut resp = streaming_response(
+        head_only,
+        total,
+        started.into_body(head_only),
+        "application/octet-stream",
+        None,
+    );
+    apply_soc_headers(&mut resp, &signature);
+    set_etag(&mut resp, wrapped_addr);
+    resp
 }
 
-/// Build the `200 OK` (or empty `200 OK` for `HEAD`) response for a
-/// SOC fetch. Mirrors [`chunk_response`] for layout, but stamps a
-/// mutable `Cache-Control` because SOCs at the same address can be
-/// re-uploaded with new payload.
-fn soc_response(method: Method, body: Vec<u8>) -> Response {
+/// Build the `200 OK` (or empty `200 OK` for `HEAD`) response carrying
+/// a SOC-derived body.
+fn soc_body_response(head_only: bool, body: Vec<u8>) -> Response {
     let len = body.len();
-    let body = if method == Method::HEAD {
+    let body = if head_only {
         Body::empty()
     } else {
         Body::from(body)
@@ -390,40 +469,30 @@ fn soc_response(method: Method, body: Vec<u8>) -> Response {
     let _ = resp
         .headers_mut()
         .insert(header::CONTENT_LENGTH, HeaderValue::from(len));
-    let _ = resp
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, MUTABLE_CACHE_CONTROL);
     resp
 }
 
-/// Decode a fixed-length hex string with optional `0x` prefix into a
-/// byte array. The error string starts with `"must be N bytes …"`;
-/// callers prepend a field name (`"reference {…}"`, `"owner {…}"`)
-/// to produce a 400 body that pinpoints which path segment was
-/// malformed.
-fn parse_hex_fixed<const N: usize>(s: &str) -> Result<[u8; N], String> {
-    let stripped = s
-        .strip_prefix("0x")
-        .or_else(|| s.strip_prefix("0X"))
-        .unwrap_or(s);
-    if stripped.len() != N * 2 {
-        return Err(format!(
-            "must be {} bytes ({} hex chars); got {}",
-            N,
-            N * 2,
-            stripped.len()
-        ));
+/// Overlay bee's SOC response headers: `swarm-soc-signature` plus the
+/// CORS expose entry, and the mutable cache policy (SOCs can be
+/// re-signed at the same address).
+fn apply_soc_headers(resp: &mut Response, signature: &[u8; 65]) {
+    let h = resp.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(&hex::encode(signature)) {
+        h.insert(SWARM_SOC_SIGNATURE, v);
     }
-    let mut out = [0u8; N];
-    hex::decode_to_slice(stripped, &mut out).map_err(|e| format!("invalid hex: {e}"))?;
-    Ok(out)
+    if let Ok(v) = HeaderValue::from_str(SWARM_SOC_SIGNATURE.as_str()) {
+        h.append(header::ACCESS_CONTROL_EXPOSE_HEADERS, v);
+    }
+    h.insert(header::CACHE_CONTROL, MUTABLE_CACHE_CONTROL);
 }
 
 /// Extract the postage batch id from the `swarm-postage-batch-id`
-/// request header. Returns a bee-shaped `400` response when the header
-/// is missing or not 32-byte hex — the node then selects the registered
-/// issuer for this id (an unknown batch fails the push with
-/// `"batch … not usable"`, which the upload handlers map to `400`).
+/// request header. Returns bee's `400 invalid header params` (with a
+/// `want required:` reason) when the header is missing, bee's hex-parse
+/// reasons when it isn't hex, and bee's `"invalid batch id"` when the
+/// id isn't 32 bytes — the node then selects the registered issuer for
+/// this id (an unknown batch fails the push with `"batch … not
+/// usable"`, which the upload handlers map to `400`).
 #[allow(clippy::result_large_err)]
 fn parse_postage_batch_header(headers: &HeaderMap) -> Result<[u8; 32], Response> {
     let raw = headers
@@ -432,17 +501,24 @@ fn parse_postage_batch_header(headers: &HeaderMap) -> Result<[u8; 32], Response>
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
-            json_error(
-                StatusCode::BAD_REQUEST,
-                "missing required swarm-postage-batch-id header",
+            params_error(
+                ParamKind::Header,
+                vec![Reason::required(SWARM_POSTAGE_BATCH_ID.as_str())],
             )
         })?;
-    parse_hex_fixed::<32>(raw).map_err(|e| {
-        json_error(
-            StatusCode::BAD_REQUEST,
-            format!("bad swarm-postage-batch-id: {e}"),
-        )
-    })
+    let mut reasons = Vec::new();
+    match parse_hex_param::<32>(SWARM_POSTAGE_BATCH_ID.as_str(), raw, &mut reasons) {
+        Some(batch) => Ok(batch),
+        None if reasons
+            .iter()
+            .any(|r| r.error.starts_with("invalid length")) =>
+        {
+            // Valid hex of the wrong size: bee's mapStructure accepts it
+            // and the stamper putter then rejects it as an invalid batch.
+            Err(json_error(StatusCode::BAD_REQUEST, "invalid batch id"))
+        }
+        None => Err(params_error(ParamKind::Header, reasons)),
+    }
 }
 
 /// `POST /chunks` — accept a single content-addressed chunk's wire
@@ -455,10 +531,15 @@ pub async fn upload_chunk(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if body.len() < 8 || body.len() > 8 + 4096 {
+    // Bee: a body shorter than the 8-byte span prefix is
+    // `400 "insufficient data length"` (`chunkUploadHandler`).
+    if body.len() < 8 {
+        return json_error(StatusCode::BAD_REQUEST, "insufficient data length");
+    }
+    if body.len() > 8 + 4096 {
         return json_error(
             StatusCode::BAD_REQUEST,
-            format!("chunk wire size out of range: {} bytes", body.len()),
+            "chunk data exceeds required length",
         );
     }
 
@@ -508,6 +589,15 @@ pub async fn upload_chunk(
                 &serde_json::json!({ "reference": stripped }),
             );
             set_immutable_cache_headers(&mut resp);
+            // Bee only attaches (and echoes) a tag on `POST /chunks`
+            // when the request carried one in `Swarm-Tag`.
+            if let Some(uid) = requested_tag(&headers) {
+                let mut address = [0u8; 32];
+                if hex::decode_to_slice(&stripped, &mut address).is_ok() {
+                    handle.tags.complete(uid, 1, address);
+                }
+                echo_tag_headers(uid, &mut resp);
+            }
             resp
         }
         ControlAck::Error { message } => {
@@ -549,49 +639,52 @@ pub async fn upload_soc(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let owner = match parse_hex_fixed::<20>(&owner_hex) {
-        Ok(o) => o,
-        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("bad owner: {e}")),
-    };
-    let id = match parse_hex_fixed::<32>(&id_hex) {
-        Ok(i) => i,
-        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("bad id: {e}")),
+    let (owner, id) = match parse_owner_pair(&owner_hex, "id", &id_hex) {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
     };
 
-    // Bee accepts the SOC signature in either the `swarm-soc-signature`
-    // header (older bee / bee-js ≤ 9) or the `?sig=…` query parameter
-    // (modern bee / bee-js ≥ 10). Mirror that to keep both client
-    // generations working unchanged.
-    let sig_str: &str = if let Some(h) = headers.get(&SWARM_SOC_SIGNATURE) {
-        match h.to_str() {
-            Ok(s) => s,
-            Err(_) => {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    "swarm-soc-signature must be ascii hex",
-                );
+    // Bee only reads the SOC signature from the `?sig=…` query
+    // parameter (required); ant additionally accepts the legacy
+    // `swarm-soc-signature` header older bee-js generations sent.
+    // Validation failures are shaped like bee's `mapStructure`
+    // responses for the parameter group the value came from.
+    let (sig_str, sig_kind, sig_field): (&str, ParamKind, &str) =
+        if let Some(h) = headers.get(&SWARM_SOC_SIGNATURE) {
+            match h.to_str() {
+                Ok(s) => (s, ParamKind::Header, "swarm-soc-signature"),
+                Err(_) => {
+                    return params_error(
+                        ParamKind::Header,
+                        vec![Reason::new(
+                            SWARM_SOC_SIGNATURE.as_str(),
+                            "value is not ascii",
+                        )],
+                    );
+                }
             }
-        }
-    } else if let Some(s) = query.sig.as_deref() {
-        s
-    } else {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "missing soc signature: provide swarm-soc-signature header or ?sig=… query param",
-        );
-    };
-    let sig = match parse_hex_fixed::<65>(sig_str) {
-        Ok(s) => s,
-        Err(e) => {
-            return json_error(StatusCode::BAD_REQUEST, format!("bad soc signature: {e}"));
+        } else if let Some(s) = query.sig.as_deref() {
+            (s, ParamKind::Query, "sig")
+        } else {
+            // Bee: `queries.Sig []byte validate:"required"` →
+            // `400 invalid query params` with a `want required:` reason.
+            return params_error(ParamKind::Query, vec![Reason::required("sig")]);
+        };
+    let sig = {
+        let mut reasons = Vec::new();
+        match parse_hex_param::<65>(sig_field, sig_str, &mut reasons) {
+            Some(s) => s,
+            None => return params_error(sig_kind, reasons),
         }
     };
 
-    if body.len() < 8 || body.len() > 8 + 4096 {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            format!("soc inner cac size out of range: {} bytes", body.len()),
-        );
+    // Bee: `"short chunk data"` below the span size, 413 above the
+    // maximum CAC wire (`socUploadHandler`).
+    if body.len() < 8 {
+        return json_error(StatusCode::BAD_REQUEST, "short chunk data");
+    }
+    if body.len() > 8 + 4096 {
+        return json_error(StatusCode::PAYLOAD_TOO_LARGE, "payload too large");
     }
 
     // SOC wire: id(32) || sig(65) || inner_cac(span(8) || payload).
@@ -607,10 +700,14 @@ pub async fn upload_soc(
     let address = ant_crypto::keccak256(&addr_input);
 
     if !ant_crypto::soc_valid(&address, &wire) {
-        return json_error(
-            StatusCode::BAD_REQUEST,
+        // Bee: `soc.Valid` failure is `401 "invalid chunk"`
+        // (`socUploadHandler`). The recovery detail stays in the log.
+        debug!(
+            target: "ant_gateway",
+            owner = %hex::encode(owner),
             "soc signature does not recover the supplied owner",
         );
+        return json_error(StatusCode::UNAUTHORIZED, "invalid chunk");
     }
 
     let batch_id = match parse_postage_batch_header(&headers) {
@@ -659,10 +756,17 @@ pub async fn upload_soc(
             // SOC writes are mutable at the address level (the owner can
             // sign a new payload at the same id), so don't apply the
             // immutable cache headers `upload_chunk` uses.
-            json_response(
+            let mut resp = json_response(
                 StatusCode::CREATED,
                 &serde_json::json!({ "reference": stripped }),
-            )
+            );
+            // Like `/chunks`, bee only echoes `Swarm-Tag` on `/soc`
+            // uploads that carried one in the request.
+            if let Some(uid) = requested_tag(&headers) {
+                handle.tags.complete(uid, 1, address);
+                echo_tag_headers(uid, &mut resp);
+            }
+            resp
         }
         ControlAck::NotReady { message } => json_error(StatusCode::SERVICE_UNAVAILABLE, message),
         ControlAck::Error { message } => {
@@ -769,6 +873,12 @@ pub async fn upload_bzz(
         &serde_json::json!({ "reference": reference_hex }),
     );
     set_immutable_cache_headers(&mut resp);
+    // Bee stamps the manifest root on the *single-file* upload response
+    // as a quoted `ETag` (`bzzUploadHandler`); its collection path
+    // (`dirUploadHandler`) sets none.
+    if !collection {
+        set_etag(&mut resp, assembled.root);
+    }
     finalize_upload_tag(
         &handle,
         &headers,
@@ -779,13 +889,36 @@ pub async fn upload_bzz(
     resp
 }
 
+/// The uid a client supplied in the `Swarm-Tag` *request* header, if
+/// any (bee-js sends it when the caller pre-created a tag via
+/// `POST /tags`).
+fn requested_tag(headers: &HeaderMap) -> Option<u32> {
+    headers
+        .get(&SWARM_TAG)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&uid| uid != 0)
+}
+
+/// Stamp the upload-tag response headers: bee's `Swarm-Tag` (what
+/// modern bee-js reads for `UploadResult.tagUid`) plus ant's legacy
+/// `Swarm-Tag-Uid` echo, which existing consumers (Freedom's
+/// `getUploadStatus`) already key off. Bee only sends `Swarm-Tag`; the
+/// extra header is additive and harmless.
+fn echo_tag_headers(uid: u32, resp: &mut Response) {
+    if let Ok(v) = HeaderValue::from_str(&uid.to_string()) {
+        resp.headers_mut().insert(SWARM_TAG, v.clone());
+        resp.headers_mut().insert(SWARM_TAG_UID, v);
+    }
+}
+
 /// Resolve (or create) the upload tag for a just-finished synchronous
-/// upload and stamp the `Swarm-Tag-Uid` response header so bee-js can
-/// poll `GET /tags/{uid}`. If the client pre-created a tag and sent it
-/// in `Swarm-Tag`, that one is marked complete and echoed; otherwise a
-/// fresh already-synced tag is minted (bee's server-side auto-tag
-/// behaviour). The whole upload is already pushsynced by the time we
-/// get here, so the tag is reported fully synced immediately.
+/// `POST /bytes` / `POST /bzz` and stamp the tag response headers. Bee
+/// creates a session implicitly for every deferred upload (the default
+/// mode) and echoes its id in `Swarm-Tag`; if the client pre-created a
+/// tag and sent it in `Swarm-Tag`, that one is marked complete and
+/// echoed instead. The whole upload is already pushsynced by the time
+/// we get here, so the tag is reported fully synced immediately.
 fn finalize_upload_tag(
     handle: &GatewayHandle,
     headers: &HeaderMap,
@@ -793,20 +926,14 @@ fn finalize_upload_tag(
     root: [u8; 32],
     resp: &mut Response,
 ) {
-    let uid = match headers
-        .get(&SWARM_TAG)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<u32>().ok())
-    {
+    let uid = match requested_tag(headers) {
         Some(existing) => {
             handle.tags.complete(existing, total_chunks, root);
             existing
         }
         None => handle.tags.create_completed(total_chunks, root),
     };
-    if let Ok(v) = HeaderValue::from_str(&uid.to_string()) {
-        resp.headers_mut().insert(SWARM_TAG_UID, v);
-    }
+    echo_tag_headers(uid, resp);
 }
 
 /// `POST /bytes` — raw byte upload. Splits the body into a content-
@@ -878,37 +1005,18 @@ pub async fn upload_bytes(
 /// `(owner, topic)` for a `Sequence` feed, pushsyncs its single chunk,
 /// and returns `{"reference":"<manifest root>"}` (PLAN.md J.2.5 / C2).
 /// The reference resolves transparently to the feed's current update
-/// via any bee gateway. `?type=` defaults to `sequence`; `epoch` feeds
-/// are not supported (501), matching the read path.
+/// via any bee gateway. Like bee's `feedPostHandler`, the `?type=`
+/// query parameter is ignored — bee only writes `Sequence` manifests
+/// regardless of what the caller asks for.
 pub async fn create_feed(
     State(handle): State<GatewayHandle>,
     Path((owner_hex, topic_hex)): Path<(String, String)>,
-    Query(query): Query<FeedQuery>,
     headers: HeaderMap,
 ) -> Response {
-    let owner = match parse_hex_fixed::<20>(&owner_hex) {
-        Ok(o) => o,
-        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("bad owner: {e}")),
+    let (owner, topic) = match parse_owner_pair(&owner_hex, "topic", &topic_hex) {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
     };
-    let topic = match parse_hex_fixed::<32>(&topic_hex) {
-        Ok(t) => t,
-        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("bad topic: {e}")),
-    };
-
-    if let Some(kind) = query.r#type.as_deref() {
-        match kind.to_ascii_lowercase().as_str() {
-            "sequence" => {}
-            "epoch" => {
-                return json_error(StatusCode::NOT_IMPLEMENTED, "epoch feeds are not supported");
-            }
-            other => {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    format!("unknown feed type: {other}"),
-                );
-            }
-        }
-    }
 
     let batch_id = match parse_postage_batch_header(&headers) {
         Ok(b) => b,
@@ -941,6 +1049,11 @@ pub async fn create_feed(
     // binds owner+topic forever; only the feed *updates* it points at
     // change), so the manifest reference itself caches like any CAC.
     set_immutable_cache_headers(&mut resp);
+    // Bee's `feedPostHandler` creates an upload session (visible in
+    // `GET /tags`) but does *not* echo `Swarm-Tag` on the response.
+    let _ = handle
+        .tags
+        .create_completed(total_chunks as u64, manifest.root);
     resp
 }
 
@@ -1095,7 +1208,11 @@ fn assemble_collection(body: &Bytes, index_doc: Option<&str>) -> Result<Assemble
             .find(|f| f.path == "index.html")
             .map(|f| f.path.clone())
     });
-    let manifest = match build_collection_manifest(&files, resolved_index.as_deref()) {
+    let manifest = match build_collection_manifest(
+        &files,
+        resolved_index.as_deref(),
+        IndexAnchor::ZeroEntry,
+    ) {
         Ok(m) => m,
         Err(e) => return Err(map_manifest_error(e)),
     };
@@ -1235,9 +1352,11 @@ fn chunk_response(method: Method, body: Vec<u8>) -> Response {
         Body::from(body)
     };
     let mut resp = Response::new(body);
+    // Bee's `chunkGetHandler` really does write `binary/octet-stream`
+    // (a non-standard media type); match it byte for byte.
     let _ = resp.headers_mut().insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_static("application/octet-stream"),
+        HeaderValue::from_static("binary/octet-stream"),
     );
     let _ = resp
         .headers_mut()
@@ -1261,7 +1380,7 @@ pub async fn bytes(
 ) -> Response {
     let reference = match parse_reference(&addr) {
         Ok(r) => r,
-        Err(e) => return json_error(StatusCode::BAD_REQUEST, e),
+        Err(resp) => return resp,
     };
 
     let raw_range = headers
@@ -1319,17 +1438,23 @@ pub async fn bytes(
     };
 
     // No Range, or Range covers the whole object: serve the in-flight
-    // full-stream response we already started.
+    // full-stream response we already started. Bee never invents a
+    // `Content-Disposition` for `/bytes` — only an explicit `?name=`
+    // (an ant extension) earns one. GET carries bee's quoted `ETag`;
+    // bee's `bytesHeadHandler` sets none on HEAD.
     if parsed_range.is_none() {
         let content_type = sniff_content_type(&started.first_bytes, query.filename());
-        let filename = raw_bytes_filename(&addr, query.filename(), content_type);
-        return streaming_response(
+        let mut resp = streaming_response(
             head_only,
             total,
             started.into_body(head_only),
             content_type,
-            Some(&filename),
+            query.filename(),
         );
+        if !head_only {
+            set_etag(&mut resp, reference);
+        }
+        return resp;
     }
 
     // Range request: cancel the full-body stream we just started and
@@ -1371,9 +1496,8 @@ pub async fn bytes(
             .and_then(content_type_from_extension)
             .unwrap_or("application/octet-stream")
     };
-    let filename = raw_bytes_filename(&addr, query.filename(), content_type);
     let body_len = end - start + 1;
-    partial_content_response(
+    let mut resp = partial_content_response(
         head_only,
         sniffable_total,
         start,
@@ -1381,8 +1505,12 @@ pub async fn bytes(
         body_len,
         ranged.into_body(head_only),
         content_type,
-        Some(&filename),
-    )
+        query.filename(),
+    );
+    if !head_only {
+        set_etag(&mut resp, reference);
+    }
+    resp
 }
 
 /// `GET /bzz/{addr}` and `HEAD /bzz/{addr}`. Empty path resolves to
@@ -1418,7 +1546,7 @@ pub async fn bzz_with_path(
 pub async fn manifest(State(handle): State<GatewayHandle>, Path(addr): Path<String>) -> Response {
     let reference = match parse_reference(&addr) {
         Ok(r) => r,
-        Err(e) => return json_error(StatusCode::BAD_REQUEST, e),
+        Err(resp) => return resp,
     };
 
     let _guard = handle
@@ -1448,7 +1576,7 @@ async fn bzz_inner(
 ) -> Response {
     let reference = match parse_reference(&addr) {
         Ok(r) => r,
-        Err(e) => return json_error(StatusCode::BAD_REQUEST, e),
+        Err(resp) => return resp,
     };
 
     let raw_range = headers
@@ -1520,6 +1648,9 @@ async fn bzz_inner(
         .clone()
         .unwrap_or_else(|| "application/octet-stream".to_string());
     let filename = started.filename.clone();
+    // Resolved data reference for the quoted `ETag` (bee's
+    // `downloadHandler` sets it on GET and HEAD alike).
+    let data_ref = started.reference;
     // Feed-backed bzz references resolve to mutable content at a stable
     // URL; serving them immutably (as `streaming_response` does by
     // default) makes browsers/proxies pin a stale resolution and never
@@ -1535,6 +1666,9 @@ async fn bzz_inner(
             &content_type,
             filename.as_deref(),
         );
+        if let Some(r) = data_ref {
+            set_etag(&mut resp, r);
+        }
         if mutable {
             set_mutable_cache_headers(&mut resp);
         }
@@ -1573,6 +1707,9 @@ async fn bzz_inner(
         &content_type,
         filename.as_deref(),
     );
+    if let Some(r) = data_ref {
+        set_etag(&mut resp, r);
+    }
     if mutable {
         set_mutable_cache_headers(&mut resp);
     }
@@ -1646,6 +1783,9 @@ struct Started {
     /// or filename.
     content_type: Option<String>,
     filename: Option<String>,
+    /// Resolved data reference of the served manifest entry — only
+    /// populated for `StreamBzz`. Bee quotes it in the `ETag` header.
+    reference: Option<[u8; 32]>,
     /// `true` when the bzz reference resolved through a feed manifest, so
     /// the response is mutable and must be served `no-cache`. Always
     /// `false` for `StreamBytes`.
@@ -1873,6 +2013,7 @@ async fn consume_stream_prologue(
     let total_bytes;
     let mut content_type = None;
     let mut filename = None;
+    let mut reference = None;
     let mut mutable = false;
     loop {
         match tokio::time::timeout(timeout, rx.recv()).await {
@@ -1882,6 +2023,7 @@ async fn consume_stream_prologue(
             }
             Ok(Some(ControlAck::BzzStreamStart {
                 total_bytes: t,
+                reference: r,
                 content_type: ct,
                 filename: fn_,
                 mutable: m,
@@ -1889,6 +2031,7 @@ async fn consume_stream_prologue(
                 total_bytes = t;
                 content_type = ct;
                 filename = fn_;
+                reference = Some(r);
                 mutable = m;
                 break;
             }
@@ -1928,6 +2071,7 @@ async fn consume_stream_prologue(
             first_bytes: Vec::new(),
             content_type,
             filename,
+            reference,
             mutable,
             first_chunk: None,
             rx,
@@ -1995,6 +2139,7 @@ async fn consume_stream_prologue(
         first_bytes,
         content_type,
         filename,
+        reference,
         mutable,
         first_chunk,
         rx,
@@ -2002,17 +2147,35 @@ async fn consume_stream_prologue(
     })
 }
 
-/// Map a daemon-reported retrieval error string into the right HTTP
-/// status. `"not found"` (joiner's `FetchChunk` wrapping a "missing
-/// chunk" remote) and manifest-lookup misses (`'path'`) become 404; the
-/// rest are bad-gateway conditions.
+/// Map a daemon-reported retrieval error string into the bee-shaped
+/// HTTP response for the condition, keeping the detailed internal
+/// message in the log rather than the body:
+///
+/// - a feed manifest whose legacy update points at an unretrievable
+///   chunk → bee's `404 "bzz download: feed pointing to the wrapped
+///   chunk not found"` (`serveReference` in `bee/pkg/api/bzz.go`);
+/// - a manifest path miss (`"path '…' not found"` and friends) → bee's
+///   `404 "path address not found"`;
+/// - any other miss (`"not found"` from the joiner / fetcher) → bee's
+///   `jsonhttp.NotFound(w, nil)` = `404 "Not Found"`;
+/// - the rest are bad-gateway conditions where the message stays —
+///   bee has no equivalent failure (it *is* the network) and operators
+///   debug through this body today.
 fn map_retrieval_error(message: String) -> Response {
-    let status = if message.contains("not found") || message.contains('\'') {
-        StatusCode::NOT_FOUND
-    } else {
-        StatusCode::BAD_GATEWAY
-    };
-    json_error(status, message)
+    debug!(target: "ant_gateway", %message, "retrieval error");
+    if message.contains("feed pointing to the wrapped chunk not found") {
+        return json_error(
+            StatusCode::NOT_FOUND,
+            "bzz download: feed pointing to the wrapped chunk not found",
+        );
+    }
+    if message.contains("path '") {
+        return json_error(StatusCode::NOT_FOUND, "path address not found");
+    }
+    if message.contains("not found") || message.contains('\'') {
+        return status_text_error(StatusCode::NOT_FOUND);
+    }
+    json_error(StatusCode::BAD_GATEWAY, message)
 }
 
 #[allow(clippy::result_large_err)]
@@ -2069,8 +2232,33 @@ async fn drain_terminal(
     }
 }
 
-fn parse_reference(s: &str) -> Result<[u8; 32], String> {
-    parse_hex_fixed::<32>(s).map_err(|e| format!("reference {e}"))
+/// Parse the `{address}` path segment of `/bytes`, `/chunks`, `/bzz`,
+/// and `/v0/manifest` bee-shaped: a malformed value is bee's
+/// `400 {"code":400,"message":"invalid path params","reasons":[{"field":
+/// "address","error":"invalid hex byte: …"}]}`.
+#[allow(clippy::result_large_err)]
+fn parse_reference(s: &str) -> Result<[u8; 32], Response> {
+    let mut reasons = Vec::new();
+    parse_hex_param::<32>("address", s, &mut reasons)
+        .ok_or_else(|| params_error(ParamKind::Path, reasons))
+}
+
+/// Parse the `{owner}` + `{id|topic}` path pair of `/soc` and `/feeds`
+/// bee-shaped, collecting every malformed segment into one
+/// `invalid path params` response like bee's `mapStructure` does.
+#[allow(clippy::result_large_err)]
+fn parse_owner_pair(
+    owner_hex: &str,
+    second_field: &'static str,
+    second_hex: &str,
+) -> Result<([u8; 20], [u8; 32]), Response> {
+    let mut reasons = Vec::new();
+    let owner = parse_hex_param::<20>("owner", owner_hex, &mut reasons);
+    let second = parse_hex_param::<32>(second_field, second_hex, &mut reasons);
+    match (owner, second) {
+        (Some(owner), Some(second)) => Ok((owner, second)),
+        _ => Err(params_error(ParamKind::Path, reasons)),
+    }
 }
 
 fn request_timeout(headers: &HeaderMap, default: Duration) -> Duration {
@@ -2159,7 +2347,11 @@ fn partial_content_response(
 }
 
 fn content_disposition(filename: &str) -> Option<HeaderValue> {
-    let filename = sanitize_filename(filename);
+    // Bee keeps only the base name of the manifest entry's `Filename`
+    // metadata (`filepath.Base` in `serveManifestEntry`), so a nested
+    // collection path like `sub/data.txt` yields `data.txt`.
+    let base = filename.rsplit('/').next().unwrap_or(filename);
+    let filename = sanitize_filename(base);
     HeaderValue::from_str(&format!("inline; filename=\"{filename}\"")).ok()
 }
 
@@ -2182,18 +2374,6 @@ fn sanitize_filename(filename: &str) -> String {
     } else {
         trimmed.to_string()
     }
-}
-
-fn raw_bytes_filename(hash: &str, requested: Option<&str>, content_type: &str) -> String {
-    if let Some(name) = requested {
-        return sanitize_filename(name);
-    }
-    let hash = hash
-        .strip_prefix("0x")
-        .or_else(|| hash.strip_prefix("0X"))
-        .unwrap_or(hash);
-    let ext = extension_for_content_type(content_type).unwrap_or("bin");
-    format!("{hash}.{ext}")
 }
 
 fn sniff_content_type(bytes: &[u8], filename: Option<&str>) -> &'static str {
@@ -2263,33 +2443,6 @@ fn content_type_from_extension(filename: &str) -> Option<&'static str> {
     }
 }
 
-fn extension_for_content_type(content_type: &str) -> Option<&'static str> {
-    match content_type.split(';').next().unwrap_or(content_type) {
-        "image/png" => Some("png"),
-        "image/jpeg" => Some("jpg"),
-        "image/gif" => Some("gif"),
-        "image/webp" => Some("webp"),
-        "image/svg+xml" => Some("svg"),
-        "audio/wav" => Some("wav"),
-        "audio/mpeg" => Some("mp3"),
-        "audio/ogg" => Some("ogg"),
-        "video/mp4" => Some("mp4"),
-        "video/webm" => Some("webm"),
-        "application/pdf" => Some("pdf"),
-        "text/plain" => Some("txt"),
-        "text/html" => Some("html"),
-        "application/json" => Some("json"),
-        "text/javascript" | "application/javascript" => Some("js"),
-        "text/css" => Some("css"),
-        "application/wasm" => Some("wasm"),
-        "font/woff" => Some("woff"),
-        "font/woff2" => Some("woff2"),
-        "image/x-icon" => Some("ico"),
-        "application/xml" | "text/xml" => Some("xml"),
-        _ => None,
-    }
-}
-
 #[derive(Debug)]
 enum RangeError {
     Multi,
@@ -2349,10 +2502,9 @@ fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Response {
     let body = serde_json::to_vec(value).expect("serialize json response");
     let mut resp = Response::new(Body::from(body));
     *resp.status_mut() = status;
-    let _ = resp.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
+    let _ = resp
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, JSON_CONTENT_TYPE);
     resp
 }
 
@@ -2372,16 +2524,6 @@ const SWARM_FEED_INDEX_NEXT: HeaderName = HeaderName::from_static("swarm-feed-in
 /// the legacy v1 payload layout, so this is always `v1`.
 const SWARM_FEED_RESOLVED_VERSION: HeaderName =
     HeaderName::from_static("swarm-feed-resolved-version");
-
-/// `?type=` query parameter on `GET /feeds/{owner}/{topic}`. Default is
-/// `sequence`. Epoch feeds aren't implemented; the gateway returns
-/// `501` for them so client probes can distinguish "feed type not
-/// supported" from "feed not found".
-#[derive(Debug, Deserialize, Default)]
-pub struct FeedQuery {
-    #[serde(default)]
-    r#type: Option<String>,
-}
 
 /// `GET /feeds/{owner}/{topic}` — resolve a sequence feed to its latest
 /// update and serve the content it points at, byte-for-byte like bee's
@@ -2404,33 +2546,17 @@ pub struct FeedQuery {
 pub async fn download_feed(
     State(handle): State<GatewayHandle>,
     Path((owner_hex, topic_hex)): Path<(String, String)>,
-    Query(query): Query<FeedQuery>,
     method: Method,
     headers: HeaderMap,
 ) -> Response {
-    let owner = match parse_hex_fixed::<20>(&owner_hex) {
-        Ok(o) => o,
-        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("bad owner: {e}")),
-    };
-    let topic = match parse_hex_fixed::<32>(&topic_hex) {
-        Ok(t) => t,
-        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("bad topic: {e}")),
+    let (owner, topic) = match parse_owner_pair(&owner_hex, "topic", &topic_hex) {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
     };
 
-    if let Some(kind) = query.r#type.as_deref() {
-        match kind.to_ascii_lowercase().as_str() {
-            "sequence" => {}
-            "epoch" => {
-                return json_error(StatusCode::NOT_IMPLEMENTED, "epoch feeds are not supported");
-            }
-            other => {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    format!("unknown feed type: {other}"),
-                );
-            }
-        }
-    }
+    // Note: like bee's `feedGetHandler`, the `?type=` query parameter is
+    // ignored — bee reads only `at` / `after` and always resolves the
+    // sequence lookup, so even `?type=epoch` runs the normal path.
 
     let guard = handle.activity.begin(
         GatewayRequestKind::Feed,
@@ -2470,7 +2596,9 @@ pub async fn download_feed(
             decrypt_key,
         } => (reference, index, signature, v2, decrypt_key),
         ControlAck::FeedNotFound => {
-            return json_error(StatusCode::NOT_FOUND, "no feed updates found");
+            // Bee's KLUDGE branch for a never-updated feed:
+            // `404 "no update found"`.
+            return json_error(StatusCode::NOT_FOUND, "no update found");
         }
         ControlAck::NotReady { message } => {
             return json_error(StatusCode::SERVICE_UNAVAILABLE, message);
@@ -2478,9 +2606,14 @@ pub async fn download_feed(
         ControlAck::Error { message } => {
             // Detailed retrieval errors (peer addresses, internal
             // failure modes) belong in the operator log, not in the
-            // public response body. Match the bee feed handler, which
-            // returns a generic "feed lookup failed" body.
+            // public response body.
             warn!(target: "ant_gateway", %message, "feed lookup failed");
+            // A legacy update pointing at an unretrievable chunk is
+            // bee's `404 "wrapped chunk cannot be retrieved"`
+            // (`feedGetHandler` on a failed `resolveFeed`).
+            if message.contains("feed pointing to the wrapped chunk not found") {
+                return json_error(StatusCode::NOT_FOUND, "wrapped chunk cannot be retrieved");
+            }
             return json_error(StatusCode::BAD_GATEWAY, "feed lookup failed");
         }
         other => {
@@ -2609,7 +2742,7 @@ pub async fn download_feed(
                 resp
             }
         };
-        apply_feed_headers(&mut resp, reference, index, &signature, v2);
+        apply_feed_headers(&mut resp, reference, index, &signature, v2, true);
         return resp;
     }
 
@@ -2665,7 +2798,7 @@ pub async fn download_feed(
         let _ = resp
             .headers_mut()
             .insert(header::CONTENT_LENGTH, HeaderValue::from(len));
-        apply_feed_headers(&mut resp, reference, index, &signature, v2);
+        apply_feed_headers(&mut resp, reference, index, &signature, v2, false);
         return resp;
     }
 
@@ -2732,7 +2865,7 @@ pub async fn download_feed(
             "application/octet-stream",
             None,
         );
-        apply_feed_headers(&mut resp, reference, index, &signature, v2);
+        apply_feed_headers(&mut resp, reference, index, &signature, v2, true);
         return resp;
     }
 
@@ -2768,7 +2901,7 @@ pub async fn download_feed(
         "application/octet-stream",
         None,
     );
-    apply_feed_headers(&mut resp, reference, index, &signature, v2);
+    apply_feed_headers(&mut resp, reference, index, &signature, v2, true);
     resp
 }
 
@@ -2787,6 +2920,7 @@ fn apply_feed_headers(
     index: u64,
     signature: &[u8; 65],
     v2: bool,
+    etag: bool,
 ) {
     let h = resp.headers_mut();
     if let Ok(v) = HeaderValue::from_str(&hex::encode(index.to_be_bytes())) {
@@ -2802,8 +2936,10 @@ fn apply_feed_headers(
         SWARM_FEED_RESOLVED_VERSION,
         HeaderValue::from_static(if v2 { "v2" } else { "v1" }),
     );
-    if let Ok(v) = HeaderValue::from_str(&format!("\"{}\"", hex::encode(reference))) {
-        h.insert(header::ETAG, v);
+    if etag {
+        if let Ok(v) = HeaderValue::from_str(&format!("\"{}\"", hex::encode(reference))) {
+            h.insert(header::ETAG, v);
+        }
     }
     h.insert(header::CACHE_CONTROL, MUTABLE_CACHE_CONTROL);
     for name in [SWARM_FEED_INDEX, SWARM_FEED_INDEX_NEXT, SWARM_SOC_SIGNATURE] {
