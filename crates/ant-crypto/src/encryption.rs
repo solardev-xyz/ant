@@ -95,6 +95,18 @@ fn transcrypt(data: &mut [u8], key: &[u8; KEY_LENGTH], init_ctr: u32) {
     }
 }
 
+/// XOR `data` in place with the Keccak counter-mode keystream starting
+/// at counter 0 — bee's `encryption.New(key, 0, 0, keccak256).Encrypt`
+/// (and, being an XOR stream, also its `Decrypt`). This is the "bare"
+/// cipher bee's access control (`pkg/accesscontrol`) applies to Swarm
+/// references and access keys: no padding, no span/data counter split,
+/// output exactly as long as the input. A fresh cipher instance per
+/// call, so the counter always restarts at 0 (matching every ACT call
+/// site in bee, which constructs a new `encryption.New(...)` each time).
+pub fn stream_xor_in_place(data: &mut [u8], key: &[u8; KEY_LENGTH]) {
+    transcrypt(data, key, 0);
+}
+
 /// Split a decrypted little-endian span into `(redundancy_level, length)`.
 /// Mirrors `bee/pkg/file/redundancy/span.go::DecodeSpan`: a level is
 /// encoded only when the most-significant span byte exceeds 128.

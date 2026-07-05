@@ -716,7 +716,10 @@ fn child_listing_path(path: &str, node_type: u8) -> String {
 /// Fetch a manifest node by a 32-byte (plain) or 64-byte (encrypted)
 /// reference and unmarshal it. Encrypted nodes go through the
 /// decrypting joiner; plain nodes fetch the root chunk and join.
-async fn load_node_ref(fetcher: &dyn ChunkFetcher, node_ref: &[u8]) -> Result<Node, ManifestError> {
+pub(crate) async fn load_node_ref(
+    fetcher: &dyn ChunkFetcher,
+    node_ref: &[u8],
+) -> Result<Node, ManifestError> {
     if node_ref.len() == ENCRYPTED_REF_SIZE {
         let enc_ref: [u8; ENCRYPTED_REF_SIZE] = node_ref.try_into().expect("length checked");
         let bytes = join_encrypted(fetcher, enc_ref, DEFAULT_MAX_FILE_BYTES).await?;
@@ -768,10 +771,10 @@ pub(crate) struct Node {
 #[derive(Debug, Clone)]
 pub(crate) struct Fork {
     node_type: u8,
-    prefix: Vec<u8>,
+    pub(crate) prefix: Vec<u8>,
     /// 32 bytes, or 64 (`address ‖ key`) in an encrypted manifest.
     pub(crate) child_ref: Vec<u8>,
-    metadata: HashMap<String, String>,
+    pub(crate) metadata: HashMap<String, String>,
 }
 
 impl Node {

@@ -19,7 +19,9 @@ use tracing::Instrument;
 use crate::fallback::not_implemented;
 use crate::handle::GatewayHandle;
 use crate::retrieval::GATEWAY_MAX_UPLOAD_BYTES;
-use crate::{chain, chunk_stream, pins, retrieval, settlements, stamps, status, stewardship, tags};
+use crate::{
+    act, chain, chunk_stream, pins, retrieval, settlements, stamps, status, stewardship, tags,
+};
 
 const SERVER_HEADER: &str = concat!("ant-gateway/", env!("CARGO_PKG_VERSION"));
 
@@ -137,6 +139,14 @@ pub fn build(handle: GatewayHandle) -> Router {
             get_or_head(retrieval::download_feed).post(retrieval::create_feed),
         )
         .route("/bzz", post(retrieval::upload_bzz))
+        // ACT (access control) grantee management, bee
+        // `pkg/api/accesscontrol.go`: create / list / patch grantee
+        // lists keyed by the publisher (this node's key).
+        .route("/grantee", post(act::grantee_create))
+        .route(
+            "/grantee/{address}",
+            get(act::grantee_get).patch(act::grantee_patch),
+        )
         .route("/bytes/{addr}", get_or_head(retrieval::bytes))
         // Ant-specific extension (not part of bee Tier-A): list paths in
         // a mantaray manifest. Namespaced under `/v0/` so the bee compat

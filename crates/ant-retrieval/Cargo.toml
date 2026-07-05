@@ -14,6 +14,10 @@ futures = "0.3.31"
 # ciphertext tail with crypto/rand bytes; keys come from ant-crypto).
 getrandom = "0.3.2"
 hex.workspace = true
+# ACT grantee lists carry secp256k1 public keys (bee stores them as
+# uncompressed SEC1 points); serde/serde_json serialize the ACT
+# key-value store's bee-compatible simple-manifest JSON.
+k256.workspace = true
 libp2p.workspace = true
 libp2p-stream = "0.4.0-alpha"
 lru = "0.17.0"
@@ -23,6 +27,8 @@ prost.workspace = true
 # with bee-generated parities is proven by ant-conformance's rs tests.
 reed-solomon-erasure = "6.0.0"
 rusqlite = { version = "0.39.0", features = ["bundled"] }
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

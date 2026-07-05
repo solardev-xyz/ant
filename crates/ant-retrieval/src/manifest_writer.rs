@@ -457,6 +457,79 @@ pub fn build_feed_manifest(
     })
 }
 
+/// One raw manifest entry for [`build_entries_manifest`]: an arbitrary
+/// path with an arbitrary metadata map, no file-upload conventions
+/// (no `Content-Type`/`Filename` defaults, no index-document anchor).
+#[derive(Debug, Clone)]
+pub struct RawManifestEntry {
+    /// Manifest key (bee mantaray path), e.g. an ACT history's
+    /// reversed-timestamp decimal string.
+    pub path: String,
+    /// 32-byte entry reference stored on the value node.
+    pub reference: ChunkAddr,
+    /// Fork metadata, verbatim (empty map → no with-metadata flag).
+    pub metadata: BTreeMap<String, String>,
+}
+
+/// Build a plain (unencrypted, zero-obfuscation-key) mantaray manifest
+/// from raw `path → (reference, metadata)` entries — the shape bee's
+/// `manifest.NewMantarayManifest(ls, false)` + `Add(path, NewEntry(ref,
+/// metadata))` + `Store()` produces. This is what bee's access-control
+/// history is: a manifest keyed by reversed-timestamp strings whose
+/// entries point at ACT key-value stores, with optional
+/// `encryptedglref` metadata (`pkg/accesscontrol/history.go`).
+///
+/// The trie construction is canonical (prefix-compressed radix), which
+/// matches what bee's incremental `mantaray.Node.Add` maintains, so a
+/// rebuild from the full entry list marshals to the same bytes — and
+/// the same root reference — as bee's load-and-extend flow. Pinned by
+/// the deterministic history vectors in `act.json`.
+pub fn build_entries_manifest(
+    entries: &[RawManifestEntry],
+) -> Result<ManifestWriteResult, ManifestWriteError> {
+    if entries.is_empty() {
+        return Err(ManifestWriteError::EmptyPath);
+    }
+    let mut root = TrieNode::default();
+    for e in entries {
+        if e.path.is_empty() {
+            return Err(ManifestWriteError::EmptyPath);
+        }
+        trie_insert(
+            &mut root,
+            e.path.as_bytes(),
+            e.reference.to_vec(),
+            e.metadata.clone(),
+        )?;
+    }
+
+    let mut chunks: Vec<SplitChunk> = Vec::new();
+    let mut saver =
+        |payload: &[u8], out: &mut Vec<SplitChunk>| -> Result<Vec<u8>, ManifestWriteError> {
+            if payload.len() > CHUNK_SIZE {
+                return Err(ManifestWriteError::ManifestTooBig {
+                    size: payload.len(),
+                    cap: CHUNK_SIZE,
+                });
+            }
+            let (addr, wire) = cac_payload(payload);
+            out.push(SplitChunk {
+                address: addr,
+                wire,
+            });
+            Ok(addr.to_vec())
+        };
+    let root_ref = serialize_node(&root, &mut chunks, &mut saver)?;
+    let root_addr: ChunkAddr = root_ref
+        .as_slice()
+        .try_into()
+        .expect("plain saver returns 32-byte refs");
+    Ok(ManifestWriteResult {
+        root: root_addr,
+        chunks,
+    })
+}
+
 // --- trie data model + insertion ---
 
 /// Marker for the "/" placeholder leaf used to anchor the
