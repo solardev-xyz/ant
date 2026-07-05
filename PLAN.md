@@ -5071,3 +5071,31 @@ and they pair with the on-chain *write* path which is itself deferred):
   `Swarm-Postage-Batch-Id`) and **D1–D4 wallet/chequebook/deposit/deploy**
   — Milestone 3 SWAP work; remain on the 501 fallback.
 
+
+## Appendix P — perf-lab (2026-07-05): the ~250 MiB upload stall is RESOLVED
+
+The production-era failure ("push chunk failed: exhausted N retries"
+at ~250 MiB, phase 7b post-mortems above) was reproduced, root-caused
+and fixed by the measure-first perf-lab campaign on branch `perf-lab`
+(notebook: `PERF-LAB.md`, raw numbers: `perf/results/`, PR #25).
+
+Mechanism (measured, not theorised): a cheque-less light node settled
+NOTHING on the push path — the pseudosettle driver only walked
+retrieval-side `Accounting` rows — so bee peers debt-killed our
+connections (SO_LINGER=0 ⇒ pure RST storms, never "overdraft"
+messages); connection churn masked it below ~100 MiB. The fix pair,
+now default-on:
+
+1. `ant-p2p::push_pseudosettle` — mirror push debits into the shared
+   `Accounting`, letting the existing pseudosettle driver time-settle
+   upload peers (bee-light behaviour; no cheques, no chain).
+2. `ant-retrieval::push_load` — per-peer latency-aware in-flight cap
+   (base 4) so the dispatcher never outspends a peer's refresh
+   budget; this also stopped the early-burst blocklist scars that
+   made upload tails grind.
+
+Proof: 3 consecutive 512 MiB mainnet completions (33 / 59 / 54 min)
+where the baseline died at ~250 MiB; first-ever 256 MiB completion.
+Also landed from the same campaign: cold feed resolution fixed
+(served the SOC-wrapped CAC instead of re-fetching it: 0 % → 100 %)
+and warm feed polls flattened to ~1.6 s at any head depth.
