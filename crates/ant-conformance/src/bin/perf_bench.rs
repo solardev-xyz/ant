@@ -1040,11 +1040,13 @@ async fn upload_one_run(
         unix_now()
     );
     write_result(&name, &value);
-    // Keep the antd log next to the result for forensics (gitignored).
-    let _ = std::fs::copy(
-        antd.data_dir.join("antd.log"),
-        results_dir().join(format!("{name}.antd.log")),
-    );
+    // Disk hygiene: a 512 MiB run leaves ~1.7 GB in /tmp (payload +
+    // chunk cache + warn log); the 2026-07-05 evening session filled
+    // the disk and killed two runs. The histogram is already computed
+    // from the log, so kill the daemon and delete the whole run dir.
+    let data_dir = antd.data_dir.clone();
+    drop(antd);
+    let _ = std::fs::remove_dir_all(&data_dir);
     println!(
         "  {} — {:.1} KiB/s over {:.0}s ({} → outcome {outcome})",
         arm.label, throughput_kibs, duration, cfg.size_mib
