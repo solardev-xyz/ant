@@ -849,6 +849,13 @@ struct SwarmState {
     /// Receipt-derived AOR estimates (perf-lab Experiment 5), `Some`
     /// only when `ANT_PUSH_AOR_SORT` is set.
     push_aor: Option<Arc<ant_retrieval::AorBook>>,
+    /// Last successfully-resolved sequence-feed index per
+    /// `(owner, topic)` (perf-lab Experiment 6b). Sequence feeds are
+    /// append-only, so a previously-resolved index is always a valid
+    /// anchor: warm re-polls gallop from it instead of re-walking the
+    /// whole sequence (measured: warm == cold at up to 4.3 s without
+    /// this). In-memory only — a restart just pays one cold walk.
+    feed_hints: Arc<std::sync::Mutex<HashMap<([u8; 20], [u8; 32]), u64>>>,
     /// Clone of the shared pseudosettle hot-hint sender, retained so a
     /// runtime [`ControlCommand::EnablePushsyncSwap`] can wire it into
     /// a freshly-built [`crate::PushsyncSwap`] the same way startup
@@ -927,6 +934,7 @@ impl SwarmState {
             push_skip: ant_retrieval::PushSkipCache::new(),
             push_load: ant_retrieval::PushLoadTracker::from_env().map(Arc::new),
             push_aor: ant_retrieval::AorBook::from_env().map(Arc::new),
+            feed_hints: Arc::new(std::sync::Mutex::new(HashMap::new())),
             hot_hint: None,
             known_dialable: HashMap::new(),
             neighborhood_dial_tx: None,
@@ -2751,6 +2759,7 @@ fn handle_control_command(
             let cache = state.cache_for_request(false);
             let disk_cache = state.disk_cache_for_request(false);
             let control = control.clone();
+            let hints = state.feed_hints.clone();
             tokio::spawn(async move {
                 let mut builder =
                     ant_retrieval::RoutingFetcher::new(control, peers_rx).with_cache(cache);
@@ -2763,16 +2772,39 @@ fn handle_control_command(
                     topic,
                     kind: ant_retrieval::FeedType::Sequence,
                 };
-                let reply = match ant_retrieval::resolve_sequence_feed_after(&fetcher, &feed, after)
-                    .await
-                {
-                    Ok(resolution) => ControlAck::FeedResolved {
-                        reference: resolution.reference,
-                        index: resolution.index,
-                        signature: resolution.signature,
-                        v2: resolution.v2,
-                        decrypt_key: resolution.decrypt_key,
-                    },
+                // Experiment 6b: anchor at the best of the caller's
+                // `after` and the daemon's last-resolved index for this
+                // feed. Append-only sequence feeds can't regress, so a
+                // previously-resolved index is always present; if the
+                // hinted walk still errors transiently we retry once
+                // without the hint rather than surfacing a hint-induced
+                // failure for a feed that plain resolution could read.
+                let hint = hints
+                    .lock()
+                    .ok()
+                    .and_then(|h| h.get(&(owner, topic)).copied())
+                    .unwrap_or(0);
+                let anchor = after.max(hint);
+                let mut result =
+                    ant_retrieval::resolve_sequence_feed_after(&fetcher, &feed, anchor).await;
+                if result.is_err() && anchor > after {
+                    result =
+                        ant_retrieval::resolve_sequence_feed_after(&fetcher, &feed, after).await;
+                }
+                let reply = match result {
+                    Ok(resolution) => {
+                        if let Ok(mut h) = hints.lock() {
+                            let e = h.entry((owner, topic)).or_insert(0);
+                            *e = (*e).max(resolution.index);
+                        }
+                        ControlAck::FeedResolved {
+                            reference: resolution.reference,
+                            index: resolution.index,
+                            signature: resolution.signature,
+                            v2: resolution.v2,
+                            decrypt_key: resolution.decrypt_key,
+                        }
+                    }
                     Err(ant_retrieval::FeedError::NoUpdates { .. }) => ControlAck::FeedNotFound,
                     Err(e) => ControlAck::Error {
                         message: format!("feed lookup: {e}"),
