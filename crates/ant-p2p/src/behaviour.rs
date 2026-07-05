@@ -3215,9 +3215,9 @@ fn push_with_stamp(
         if let Some(svc) = pushsync_swap {
             let s: Arc<dyn ant_retrieval::PushsyncSettlement> = svc;
             fetcher = fetcher.with_pushsync_settlement(s);
-        } else if let Some(acc) = accounting.filter(|_| {
-            crate::push_pseudosettle::PushPseudosettle::enabled_by_env()
-        }) {
+        } else if let Some(acc) =
+            accounting.filter(|_| crate::push_pseudosettle::PushPseudosettle::enabled_by_env())
+        {
             // Experiment 1: cheque-less push settlement — mirror push
             // debits into the shared Accounting so the pseudosettle
             // driver time-settles upload peers (bee-light behaviour).
@@ -3324,9 +3324,9 @@ fn push_soc_with_stamp(
         if let Some(svc) = pushsync_swap {
             let s: Arc<dyn ant_retrieval::PushsyncSettlement> = svc;
             fetcher = fetcher.with_pushsync_settlement(s);
-        } else if let Some(acc) = accounting.filter(|_| {
-            crate::push_pseudosettle::PushPseudosettle::enabled_by_env()
-        }) {
+        } else if let Some(acc) =
+            accounting.filter(|_| crate::push_pseudosettle::PushPseudosettle::enabled_by_env())
+        {
             // Experiment 1: cheque-less push settlement — mirror push
             // debits into the shared Accounting so the pseudosettle
             // driver time-settles upload peers (bee-light behaviour).

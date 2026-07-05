@@ -196,11 +196,8 @@ struct AntdSpec {
 
 impl AntdSpec {
     fn spawn(&self, tag: &str) -> Antd {
-        let data_dir = std::env::temp_dir().join(format!(
-            "ant-perf-{tag}-{}-{}",
-            self.port,
-            unix_now()
-        ));
+        let data_dir =
+            std::env::temp_dir().join(format!("ant-perf-{tag}-{}-{}", self.port, unix_now()));
         std::fs::create_dir_all(&data_dir).expect("create data dir");
         if self.upload_capable {
             let shared = lab_state_dir().join("postage");
@@ -527,7 +524,11 @@ fn seed_issuer(args: &Args) {
     let bucket_depth = first.bucket_depth();
     let immutable = first.immutable();
     for s in &sources[1..] {
-        assert_eq!(s.batch_id(), &batch_id, "merge sources are different batches");
+        assert_eq!(
+            s.batch_id(),
+            &batch_id,
+            "merge sources are different batches"
+        );
         assert_eq!(s.batch_depth(), batch_depth);
         assert_eq!(s.bucket_depth(), bucket_depth);
     }
@@ -689,7 +690,8 @@ async fn upload(args: &Args) {
     let size_mib = args.u64_or("size-mib", 1);
     let runs = args.u64_or("runs", 5);
     let peers_min = args.u64_or("peers-min", 30) as usize;
-    let stall_abort = Duration::from_secs(args.u64_or("stall-abort-secs", DEFAULT_STALL_ABORT_SECS));
+    let stall_abort =
+        Duration::from_secs(args.u64_or("stall-abort-secs", DEFAULT_STALL_ABORT_SECS));
     let run_timeout = Duration::from_secs(args.u64_or("run-timeout-secs", 6 * 3600));
     let port_base = args.u64_or("port-base", 3633) as u16;
 
@@ -781,8 +783,17 @@ async fn upload_one_run(
         extra_env: arm.env.clone(),
     };
     let antd = spec.spawn("upload");
-    if !wait_http_ok(client, &format!("{}/health", antd.api), Duration::from_mins(2)).await {
-        eprintln!("antd api did not come up (log: {})", antd.data_dir.join("antd.log").display());
+    if !wait_http_ok(
+        client,
+        &format!("{}/health", antd.api),
+        Duration::from_mins(2),
+    )
+    .await
+    {
+        eprintln!(
+            "antd api did not come up (log: {})",
+            antd.data_dir.join("antd.log").display()
+        );
         return None;
     }
 
@@ -792,7 +803,10 @@ async fn upload_one_run(
         eprintln!("PostageStatus failed — is the lab postage state seeded + symlinked?");
         return None;
     };
-    assert!(pre.enabled, "daemon has no postage issuer — seeding/symlink broken");
+    assert!(
+        pre.enabled,
+        "daemon has no postage issuer — seeding/symlink broken"
+    );
     let pre_ratio = utilization_ratio(&pre);
     if pre_ratio >= UTILIZATION_STOP {
         eprintln!("refusing run: utilization {pre_ratio:.3} ≥ {UTILIZATION_STOP}");
@@ -808,13 +822,8 @@ async fn upload_one_run(
     }
 
     // Peer warm-up.
-    let (warmed, warm_secs, peers_start, _) = wait_peers(
-        client,
-        &antd.api,
-        cfg.peers_min,
-        Duration::from_mins(5),
-    )
-    .await;
+    let (warmed, warm_secs, peers_start, _) =
+        wait_peers(client, &antd.api, cfg.peers_min, Duration::from_mins(5)).await;
     if !warmed {
         eprintln!("peer warm-up failed ({peers_start} peers) — recording aborted run");
     }
@@ -823,7 +832,9 @@ async fn upload_one_run(
     let seed = unix_now()
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
         .wrapping_add(u64::from(cfg.port));
-    let src = antd.data_dir.join(format!("payload-{}mib.bin", cfg.size_mib));
+    let src = antd
+        .data_dir
+        .join(format!("payload-{}mib.bin", cfg.size_mib));
     write_random_file(&src, cfg.size_mib * 1024 * 1024, seed).expect("write payload");
 
     // Start the job.
@@ -1032,7 +1043,13 @@ async fn download(args: &Args) {
             extra_env: Vec::new(),
         };
         let antd = spec.spawn("download");
-        if !wait_http_ok(&client, &format!("{}/health", antd.api), Duration::from_mins(2)).await {
+        if !wait_http_ok(
+            &client,
+            &format!("{}/health", antd.api),
+            Duration::from_mins(2),
+        )
+        .await
+        {
             eprintln!("antd api did not come up");
             continue;
         }
@@ -1174,19 +1191,22 @@ async fn feed_setup(args: &Args) {
     };
     let antd = spec.spawn("feedsetup");
     assert!(
-        wait_http_ok(&client, &format!("{}/health", antd.api), Duration::from_mins(2)).await,
+        wait_http_ok(
+            &client,
+            &format!("{}/health", antd.api),
+            Duration::from_mins(2)
+        )
+        .await,
         "antd api did not come up"
     );
-    let (warmed, _, peers, _) =
-        wait_peers(&client, &antd.api, 30, Duration::from_mins(5)).await;
+    let (warmed, _, peers, _) = wait_peers(&client, &antd.api, 30, Duration::from_mins(5)).await;
     assert!(warmed, "peer warm-up failed ({peers} peers)");
 
     let run_nonce = unix_now();
     let mut topics = Vec::new();
     for count in &counts {
-        let topic = ant_crypto::keccak256(
-            format!("ant-perf-lab/feed-{count}/{run_nonce}").as_bytes(),
-        );
+        let topic =
+            ant_crypto::keccak256(format!("ant-perf-lab/feed-{count}/{run_nonce}").as_bytes());
         let topic_hex = hex::encode(topic);
         println!("creating feed {topic_hex} with {count} updates …");
         for idx in 0..*count {
@@ -1196,11 +1216,9 @@ async fn feed_setup(args: &Args) {
             let mut digest_input = Vec::with_capacity(64);
             digest_input.extend_from_slice(&id);
             digest_input.extend_from_slice(&cac_addr);
-            let sig = ant_crypto::sign_handshake_data(
-                &secret,
-                &ant_crypto::keccak256(&digest_input),
-            )
-            .expect("sign");
+            let sig =
+                ant_crypto::sign_handshake_data(&secret, &ant_crypto::keccak256(&digest_input))
+                    .expect("sign");
             let r = client
                 .post(format!(
                     "{}/soc/{owner_hex}/{}?sig={}",
@@ -1240,12 +1258,10 @@ async fn feed_setup(args: &Args) {
 
 async fn feed_bench(args: &Args) {
     let feeds: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(
-            args.str_or(
-                "topics-file",
-                lab_state_dir().join("feeds.json").to_str().unwrap(),
-            ),
-        )
+        &std::fs::read_to_string(args.str_or(
+            "topics-file",
+            lab_state_dir().join("feeds.json").to_str().unwrap(),
+        ))
         .expect("read feeds.json — run feed-setup first"),
     )
     .expect("parse feeds.json");
@@ -1270,7 +1286,13 @@ async fn feed_bench(args: &Args) {
             extra_env: Vec::new(),
         };
         let antd = spec.spawn("feed");
-        if !wait_http_ok(&client, &format!("{}/health", antd.api), Duration::from_mins(2)).await {
+        if !wait_http_ok(
+            &client,
+            &format!("{}/health", antd.api),
+            Duration::from_mins(2),
+        )
+        .await
+        {
             eprintln!("antd api did not come up");
             continue;
         }
