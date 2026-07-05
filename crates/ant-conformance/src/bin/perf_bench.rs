@@ -220,9 +220,17 @@ impl AntdSpec {
             .arg(&api)
             .arg("--log-level")
             .arg(self.log_level)
-            .stdout(Stdio::null())
-            .stderr(
+            // antd's tracing subscriber writes to STDOUT — capture both
+            // streams into antd.log (histograms were silently empty when
+            // only stderr was captured).
+            .stdout(
                 std::fs::File::create(data_dir.join("antd.log"))
+                    .map_or_else(|_| Stdio::null(), Stdio::from),
+            )
+            .stderr(
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(data_dir.join("antd.log"))
                     .map_or_else(|_| Stdio::null(), Stdio::from),
             );
         // Deliberately NO GNOSIS_RPC_URL / STORAGE_STAMP_BATCH_ID: the

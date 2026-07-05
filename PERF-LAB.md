@@ -7,19 +7,23 @@ Every experiment: Hypothesis → Change → Method → Results → Decision
 
 ## STATUS
 
-- **Current experiment**: #0 — baselines (cheap cells)
+- **Current experiment**: #0 — baselines (big cells)
 - **Phase**: benchmarking
-- **Next action**: when `perf/run-baselines-cheap.sh` finishes
-  (warmup ×5 → upload 1 MiB ×5 → 32 MiB ×5 → feed-setup → feed ×5 →
-  download ×5), transcribe median tables into "Baselines" below,
-  commit results, open the PR. Then run 256 MiB ×1 and 512 MiB ×1
-  (stall characterization) overnight. Meanwhile: Experiment 1 recon
-  (PLAN.md GGUF stall history around lines 700–930).
-- **In-flight hypotheses**: none yet.
-- **Long-running processes**: `perf/run-baselines-cheap.sh` in the
-  background (spawns one antd at a time on ports 3633–3641; kills
-  each after its run). Shakedown result already committed:
-  1 MiB = 102 KiB/s, clean histogram.
+- **Next action**: `perf/run-baselines-big.sh` (256 MiB ×1 then
+  512 MiB ×1, stall-abort 35 min) is the long overnight step — check
+  `pgrep -af 'perf_bench|antd'` and `perf/results/baseline-upload-
+  {256,512}mib-*`. When done: transcribe into the Baselines table,
+  commit, update the PR. Then start Experiment 1 (or renumber: the
+  feed wrapped-chunk fix may become the first experiment if 512
+  completes without a stall).
+- **In-flight hypotheses**: (a) the 512 stall may not reproduce on
+  this branch (pseudosettle landed since the goal-era failures);
+  (b) cold feed resolution 404s because ant re-fetches the wrapped
+  update CAC by address instead of reading it from the SOC payload
+  (root-caused, see Baselines).
+- **Long-running processes**: `perf/run-baselines-big.sh` (background,
+  single antd at a time). Cheap battery finished 14:33Z, all results
+  committed.
 
 ### ⚠ Batch budget vs. the full matrix (2026-07-05 arithmetic)
 
@@ -114,7 +118,69 @@ result JSON; utilization checked before/after every upload run.
 
 ## Baselines
 
-_(pending — filled by task 2)_
+Pre-experiment code = commit `7d2880f` ancestry (branch point
+`cc9ba84`). Config: cheque-less light node (pseudosettle only), fresh
+data dir per run, shared lab issuer, ports 3633–3641. Peer counts and
+wall-clock windows per run in the JSONs.
+
+### Upload (antctl job path, fresh random content)
+
+| size | outcome | median KiB/s (spread) | median secs | requeues |
+|---|---|---|---|---|
+| 1 MiB ×5 | 5/5 ok | 152.3 (35.8–232.7) | 7 (4–29) | 0 |
+| 32 MiB ×5 | 5/5 ok | **489.2 (470.8–534.7)** | 67 (61–70) | 0 |
+| 256 MiB | _tonight_ | | | |
+| 512 MiB | _tonight_ | | | |
+
+Window 2026-07-05T14:10–14:17Z, 64–100 peers at start. 1 MiB is
+startup/manifest dominated (run 1 at 35.8 was the fresh-daemon cold
+outlier). Caveat: the log-derived outcome histograms for these runs
+read an empty file (stdout-capture bug, fixed in the harness after
+this battery) — requeue counts (0 across all runs) come from the job
+view and are trustworthy; deeper per-chunk histograms start with the
+256 MiB run.
+
+### Download (cold = fresh daemon; warm = same daemon, 2nd fetch)
+
+| content | ok | cold TTFB s | cold KiB/s | warm KiB/s |
+|---|---|---|---|---|
+| self 1 MiB a (3a92…) ×5 | 5/5 | 0.14 (0.04–0.25) | 1858 (944–3665) | ~145 000 |
+| self 1 MiB b (3bdd…) ×5 | 5/5 | 0.21 (0.13–0.73) | 893 (591–1332) | ~208 000 |
+| self 1 MiB c (50c1…) ×5 | 5/5 | 0.12 (0.08–0.77) | 923 (569–1775) | ~203 000 |
+| third-party 55 MiB WAV (c4f8…) ×5 | 5/5 | 0.37 (0.18–2.78) | **685 (650–716)** | ~325 000 |
+
+Self-uploaded content (pushed by a *different* daemon minutes
+earlier) is 100 % cold-retrievable — upload propagation is healthy.
+Warm numbers are the local disk/mem cache, recorded for completeness.
+
+### Feed head resolution — **BROKEN cold (0/45), root-caused**
+
+All 45 cold+warm-pool resolutions across head 0/10/100 returned 404
+in 7–10 s. Debug trace (`/tmp/ant-diag-*/antd.log`, 2026-07-05
+14:35Z): the sequence finder itself SUCCEEDS ("feed resolved
+latest_index=0 reference=531b9cee… probed=11") — the SOC is
+network-retrievable — but ant then re-fetches the update's wrapped
+CAC **by address from the network** ("fetch root chunk 531b9cee…:
+all peers failed … storage: not found"). A wrapped feed-update chunk
+only exists *inside* the SOC payload; nobody pushes it standalone.
+Bee reads the wrapped chunk straight out of the SOC (its GetWrappedChunk
+path), which is why the smoke's bee cross-check passes while ant's own
+cold resolution 404s (the uploader daemon masks this via local cache).
+→ Experiment 6 scope: use the wrapped chunk carried by the SOC; also
+note the finder burns ~7 s at head 0 on a cold pool (800 ms
+speculative-probe timeouts folding into "transient miss").
+
+### Session warm-up (process spawn → N BZZ-handshaked peers)
+
+| api-up s | to 30 peers s | peers @end |
+|---|---|---|
+| 1.51 (1.26–1.76) | 0.25 (0.25–1.76) | 95 (88–97) |
+
+30+ BZZ-handshaked peers ~0.3–1.8 s after the API binds, 5/5 runs —
+ant's wait-for-identify pipeline + parallel bootstrap already deliver
+what hoverfly's identify-push bought them (their pre-fix figure was
+minutes for a 128-session fill). Experiment 4 will verify per-fresh-
+session push latencies rather than handshake counts.
 
 ## Experiments
 
