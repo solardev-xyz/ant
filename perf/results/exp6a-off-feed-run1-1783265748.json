@@ -1,0 +1,102 @@
+{
+  "antd_bin": "perf/state/antd-baseline-bin",
+  "git_commit": "2ea8d2e",
+  "label": "exp6a-off",
+  "peer_warmup_secs": 0.511442544,
+  "peers_at_start": 97,
+  "resolutions": [
+    {
+      "head_index": 0,
+      "timings": [
+        {
+          "attempt": 0,
+          "cold": true,
+          "ok": false,
+          "resolved_index": null,
+          "secs": 9.899742296,
+          "status": 404
+        },
+        {
+          "attempt": 1,
+          "cold": false,
+          "ok": false,
+          "resolved_index": null,
+          "secs": 9.314229213,
+          "status": 404
+        },
+        {
+          "attempt": 2,
+          "cold": false,
+          "ok": false,
+          "resolved_index": null,
+          "secs": 9.09589138,
+          "status": 404
+        }
+      ],
+      "topic": "4ce252011e759cdc4c420b57aa4812b7c57cc7c6a83c8db0523a86afa019b4ba"
+    },
+    {
+      "head_index": 10,
+      "timings": [
+        {
+          "attempt": 0,
+          "cold": true,
+          "ok": false,
+          "resolved_index": null,
+          "secs": 11.653853339,
+          "status": 404
+        },
+        {
+          "attempt": 1,
+          "cold": false,
+          "ok": false,
+          "resolved_index": null,
+          "secs": 11.186343804,
+          "status": 404
+        },
+        {
+          "attempt": 2,
+          "cold": false,
+          "ok": false,
+          "resolved_index": null,
+          "secs": 10.793972409,
+          "status": 404
+        }
+      ],
+      "topic": "fd7b4635adf647bbf06b303461ce07028b0848739feef7bca6b66da0a3e0e3e8"
+    },
+    {
+      "head_index": 100,
+      "timings": [
+        {
+          "attempt": 0,
+          "cold": true,
+          "ok": false,
+          "resolved_index": null,
+          "secs": 13.214108347,
+          "status": 404
+        },
+        {
+          "attempt": 1,
+          "cold": false,
+          "ok": false,
+          "resolved_index": null,
+          "secs": 12.633505552999999,
+          "status": 404
+        },
+        {
+          "attempt": 2,
+          "cold": false,
+          "ok": false,
+          "resolved_index": null,
+          "secs": 12.419772608,
+          "status": 404
+        }
+      ],
+      "topic": "a3cd2bc4bb9b076a1bb3e83820fcd2ac59d4ba8d5835845e74d9df8b8768271a"
+    }
+  ],
+  "run": 1,
+  "started_utc": "2026-07-05T15:35:48Z",
+  "suite": "feed"
+}
