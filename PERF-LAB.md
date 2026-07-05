@@ -7,30 +7,31 @@ Every experiment: Hypothesis → Change → Method → Results → Decision
 
 ## STATUS
 
-- **Current experiment**: #1 (push pseudosettle) — waiting for the
-  512 MiB baseline to release the postage lock
-- **Phase**: benchmarking (512 baseline) / exp 1 implemented
-- **Next action**: when `perf/run-baselines-big.sh` exits (512 will
-  grind, freeze, stall-abort ≈ like the 256 run), transcribe the 512
-  row into Baselines, then IMMEDIATELY run
-  `perf/run-exp1-pseudosettle.sh` (32 MiB ×5 interleaved A/B, then
-  256 MiB ×1 on the treated arm). Verdict criteria in the exp 1
-  section. After exp 1: exp 2 A/B (`ANT_PUSH_INFLIGHT_CAP=4` alone,
-  then + `ANT_PUSH_CONCURRENCY=128`), then exp 3
-  (`ANT_SUBSTREAM_UPGRADE_CAP=64`).
-- **Scoreboard**: exp 4 CLOSED (no change needed — measured), exp
-  6(a) CLOSED (KEEP, 0/27 → 27/27). Exps 1/2/3 implemented +
-  committed, env-gated off, unmeasured. Exp 5 and 6(b) not started.
-- **In-flight hypotheses**: unsettled push debt is the stall (256
-  evidence conclusive; exp 1 tests the fix). Exp 2's cap should
-  compose with higher job width (the 2026-05 "256 collapses" predates
-  per-peer caps).
-- **Long-running processes**: `perf/run-baselines-big.sh` — 512 MiB
-  run on port 3634, data dir `/tmp/ant-perf-upload-3634-1783265452`,
-  started 15:30:52Z. Only upload-capable daemon (postage lock).
-- **Binaries**: `target/release/antd` = HEAD (all experiments
-  env-gated off; feed fix active). `perf/state/antd-baseline-bin` =
-  pre-experiment snapshot for A/B control arms.
+- **Current experiment**: 512 MiB completion proof #1 of 3
+  (kept exp 1+2 config, batch 2)
+- **Phase**: benchmarking
+- **Next action**: when `exp12-512-proof1` lands (result
+  `perf/results/exp12-512-proof1-*`), transcribe; if completed, run
+  proofs #2 and #3 back-to-back (`--batch 2`, same env). Then exp 5
+  (AOR receipt routing — implement env-gated, A/B at 8 MiB ×5 on
+  batch 1) and exp 6(b) (finder phase instrumentation → adopt-or-
+  close). Then flip the kept experiment defaults ON (pseudosettle +
+  cap without env vars), final gate (task 9), PR summary table.
+- **Scoreboard**: exp 1 KEEP · exp 2 KEEP (provisional n=1 at 256;
+  first-ever full 256 MiB completion, 27 min) · exp 3 REVERT
+  (−30 %) · exp 4 NO CHANGE (already implemented) · exp 6(a) KEEP
+  (0/27 → 27/27) · exp 5, 6(b) open.
+- **Batches**: batch 1 (`1decad4e…`, immutable) at utilization
+  0.656 — small runs only (8 MiB A/Bs), hard-stop 0.8. Batch 2
+  (`7fb5cb0b…`, depth 21 MUTABLE, user-funded 2026-07-05 evening,
+  creds in `.env` as *_2) fresh at 0.0 — reserved for the 512×3
+  proof + 256 confirmations. `--batch 2` selects it (issuer .bin
+  chain-verified + adopted in `perf/state/postage/`).
+- **Long-running processes**: `exp12-512-proof1` upload (port 3633,
+  started ~18:57Z, task bp39gp699).
+- **Binaries**: `target/release/antd` = HEAD (exp 1/2 env-gated,
+  feed fix active, exp 3 vendor reverted).
+  `perf/state/antd-baseline-bin` = pre-experiment snapshot.
 
 ### ⚠ Batch budget vs. the full matrix (2026-07-05 arithmetic)
 
