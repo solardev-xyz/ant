@@ -14,8 +14,10 @@
 //! peers): fast peers (EWMA < 200 ms) get `2×base`, slow peers
 //! (EWMA ≥ 2 s) get `base/2` (min 1), fresh/medium peers get `base`.
 //!
-//! Enabled via `ANT_PUSH_INFLIGHT_CAP=<base>` (0/unset = disabled) so
-//! a single build serves both arms of the A/B benchmark.
+//! DEFAULT ON with base cap 4 since the perf-lab verdict (first-ever
+//! full 256/512 MiB mainnet completions; see PERF-LAB.md exp 2).
+//! `ANT_PUSH_INFLIGHT_CAP=<base>` overrides the base; `0` disables
+//! (the A/B control arm).
 
 use libp2p::PeerId;
 use std::collections::HashMap;
@@ -62,13 +64,21 @@ impl PushLoadTracker {
         }
     }
 
-    /// Read `ANT_PUSH_INFLIGHT_CAP`; `None` when unset/0/unparsable
-    /// (feature disabled — the baseline arm).
+    /// Kept-experiment default base cap (perf-lab exp 2 verdict).
+    pub const DEFAULT_BASE_CAP: u32 = 4;
+
+    /// Build from `ANT_PUSH_INFLIGHT_CAP`: unset ⇒ ON at
+    /// [`Self::DEFAULT_BASE_CAP`]; `0` (or unparsable) ⇒ disabled
+    /// (control arm); any other number ⇒ ON at that base.
     #[must_use]
     pub fn from_env() -> Option<Self> {
-        let raw = std::env::var("ANT_PUSH_INFLIGHT_CAP").ok()?;
-        let base: u32 = raw.trim().parse().ok()?;
-        (base > 0).then(|| Self::new(base))
+        match std::env::var("ANT_PUSH_INFLIGHT_CAP") {
+            Err(_) => Some(Self::new(Self::DEFAULT_BASE_CAP)),
+            Ok(raw) => {
+                let base: u32 = raw.trim().parse().unwrap_or(0);
+                (base > 0).then(|| Self::new(base))
+            }
+        }
     }
 
     /// Latency-aware cap for `peer` right now.

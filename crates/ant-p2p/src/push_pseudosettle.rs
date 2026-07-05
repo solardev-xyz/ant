@@ -22,9 +22,10 @@
 //! automatically fires the driver's `HotHint` when a peer's mirrored
 //! debt crosses `HOT_DEBT_THRESHOLD`.
 //!
-//! Enabled via `ANT_PUSH_PSEUDOSETTLE=1` while the experiment is A/B
-//! measured (one build serves both arms); the SWAP service still wins
-//! when a chequebook is configured (it settles harder debts and also
+//! DEFAULT ON since the perf-lab verdict (collapse-to-zero became a
+//! stable plateau; see PERF-LAB.md exp 1). `ANT_PUSH_PSEUDOSETTLE=0`
+//! disables (the A/B control arm). The SWAP service still wins when a
+//! chequebook is configured (it settles harder debts and also
 //! hot-hints).
 
 use ant_retrieval::accounting::Accounting;
@@ -42,13 +43,17 @@ impl PushPseudosettle {
         Self(accounting)
     }
 
-    /// `true` when the operator opted into the experiment arm.
+    /// Default ON; `ANT_PUSH_PSEUDOSETTLE=0`/`false` opts out (the
+    /// A/B control arm).
     #[must_use]
     pub fn enabled_by_env() -> bool {
-        std::env::var("ANT_PUSH_PSEUDOSETTLE").is_ok_and(|v| {
-            let v = v.trim();
-            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
-        })
+        match std::env::var("ANT_PUSH_PSEUDOSETTLE") {
+            Err(_) => true,
+            Ok(v) => {
+                let v = v.trim();
+                !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+            }
+        }
     }
 }
 
