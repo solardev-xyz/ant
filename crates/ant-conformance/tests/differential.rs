@@ -117,6 +117,15 @@ struct Step {
     body: Vec<u8>,
     /// Extract JSON fields (by key) from the response into variables.
     extract: Vec<(&'static str, &'static str)>,
+    /// Extract response headers (by lowercase name) into variables —
+    /// e.g. the ACT upload's `swarm-act-history-address`.
+    extract_headers: Vec<(&'static str, &'static str)>,
+    /// Milliseconds to sleep before running this step (on both
+    /// backends). Used by the ACT grantee flow: bee keys history
+    /// epochs by unix *seconds*, so two mutations in the same second
+    /// collide (the documented same-second limitation) — a >1s gap
+    /// guarantees distinct epochs deterministically.
+    sleep_before_ms: u64,
     /// Step-scoped volatile JSON keys: their values legitimately differ
     /// between backends (e.g. envelope stamps signed by different node
     /// keys), so they're masked *shape-preserving* — presence and value
@@ -147,6 +156,8 @@ impl Step {
             headers: Vec::new(),
             body: Vec::new(),
             extract: Vec::new(),
+            extract_headers: Vec::new(),
+            sleep_before_ms: 0,
             volatile: &[],
             volatile_headers: &[],
             build: None,
@@ -162,6 +173,14 @@ impl Step {
     }
     fn extract(mut self, json_key: &'static str, var: &'static str) -> Self {
         self.extract.push((json_key, var));
+        self
+    }
+    fn extract_header(mut self, header: &'static str, var: &'static str) -> Self {
+        self.extract_headers.push((header, var));
+        self
+    }
+    fn sleep_before(mut self, ms: u64) -> Self {
+        self.sleep_before_ms = ms;
         self
     }
     fn volatile(mut self, keys: &'static [&'static str]) -> Self {
@@ -446,6 +465,11 @@ async fn run_step(client: &reqwest::Client, backend: &mut Backend, step: &Step) 
             }
         }
     }
+    for (name, var) in &step.extract_headers {
+        if let Some(v) = headers.get(*name).and_then(|v| v.to_str().ok()) {
+            backend.vars.insert((*var).to_string(), v.to_string());
+        }
+    }
     observe(
         status,
         &headers,
@@ -593,6 +617,13 @@ fn enc_feed_update_step(vars: &HashMap<String, String>) -> (String, Vec<u8>) {
 }
 
 // --- scenarios --------------------------------------------------------------------
+
+/// Fixed ACT grantee identities (compressed secp256k1 public keys of
+/// the 0x11/0x22/0x33 scalars). Identical on both backends, so
+/// `GET /grantee` list responses compare byte-for-byte.
+const ACT_GRANTEE_1: &str = "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa";
+const ACT_GRANTEE_2: &str = "02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27";
+const ACT_GRANTEE_3: &str = "023c72addb4fdf09af94f0c94d7fe92a386a7e70cf8a1d85916386bb2535c7b1b1";
 
 fn scenarios() -> Vec<Scenario> {
     let soc: SocVectors = load("soc.json");
@@ -1388,6 +1419,197 @@ fn scenarios() -> Vec<Scenario> {
                 Step::new("get-bad-id", "GET", "/batches/zznothex"),
             ],
         },
+        // ACT (access control): upload with `swarm-act: true`, download
+        // via publisher/history/timestamp headers, error shapes. The
+        // access key, history address and act-encrypted references are
+        // random per run, so upload responses mask the reference and
+        // the history header shape-preserving; the *decrypted* download
+        // bodies — and their ETags, which quote the deterministic
+        // resolved content reference — must still match byte-for-byte.
+        // The `{publisher}` var is per-backend (each node's own key).
+        Scenario {
+            name: "act",
+            steps: vec![
+                Step::new("upload-bytes", "POST", "/bytes")
+                    .header("content-type", "application/octet-stream")
+                    .header("swarm-postage-batch-id", batch)
+                    .header("swarm-act", "true")
+                    .body(&b"act differential payload"[..])
+                    .extract("reference", "act_ref")
+                    .extract_header("swarm-act-history-address", "act_hist")
+                    .volatile(&["reference"])
+                    .volatile_headers(&["swarm-act-history-address"]),
+                Step::new("download-bytes", "GET", "/bytes/{act_ref}")
+                    .header("swarm-act-publisher", "{publisher}")
+                    .header("swarm-act-history-address", "{act_hist}"),
+                Step::new("head-bytes", "HEAD", "/bytes/{act_ref}")
+                    .header("swarm-act-publisher", "{publisher}")
+                    .header("swarm-act-history-address", "{act_hist}"),
+                // A future timestamp resolves the newest epoch.
+                Step::new("download-future-timestamp", "GET", "/bytes/{act_ref}")
+                    .header("swarm-act-publisher", "{publisher}")
+                    .header("swarm-act-history-address", "{act_hist}")
+                    .header("swarm-act-timestamp", "99999999999"),
+                // A publisher whose ECDH row isn't in the ACT: bee's
+                // accesscontrol.ErrNotFound 404.
+                Step::new("download-wrong-publisher", "GET", "/bytes/{act_ref}")
+                    .header(
+                        "swarm-act-publisher",
+                        // compressed pubkey of the 0x77… scalar — a key
+                        // that was never granted on either backend
+                        "037962d45b38e8bcf82fa8efa8432a01f20c9a53e24c7d3f11df197cb8e70926da",
+                    )
+                    .header("swarm-act-history-address", "{act_hist}"),
+                // mapStructure parse failures, bee's exact reasons.
+                Step::new("download-bad-publisher", "GET", "/bytes/{act_ref}")
+                    .header("swarm-act-publisher", "zznothex")
+                    .header("swarm-act-history-address", "{act_hist}"),
+                Step::new("download-short-publisher", "GET", "/bytes/{act_ref}")
+                    .header("swarm-act-publisher", "deadbeef")
+                    .header("swarm-act-history-address", "{act_hist}"),
+                // Lookup(0) → accesscontrol.ErrInvalidTimestamp 400.
+                Step::new("download-timestamp-zero", "GET", "/bytes/{act_ref}")
+                    .header("swarm-act-publisher", "{publisher}")
+                    .header("swarm-act-history-address", "{act_hist}")
+                    .header("swarm-act-timestamp", "0"),
+                Step::new("download-bad-timestamp", "GET", "/bytes/{act_ref}")
+                    .header("swarm-act-publisher", "{publisher}")
+                    .header("swarm-act-history-address", "{act_hist}")
+                    .header("swarm-act-timestamp", "abc"),
+                Step::new("upload-bad-act-header", "POST", "/bytes")
+                    .header("content-type", "application/octet-stream")
+                    .header("swarm-postage-batch-id", batch)
+                    .header("swarm-act", "maybe")
+                    .body(&b"x"[..]),
+                // Reusing an existing history: the epoch valid now is
+                // reused, nothing new stored, same history echoed.
+                Step::new("upload-reuse-history", "POST", "/bytes")
+                    .header("content-type", "application/octet-stream")
+                    .header("swarm-postage-batch-id", batch)
+                    .header("swarm-act", "true")
+                    .header("swarm-act-history-address", "{act_hist}")
+                    .body(&b"act reused-history payload"[..])
+                    .extract("reference", "act_ref2")
+                    .volatile(&["reference"])
+                    .volatile_headers(&["swarm-act-history-address"]),
+                Step::new("download-reused", "GET", "/bytes/{act_ref2}")
+                    .header("swarm-act-publisher", "{publisher}")
+                    .header("swarm-act-history-address", "{act_hist}"),
+                // /bzz single file under ACT.
+                Step::new("upload-bzz", "POST", "/bzz?name=act.txt")
+                    .header("content-type", "text/plain")
+                    .header("swarm-postage-batch-id", batch)
+                    .header("swarm-act", "true")
+                    .body(&b"act bzz differential content\n"[..])
+                    .extract("reference", "act_bzz_ref")
+                    .volatile(&["reference"])
+                    .volatile_headers(&["swarm-act-history-address", "etag"])
+                    .extract_header("swarm-act-history-address", "act_bzz_hist"),
+                Step::new("download-bzz", "GET", "/bzz/{act_bzz_ref}/")
+                    .header("swarm-act-publisher", "{publisher}")
+                    .header("swarm-act-history-address", "{act_bzz_hist}"),
+                Step::new("download-bzz-by-name", "GET", "/bzz/{act_bzz_ref}/act.txt")
+                    .header("swarm-act-publisher", "{publisher}")
+                    .header("swarm-act-history-address", "{act_bzz_hist}"),
+                // ACT composes with content encryption: the pipeline
+                // output (64-byte reference) is what ACT encrypts, so
+                // the resolved download serves the decrypted content.
+                Step::new("upload-bytes-encrypted", "POST", "/bytes")
+                    .header("content-type", "application/octet-stream")
+                    .header("swarm-postage-batch-id", batch)
+                    .header("swarm-encrypt", "true")
+                    .header("swarm-act", "true")
+                    .body(&b"act + swarm-encrypt differential payload"[..])
+                    .extract("reference", "act_enc_ref")
+                    .extract_header("swarm-act-history-address", "act_enc_hist")
+                    .volatile(&["reference"])
+                    .volatile_headers(&["swarm-act-history-address"]),
+                Step::new("download-bytes-encrypted", "GET", "/bytes/{act_enc_ref}")
+                    .header("swarm-act-publisher", "{publisher}")
+                    .header("swarm-act-history-address", "{act_enc_hist}")
+                    .volatile_headers(&["etag"]),
+                // /chunks under ACT (bee wraps chunkGetHandler in the
+                // same middleware; the encrypted address is 32 bytes).
+                Step::new("upload-chunk", "POST", "/chunks")
+                    .header("content-type", "application/octet-stream")
+                    .header("swarm-postage-batch-id", batch)
+                    .header("swarm-act", "true")
+                    .body({
+                        let payload = b"act chunk payload".to_vec();
+                        let mut wire = (payload.len() as u64).to_le_bytes().to_vec();
+                        wire.extend_from_slice(&payload);
+                        wire
+                    })
+                    .extract("reference", "act_chunk_ref")
+                    .extract_header("swarm-act-history-address", "act_chunk_hist")
+                    .volatile(&["reference"])
+                    .volatile_headers(&["swarm-act-history-address"]),
+                Step::new("download-chunk", "GET", "/chunks/{act_chunk_ref}")
+                    .header("swarm-act-publisher", "{publisher}")
+                    .header("swarm-act-history-address", "{act_chunk_hist}"),
+            ],
+        },
+        // ACT grantee management: create / list / patch, plus the error
+        // shapes. Grantee keys are fixed scalars, identical on both
+        // backends, so list responses compare byte-for-byte; the
+        // encrypted grantee-list and history references are random and
+        // masked. The 1.2 s sleeps keep history mutations in distinct
+        // unix seconds — bee's mantaray history keys epochs by second
+        // and a same-second update fails by design.
+        Scenario {
+            name: "act-grantees",
+            steps: vec![
+                Step::new("create", "POST", "/grantee")
+                    .header("content-type", "application/json")
+                    .header("swarm-postage-batch-id", batch)
+                    .body(format!(
+                        "{{\"grantees\":[\"{ACT_GRANTEE_1}\",\"{ACT_GRANTEE_2}\"]}}"
+                    ))
+                    .extract("ref", "gl_ref")
+                    .extract("historyref", "gl_hist")
+                    .volatile(&["ref", "historyref"]),
+                Step::new("list", "GET", "/grantee/{gl_ref}"),
+                Step::new("patch", "PATCH", "/grantee/{gl_ref}")
+                    .sleep_before(1200)
+                    .header("content-type", "application/json")
+                    .header("swarm-postage-batch-id", batch)
+                    .header("swarm-act-history-address", "{gl_hist}")
+                    .body(format!(
+                        "{{\"add\":[\"{ACT_GRANTEE_3}\"],\"revoke\":[\"{ACT_GRANTEE_1}\"]}}"
+                    ))
+                    .extract("ref", "gl_ref2")
+                    .extract("historyref", "gl_hist2")
+                    .volatile(&["ref", "historyref"]),
+                // Post-revoke order pins bee's swap-remove: [g3, g2].
+                Step::new("list-after-patch", "GET", "/grantee/{gl_ref2}"),
+                Step::new(
+                    "get-unknown-list",
+                    "GET",
+                    // Well-formed 64-byte value that decrypts to garbage
+                    // on both backends → 404 "granteelist not found".
+                    format!("/grantee/{}", "ab".repeat(64)),
+                ),
+                Step::new("create-no-body", "POST", "/grantee")
+                    .header("swarm-postage-batch-id", batch),
+                Step::new("create-no-batch", "POST", "/grantee")
+                    .header("content-type", "application/json")
+                    .body(format!("{{\"grantees\":[\"{ACT_GRANTEE_1}\"]}}")),
+                Step::new("patch-no-history", "PATCH", "/grantee/{gl_ref2}")
+                    .header("content-type", "application/json")
+                    .header("swarm-postage-batch-id", batch)
+                    .body(format!("{{\"add\":[\"{ACT_GRANTEE_1}\"]}}")),
+                Step::new("create-invalid-key", "POST", "/grantee")
+                    .header("content-type", "application/json")
+                    .header("swarm-postage-batch-id", batch)
+                    .body(&br#"{"grantees":["deadbeef"]}"#[..]),
+                Step::new("patch-bad-json", "PATCH", "/grantee/{gl_ref2}")
+                    .sleep_before(1200)
+                    .header("content-type", "application/json")
+                    .header("swarm-postage-batch-id", batch)
+                    .header("swarm-act-history-address", "{gl_hist2}")
+                    .body(&b"notjson"[..]),
+            ],
+        },
         Scenario {
             name: "settlements",
             steps: vec![
@@ -1447,18 +1669,37 @@ async fn differential_ant_vs_bee() {
     let mut failures = Vec::new();
     let mut ok_count = 0usize;
 
+    // ACT publisher identity per backend: each node's own key (bee's
+    // access-control session is over the swarm key). Beemock's node key
+    // is the fixed 0xbe scalar (see conformance/beemock/main.go);
+    // MemNode's is `MEM_NODE_SECRET`.
+    let bee_publisher = {
+        let pk = ant_crypto::act::public_key_of(&[0xbe; 32]).expect("beemock node key");
+        hex::encode(ant_crypto::act::compress_public_key(&pk))
+    };
+    let ant_publisher = ant_conformance::mem_node_public_key_hex();
+
     for scenario in scenarios() {
         let mut ant = Backend {
             name: "ant",
             base: ant_gw.base_url(),
-            vars: HashMap::from([("batch".to_string(), bee.batch_id.clone())]),
+            vars: HashMap::from([
+                ("batch".to_string(), bee.batch_id.clone()),
+                ("publisher".to_string(), ant_publisher.clone()),
+            ]),
         };
         let mut oracle = Backend {
             name: "bee",
             base: bee.base.clone(),
-            vars: HashMap::from([("batch".to_string(), bee.batch_id.clone())]),
+            vars: HashMap::from([
+                ("batch".to_string(), bee.batch_id.clone()),
+                ("publisher".to_string(), bee_publisher.clone()),
+            ]),
         };
         for step in &scenario.steps {
+            if step.sleep_before_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(step.sleep_before_ms)).await;
+            }
             let ant_obs = run_step(&client, &mut ant, step).await;
             let bee_obs = run_step(&client, &mut oracle, step).await;
             let diffs = compare(scenario.name, step.name, &ant_obs, &bee_obs);

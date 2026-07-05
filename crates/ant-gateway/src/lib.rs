@@ -28,6 +28,8 @@
 #![cfg_attr(not(feature = "http-api"), allow(dead_code))]
 
 #[cfg(feature = "http-api")]
+mod act;
+#[cfg(feature = "http-api")]
 mod chain;
 #[cfg(feature = "chain")]
 pub mod chainreader;

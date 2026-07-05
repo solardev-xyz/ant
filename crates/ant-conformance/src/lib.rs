@@ -16,7 +16,10 @@
 
 pub mod memnode;
 
-pub use memnode::{spawn_mem_gateway, MemChunkStore, MemGateway, MemGatewayConfig};
+pub use memnode::{
+    mem_node_public_key_hex, spawn_mem_gateway, MemChunkStore, MemGateway, MemGatewayConfig,
+    MEM_NODE_SECRET,
+};
 
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -276,4 +279,110 @@ pub struct EncTreeCase {
     pub root_ref_hex: String,
     pub chunks: Vec<RsChunkEntry>,
     pub root_replicas: Vec<RsChunkEntry>,
+}
+
+// --- ACT (access control) vectors -------------------------------------------
+
+/// `act.json`: bee's `pkg/accesscontrol` primitives with injected keys
+/// (KDF / wrap / reference encryption / kvs manifest / history
+/// manifests + lookup table) plus two frozen full-controller flows.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActVectors {
+    pub publisher_secret_hex: String,
+    pub publisher_pub_hex: String,
+    pub kdf_cases: Vec<ActKdfCase>,
+    pub ref_cases: Vec<ActRefCase>,
+    pub kvs_cases: Vec<ActKvsCase>,
+    pub history_cases: Vec<ActHistoryCase>,
+    pub upload_flow: ActUploadFlow,
+    pub grantee_flow: ActGranteeFlow,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActKdfCase {
+    pub name: String,
+    pub secret_hex: String,
+    pub counterparty_pub_hex: String,
+    pub lookup_key_hex: String,
+    pub akdk_hex: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActRefCase {
+    pub name: String,
+    pub ref_hex: String,
+    pub access_key_hex: String,
+    pub encrypted_hex: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActKvsCase {
+    pub name: String,
+    pub rows: Vec<ActKvsRow>,
+    pub manifest_json: String,
+    pub root_hex: String,
+    pub chunks: Vec<RsChunkEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActKvsRow {
+    pub key_hex: String,
+    pub value_hex: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActHistoryCase {
+    pub name: String,
+    pub steps: Vec<ActHistoryStep>,
+    pub lookups: Vec<ActLookupCase>,
+    pub chunks: Vec<RsChunkEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActHistoryStep {
+    pub timestamp: i64,
+    pub act_ref_hex: String,
+    #[serde(default)]
+    pub metadata: std::collections::BTreeMap<String, String>,
+    pub root_hex: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActLookupCase {
+    pub timestamp: i64,
+    #[serde(default)]
+    pub act_ref_hex: String,
+    #[serde(default)]
+    pub error: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActUploadFlow {
+    pub publisher_secret_hex: String,
+    pub content_ref_hex: String,
+    pub history_ref_hex: String,
+    pub encrypted_ref_hex: String,
+    pub chunks: Vec<RsChunkEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActGranteeFlow {
+    pub publisher_secret_hex: String,
+    pub grantee_secrets_hex: Vec<String>,
+    pub grantee_pubs_hex: Vec<String>,
+    pub egrantee_ref_hex: String,
+    pub history_ref_hex: String,
+    pub content_ref_hex: String,
+    pub encrypted_ref_hex: String,
+    pub chunks: Vec<RsChunkEntry>,
 }

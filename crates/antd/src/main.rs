@@ -723,6 +723,9 @@ async fn main() -> Result<()> {
                 opt.cors_allowed_origins.iter(),
             )),
             chain: chain_ctx,
+            // ACT publisher identity = the node's swarm key, exactly
+            // bee's `accesscontrol.NewDefaultSession(swarmPrivateKey)`.
+            act_secret: Arc::new(signing_secret),
         })
     };
 

@@ -19,7 +19,17 @@ network or needs credentials.
   `crypto/rand`, so whole encrypted trees can't be made deterministic)
   plus frozen encrypted trees from bee's real pipeline, incl. an
   encrypted+RS-level-1 composition, that ant's decrypting joiner must
-  reproduce.
+  reproduce. ACT (access control) vectors (`act.json`, from bee's
+  `pkg/accesscontrol`): deterministic ECDH session-KDF cases
+  (lookup-key / access-key-decryption-key derivations under fixed
+  publisher+grantee keys), access-key wrap, reference encryption, the
+  ACT key-value store's simple-manifest JSON + chunk address, and
+  multi-epoch history manifests built through bee's real
+  load-add-store cycle with fixed timestamps (byte-exact roots +
+  a `Lookup` truth table) — plus two *frozen* full
+  `accesscontrol.Controller` flows (random access keys, encrypted
+  grantee lists) that ant must resolve from the chunks alone
+  (`tests/act_vectors.rs`).
 - [`vectors/`](vectors/) — generated JSON, checked in so tests run
   without Go or the bee checkout.
 - Consuming tests: `crates/ant-conformance` (`tests/vectors.rs`,
@@ -41,6 +51,11 @@ fields masked):
 - **oracle**: [`beemock/`](beemock/) — bee's *real* `pkg/api` service
   over in-memory mocks (what `bee dev` used to be). Build once:
   `cd conformance/beemock && go build -o beemock .`
+  Access control is the REAL `accesscontrol.Controller` wired like
+  bee's `node.go` (Diffie-Hellman session over the fixed `0xbe…` node
+  key; the api layer's own loadsave runs over the in-memory storer) —
+  not the `accesscontrol/mock` package — so ACT scenarios exercise
+  bee's canonical history/kvs/grantee code end to end.
 - **subject**: MemNode (`crates/ant-conformance/src/memnode.rs`) — ant's
   production router + retrieval/feed code over an in-memory store.
 - Encrypted uploads (`swarm-encrypt: true`) are compared by *shape*:
@@ -62,7 +77,33 @@ reference: clamping, suffix/open-ended ranges, both 416 shapes,
 `multipart/byteranges` with the boundary normalized by the harness,
 HEAD ignoring Range), `stamps-buckets` (`GET /stamps/{id}/buckets`),
 `batches` (`GET /batches`; ant's no-event-sync subset is a registered
-divergence), and `settlements`.
+divergence), `act` (ACT uploads via `swarm-act: true` on `/bytes`,
+`/bzz` and `/chunks` — incl. the `swarm-encrypt` composition and
+history reuse via `swarm-act-history-address` — downloads with the
+`swarm-act-publisher`/`-history-address`/`-timestamp` headers, and
+the error shapes: wrong publisher → 404 `act or history entry not
+found`, malformed publisher/timestamp headers → bee's mapStructure
+reasons, timestamp 0 → 400 `invalid timestamp`), `act-grantees`
+(`POST /grantee` → 201, `GET /grantee/{ref}` byte-identical grantee
+lists, `PATCH` add+revoke pinning bee's swap-remove order, plus
+no-body / no-batch / missing-history / invalid-key / bad-JSON
+shapes), and `settlements`.
+
+ACT notes: the publisher identity is each backend's own node key
+(beemock `0xbe…`, MemNode `MEM_NODE_SECRET`), passed per backend via
+the `{publisher}` template var. Access keys, history addresses and
+ACT-encrypted references are random per run and masked
+shape-preserving; the *decrypted* download bodies and their ETags
+(which quote the deterministic resolved content reference) must match
+byte-for-byte. Grantee mutations sleep >1 s apart because bee keys
+history epochs by unix second and a same-second update fails by
+design (mantaray `ErrInvalidInput` → 500 "failed to create or update
+grantee list"); the failure itself is timing-dependent over HTTP, so
+it is pinned by construction (ant refuses duplicate epoch keys with
+the same shape) rather than by a differential step. A non-grantee
+download is representable only as the wrong-publisher 404: with a
+single node per backend there is no second identity whose session key
+could be granted and then denied.
 
 `GET /pins/check` is **not** in the differential: bee's
 `pinIntegrityHandler` needs a real `storer.PinIntegrity` (transactional
@@ -85,7 +126,11 @@ notice if the beemock binary is missing** (e.g. CI without Go).
 
 [`beejs/`](beejs/) drives **unmodified bee-js v12** against both
 backends and asserts every operation succeeds and every
-content-addressed reference is byte-identical across them:
+content-addressed reference is byte-identical across them (32/32
+checks, incl. an ACT round-trip — `uploadData(act: true)` +
+`downloadData` with `actPublisher`/`actHistoryAddress`/`actTimestamp`
+from `getNodeAddresses().publicKey` — and the
+`createGrantees`/`getGrantees`/`patchGrantees` flow):
 
 ```sh
 cargo build -p ant-conformance --bin memgateway

@@ -20,7 +20,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
-	mockac "github.com/ethersphere/bee/v2/pkg/accesscontrol/mock"
+	"github.com/ethersphere/bee/v2/pkg/accesscontrol"
 	"github.com/ethersphere/bee/v2/pkg/accounting"
 	accountingmock "github.com/ethersphere/bee/v2/pkg/accounting/mock"
 	"github.com/ethersphere/bee/v2/pkg/api"
@@ -208,7 +208,16 @@ func main() {
 			Immutable:   false,
 		}),
 	)
-	accessControl := mockac.New()
+	// REAL access control controller, wired exactly like bee's node.go:
+	// a Diffie-Hellman session over the node key feeds the ACT logic
+	// (cmd/bee/cmd/start.go: accesscontrol.NewDefaultSession(swarmKey)).
+	// The api.Service constructs its loadsave over `storer` itself, so
+	// every ACT artifact (history manifest, key-value store, grantee
+	// list) is produced by bee's canonical code paths against the
+	// in-memory chunk store — no mock shortcuts.
+	accessControl := accesscontrol.NewController(accesscontrol.NewLogic(
+		accesscontrol.NewDefaultSession(pk),
+	))
 
 	// Remaining mocks, mirroring newTestServer defaults.
 	topologyDriver := topologymock.NewTopologyDriver()

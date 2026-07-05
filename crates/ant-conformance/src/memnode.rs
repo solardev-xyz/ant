@@ -345,6 +345,7 @@ pub async fn spawn_mem_gateway(cfg: MemGatewayConfig) -> MemGateway {
         tags: Arc::new(TagRegistry::new()),
         cors: Arc::new(CorsConfig::default()),
         chain: None,
+        act_secret: Arc::new(MEM_NODE_SECRET),
     };
     let router = build_router(handle);
 
@@ -373,14 +374,29 @@ pub async fn spawn_mem_gateway(cfg: MemGatewayConfig) -> MemGateway {
     }
 }
 
-/// Well-formed but obviously-fake identity, mirroring the gateway test
-/// fixture's `test_identity`.
+/// Fixed node signing secret: the `MemNode`'s ACT **publisher** identity
+/// (bee uses the swarm key for `accesscontrol.NewDefaultSession`).
+/// Public so the differential harness and the bee-js runner can compute
+/// the matching `swarm-act-publisher` value.
+pub const MEM_NODE_SECRET: [u8; 32] = [0xae; 32];
+
+/// Compressed public key (hex) of [`MEM_NODE_SECRET`] — the value
+/// `GET /addresses.publicKey` must report so ACT clients (bee-js) can
+/// discover the publisher key.
+#[must_use]
+pub fn mem_node_public_key_hex() -> String {
+    let pk = ant_crypto::act::public_key_of(&MEM_NODE_SECRET).expect("fixed scalar is valid");
+    hex::encode(ant_crypto::act::compress_public_key(&pk))
+}
+
+/// Well-formed identity, mirroring the gateway test fixture's
+/// `test_identity` — except the public key, which is the real ACT
+/// publisher key so `GET /addresses` and the ACT surface agree.
 fn mem_identity() -> GatewayIdentity {
     GatewayIdentity {
         overlay_hex: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".to_string(),
         ethereum_hex: "0x0102030405060708090a0b0c0d0e0f1011121314".to_string(),
-        public_key_hex: "020102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
-            .to_string(),
+        public_key_hex: mem_node_public_key_hex(),
         peer_id: "12D3KooWMemGateway000000000000000000000000000".to_string(),
     }
 }

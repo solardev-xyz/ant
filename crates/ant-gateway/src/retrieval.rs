@@ -300,6 +300,14 @@ pub async fn chunk(
         Ok(r) => r,
         Err(resp) => return resp,
     };
+    // ACT resolution (bee wraps `chunkGetHandler` in its
+    // `actDecryptionHandler`): a 32-byte ACT-encrypted address
+    // decrypts to the stored chunk's address.
+    let reference: [u8; 32] =
+        match crate::act::act_maybe_resolve(&handle, &headers, reference.to_vec()).await {
+            Ok(r) => r.try_into().expect("32-byte input resolves to 32 bytes"),
+            Err(resp) => return resp,
+        };
 
     // Register the request with the live gateway-activity registry so
     // it shows up in the `antop` Retrieval tab. The guard's
@@ -730,6 +738,10 @@ pub async fn upload_chunk(
         Ok(p) => p,
         Err(resp) => return resp,
     };
+    let act = match crate::act::parse_act_upload(&headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
 
     // Pre-signed stamp: check the signature actually covers this chunk
     // before pushing. Bee surfaces the presigned stamper's
@@ -790,9 +802,25 @@ pub async fn upload_chunk(
                     }
                 }
             }
+            // ACT on `POST /chunks` (bee `chunkUploadHandler`): wrap
+            // the chunk address like any other reference.
+            let mut response_ref = stripped.clone();
+            let mut act_history: Option<String> = None;
+            if let Some(act_params) = &act {
+                let raw = hex::decode(&stripped).unwrap_or_default();
+                match crate::act::act_encrypt_upload(&handle, act_params, &raw, batch_id, timeout)
+                    .await
+                {
+                    Ok(outcome) => {
+                        response_ref = hex::encode(outcome.reference);
+                        act_history = Some(outcome.history_hex);
+                    }
+                    Err(resp) => return resp,
+                }
+            }
             let mut resp = json_response(
                 StatusCode::CREATED,
-                &serde_json::json!({ "reference": stripped }),
+                &serde_json::json!({ "reference": response_ref }),
             );
             set_immutable_cache_headers(&mut resp);
             // Bee only attaches (and echoes) a tag on `POST /chunks`
@@ -803,6 +831,9 @@ pub async fn upload_chunk(
                     handle.tags.complete(uid, 1, address);
                 }
                 echo_tag_headers(uid, &mut resp);
+            }
+            if let Some(history_hex) = &act_history {
+                crate::act::set_act_history_header(&mut resp, history_hex);
             }
             resp
         }
@@ -925,6 +956,10 @@ pub async fn upload_soc(
         Ok(p) => p,
         Err(resp) => return resp,
     };
+    let act = match crate::act::parse_act_upload(&headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
 
     // Pre-signed stamp: check the signature covers the SOC's
     // owner-bound address. Bee's soc handler surfaces the presigned
@@ -980,18 +1015,37 @@ pub async fn upload_soc(
                     return resp;
                 }
             }
+            // ACT on `POST /soc` (bee `socUploadHandler`): wrap the
+            // SOC address like any other reference.
+            let mut response_ref = stripped.clone();
+            let mut act_history: Option<String> = None;
+            if let Some(act_params) = &act {
+                let raw = hex::decode(&stripped).unwrap_or_default();
+                match crate::act::act_encrypt_upload(&handle, act_params, &raw, batch_id, timeout)
+                    .await
+                {
+                    Ok(outcome) => {
+                        response_ref = hex::encode(outcome.reference);
+                        act_history = Some(outcome.history_hex);
+                    }
+                    Err(resp) => return resp,
+                }
+            }
             // SOC writes are mutable at the address level (the owner can
             // sign a new payload at the same id), so don't apply the
             // immutable cache headers `upload_chunk` uses.
             let mut resp = json_response(
                 StatusCode::CREATED,
-                &serde_json::json!({ "reference": stripped }),
+                &serde_json::json!({ "reference": response_ref }),
             );
             // Like `/chunks`, bee only echoes `Swarm-Tag` on `/soc`
             // uploads that carried one in the request.
             if let Some(uid) = requested_tag(&headers) {
                 handle.tags.complete(uid, 1, address);
                 echo_tag_headers(uid, &mut resp);
+            }
+            if let Some(history_hex) = &act_history {
+                crate::act::set_act_history_header(&mut resp, history_hex);
             }
             resp
         }
@@ -1074,6 +1128,10 @@ pub async fn upload_bzz(
         Ok(p) => p,
         Err(resp) => return resp,
     };
+    let act = match crate::act::parse_act_upload(&headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
 
     let timeout = request_timeout(&headers, DEFAULT_REQUEST_TIMEOUT);
 
@@ -1117,17 +1175,35 @@ pub async fn upload_bzz(
         }
     }
 
-    let reference_hex = hex::encode(&assembled.root);
+    // ACT wraps the manifest root reference; the manifest and content
+    // pipelines above are untouched (bee's `actEncryptionHandler` runs
+    // on the finished manifest reference).
+    let mut response_ref = assembled.root.clone();
+    let mut act_history: Option<String> = None;
+    if let Some(act_params) = &act {
+        match crate::act::act_encrypt_upload(&handle, act_params, &response_ref, batch_id, timeout)
+            .await
+        {
+            Ok(outcome) => {
+                response_ref = outcome.reference;
+                act_history = Some(outcome.history_hex);
+            }
+            Err(resp) => return resp,
+        }
+    }
+
+    let reference_hex = hex::encode(&response_ref);
     let mut resp = json_response(
         StatusCode::CREATED,
         &serde_json::json!({ "reference": reference_hex }),
     );
     set_immutable_cache_headers(&mut resp);
-    // Bee stamps the manifest root on the *single-file* upload response
-    // as a quoted `ETag` (`bzzUploadHandler`); its collection path
+    // Bee stamps the returned reference on the *single-file* upload
+    // response as a quoted `ETag` (`bzzUploadHandler` uses the
+    // ACT-encrypted reference when ACT is on); its collection path
     // (`dirUploadHandler`) sets none.
     if !collection {
-        set_etag(&mut resp, &assembled.root);
+        set_etag(&mut resp, &response_ref);
     }
     // Tags key on the root chunk's 32-byte address (the leading half of
     // an encrypted reference).
@@ -1141,6 +1217,9 @@ pub async fn upload_bzz(
         root_address,
         &mut resp,
     );
+    if let Some(history_hex) = &act_history {
+        crate::act::set_act_history_header(&mut resp, history_hex);
+    }
     resp
 }
 
@@ -1230,6 +1309,10 @@ pub async fn upload_bytes(
         Ok(p) => p,
         Err(resp) => return resp,
     };
+    let act = match crate::act::parse_act_upload(&headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
 
     let timeout = request_timeout(&headers, DEFAULT_REQUEST_TIMEOUT);
     let guard = handle
@@ -1275,9 +1358,32 @@ pub async fn upload_bytes(
             }
         }
 
+        // ACT composes with encryption: the content pipeline above is
+        // unchanged, ACT wraps the resulting 64-byte reference
+        // (bee's `actEncryptionHandler` runs after the split).
+        let mut response_ref = split.root_ref.to_vec();
+        let mut act_history: Option<String> = None;
+        if let Some(act_params) = &act {
+            match crate::act::act_encrypt_upload(
+                &handle,
+                act_params,
+                &response_ref,
+                batch_id,
+                timeout,
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    response_ref = outcome.reference;
+                    act_history = Some(outcome.history_hex);
+                }
+                Err(resp) => return resp,
+            }
+        }
+
         let mut resp = json_response(
             StatusCode::CREATED,
-            &serde_json::json!({ "reference": hex::encode(split.root_ref) }),
+            &serde_json::json!({ "reference": hex::encode(&response_ref) }),
         );
         set_immutable_cache_headers(&mut resp);
         finalize_upload_tag(
@@ -1287,6 +1393,9 @@ pub async fn upload_bytes(
             root_address,
             &mut resp,
         );
+        if let Some(history_hex) = &act_history {
+            crate::act::set_act_history_header(&mut resp, history_hex);
+        }
         return resp;
     }
 
@@ -1319,7 +1428,21 @@ pub async fn upload_bytes(
         }
     }
 
-    let reference_hex = hex::encode(split.root);
+    let mut response_ref = split.root.to_vec();
+    let mut act_history: Option<String> = None;
+    if let Some(act_params) = &act {
+        match crate::act::act_encrypt_upload(&handle, act_params, &response_ref, batch_id, timeout)
+            .await
+        {
+            Ok(outcome) => {
+                response_ref = outcome.reference;
+                act_history = Some(outcome.history_hex);
+            }
+            Err(resp) => return resp,
+        }
+    }
+
+    let reference_hex = hex::encode(&response_ref);
     let mut resp = json_response(
         StatusCode::CREATED,
         &serde_json::json!({ "reference": reference_hex }),
@@ -1332,6 +1455,9 @@ pub async fn upload_bytes(
         split.root,
         &mut resp,
     );
+    if let Some(history_hex) = &act_history {
+        crate::act::set_act_history_header(&mut resp, history_hex);
+    }
     resp
 }
 
@@ -1359,6 +1485,10 @@ pub async fn create_feed(
     };
     let level = match parse_redundancy_level_header(&headers) {
         Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    let act = match crate::act::parse_act_upload(&headers) {
+        Ok(a) => a,
         Err(resp) => return resp,
     };
 
@@ -1390,7 +1520,23 @@ pub async fn create_feed(
         return err_resp;
     }
 
-    let reference_hex = hex::encode(manifest.root);
+    // ACT on `POST /feeds` (bee `feedPostHandler`): wrap the feed
+    // manifest reference.
+    let mut response_ref = manifest.root.to_vec();
+    let mut act_history: Option<String> = None;
+    if let Some(act_params) = &act {
+        match crate::act::act_encrypt_upload(&handle, act_params, &response_ref, batch_id, timeout)
+            .await
+        {
+            Ok(outcome) => {
+                response_ref = outcome.reference;
+                act_history = Some(outcome.history_hex);
+            }
+            Err(resp) => return resp,
+        }
+    }
+
+    let reference_hex = hex::encode(&response_ref);
     let mut resp = json_response(
         StatusCode::CREATED,
         &serde_json::json!({ "reference": reference_hex }),
@@ -1404,6 +1550,9 @@ pub async fn create_feed(
     let _ = handle
         .tags
         .create_completed(total_chunks as u64, manifest.root);
+    if let Some(history_hex) = &act_history {
+        crate::act::set_act_history_header(&mut resp, history_hex);
+    }
     resp
 }
 
@@ -1698,7 +1847,7 @@ fn map_manifest_error(e: ant_retrieval::manifest_writer::ManifestWriteError) -> 
 /// doesn't open 1 K simultaneous outbound libp2p streams. Returns an
 /// HTTP error response on the first chunk that fails to push.
 #[allow(clippy::result_large_err)]
-async fn push_chunks(
+pub(crate) async fn push_chunks(
     handle: &GatewayHandle,
     chunks: &[SplitChunk],
     batch_id: [u8; 32],
@@ -1902,6 +2051,14 @@ pub async fn bytes(
     headers: HeaderMap,
 ) -> Response {
     let any_reference = match parse_any_reference(&addr) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    // ACT resolution (bee's `actDecryptionHandler` middleware): with
+    // the publisher + history headers present, the path address is an
+    // ACT-encrypted reference — decrypt it and serve what it points at.
+    let any_reference = match crate::act::act_maybe_resolve(&handle, &headers, any_reference).await
+    {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -2262,6 +2419,12 @@ async fn bzz_inner(
     // 32-byte plain or 64-byte encrypted manifest root; the node loop
     // walks encrypted manifests transparently (`StreamBzz` takes both).
     let reference = match parse_any_reference(&addr) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    // ACT resolution (bee wraps `bzzDownloadHandler`/`bzzHeadHandler`
+    // in its `actDecryptionHandler`).
+    let reference = match crate::act::act_maybe_resolve(&handle, &headers, reference).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -3259,7 +3422,7 @@ fn content_disposition(filename: &str) -> Option<HeaderValue> {
 /// `"invalid syntax"` (`strconv.ErrSyntax` — including `-1` for a
 /// uint64), an out-of-range one is `"value out of range"`
 /// (`strconv.ErrRange`).
-fn strconv_error_text(e: &std::num::ParseIntError) -> &'static str {
+pub(crate) fn strconv_error_text(e: &std::num::ParseIntError) -> &'static str {
     use std::num::IntErrorKind;
     match e.kind() {
         IntErrorKind::PosOverflow | IntErrorKind::NegOverflow => "value out of range",
@@ -4250,7 +4413,7 @@ fn apply_feed_headers(
 /// Go's `strconv.ParseBool` — the exact forms bee's mapStructure
 /// accepts for a `bool` header. Anything else (including mixed case
 /// like `tRuE`) is a syntax error.
-fn go_parse_bool(s: &str) -> Option<bool> {
+pub(crate) fn go_parse_bool(s: &str) -> Option<bool> {
     match s {
         "1" | "t" | "T" | "true" | "TRUE" | "True" => Some(true),
         "0" | "f" | "F" | "false" | "FALSE" | "False" => Some(false),

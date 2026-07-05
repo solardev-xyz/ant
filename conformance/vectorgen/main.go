@@ -69,6 +69,7 @@ func run(outDir string) error {
 		"redundancy.json":    redundancyVectors(),
 		"rs_files.json":      redundantFileVectors(),
 		"encryption.json":    encryptionVectors(),
+		"act.json":           actVectors(),
 	}
 	for name, v := range files {
 		blob, err := json.MarshalIndent(v, "", "  ")

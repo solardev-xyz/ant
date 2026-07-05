@@ -214,6 +214,63 @@ async function runScenarios(backend, base) {
     record(backend, 'feeds', false, e.message);
   }
 
+  // 7. ACT round-trip: upload with act:true (the content reference is
+  // encrypted under a fresh access key; the history address comes back
+  // in swarm-act-history-address), then download as the publisher (the
+  // node's own key, read from /addresses). References are random per
+  // run, so this is a same-backend round-trip like the encrypt case.
+  try {
+    const addresses = await bee.getNodeAddresses();
+    const payload = new TextEncoder().encode('act beejs payload');
+    const up = await bee.uploadData(BATCH, payload, { act: true });
+    const history = up.historyAddress.getOrThrow();
+    const down = await bee.downloadData(up.reference, {
+      actPublisher: addresses.publicKey,
+      actHistoryAddress: history,
+      actTimestamp: Math.floor(Date.now() / 1000),
+    });
+    record(
+      backend,
+      'uploadData(act)/downloadData(actPublisher)',
+      Buffer.compare(down.toUint8Array(), payload) === 0,
+      `hist=${history.toHex().slice(0, 16)}…`,
+    );
+  } catch (e) {
+    record(backend, 'uploadData(act)/downloadData(actPublisher)', false, e.message);
+  }
+
+  // 8. ACT grantee list: create with two grantees, read it back, patch
+  // (add one, revoke one), read again. Bee keys history epochs by unix
+  // second and a same-second update fails by design, so wait >1s
+  // before the patch. The post-revoke list order pins bee's
+  // swap-remove: [g3, g2].
+  try {
+    const g1 = new PrivateKey('11'.repeat(32)).publicKey();
+    const g2 = new PrivateKey('22'.repeat(32)).publicKey();
+    const g3 = new PrivateKey('33'.repeat(32)).publicKey();
+    const created = await bee.createGrantees(BATCH, [g1, g2]);
+    const list = await bee.getGrantees(created.ref);
+    const before = list.grantees.map((g) => g.toCompressedHex());
+    const okBefore =
+      before.length === 2 && before[0] === g1.toCompressedHex() && before[1] === g2.toCompressedHex();
+    await new Promise((r) => setTimeout(r, 1200));
+    const patched = await bee.patchGrantees(BATCH, created.ref, created.historyref, {
+      add: [g3],
+      revoke: [g1],
+    });
+    const after = (await bee.getGrantees(patched.ref)).grantees.map((g) => g.toCompressedHex());
+    const okAfter =
+      after.length === 2 && after[0] === g3.toCompressedHex() && after[1] === g2.toCompressedHex();
+    record(
+      backend,
+      'createGrantees/getGrantees/patchGrantees',
+      okBefore && okAfter,
+      `before=${before.length} after=[${after.map((n) => n.slice(0, 8)).join(',')}]`,
+    );
+  } catch (e) {
+    record(backend, 'createGrantees/getGrantees/patchGrantees', false, e.message);
+  }
+
   return refs;
 }
 
