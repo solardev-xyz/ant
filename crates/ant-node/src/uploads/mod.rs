@@ -101,6 +101,23 @@ const CHUNK_SIZE: usize = 4096;
 /// set, not from raising this constant.
 const MAX_PUSH_CONCURRENCY: usize = 32;
 
+/// Effective in-flight push width: [`MAX_PUSH_CONCURRENCY`] unless the
+/// perf-lab override `ANT_PUSH_CONCURRENCY` is set (Experiment 2 pairs
+/// a higher total width with the per-peer in-flight cap in
+/// `ant-retrieval::push_load` — the 2026-05 finding that 256 collapses
+/// was measured WITHOUT a per-peer cap, so the pair must be re-tested
+/// together; see PERF-LAB.md). Read once per process.
+fn max_push_concurrency() -> usize {
+    static WIDTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WIDTH.get_or_init(|| {
+        std::env::var("ANT_PUSH_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(MAX_PUSH_CONCURRENCY)
+    })
+}
+
 /// Re-checkpoint the on-disk job manifest every N successful pushes.
 /// Chosen so a crash loses ≤ ~250 chunks (~1 MB at 4 KiB chunks)
 /// without thrashing the disk: at peak push throughput (~5 K
@@ -1572,7 +1589,7 @@ impl UploadManager {
             // the same: the retry channel outranks the fresh-chunk
             // channel).
             let now = tokio::time::Instant::now();
-            while in_flight.len() < MAX_PUSH_CONCURRENCY {
+            while in_flight.len() < max_push_concurrency() {
                 let Some(entry) = retries.pop_due(now) else {
                     break;
                 };
@@ -1590,7 +1607,7 @@ impl UploadManager {
             // in-flight completion, or — if all queues are empty
             // and the splitter is exhausted — break to the finish
             // step.
-            if in_flight.len() < MAX_PUSH_CONCURRENCY {
+            if in_flight.len() < max_push_concurrency() {
                 if let Some(leaf) = leaf_iter.next() {
                     bytes_emitted += leaf.len() as u64;
                     let chunks = splitter.push_leaf(leaf);
@@ -1636,7 +1653,7 @@ impl UploadManager {
                     )?;
                 }
                 () = tokio::time::sleep_until(next_due.unwrap_or(now)),
-                    if next_due.is_some() && in_flight.len() < MAX_PUSH_CONCURRENCY => {
+                    if next_due.is_some() && in_flight.len() < max_push_concurrency() => {
                     // Loop turn re-dispatches the due retry.
                 }
                 _ = live.tick.tick() => {
@@ -1979,7 +1996,7 @@ impl UploadManager {
                 return Ok(());
             }
             let now = tokio::time::Instant::now();
-            while in_flight.len() < MAX_PUSH_CONCURRENCY {
+            while in_flight.len() < max_push_concurrency() {
                 let Some(entry) = retries.pop_due(now) else {
                     break;
                 };
@@ -2004,7 +2021,7 @@ impl UploadManager {
                     )?;
                 }
                 () = tokio::time::sleep_until(next_due.unwrap_or(now)),
-                    if next_due.is_some() && in_flight.len() < MAX_PUSH_CONCURRENCY => {}
+                    if next_due.is_some() && in_flight.len() < max_push_concurrency() => {}
                 _ = live.tick.tick() => {
                     self.heartbeat(handle, requeued, live, &job_id);
                 }

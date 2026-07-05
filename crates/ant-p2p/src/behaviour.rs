@@ -842,6 +842,10 @@ struct SwarmState {
     /// times across a multi-chunk upload. See
     /// [`ant_retrieval::PushSkipCache`] for the design rationale.
     push_skip: ant_retrieval::PushSkipCache,
+    /// Per-peer pushsync load tracker (perf-lab Experiment 2). `Some`
+    /// only when `ANT_PUSH_INFLIGHT_CAP` is set — one build serves
+    /// both A/B benchmark arms.
+    push_load: Option<Arc<ant_retrieval::PushLoadTracker>>,
     /// Clone of the shared pseudosettle hot-hint sender, retained so a
     /// runtime [`ControlCommand::EnablePushsyncSwap`] can wire it into
     /// a freshly-built [`crate::PushsyncSwap`] the same way startup
@@ -918,6 +922,7 @@ impl SwarmState {
             pushsync_swap: None,
             credit_ledger: None,
             push_skip: ant_retrieval::PushSkipCache::new(),
+            push_load: ant_retrieval::PushLoadTracker::from_env().map(Arc::new),
             hot_hint: None,
             known_dialable: HashMap::new(),
             neighborhood_dial_tx: None,
@@ -3169,7 +3174,9 @@ fn push_with_stamp(
     }
     let control = control.clone();
     let pushsync_swap = state.pushsync_swap.clone();
+    let accounting = state.accounting.clone();
     let push_skip = state.push_skip.clone();
+    let push_load = state.push_load.clone();
     let disk_cache = state.disk_cache.clone();
     let mem_cache = state.chunk_cache.clone();
     let neighborhood_dial = state.neighborhood_dial_tx.clone();
@@ -3199,11 +3206,23 @@ fn push_with_stamp(
         let mut fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx)
             .with_push_skip(push_skip)
             .with_network_id(network_id);
+        if let Some(load) = push_load {
+            fetcher = fetcher.with_push_load(load);
+        }
         if let Some(tx) = neighborhood_dial {
             fetcher = fetcher.with_neighborhood_dialer(tx);
         }
         if let Some(svc) = pushsync_swap {
             let s: Arc<dyn ant_retrieval::PushsyncSettlement> = svc;
+            fetcher = fetcher.with_pushsync_settlement(s);
+        } else if let Some(acc) = accounting.filter(|_| {
+            crate::push_pseudosettle::PushPseudosettle::enabled_by_env()
+        }) {
+            // Experiment 1: cheque-less push settlement — mirror push
+            // debits into the shared Accounting so the pseudosettle
+            // driver time-settles upload peers (bee-light behaviour).
+            let s: Arc<dyn ant_retrieval::PushsyncSettlement> =
+                Arc::new(crate::push_pseudosettle::PushPseudosettle::new(acc));
             fetcher = fetcher.with_pushsync_settlement(s);
         }
         let reply = match fetcher.push_stamped_chunk(addr, wire, stamp).await {
@@ -3240,7 +3259,9 @@ fn push_soc_with_stamp(
     }
     let control = control.clone();
     let pushsync_swap = state.pushsync_swap.clone();
+    let accounting = state.accounting.clone();
     let push_skip = state.push_skip.clone();
+    let push_load = state.push_load.clone();
     let disk_cache = state.disk_cache.clone();
     let mem_cache = state.chunk_cache.clone();
     let neighborhood_dial = state.neighborhood_dial_tx.clone();
@@ -3294,11 +3315,23 @@ fn push_soc_with_stamp(
         let mut fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx)
             .with_push_skip(push_skip)
             .with_network_id(network_id);
+        if let Some(load) = push_load {
+            fetcher = fetcher.with_push_load(load);
+        }
         if let Some(tx) = neighborhood_dial {
             fetcher = fetcher.with_neighborhood_dialer(tx);
         }
         if let Some(svc) = pushsync_swap {
             let s: Arc<dyn ant_retrieval::PushsyncSettlement> = svc;
+            fetcher = fetcher.with_pushsync_settlement(s);
+        } else if let Some(acc) = accounting.filter(|_| {
+            crate::push_pseudosettle::PushPseudosettle::enabled_by_env()
+        }) {
+            // Experiment 1: cheque-less push settlement — mirror push
+            // debits into the shared Accounting so the pseudosettle
+            // driver time-settles upload peers (bee-light behaviour).
+            let s: Arc<dyn ant_retrieval::PushsyncSettlement> =
+                Arc::new(crate::push_pseudosettle::PushPseudosettle::new(acc));
             fetcher = fetcher.with_pushsync_settlement(s);
         }
         let reply = match fetcher.push_stamped_chunk(address, wire, stamp).await {
@@ -7059,6 +7092,104 @@ mod tests {
             }
             other => panic!("expected the cached feed update to resolve, got {other:?}"),
         }
+    }
+
+    /// A **v2** feed resolution must leave the update's wrapped CAC in
+    /// the node's mem cache under its own address: bee serves the
+    /// wrapped chunk straight from the SOC, and for v2 updates that CAC
+    /// exists nowhere else on the network — without the seed, the
+    /// gateway's follow-up content fetch 404s on every node that didn't
+    /// author the update (perf-lab baseline: 0/45 cold resolutions).
+    #[tokio::test]
+    async fn get_feed_seeds_wrapped_v2_cac_into_cache() {
+        use k256::ecdsa::{SigningKey, VerifyingKey};
+
+        let secret: [u8; 32] = [9u8; 32];
+        let sk = SigningKey::from_bytes((&secret).into()).unwrap();
+        let owner = ant_crypto::ethereum_address_from_public_key(&VerifyingKey::from(&sk));
+        let topic: [u8; 32] = [0xccu8; 32];
+
+        // v2: the wrapped CAC is the content itself (length ≠ 48/80).
+        let content = b"wrapped v2 feed content, served from the SOC";
+        let (inner_addr, inner_wire) = ant_crypto::cac_new(content).unwrap();
+        let (soc_addr, wire) = feed_update_wrapping(&secret, &owner, &topic, 0, &inner_wire);
+
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Arc::new(
+            ant_retrieval::DiskChunkCache::open(dir.path().join("disk.sqlite"), 1 << 20).unwrap(),
+        );
+        disk.put(soc_addr, wire).await.unwrap();
+
+        let mut state = state_with_disk_cache(disk);
+        let mut peerstore = PeerStore::disabled();
+        let control = test_control();
+        let (ack_tx, ack_rx) = oneshot::channel();
+        handle_control_command(
+            &mut state,
+            &mut peerstore,
+            &control,
+            None,
+            0,
+            ControlCommand::GetFeed {
+                owner,
+                topic,
+                after: 0,
+                ack: ack_tx,
+            },
+        );
+        match ack_rx.await.unwrap() {
+            ControlAck::FeedResolved { reference, v2, .. } => {
+                assert!(v2, "wrapped-content update must classify as v2");
+                assert_eq!(reference, inner_addr);
+            }
+            other => panic!("expected v2 resolution, got {other:?}"),
+        }
+        let cached = state
+            .chunk_cache
+            .as_ref()
+            .expect("shared mem cache")
+            .get(&inner_addr);
+        assert_eq!(
+            cached.as_deref(),
+            Some(inner_wire.as_slice()),
+            "resolution must seed the wrapped CAC so the content fetch never hits the network"
+        );
+    }
+
+    /// Like [`feed_update_v1`] but wraps caller-supplied CAC wire (v2
+    /// updates wrap the content chunk itself).
+    fn feed_update_wrapping(
+        secret: &[u8; 32],
+        owner: &[u8; 20],
+        topic: &[u8; 32],
+        index: u64,
+        inner_cac_wire: &[u8],
+    ) -> ([u8; 32], Vec<u8>) {
+        let mut id_input = Vec::with_capacity(40);
+        id_input.extend_from_slice(topic);
+        id_input.extend_from_slice(&index.to_be_bytes());
+        let id = ant_crypto::keccak256(&id_input);
+
+        let inner_span: &[u8; 8] = inner_cac_wire[..8].try_into().unwrap();
+        let inner_cac_addr =
+            ant_crypto::bmt_hash_with_span(inner_span, &inner_cac_wire[8..]).unwrap();
+
+        let mut sig_input = Vec::with_capacity(64);
+        sig_input.extend_from_slice(&id);
+        sig_input.extend_from_slice(&inner_cac_addr);
+        let prehash = ant_crypto::keccak256(&sig_input);
+        let sig = ant_crypto::sign_handshake_data(secret, &prehash).unwrap();
+
+        let mut soc_addr_input = Vec::with_capacity(52);
+        soc_addr_input.extend_from_slice(&id);
+        soc_addr_input.extend_from_slice(owner);
+        let soc_addr = ant_crypto::keccak256(&soc_addr_input);
+
+        let mut wire = Vec::with_capacity(ant_crypto::SOC_HEADER_SIZE + inner_cac_wire.len());
+        wire.extend_from_slice(&id);
+        wire.extend_from_slice(&sig);
+        wire.extend_from_slice(inner_cac_wire);
+        (soc_addr, wire)
     }
 
     /// Build a v1 sequence feed-update SOC exactly the way a bee-compatible
