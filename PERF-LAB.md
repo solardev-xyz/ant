@@ -244,12 +244,31 @@ session push latencies rather than handshake counts.
   wired as fallback in `push_with_stamp`/`push_soc_with_stamp` when
   no chequebook is configured. Env-gated `ANT_PUSH_PSEUDOSETTLE=1`
   for the A/B (one build, both arms). Commits: _(pending)_
-- **Method**: `perf/run-exp1-pseudosettle.sh` — 32 MiB ×5 interleaved
-  A/B, then 256 MiB ×1 on the treated arm vs today's baseline curve;
-  stall verdict = tail completes (esp. the post-data tree/manifest
-  chunks) + failed-attempts-per-chunk collapse.
-- **Results**: _(pending)_
-- **Decision**: _(pending)_
+- **Method**: `perf/run-exp1-pseudosettle.sh` — 32 MiB ×3 interleaved
+  pairs (trimmed from 5 for batch budget), then 256 MiB ×1 treated vs
+  the same-day baseline 256 curve. Window 17:00–18:04Z, 60–100 peers.
+- **Results**:
+  - 32 MiB (throughput a wash, as expected — the debt wall barely
+    bites at this size): off = 511/515/492 KiB/s; treated = 533/394
+    (n=2; run 1 lost to a harness poll bug, fixed in-session). Hard
+    failures leaned treated: 275/796 vs 1001/1001/1347.
+  - **256 MiB (decisive)**: baseline collapsed 459→79→**0** KiB/s by
+    min 18 and froze 221 chunks short for 34 min. Treated run held a
+    **sustained ~190 KiB/s plateau** (per-min: 540, 471, 352, 270,
+    then 178–230 for 17 straight minutes — the pseudosettle
+    refresh-limited steady state) until bytes hit 100 %, with hard
+    failures **159 801 → 86 474**, requeues **676 → 187**, and the
+    frozen tail **221 → 1 chunk**. That last chunk ground for 35 min
+    against ~3 connection-killing candidates (its neighbourhood
+    plausibly blocklisted us during the run's own first-minute burst,
+    540 KiB/s ≫ per-peer refresh budgets) → stall-abort.
+- **Decision**: **KEEP** (`ANT_PUSH_PSEUDOSETTLE` default remains env
+  opt-in until exp 2 lands, then flip on). Removes the systemic debt
+  collapse; not yet sufficient alone for full-file completion — the
+  residual single-chunk hang is the per-peer *spend-rate* problem
+  (we outrun refresh budgets early and earn escalating blocklists),
+  which is exactly Experiment 2's cap. The two are one mechanism:
+  settle what you spend (1) + never outspend a peer's refresh (2).
 
 ### Experiment 4: identify-push session accelerator — **NO CHANGE NEEDED (closed on measurements)**
 
