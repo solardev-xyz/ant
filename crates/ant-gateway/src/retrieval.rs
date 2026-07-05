@@ -46,7 +46,7 @@ use ant_retrieval::{
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures::stream;
 use futures::stream::StreamExt;
@@ -385,6 +385,13 @@ pub async fn download_soc(
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
+    // Bee validates the header struct before fetching anything, so a
+    // malformed `swarm-only-root-chunk` 400s even for a chunk that
+    // doesn't exist.
+    let only_root_chunk = match only_root_chunk_header(&headers) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
 
     let mut addr_input = [0u8; 32 + 20];
     addr_input[..32].copy_from_slice(&id);
@@ -457,7 +464,7 @@ pub async fn download_soc(
     };
 
     let head_only = method == Method::HEAD;
-    if header_is_true(&headers, &SWARM_ONLY_ROOT_CHUNK) {
+    if only_root_chunk {
         // Bee writes the wrapped chunk's wire data verbatim, without
         // the ETag `downloadHandler` would add.
         let mut resp = soc_body_response(head_only, wrapped.to_vec());
@@ -1366,10 +1373,18 @@ fn assemble_bzz(
     level: u8,
     encrypt: bool,
 ) -> Result<AssembledUpload, Response> {
-    if collection {
-        let index_doc = headers
+    // Header values are read as raw UTF-8, not ASCII: Go's net/http
+    // hands bee the raw header bytes, so a unicode
+    // `swarm-index-document` (e.g. a Japanese filename) is honored by
+    // bee — `HeaderValue::to_str()` would silently drop it and fork
+    // the manifest reference.
+    let index_doc_header = || {
+        headers
             .get(SWARM_INDEX_DOCUMENT)
-            .and_then(|v| v.to_str().ok())
+            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+    };
+    if collection {
+        let index_doc = index_doc_header()
             .map(|s| s.trim().trim_start_matches('/').to_string())
             .filter(|s| !s.is_empty());
         assemble_collection(body, index_doc.as_deref(), level, encrypt)
@@ -1377,12 +1392,7 @@ fn assemble_bzz(
         let filename = query
             .name()
             .map(|s| s.trim().trim_start_matches('/').to_string())
-            .or_else(|| {
-                headers
-                    .get(SWARM_INDEX_DOCUMENT)
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.trim().trim_start_matches('/').to_string())
-            })
+            .or_else(|| index_doc_header().map(|s| s.trim().trim_start_matches('/').to_string()))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "index.html".to_string());
 
@@ -1518,7 +1528,16 @@ fn assemble_collection(
                 format!("tar entry {path_str}: read failed: {e}"),
             ));
         }
-        let ct = content_type_from_extension(&path_str).map(std::string::ToString::to_string);
+        // Bee's tar reader stores `mime.TypeByExtension` verbatim —
+        // including the EMPTY string for unknown/absent extensions
+        // (dirs.go always writes the Content-Type metadata key). An
+        // octet-stream substitute here would change the manifest bytes
+        // and fork the /bzz reference.
+        let ct = Some(
+            content_type_from_extension(&path_str)
+                .unwrap_or_default()
+                .to_string(),
+        );
         let data_ref = if encrypt {
             let split = ant_retrieval::split_bytes_encrypted(&buf, level);
             replicas.extend(replica_chunks(
@@ -1547,14 +1566,13 @@ fn assemble_collection(
         ));
     }
 
-    // Default index doc: `index.html` if it's present and the caller
-    // didn't override. Bee's `Bee.UploadCollection` uses the same heuristic.
-    let resolved_index = index_doc.map(str::to_string).or_else(|| {
-        files
-            .iter()
-            .find(|f| f.path == "index.html")
-            .map(|f| f.path.clone())
-    });
+    // Index document comes ONLY from the `swarm-index-document` header.
+    // Bee's HTTP API (`storeDir` in bee/pkg/api/dirs.go) adds no root
+    // metadata when the header is absent — a tar that happens to
+    // contain `index.html` must NOT grow an implicit anchor, or the
+    // manifest reference forks from bee's. (bee-js's `uploadCollection`
+    // convenience default lives client-side, not in the API.)
+    let resolved_index = index_doc.map(str::to_string);
     if encrypt {
         let manifest = match ant_retrieval::manifest_writer::build_collection_manifest_encrypted(
             &files,
@@ -2106,7 +2124,7 @@ pub async fn bzz_root(
     method: Method,
     headers: HeaderMap,
 ) -> Response {
-    bzz_inner(handle, addr, String::new(), method, headers).await
+    bzz_inner(handle, addr, String::new(), None, method, headers).await
 }
 
 /// `GET /bzz/{addr}/{*path}` and the matching HEAD. Walks the
@@ -2116,10 +2134,11 @@ pub async fn bzz_root(
 pub async fn bzz_with_path(
     State(handle): State<GatewayHandle>,
     Path((addr, path)): Path<(String, String)>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
     method: Method,
     headers: HeaderMap,
 ) -> Response {
-    bzz_inner(handle, addr, path, method, headers).await
+    bzz_inner(handle, addr, path, query, method, headers).await
 }
 
 /// `GET /v0/manifest/{addr}`. Lists the paths and metadata currently
@@ -2155,6 +2174,7 @@ async fn bzz_inner(
     handle: GatewayHandle,
     addr: String,
     path: String,
+    query: Option<String>,
     method: Method,
     headers: HeaderMap,
 ) -> Response {
@@ -2196,6 +2216,12 @@ async fn bzz_inner(
     .await
     {
         Ok(s) => s,
+        // `map_retrieval_error` signals a manifest directory miss with
+        // a bare 308 (it can't know the request URL); complete it here
+        // into bee's exact redirect shape.
+        Err(e) if e.status() == StatusCode::PERMANENT_REDIRECT => {
+            return directory_redirect(&addr, &path, query.as_deref(), &method);
+        }
         Err(e) => return e,
     };
 
@@ -2756,6 +2782,19 @@ fn map_retrieval_error(message: String) -> Response {
             "bzz download: feed pointing to the wrapped chunk not found",
         );
     }
+    // Manifest directory miss (`ManifestError::Directory`): bee 308s to
+    // the slash-terminated URL. Returned as a bare status here;
+    // `bzz_inner` fills in the Location header + Go-shaped HTML body
+    // (it knows the request path, this function doesn't).
+    if message.contains("is a directory (redirect to trailing slash)") {
+        return StatusCode::PERMANENT_REDIRECT.into_response();
+    }
+    // Bare-root miss (empty path, no resolvable index document):
+    // bee's empty-path branch has its own message, distinct from the
+    // subpath miss below (`bzzDownloadHandler` in bee/pkg/api/bzz.go).
+    if message.contains("path '(root)' not found") {
+        return json_error(StatusCode::NOT_FOUND, "address not found or incorrect");
+    }
     if message.contains("path '") {
         return json_error(StatusCode::NOT_FOUND, "path address not found");
     }
@@ -2915,6 +2954,15 @@ fn note_redundancy_headers(headers: &HeaderMap) {
     }
 }
 
+/// Response-extension marker: this response's `Content-Type` is served
+/// VERBATIM (it came from manifest metadata / sniffing, the way bee's
+/// `serveManifestEntry` copies the stored value byte-for-byte) and must
+/// not be normalized by the router's bee-`jsonhttp` charset middleware.
+/// Without it, a manifest entry stored as `application/json` would grow
+/// a `; charset=utf-8` suffix bee doesn't send.
+#[derive(Clone, Copy)]
+pub(crate) struct VerbatimContentType;
+
 /// Build a `200 OK` (or empty `200 OK` for `HEAD`) response for a full
 /// streaming GET. `body` should already be `Body::empty()` when
 /// `head_only`; we set headers identically either way so HEAD and GET
@@ -2928,6 +2976,7 @@ fn streaming_response(
 ) -> Response {
     let body = if head_only { Body::empty() } else { body };
     let mut resp = Response::new(body);
+    resp.extensions_mut().insert(VerbatimContentType);
     let _ = resp.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_str(content_type)
@@ -2967,6 +3016,7 @@ fn partial_content_response(
 ) -> Response {
     let body = if head_only { Body::empty() } else { body };
     let mut resp = Response::new(body);
+    resp.extensions_mut().insert(VerbatimContentType);
     *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
     let _ = resp.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -2994,32 +3044,111 @@ fn partial_content_response(
 
 fn content_disposition(filename: &str) -> Option<HeaderValue> {
     // Bee keeps only the base name of the manifest entry's `Filename`
-    // metadata (`filepath.Base` in `serveManifestEntry`), so a nested
-    // collection path like `sub/data.txt` yields `data.txt`.
+    // metadata (`filepath.Base` in `serveManifestEntry`), then escapes
+    // ONLY backslash and double-quote (`escapeQuotes` in
+    // bee/pkg/api/util.go) — characters like `<`, `>` or `'` pass
+    // through verbatim, and so must ant's (the header value is part of
+    // the compared API surface). `HeaderValue::from_str` still rejects
+    // control bytes; such names simply get no disposition header.
     let base = filename.rsplit('/').next().unwrap_or(filename);
-    let filename = sanitize_filename(base);
-    HeaderValue::from_str(&format!("inline; filename=\"{filename}\"")).ok()
+    let escaped = base.replace('\\', "\\\\").replace('"', "\\\"");
+    HeaderValue::from_str(&format!("inline; filename=\"{escaped}\"")).ok()
 }
 
-fn sanitize_filename(filename: &str) -> String {
-    let mut out = String::with_capacity(filename.len().min(128));
-    for ch in filename.chars() {
-        let safe = match ch {
-            '"' | '\'' | '\\' | '/' | ':' | '<' | '>' | '|' | '?' | '*' => '_',
-            c if c.is_control() => '_',
-            c => c,
-        };
-        out.push(safe);
-        if out.len() >= 128 {
-            break;
+/// Go `strconv.ParseInt`/`ParseUint` error text, as bee's mapStructure
+/// surfaces it in a validation `reasons` entry: a malformed number is
+/// `"invalid syntax"` (`strconv.ErrSyntax` — including `-1` for a
+/// uint64), an out-of-range one is `"value out of range"`
+/// (`strconv.ErrRange`).
+fn strconv_error_text(e: &std::num::ParseIntError) -> &'static str {
+    use std::num::IntErrorKind;
+    match e.kind() {
+        IntErrorKind::PosOverflow | IntErrorKind::NegOverflow => "value out of range",
+        _ => "invalid syntax",
+    }
+}
+
+/// Bee's directory redirect (`bzzDownloadHandler`): `GET
+/// /bzz/<ref>/<dir>` where the manifest holds entries under `<dir>/`
+/// answers `308` with `Location: /bzz/<ref>/<dir>/` (query preserved)
+/// and — Go's `http.Redirect` on GET — a small HTML anchor body.
+fn directory_redirect(addr: &str, path: &str, query: Option<&str>, method: &Method) -> Response {
+    let mut url = format!("/bzz/{addr}/{}/", go_encode_path(path));
+    if let Some(q) = query {
+        url.push('?');
+        url.push_str(q);
+    }
+    let mut resp = Response::new(Body::empty());
+    *resp.status_mut() = StatusCode::PERMANENT_REDIRECT;
+    if let Ok(v) = HeaderValue::from_str(&url) {
+        resp.headers_mut().insert(header::LOCATION, v);
+    }
+    // Go writes the anchor body (and its content-type) only for GET —
+    // HEAD gets the bare status + Location.
+    if method == Method::GET {
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        let body = format!(
+            "<a href=\"{}\">Permanent Redirect</a>.\n",
+            html_escape_go(&url)
+        );
+        *resp.body_mut() = Body::from(body);
+    }
+    resp
+}
+
+/// Go `net/url` path escaping (`shouldEscape` with `encodePath`):
+/// alphanumerics, `-_.~` and the path sub-delims `$&+,/:;=@` stay
+/// literal; everything else (including `?`, spaces, quotes and all
+/// non-ASCII bytes) is percent-encoded uppercase. Bee's redirect
+/// Location is produced by exactly this encoding (`u.String()` after
+/// mutating `u.Path` drops the raw path and re-encodes).
+fn go_encode_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for &b in path.as_bytes() {
+        let literal = b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'-' | b'_'
+                    | b'.'
+                    | b'~'
+                    | b'$'
+                    | b'&'
+                    | b'+'
+                    | b','
+                    | b'/'
+                    | b':'
+                    | b';'
+                    | b'='
+                    | b'@'
+            );
+        if literal {
+            out.push(b as char);
+        } else {
+            use std::fmt::Write;
+            write!(out, "%{b:02X}").expect("writing to String");
         }
     }
-    let trimmed = out.trim_matches([' ', '.']).trim();
-    if trimmed.is_empty() {
-        "download.bin".to_string()
-    } else {
-        trimmed.to_string()
+    out
+}
+
+/// Go's `htmlEscape` (net/http): the five entities `http.Redirect`
+/// substitutes into the anchor body.
+fn html_escape_go(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&#34;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(c),
+        }
     }
+    out
 }
 
 fn sniff_content_type(bytes: &[u8], filename: Option<&str>) -> &'static str {
@@ -3061,30 +3190,75 @@ fn sniff_content_type(bytes: &[u8], filename: Option<&str>) -> &'static str {
     "application/octet-stream"
 }
 
+/// MIME type by file extension, mirroring what bee sees from Go's
+/// `mime.TypeByExtension`: the complete Go ≥ 1.25 built-in table (the
+/// Chromium-derived list, including the surprising `.webm → audio/webm`
+/// and `.ico → image/vnd.microsoft.icon`), which takes precedence over
+/// `/etc/mime.types`, plus the handful of web-relevant extensions
+/// (fonts, `.m4v`) that stock Linux `mime.types` files resolve
+/// identically everywhere. A file with *no* extension (or an unknown
+/// one) gets `None`, and bee stores an **empty** Content-Type for it —
+/// do not substitute `application/octet-stream` here (that forks the
+/// manifest reference from bee's; caught by the manifest fuzz).
 fn content_type_from_extension(filename: &str) -> Option<&'static str> {
-    let ext = filename.rsplit('.').next()?.to_ascii_lowercase();
+    // Go's `filepath.Ext`: the suffix after the last '.' in the last
+    // path element; a dotless name has no extension (`rsplit('.')`
+    // would wrongly treat the whole name as one).
+    let basename = filename.rsplit('/').next().unwrap_or(filename);
+    let dot = basename.rfind('.')?;
+    let ext = basename[dot + 1..].to_ascii_lowercase();
     match ext.as_str() {
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        "svg" => Some("image/svg+xml"),
-        "wav" => Some("audio/wav"),
-        "mp3" => Some("audio/mpeg"),
-        "ogg" | "oga" => Some("audio/ogg"),
-        "mp4" | "m4v" => Some("video/mp4"),
-        "webm" => Some("video/webm"),
-        "pdf" => Some("application/pdf"),
-        "txt" => Some("text/plain; charset=utf-8"),
-        "html" | "htm" => Some("text/html; charset=utf-8"),
-        "map" | "json" => Some("application/json"),
-        "js" | "mjs" => Some("text/javascript; charset=utf-8"),
+        // --- Go's builtinTypesLower, verbatim ---
+        "ai" | "eps" | "ps" => Some("application/postscript"),
+        "apk" => Some("application/vnd.android.package-archive"),
+        "apng" => Some("image/apng"),
+        "avif" => Some("image/avif"),
+        "bin" | "com" | "exe" => Some("application/octet-stream"),
+        "bmp" => Some("image/bmp"),
         "css" => Some("text/css; charset=utf-8"),
+        "csv" => Some("text/csv; charset=utf-8"),
+        "doc" => Some("application/msword"),
+        "docx" => Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        "ehtml" | "htm" | "html" | "shtml" => Some("text/html; charset=utf-8"),
+        "eml" => Some("message/rfc822"),
+        "flac" => Some("audio/flac"),
+        "gif" => Some("image/gif"),
+        "gz" => Some("application/gzip"),
+        "ico" => Some("image/vnd.microsoft.icon"),
+        "ics" => Some("text/calendar; charset=utf-8"),
+        "jfif" | "jpeg" | "jpg" | "pjp" | "pjpeg" => Some("image/jpeg"),
+        "js" | "mjs" => Some("text/javascript; charset=utf-8"),
+        "json" => Some("application/json"),
+        "m4a" => Some("audio/mp4"),
+        "mp3" => Some("audio/mpeg"),
+        // `.m4v` is a /etc/mime.types extra (identical across
+        // distros); Go's builtin table only lists `.mp4`.
+        "mp4" | "m4v" => Some("video/mp4"),
+        "oga" | "ogg" | "opus" => Some("audio/ogg"),
+        "ogv" => Some("video/ogg"),
+        "pdf" => Some("application/pdf"),
+        "png" => Some("image/png"),
+        "ppt" => Some("application/vnd.ms-powerpoint"),
+        "pptx" => Some("application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+        "rdf" => Some("application/rdf+xml"),
+        "rtf" => Some("application/rtf"),
+        "svg" => Some("image/svg+xml"),
+        "text" | "txt" => Some("text/plain; charset=utf-8"),
+        "tif" | "tiff" => Some("image/tiff"),
+        "vtt" => Some("text/vtt; charset=utf-8"),
         "wasm" => Some("application/wasm"),
+        "wav" => Some("audio/wav"),
+        "webm" => Some("audio/webm"),
+        "webp" => Some("image/webp"),
+        "xbl" | "xml" | "xsl" => Some("text/xml; charset=utf-8"),
+        "xbm" => Some("image/x-xbitmap"),
+        "xht" | "xhtml" => Some("application/xhtml+xml"),
+        "xls" => Some("application/vnd.ms-excel"),
+        "xlsx" => Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        "zip" => Some("application/zip"),
+        // --- stable /etc/mime.types extras (identical across distros) ---
         "woff" => Some("font/woff"),
         "woff2" => Some("font/woff2"),
-        "ico" => Some("image/x-icon"),
-        "xml" => Some("application/xml; charset=utf-8"),
         _ => None,
     }
 }
@@ -3192,6 +3366,7 @@ const SWARM_FEED_RESOLVED_VERSION: HeaderName =
 pub async fn download_feed(
     State(handle): State<GatewayHandle>,
     Path((owner_hex, topic_hex)): Path<(String, String)>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
     method: Method,
     headers: HeaderMap,
 ) -> Response {
@@ -3200,9 +3375,42 @@ pub async fn download_feed(
         Err(resp) => return resp,
     };
 
-    // Note: like bee's `feedGetHandler`, the `?type=` query parameter is
-    // ignored — bee reads only `at` / `after` and always resolves the
-    // sequence lookup, so even `?type=epoch` runs the normal path.
+    // Query params, validated bee-shaped (`feedGetHandler`'s
+    // mapStructure over `{At int64; After uint64}`):
+    //
+    // - `at` must parse as an int64 but is otherwise IGNORED — bee
+    //   defaults it to time.Now() and passes it to the sequence
+    //   finder, whose `get` never reads it (it's an epoch-feed hint,
+    //   and the handler hardcodes the Sequence lookup anyway).
+    // - `after` anchors the finder at that index (absent ⇒ 404 "no
+    //   update found", even when earlier updates exist).
+    // - `type` is ignored entirely — bee never parses it here, so even
+    //   `?type=epoch` runs the sequence path.
+    //
+    // Parse failures collect into bee's `reasons` array with Go's
+    // strconv error text ("invalid syntax" / "value out of range").
+    let mut reasons: Vec<Reason> = Vec::new();
+    if let Some(raw) = query.get("at") {
+        if let Err(e) = raw.parse::<i64>() {
+            reasons.push(Reason::new("at", strconv_error_text(&e)));
+        }
+    }
+    let mut after = 0u64;
+    if let Some(raw) = query.get("after") {
+        match raw.parse::<u64>() {
+            Ok(v) => after = v,
+            Err(e) => reasons.push(Reason::new("after", strconv_error_text(&e))),
+        }
+    }
+    if !reasons.is_empty() {
+        return params_error(ParamKind::Query, reasons);
+    }
+    // Header struct is validated after the queries (bee's handler
+    // order), and before any lookup work.
+    let only_root_chunk = match only_root_chunk_header(&headers) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
 
     let guard = handle.activity.begin(
         GatewayRequestKind::Feed,
@@ -3215,6 +3423,7 @@ pub async fn download_feed(
     let cmd = ControlCommand::GetFeed {
         owner,
         topic,
+        after,
         ack: ack_tx,
     };
     if handle.commands.send(cmd).await.is_err() {
@@ -3396,7 +3605,7 @@ pub async fn download_feed(
     // root chunk verbatim (`span(8 LE) || payload`) without joining the
     // whole tree. Bee writes `wc.Data()` here; we fetch the raw chunk
     // at `reference` via the same path `/chunks/{addr}` uses.
-    if header_is_true(&headers, &SWARM_ONLY_ROOT_CHUNK) {
+    if only_root_chunk {
         let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
         let cmd = ControlCommand::GetChunkRaw {
             reference,
@@ -3598,12 +3807,32 @@ fn apply_feed_headers(
 /// Parse a bee-style boolean request header (`Swarm-Only-Root-Chunk`,
 /// etc.). Accepts the values Go's `strconv.ParseBool` treats as true
 /// that clients actually send: `1`, `t`, `true` (any case).
-fn header_is_true(headers: &HeaderMap, name: &HeaderName) -> bool {
-    headers
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .is_some_and(|s| s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("t") || s == "1")
+/// Go's `strconv.ParseBool` — the exact forms bee's mapStructure
+/// accepts for a `bool` header. Anything else (including mixed case
+/// like `tRuE`) is a syntax error.
+fn go_parse_bool(s: &str) -> Option<bool> {
+    match s {
+        "1" | "t" | "T" | "true" | "TRUE" | "True" => Some(true),
+        "0" | "f" | "F" | "false" | "FALSE" | "False" => Some(false),
+        _ => None,
+    }
+}
+
+/// The `swarm-only-root-chunk` header, validated the way bee's
+/// mapStructure does (`OnlyRootChunk bool` in the soc/feed GET
+/// handlers): absent ⇒ `false`; present but not a Go bool ⇒
+/// `400 invalid header params` with the map-tag-cased field name.
+#[allow(clippy::result_large_err)]
+fn only_root_chunk_header(headers: &HeaderMap) -> Result<bool, Response> {
+    let Some(v) = headers.get(&SWARM_ONLY_ROOT_CHUNK) else {
+        return Ok(false);
+    };
+    v.to_str().ok().and_then(go_parse_bool).ok_or_else(|| {
+        params_error(
+            ParamKind::Header,
+            vec![Reason::new("Swarm-Only-Root-Chunk", "invalid syntax")],
+        )
+    })
 }
 
 /// Tiny `humantime`-shaped duration parser so we don't pull in a whole

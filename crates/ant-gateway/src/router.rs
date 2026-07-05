@@ -172,11 +172,19 @@ async fn request_span(req: Request, next: Next) -> Response {
     // Bee's `jsonhttp.Respond` stamps `application/json; charset=utf-8`
     // on every JSON body; axum's `Json` writes the bare media type.
     // Normalize here so every handler (and any future one) matches bee
-    // without each call site needing to remember the charset.
+    // without each call site needing to remember the charset. Skip
+    // responses whose content type is served verbatim from manifest
+    // metadata (`VerbatimContentType`): bee's `serveManifestEntry`
+    // copies the stored value byte-for-byte, so a `.json` file's
+    // `application/json` must NOT grow a charset suffix.
     if resp
-        .headers()
-        .get(axum::http::header::CONTENT_TYPE)
-        .is_some_and(|ct| ct.as_bytes() == b"application/json")
+        .extensions()
+        .get::<crate::retrieval::VerbatimContentType>()
+        .is_none()
+        && resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .is_some_and(|ct| ct.as_bytes() == b"application/json")
     {
         resp.headers_mut().insert(
             axum::http::header::CONTENT_TYPE,

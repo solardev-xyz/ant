@@ -1495,8 +1495,13 @@ async fn handle_feed_test_command(
             };
             let _ = ack.send(reply);
         }
-        ControlCommand::GetFeed { owner, topic, ack } => {
-            // Resolve via the real `resolve_sequence_feed_full` against
+        ControlCommand::GetFeed {
+            owner,
+            topic,
+            after,
+            ack,
+        } => {
+            // Resolve via the real `resolve_sequence_feed_after` against
             // the staged HashMap. Mirrors how the production node-side
             // handler runs the resolver, so an end-to-end gateway test
             // exercises the wiring without a swarm.
@@ -1510,19 +1515,20 @@ async fn handle_feed_test_command(
             let fetcher = MapFetcher {
                 chunks: chunks.clone(),
             };
-            let reply = match ant_retrieval::resolve_sequence_feed_full(&fetcher, &feed).await {
-                Ok(r) => ControlAck::FeedResolved {
-                    reference: r.reference,
-                    index: r.index,
-                    signature: r.signature,
-                    v2: r.v2,
-                    decrypt_key: r.decrypt_key,
-                },
-                Err(ant_retrieval::FeedError::NoUpdates { .. }) => ControlAck::FeedNotFound,
-                Err(e) => ControlAck::Error {
-                    message: format!("feed lookup: {e}"),
-                },
-            };
+            let reply =
+                match ant_retrieval::resolve_sequence_feed_after(&fetcher, &feed, after).await {
+                    Ok(r) => ControlAck::FeedResolved {
+                        reference: r.reference,
+                        index: r.index,
+                        signature: r.signature,
+                        v2: r.v2,
+                        decrypt_key: r.decrypt_key,
+                    },
+                    Err(ant_retrieval::FeedError::NoUpdates { .. }) => ControlAck::FeedNotFound,
+                    Err(e) => ControlAck::Error {
+                        message: format!("feed lookup: {e}"),
+                    },
+                };
             let _ = ack.send(reply);
         }
         ControlCommand::StreamBytes {

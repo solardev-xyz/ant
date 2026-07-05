@@ -109,6 +109,13 @@ pub enum ManifestError {
     /// Typically signals a broken path like `/index.html/extra`.
     #[error("path '{path}' descends past leaf")]
     DescendPastLeaf { path: String },
+    /// The literal path missed but `path + "/"` is a prefix of entries
+    /// in the manifest — bee's `bzzDownloadHandler` answers this with a
+    /// `308` redirect to the slash-terminated URL (`HasPrefix` check in
+    /// `bee/pkg/api/bzz.go`) *before* trying the index-document suffix.
+    /// The gateway maps this variant to that redirect.
+    #[error("path '{path}' is a directory (redirect to trailing slash)")]
+    Directory { path: String },
     /// The reference points at file data instead of a manifest. Bee's
     /// own bzz handler treats this as a 404 too; we propagate it as a
     /// distinct variant so callers can fall back to raw bytes if they
@@ -271,14 +278,12 @@ pub async fn lookup_path(
                 return Ok(result);
             }
         }
-        // No index document (or it didn't resolve): fall through to the
-        // error-document fallback below, then a friendly root 404.
-        if let Some(err) = &error_doc {
-            if let Some(mut result) = try_walk(fetcher, &root_node, err).await? {
-                result.is_feed = is_feed;
-                return Ok(result);
-            }
-        }
+        // No index document (or it didn't resolve): bee's empty-path
+        // branch goes straight to `404 "address not found or
+        // incorrect"` — it does NOT consult the error document (that
+        // fallback only exists on the non-empty-path branch of
+        // `bzzDownloadHandler`). The "(root)" marker lets the gateway
+        // map this miss to bee's distinct root-404 message.
         return Err(ManifestError::NotFound {
             path: "(root)".into(),
         });
@@ -288,6 +293,20 @@ pub async fn lookup_path(
     if let Some(mut result) = try_walk(fetcher, &root_node, path).await? {
         result.is_feed = is_feed;
         return Ok(result);
+    }
+
+    // Directory redirect. Bee checks — BEFORE the index-document
+    // retry — whether `path + "/"` is a prefix of anything in the
+    // manifest, and answers with a 308 to the slash-terminated URL.
+    // (Bee skips the check when pathVar starts with '/'; ant already
+    // trimmed leading slashes above, matching the common form.) A
+    // prefix-walk failure (unfetchable node) falls through like bee's
+    // `err == nil && exists` guard.
+    let dir_path = format!("{path}/");
+    if let Ok(true) = has_prefix(fetcher, &root_node, dir_path.as_bytes()).await {
+        return Err(ManifestError::Directory {
+            path: path.to_string(),
+        });
     }
 
     // Directory-suffix retry. Bee appends the single root-level index
@@ -341,6 +360,45 @@ async fn try_walk(
         Ok(result) => Ok(Some(result)),
         Err(ManifestError::NotFound { .. } | ManifestError::DescendPastLeaf { .. }) => Ok(None),
         Err(e) => Err(e),
+    }
+}
+
+/// Bee's `Node.HasPrefix` (`pkg/manifest/mantaray/node.go`): true iff
+/// `path` can be fully consumed walking the trie, where landing in the
+/// *middle* of a fork prefix still counts (`bytes.HasPrefix(f.prefix,
+/// rest)`). Used only for the directory-redirect check, so it loads
+/// nodes lazily and stops as soon as the answer is known.
+async fn has_prefix(
+    fetcher: &dyn ChunkFetcher,
+    root_node: &Node,
+    path: &[u8],
+) -> Result<bool, ManifestError> {
+    let mut node = root_node.clone();
+    let mut remaining = path;
+    loop {
+        if remaining.is_empty() {
+            return Ok(true);
+        }
+        let Some(fork) = node.forks.get(&remaining[0]) else {
+            return Ok(false);
+        };
+        let common = fork
+            .prefix
+            .iter()
+            .zip(remaining.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        if common < fork.prefix.len() {
+            // Path ends inside this fork's prefix ⇒ prefix match iff
+            // the whole remaining path was consumed.
+            return Ok(common == remaining.len());
+        }
+        let child_ref = fork.child_ref.clone();
+        remaining = &remaining[common..];
+        if remaining.is_empty() {
+            return Ok(true);
+        }
+        node = load_node_ref(fetcher, &child_ref).await?;
     }
 }
 
@@ -1178,10 +1236,12 @@ mod tests {
         (fetcher, manifest.root, data_refs)
     }
 
-    /// Bee-compat directory-suffix fallback: a request for a directory
-    /// path (`developer/` or the slash-less `developer`) resolves to that
-    /// directory's `index.html`, and nested directories work too. Mirrors
-    /// `lookup_empty_path_uses_index_document` for non-root directories.
+    /// Bee-compat directory handling: a slash-terminated directory path
+    /// resolves to that directory's `index.html` (the directory-suffix
+    /// retry), while the slash-less form is a `Directory` miss — bee's
+    /// `bzzDownloadHandler` answers those with a 308 redirect to the
+    /// slash-terminated URL *before* trying the index suffix, and the
+    /// gateway maps `ManifestError::Directory` to exactly that.
     #[tokio::test]
     async fn lookup_directory_path_uses_index_document() {
         let (fetcher, root, refs) = website_fetcher(&[
@@ -1192,13 +1252,21 @@ mod tests {
 
         for (req, want) in [
             ("developer/", "developer/index.html"),
-            ("developer", "developer/index.html"),
             ("/developer/", "developer/index.html"),
             ("developer/deep/", "developer/deep/index.html"),
-            ("developer/deep", "developer/deep/index.html"),
         ] {
             let res = lookup_path(&fetcher, &root, req).await.unwrap();
             assert_eq!(res.data_ref, refs[want], "request {req:?}");
+        }
+
+        // Slash-less directory requests redirect (bee's HasPrefix check
+        // runs before the index-document retry).
+        for req in ["developer", "developer/deep"] {
+            let err = lookup_path(&fetcher, &root, req).await.unwrap_err();
+            assert!(
+                matches!(err, ManifestError::Directory { ref path } if path == req),
+                "request {req:?}: expected Directory, got {err:?}",
+            );
         }
     }
 
@@ -1323,12 +1391,14 @@ mod tests {
     /// path `/search`. This was the request that timed out in
     /// production with a flood of `chunk=00000000…` retrievals. The
     /// literal `search` path misses (the `s` fork's child prefix is
-    /// `earch/index.html`, not `earch`), so the Bee-compatible
-    /// directory-index fallback now retries `search/index.html` — which
-    /// *is* a real entry in this manifest. We don't stage that leaf node,
-    /// so the lookup surfaces a `Fetch` error for the **real, non-zero**
-    /// leaf address `14c3a451…` and crucially **never** asks the fetcher
-    /// for the all-zero address that caused the original flood.
+    /// `earch/index.html`, not `earch`), and `search/` IS a prefix of
+    /// entries in this manifest — so bee's `bzzDownloadHandler` answers
+    /// with a 308 redirect to `search/` before ever trying the
+    /// index-document retry. The lookup must surface
+    /// `ManifestError::Directory` (which the gateway turns into that
+    /// redirect) and crucially never ask the fetcher for the all-zero
+    /// address that caused the original flood — the prefix walk decides
+    /// from the already-staged `s` child node alone.
     #[tokio::test]
     async fn walk_blog_swarm_eth_search_falls_back_to_index_document() {
         const ROOT_PAYLOAD: &str = "00000000000000000000000000000000000000000000000000000000000000005768b3b6a7db56d21d1abff40d41cebfc83448fed8d7e9b06ec0d3b073f28f2000000000000000000000000000000000000000000000000000000000000000000000000000801000000000007a03a9040000000000000000000000000000000012012f00000000000000000000000000000000000000000000000000000000000cc878d32c96126d47f63fbe391114ee1438cd521146fc975dea1546d302b6c0003e7b22776562736974652d696e6465782d646f63756d656e74223a22696e6465782e68746d6c227d0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a12083430342e68746d6c000000000000000000000000000000000000000000009d2afcaf1de60508865777137fc2eafd61221b37101083a0b4847dc818d6b4e7005e7b22436f6e74656e742d54797065223a22746578742f68746d6c3b20636861727365743d7574662d38222c2246696c656e616d65223a223430342e68746d6c227d0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a1a1061646d696e2f2e67697469676e6f726500000000000000000000000000003891cf97520e77cc4b11d0606863f6d25b1476ee01e23eed4ec8196a74ac8fea005e7b22436f6e74656e742d54797065223a226170706c69636174696f6e2f6f637465742d73747265616d222c2246696c656e616d65223a222e67697469676e6f7265227d0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0401630000000000000000000000000000000000000000000000000000000000d7b04da63d26b8b8b40300102f810a7ca5247095d6c6a6d030d8d9f25e9dea71120b64656661756c742e706e6700000000000000000000000000000000000000e1eb16a43f2bd7d41cc476c129eace731e4c9f620b8d6241a6e3c051ba7b4bd7003e7b22436f6e74656e742d54797065223a22696d6167652f706e67222c2246696c656e616d65223a2264656661756c742e706e67227d0a0a0a0a0a0a0a0a0a0c03656e2f000000000000000000000000000000000000000000000000000000d30d9932f844f8aeeef19f8aa2a45fd90c83aba3afed92447ba0931b4cf29ddb0401660000000000000000000000000000000000000000000000000000000000348afc6f95e6dd6612631a66777352849add9f451f43490dd220f44a03ad548d0c05686976652f0000000000000000000000000000000000000000000000000094289260467f5cb1a285b1d6d772f585337e1202eacd148c0d2e95eca29206b1120a696e6465782e68746d6c0000000000000000000000000000000000000000ba2e49319f9718dedc1cebd3b3d1933c41b3212aa89677e2e5c5a1bae3518375005e7b22436f6e74656e742d54797065223a22746578742f68746d6c3b20636861727365743d7574662d38222c2246696c656e616d65223a22696e6465782e68746d6c227d0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0c097061676566696e642f00000000000000000000000000000000000000000031f2e6c0601ee97fd5127b3c00d4539b183b2dd8a4380f280b186f066bdfba7a0401730000000000000000000000000000000000000000000000000000000000e8aa9151a4c271bc7099cd1de086aa563b6b2e5ad8191e5208ad55fdaccb44840c0875706c6f6164732f000000000000000000000000000000000000000000002613920be866d1dc196a1ebe17bf89058d7f3236fbbb6b0206b286fab20d45eb0c0477616d2f0000000000000000000000000000000000000000000000000000fadf98f25eb13245da5a0ee52a9c899d964a5d8bd9b1716787a69779118c82df0c037a682f00000000000000000000000000000000000000000000000000000069892465cd55cbd6cce1e3fcca4b24566355dfa05fdbfadb80341181e60b640b";
@@ -1357,10 +1427,24 @@ mod tests {
         let err = lookup_path(&fetcher, &root_addr, "search")
             .await
             .unwrap_err();
-        // The directory-index fallback descended into the real
-        // `search/index.html` leaf, whose node chunk we deliberately
-        // didn't stage. The error must name that exact non-zero address —
-        // and never the all-zero address from the original production bug.
+        // `search/` prefixes the real `search/index.html` entry, so the
+        // lookup reports a directory (the gateway 308s to `search/`,
+        // exactly like bee). The decision comes from the staged `s`
+        // child node alone — in particular the walk never requested the
+        // all-zero address from the original production bug (the
+        // MapFetcher would have errored with a "missing 0000…" fetch).
+        match err {
+            ManifestError::Directory { path } => assert_eq!(path, "search"),
+            other => panic!("expected Directory for 'search', got {other:?}"),
+        }
+
+        // The slash-terminated form runs the index-document retry and
+        // descends into the real `search/index.html` leaf, whose node
+        // chunk we deliberately didn't stage: the error names that
+        // exact non-zero address, never the all-zero one.
+        let err = lookup_path(&fetcher, &root_addr, "search/")
+            .await
+            .unwrap_err();
         match err {
             ManifestError::Fetch(JoinError::FetchChunk { addr, .. }) => {
                 assert_eq!(
