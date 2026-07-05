@@ -153,6 +153,23 @@ impl TagRegistry {
         }
     }
 
+    /// Add `n` fully-processed chunks to an existing tag's cumulative
+    /// counters without touching its address. Used by the
+    /// `/chunks/stream` WebSocket upload, where chunks arrive one at a
+    /// time and each is pushsynced synchronously before the ack, so
+    /// split/stored/sent/synced advance in lock-step (bee's deferred
+    /// pipeline splits these; ant's synchronous path doesn't). No-op
+    /// for an unknown uid.
+    pub fn add_synced(&self, uid: u32, n: u64) {
+        let mut inner = self.inner.lock().expect("tag registry poisoned");
+        if let Some(tag) = inner.tags.get_mut(&uid) {
+            tag.split += n;
+            tag.stored += n;
+            tag.sent += n;
+            tag.synced += n;
+        }
+    }
+
     /// Snapshot a tag for `GET /tags/{uid}`.
     pub fn get(&self, uid: u32) -> Option<TagView> {
         let inner = self.inner.lock().expect("tag registry poisoned");

@@ -274,11 +274,13 @@ pub fn handle_with_fixture_node() -> Router {
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<ControlCommand>(8);
 
     let fetcher = Arc::new(DirFetcher::from_dir(&fixture_dir()).expect("load fixture chunks"));
+    let pins: PinStore = Arc::new(std::sync::Mutex::new(Vec::new()));
     tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
             let f = fetcher.clone();
+            let p = pins.clone();
             tokio::spawn(async move {
-                handle_command(f.as_ref(), cmd).await;
+                handle_command_with_pins(f.as_ref(), &p, cmd).await;
             });
         }
     });
@@ -298,6 +300,131 @@ pub fn handle_with_fixture_node() -> Router {
     build_router(handle)
 }
 
+/// Pin membership rows: `(reference, member addresses)`.
+pub type PinRows = Vec<(Vec<u8>, Vec<[u8; 32]>)>;
+
+/// In-memory pin registry for the fixture node, in pin-creation order,
+/// mirroring what the production disk cache records.
+pub type PinStore = Arc<std::sync::Mutex<PinRows>>;
+
+/// Fixture stand-ins for the pin commands, mirroring the production
+/// node's pin handlers over the `DirFetcher` corpus: traversal via the
+/// real `ant-retrieval` walkers, membership recorded in `pins`.
+async fn handle_pin_command(fetcher: &DirFetcher, pins: &PinStore, cmd: ControlCommand) {
+    fn lock(p: &PinStore) -> std::sync::MutexGuard<'_, PinRows> {
+        p.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    match cmd {
+        ControlCommand::PinAdd { reference, ack } => {
+            if lock(pins).iter().any(|(r, _)| *r == reference) {
+                let _ = ack.send(ControlAck::PinAdded {
+                    already_pinned: true,
+                });
+                return;
+            }
+            let addrs = match reference.len() {
+                32 => {
+                    let root: [u8; 32] = reference.as_slice().try_into().expect("len checked");
+                    ant_retrieval::traverse_chunk_addresses(fetcher, root, DEFAULT_MAX_FILE_BYTES)
+                        .await
+                }
+                64 => {
+                    let root: [u8; 64] = reference.as_slice().try_into().expect("len checked");
+                    ant_retrieval::traverse_encrypted_chunk_addresses(
+                        fetcher,
+                        root,
+                        DEFAULT_MAX_FILE_BYTES,
+                    )
+                    .await
+                }
+                n => {
+                    let _ = ack.send(ControlAck::Error {
+                        message: format!("invalid pin reference length: {n} bytes"),
+                    });
+                    return;
+                }
+            };
+            let reply = match addrs {
+                Ok(addrs) => {
+                    let mut missing = None;
+                    for addr in &addrs {
+                        if fetcher.fetch(*addr).await.is_err() {
+                            missing = Some(*addr);
+                            break;
+                        }
+                    }
+                    match missing {
+                        None => {
+                            lock(pins).push((reference, addrs));
+                            ControlAck::PinAdded {
+                                already_pinned: false,
+                            }
+                        }
+                        Some(addr) => ControlAck::Error {
+                            message: format!("fetch {}: chunk not found", hex::encode(addr)),
+                        },
+                    }
+                }
+                Err(e) => ControlAck::Error {
+                    message: format!("pin traversal failed: {e}"),
+                },
+            };
+            let _ = ack.send(reply);
+        }
+        ControlCommand::PinRemove { reference, ack } => {
+            let mut g = lock(pins);
+            let before = g.len();
+            g.retain(|(r, _)| *r != reference);
+            let _ = ack.send(ControlAck::PinRemoved {
+                was_pinned: g.len() < before,
+            });
+        }
+        ControlCommand::PinHas { reference, ack } => {
+            let pinned = lock(pins).iter().any(|(r, _)| *r == reference);
+            let _ = ack.send(ControlAck::PinPresent { pinned });
+        }
+        ControlCommand::PinList { ack } => {
+            let references = lock(pins).iter().map(|(r, _)| r.clone()).collect();
+            let _ = ack.send(ControlAck::PinList { references });
+        }
+        ControlCommand::PinCheck { reference, ack } => {
+            let entries: PinRows = lock(pins)
+                .iter()
+                .filter(|(r, _)| reference.as_ref().is_none_or(|want| r == want))
+                .cloned()
+                .collect();
+            let mut stats = Vec::new();
+            for (r, members) in entries {
+                let mut stat = ant_control::PinCheckStat {
+                    reference: r,
+                    total: members.len() as u64,
+                    ..Default::default()
+                };
+                for addr in members {
+                    match fetcher.fetch(addr).await {
+                        Ok(wire) => {
+                            if !(ant_crypto::cac_valid(&addr, &wire)
+                                || ant_crypto::soc_valid(&addr, &wire))
+                            {
+                                stat.invalid += 1;
+                            }
+                        }
+                        Err(_) => stat.missing += 1,
+                    }
+                }
+                stats.push(stat);
+            }
+            let _ = ack.send(ControlAck::PinCheck { stats });
+        }
+        other => handle_command(fetcher, other).await,
+    }
+}
+
+/// Pin-aware wrapper used by [`handle_with_fixture_node`].
+async fn handle_command_with_pins(fetcher: &DirFetcher, pins: &PinStore, cmd: ControlCommand) {
+    handle_pin_command(fetcher, pins, cmd).await;
+}
+
 /// Single-command dispatcher used by the fake node loop: mirrors the
 /// production handlers in `ant-p2p` but pulls chunks from the fixture
 /// `DirFetcher`. Keeping the dispatch shape identical means the test
@@ -305,6 +432,27 @@ pub fn handle_with_fixture_node() -> Router {
 /// production hits.
 async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
     match cmd {
+        // Pin commands are handled by `handle_pin_command` when the
+        // caller wires a `PinStore`; a bare fixture without one rejects
+        // them like a daemon without a disk cache.
+        ControlCommand::PinAdd { ack, .. }
+        | ControlCommand::PinRemove { ack, .. }
+        | ControlCommand::PinHas { ack, .. }
+        | ControlCommand::PinList { ack }
+        | ControlCommand::PinCheck { ack, .. } => {
+            let _ = ack.send(ControlAck::Error {
+                message:
+                    "pinning requires the disk chunk cache; pass --disk-cache-bytes > 0 at startup"
+                        .into(),
+            });
+        }
+        // The fixture models a node with no registered postage batches:
+        // bee's 404 "issuer does not exist" shape.
+        ControlCommand::PostageBuckets { batch_id, ack } => {
+            let _ = ack.send(ControlAck::Error {
+                message: format!("issuer does not exist: 0x{}", hex::encode(batch_id)),
+            });
+        }
         ControlCommand::GetChunkRaw { reference, ack } => {
             let reply = match fetcher.fetch(reference).await {
                 Ok(data) => ControlAck::Bytes { data },

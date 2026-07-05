@@ -56,6 +56,25 @@ pub trait ChainReader: Send + Sync {
     async fn batch_remaining_balance(&self, _batch_id: [u8; 32]) -> Result<u128, String> {
         Err("batch_remaining_balance unsupported".to_string())
     }
+    /// `PostageStamp.batchOwner/batchDepth/batchBucketDepth/
+    /// batchImmutableFlag` — the on-chain views backing the light
+    /// `GET /batches/{id}` lookup. Defaulted to "unsupported" like
+    /// [`Self::batch_remaining_balance`].
+    async fn batch_meta(&self, _batch_id: [u8; 32]) -> Result<BatchMetaView, String> {
+        Err("batch_meta unsupported".to_string())
+    }
+}
+
+/// On-chain views of one postage batch, read directly from the
+/// `PostageStamp` contract (no event sync). `start` (the creation
+/// block) is not derivable from contract views alone, so it is absent
+/// here; the `/batches/{id}` handler reports bee's `start` as `0`.
+#[derive(Debug, Clone, Copy)]
+pub struct BatchMetaView {
+    pub owner: [u8; 20],
+    pub depth: u8,
+    pub bucket_depth: u8,
+    pub immutable: bool,
 }
 
 /// On-chain write surface backing the postage-buy / topup / dilute and

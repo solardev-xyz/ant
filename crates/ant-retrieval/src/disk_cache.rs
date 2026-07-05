@@ -103,6 +103,10 @@ impl From<std::io::Error> for DiskCacheError {
     }
 }
 
+/// Pin membership rows: `(pinned root reference, member chunk
+/// addresses)`.
+pub type PinMembership = Vec<(Vec<u8>, Vec<[u8; 32]>)>;
+
 /// SQLite-backed persistent chunk cache.
 pub struct DiskChunkCache {
     inner: Arc<Inner>,
@@ -122,7 +126,58 @@ enum WriteMsg {
         addr: [u8; 32],
         last_access: i64,
     },
+    /// Pin bookkeeping (see [`PinOp`]). Routed through the writer
+    /// thread even for the read-shaped queries: pin traffic is rare
+    /// (operator / bee-`/pins` actions, not the chunk hot path), and a
+    /// single serialisation point keeps the pin tables and the
+    /// `pin_count` budget accounting trivially consistent.
+    Pin(PinOp),
     Shutdown,
+}
+
+/// Pin mutations and queries handled by the writer thread.
+///
+/// **Eviction invariant** (documented once, here): a chunk row with
+/// `pin_count > 0` is *outside the cache budget* — its bytes are not
+/// part of `total_bytes` (which tracks evictable bytes only) and the
+/// eviction sweep never visits it. Pinning a chunk (0→1) subtracts its
+/// size from the budget; dropping the last pin (1→0) adds it back and
+/// re-checks the cap. `pin_count` is a reference count because two
+/// pinned roots may share chunks (bee's pinstore refcounts the same
+/// way); a chunk becomes evictable again only when *every* pin
+/// covering it is removed.
+enum PinOp {
+    /// Record a pin collection: the root `reference` (32-byte plain or
+    /// 64-byte encrypted reference), plus every member chunk of its
+    /// tree with the wire bytes (inserted if not already cached).
+    /// Replies `Ok(false)` when the reference was already pinned
+    /// (idempotent, nothing written), `Ok(true)` when freshly pinned.
+    Collection {
+        reference: Vec<u8>,
+        members: Vec<([u8; 32], Vec<u8>)>,
+        ack: oneshot::Sender<Result<bool, DiskCacheError>>,
+    },
+    /// Drop a pin: decrement `pin_count` on every recorded member and
+    /// delete the membership rows. Replies `Ok(false)` when the
+    /// reference wasn't pinned.
+    Unpin {
+        reference: Vec<u8>,
+        ack: oneshot::Sender<Result<bool, DiskCacheError>>,
+    },
+    Has {
+        reference: Vec<u8>,
+        ack: oneshot::Sender<Result<bool, DiskCacheError>>,
+    },
+    /// Every pinned reference, in pin-creation order.
+    List {
+        ack: oneshot::Sender<Result<Vec<Vec<u8>>, DiskCacheError>>,
+    },
+    /// Recorded member addresses per pin (all pins, or just
+    /// `reference`). Backs the `/pins/check` integrity walk.
+    Members {
+        reference: Option<Vec<u8>>,
+        ack: oneshot::Sender<Result<PinMembership, DiskCacheError>>,
+    },
 }
 
 enum ReadJob {
@@ -343,6 +398,65 @@ impl DiskChunkCache {
             .map_err(|_| DiskCacheError::WriterStopped)?;
         reply_rx.await.map_err(|_| DiskCacheError::Panicked)?
     }
+
+    async fn pin_op<T>(
+        &self,
+        build: impl FnOnce(oneshot::Sender<Result<T, DiskCacheError>>) -> PinOp,
+    ) -> Result<T, DiskCacheError> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.inner
+            .write_tx
+            .send(WriteMsg::Pin(build(ack_tx)))
+            .map_err(|_| DiskCacheError::WriterStopped)?;
+        ack_rx.await.map_err(|_| DiskCacheError::Panicked)?
+    }
+
+    /// Pin the collection rooted at `reference`: store every member
+    /// chunk (upserting rows that aren't cached yet) and mark them all
+    /// pin-protected. Idempotent — returns `Ok(false)` (writing
+    /// nothing) when `reference` is already pinned, `Ok(true)` on a
+    /// fresh pin. See [`PinOp`] for the eviction/budget invariant.
+    pub async fn pin_collection(
+        &self,
+        reference: Vec<u8>,
+        members: Vec<([u8; 32], Vec<u8>)>,
+    ) -> Result<bool, DiskCacheError> {
+        self.pin_op(|ack| PinOp::Collection {
+            reference,
+            members,
+            ack,
+        })
+        .await
+    }
+
+    /// Drop the pin at `reference`; member chunks whose last pin is
+    /// removed become evictable again (their `last_access` is
+    /// refreshed so they age out like freshly-read rows rather than
+    /// being first in line). Returns `Ok(false)` when `reference`
+    /// wasn't pinned.
+    pub async fn unpin(&self, reference: Vec<u8>) -> Result<bool, DiskCacheError> {
+        self.pin_op(|ack| PinOp::Unpin { reference, ack }).await
+    }
+
+    /// Whether `reference` is a pinned root.
+    pub async fn has_pin(&self, reference: Vec<u8>) -> Result<bool, DiskCacheError> {
+        self.pin_op(|ack| PinOp::Has { reference, ack }).await
+    }
+
+    /// Every pinned root reference, in pin-creation order.
+    pub async fn list_pins(&self) -> Result<Vec<Vec<u8>>, DiskCacheError> {
+        self.pin_op(|ack| PinOp::List { ack }).await
+    }
+
+    /// Recorded member chunk addresses per pin — all pins when
+    /// `reference` is `None`, else just that pin (empty result when it
+    /// isn't pinned). Backs the `/pins/check` integrity walk.
+    pub async fn pin_members(
+        &self,
+        reference: Option<Vec<u8>>,
+    ) -> Result<PinMembership, DiskCacheError> {
+        self.pin_op(|ack| PinOp::Members { reference, ack }).await
+    }
 }
 
 fn apply_shared_pragmas(conn: &Connection, is_write: bool) -> Result<(), rusqlite::Error> {
@@ -374,8 +488,31 @@ fn open_write_connection(path: &Path) -> Result<Connection, rusqlite::Error> {
                 inserted_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS chunks_last_access_idx
-                ON chunks(last_access);",
+                ON chunks(last_access);
+            CREATE TABLE IF NOT EXISTS pins (
+                reference  BLOB PRIMARY KEY,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS pin_members (
+                reference BLOB NOT NULL,
+                address   BLOB NOT NULL,
+                PRIMARY KEY (reference, address)
+            );",
     )?;
+    // Additive migration for pre-pin databases: the pin refcount rides
+    // on the chunks table so the eviction sweep can filter on it
+    // without a join. `DEFAULT 0` keeps every pre-existing row
+    // evictable, exactly as it was.
+    let has_pin_count: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('chunks') WHERE name = 'pin_count'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .is_ok_and(|n| n > 0);
+    if !has_pin_count {
+        conn.execute_batch("ALTER TABLE chunks ADD COLUMN pin_count INTEGER NOT NULL DEFAULT 0;")?;
+    }
     Ok(conn)
 }
 
@@ -485,7 +622,9 @@ fn consume_put_touch_batch(
             WriteMsg::Put { addr, data, ack } => put_ops.push((addr, data, ack)),
             WriteMsg::Touch { addr, last_access } => touches.push((addr, last_access)),
             WriteMsg::Shutdown => shutdown = true,
-            WriteMsg::PutBatch { .. } => {}
+            // PutBatch / Pin never enter the coalescing buffer — the
+            // writer loop flushes and handles them out-of-band.
+            WriteMsg::PutBatch { .. } | WriteMsg::Pin(_) => {}
         }
     }
 
@@ -567,10 +706,13 @@ fn writer_main(
 
     // Single combined backfill query: SQLite serves SUM + COUNT from
     // the same sequential scan, so we pay the cold-cache scan cost
-    // once.
+    // once. Pinned rows are outside the budget (see [`PinOp`]), so the
+    // byte total only sums evictable rows; the row count covers
+    // everything.
     let (initial_total, initial_rows): (u64, u64) = conn
         .query_row(
-            "SELECT COALESCE(SUM(size), 0), COUNT(*) FROM chunks",
+            "SELECT COALESCE(SUM(CASE WHEN pin_count = 0 THEN size ELSE 0 END), 0), COUNT(*) \
+             FROM chunks",
             [],
             |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
         )
@@ -592,6 +734,16 @@ fn writer_main(
                 );
                 let _ = ack.send(r);
             }
+            Ok(WriteMsg::Pin(op)) => {
+                process_pin_op(
+                    &mut conn,
+                    op,
+                    &total_bytes,
+                    &total_rows,
+                    max_bytes,
+                    slack_bytes,
+                );
+            }
             Ok(first) => {
                 let mut batch = vec![first];
                 while batch.len() < WRITE_BATCH_MAX {
@@ -599,6 +751,37 @@ fn writer_main(
                         Ok(WriteMsg::Shutdown) => {
                             batch.push(WriteMsg::Shutdown);
                             break;
+                        }
+                        Ok(WriteMsg::Pin(op)) => {
+                            let shutdown_after = match consume_put_touch_batch(
+                                &mut conn,
+                                std::mem::take(&mut batch),
+                                &total_bytes,
+                                &total_rows,
+                                max_bytes,
+                                slack_bytes,
+                            ) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    warn!(
+                                        target: "ant_retrieval::disk_cache",
+                                        "write batch ahead of pin op failed: {e}",
+                                    );
+                                    false
+                                }
+                            };
+                            process_pin_op(
+                                &mut conn,
+                                op,
+                                &total_bytes,
+                                &total_rows,
+                                max_bytes,
+                                slack_bytes,
+                            );
+                            if shutdown_after {
+                                break 'outer;
+                            }
+                            continue 'outer;
                         }
                         Ok(WriteMsg::PutBatch { items, ack }) => {
                             let shutdown_after = match consume_put_touch_batch(
@@ -662,11 +845,11 @@ fn put_upsert_tx(
 ) -> Result<(), DiskCacheError> {
     let size = data.len() as u64;
     let now = unix_now();
-    let existing: Option<u64> = tx
+    let existing: Option<(u64, i64)> = tx
         .query_row(
-            "SELECT size FROM chunks WHERE address = ?1",
+            "SELECT size, pin_count FROM chunks WHERE address = ?1",
             params![&addr[..]],
-            |row| row.get::<_, i64>(0).map(|n| n as u64),
+            |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)?)),
         )
         .optional()?;
 
@@ -680,9 +863,14 @@ fn put_upsert_tx(
         params![&addr[..], data, size as i64, now as i64, now as i64],
     )?;
 
-    let delta = size as i64 - existing.unwrap_or(0) as i64;
-    update_total(total_bytes, delta);
-    if existing.is_none() {
+    // Pinned rows live outside the byte budget (see [`PinOp`]): an
+    // upsert over one must not (re-)count its bytes.
+    if let Some((old, pin_count)) = existing {
+        if pin_count == 0 {
+            update_total(total_bytes, size as i64 - old as i64);
+        }
+    } else {
+        update_total(total_bytes, size as i64);
         total_rows.fetch_add(1, Ordering::Relaxed);
     }
     Ok(())
@@ -714,8 +902,14 @@ fn evict_to_slack(
     }
     let need_to_free = current.saturating_sub(slack_bytes);
 
+    // Pinned rows are exempt: the sweep only ever sees `pin_count = 0`
+    // rows, and their bytes are the only ones in `total_bytes`, so the
+    // slack target is reachable without touching pins (see [`PinOp`]).
     let mut stmt = conn
-        .prepare("SELECT address, size FROM chunks ORDER BY last_access ASC, address ASC")
+        .prepare(
+            "SELECT address, size FROM chunks WHERE pin_count = 0 \
+             ORDER BY last_access ASC, address ASC",
+        )
         .map_err(DiskCacheError::from)?;
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)? as u64))
@@ -767,6 +961,238 @@ fn evict_to_slack(
         "disk cache eviction sweep complete",
     );
     Ok(())
+}
+
+/// Dispatch one [`PinOp`] on the writer connection. Failures are
+/// reported to the caller through the op's ack channel; the writer
+/// thread itself never dies over a pin error.
+fn process_pin_op(
+    conn: &mut Connection,
+    op: PinOp,
+    total_bytes: &Arc<AtomicU64>,
+    total_rows: &Arc<AtomicU64>,
+    max_bytes: u64,
+    slack_bytes: u64,
+) {
+    match op {
+        PinOp::Collection {
+            reference,
+            members,
+            ack,
+        } => {
+            let r = pin_collection_tx(conn, &reference, &members, total_bytes, total_rows);
+            let _ = ack.send(r);
+        }
+        PinOp::Unpin { reference, ack } => {
+            let r = unpin_tx(conn, &reference, total_bytes);
+            // Bytes returned to the budget may push it over the cap.
+            if matches!(r, Ok(true)) && total_bytes.load(Ordering::Relaxed) > max_bytes {
+                if let Err(e) = evict_to_slack(conn, total_bytes, total_rows, slack_bytes) {
+                    warn!(
+                        target: "ant_retrieval::disk_cache",
+                        "post-unpin eviction sweep failed: {e}",
+                    );
+                }
+            }
+            let _ = ack.send(r);
+        }
+        PinOp::Has { reference, ack } => {
+            let r = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pins WHERE reference = ?1",
+                    params![&reference[..]],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|n| n > 0)
+                .map_err(DiskCacheError::from);
+            let _ = ack.send(r);
+        }
+        PinOp::List { ack } => {
+            let r = (|| -> Result<Vec<Vec<u8>>, DiskCacheError> {
+                let mut stmt =
+                    conn.prepare("SELECT reference FROM pins ORDER BY created_at ASC, rowid ASC")?;
+                let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row?);
+                }
+                Ok(out)
+            })();
+            let _ = ack.send(r);
+        }
+        PinOp::Members { reference, ack } => {
+            let r = (|| -> Result<PinMembership, DiskCacheError> {
+                let refs: Vec<Vec<u8>> = if let Some(r) = reference {
+                    let pinned: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM pins WHERE reference = ?1",
+                        params![&r[..]],
+                        |row| row.get(0),
+                    )?;
+                    if pinned > 0 {
+                        vec![r]
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    let mut stmt = conn
+                        .prepare("SELECT reference FROM pins ORDER BY created_at ASC, rowid ASC")?;
+                    let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+                    rows.collect::<Result<_, _>>()?
+                };
+                let mut out = Vec::with_capacity(refs.len());
+                let mut stmt = conn.prepare(
+                    "SELECT address FROM pin_members WHERE reference = ?1 ORDER BY rowid ASC",
+                )?;
+                for r in refs {
+                    let rows = stmt.query_map(params![&r[..]], |row| row.get::<_, Vec<u8>>(0))?;
+                    let mut members = Vec::new();
+                    for row in rows {
+                        let raw = row?;
+                        if let Ok(addr) = <[u8; 32]>::try_from(raw.as_slice()) {
+                            members.push(addr);
+                        }
+                    }
+                    out.push((r, members));
+                }
+                Ok(out)
+            })();
+            let _ = ack.send(r);
+        }
+    }
+}
+
+/// Record a pin collection in one transaction. Returns `Ok(false)`
+/// without writing anything when `reference` is already pinned.
+fn pin_collection_tx(
+    conn: &mut Connection,
+    reference: &[u8],
+    members: &[([u8; 32], Vec<u8>)],
+    total_bytes: &Arc<AtomicU64>,
+    total_rows: &Arc<AtomicU64>,
+) -> Result<bool, DiskCacheError> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let already: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM pins WHERE reference = ?1",
+        params![reference],
+        |row| row.get(0),
+    )?;
+    if already > 0 {
+        return Ok(false);
+    }
+    tx.execute(
+        "INSERT INTO pins (reference, created_at) VALUES (?1, ?2)",
+        params![reference, unix_now() as i64],
+    )?;
+
+    let mut seen = std::collections::HashSet::with_capacity(members.len());
+    let mut new_rows = 0u64;
+    let mut bytes_leaving_budget = 0u64;
+    let now = unix_now() as i64;
+    for (addr, wire) in members {
+        if !seen.insert(*addr) {
+            continue;
+        }
+        tx.execute(
+            "INSERT INTO pin_members (reference, address) VALUES (?1, ?2)",
+            params![reference, &addr[..]],
+        )?;
+        let existing: Option<(u64, i64)> = tx
+            .query_row(
+                "SELECT size, pin_count FROM chunks WHERE address = ?1",
+                params![&addr[..]],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        match existing {
+            None => {
+                // Fresh row, pinned from birth: never enters the budget.
+                tx.execute(
+                    "INSERT INTO chunks (address, data, size, last_access, inserted_at, pin_count)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+                    params![&addr[..], wire, wire.len() as i64, now, now],
+                )?;
+                new_rows += 1;
+            }
+            Some((size, 0)) => {
+                // First pin over a cached row: bytes leave the budget.
+                tx.execute(
+                    "UPDATE chunks SET pin_count = 1 WHERE address = ?1",
+                    params![&addr[..]],
+                )?;
+                bytes_leaving_budget += size;
+            }
+            Some((_, n)) => {
+                tx.execute(
+                    "UPDATE chunks SET pin_count = ?1 WHERE address = ?2",
+                    params![n + 1, &addr[..]],
+                )?;
+            }
+        }
+    }
+    tx.commit()?;
+    total_rows.fetch_add(new_rows, Ordering::Relaxed);
+    update_total(total_bytes, -(bytes_leaving_budget as i64));
+    Ok(true)
+}
+
+/// Remove a pin in one transaction. Returns `Ok(false)` when
+/// `reference` wasn't pinned. Chunks whose last pin drops re-enter the
+/// byte budget (the caller re-checks the cap afterwards).
+fn unpin_tx(
+    conn: &mut Connection,
+    reference: &[u8],
+    total_bytes: &Arc<AtomicU64>,
+) -> Result<bool, DiskCacheError> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let pinned: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM pins WHERE reference = ?1",
+        params![reference],
+        |row| row.get(0),
+    )?;
+    if pinned == 0 {
+        return Ok(false);
+    }
+    let members: Vec<Vec<u8>> = {
+        let mut stmt = tx.prepare("SELECT address FROM pin_members WHERE reference = ?1")?;
+        let rows = stmt.query_map(params![reference], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    let mut bytes_returning = 0u64;
+    for addr in &members {
+        let existing: Option<(u64, i64)> = tx
+            .query_row(
+                "SELECT size, pin_count FROM chunks WHERE address = ?1",
+                params![&addr[..]],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        match existing {
+            Some((size, n)) if n <= 1 => {
+                tx.execute(
+                    "UPDATE chunks SET pin_count = 0, last_access = ?1 WHERE address = ?2",
+                    params![unix_now() as i64, &addr[..]],
+                )?;
+                if n == 1 {
+                    bytes_returning += size;
+                }
+            }
+            Some((_, n)) => {
+                tx.execute(
+                    "UPDATE chunks SET pin_count = ?1 WHERE address = ?2",
+                    params![n - 1, &addr[..]],
+                )?;
+            }
+            None => {}
+        }
+    }
+    tx.execute(
+        "DELETE FROM pin_members WHERE reference = ?1",
+        params![reference],
+    )?;
+    tx.execute("DELETE FROM pins WHERE reference = ?1", params![reference])?;
+    tx.commit()?;
+    update_total(total_bytes, bytes_returning as i64);
+    Ok(true)
 }
 
 fn unix_now() -> u64 {
@@ -955,6 +1381,164 @@ mod tests {
             "ten consecutive hot reads inside the refresh window must leave \
              last_access untouched (was {after_put}, now {after_reads})",
         );
+    }
+
+    /// The core pin invariant: pinned rows are exempt from the
+    /// eviction sweep (and outside the byte budget), and unpinning
+    /// restores evictability.
+    #[tokio::test]
+    async fn eviction_skips_pinned_rows_and_unpin_restores_evictability() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("pin-evict.sqlite");
+        // Cap fits ~2 chunks of unpinned bytes.
+        let cache = DiskChunkCache::open(&path, 9 * 1024).unwrap();
+
+        let pinned = make_chunk(&vec![0xaau8; 4096]);
+        cache.put(pinned.0, pinned.1.clone()).await.unwrap();
+        let newly = cache
+            .pin_collection(pinned.0.to_vec(), vec![(pinned.0, pinned.1.clone())])
+            .await
+            .unwrap();
+        assert!(newly, "first pin is fresh");
+        assert!(
+            !cache
+                .pin_collection(pinned.0.to_vec(), vec![(pinned.0, pinned.1.clone())])
+                .await
+                .unwrap(),
+            "second pin of the same root is a no-op"
+        );
+        // Pinned bytes left the budget entirely.
+        assert_eq!(cache.used_bytes(), 0, "pinned bytes are outside the budget");
+
+        // Backdate the pinned row so LRU order would evict it first if
+        // the sweep could see it.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute(
+                "UPDATE chunks SET last_access = 0 WHERE address = ?1",
+                rparams![&pinned.0[..]],
+            )
+            .unwrap();
+        }
+
+        // Fill past the cap with unpinned chunks → eviction fires.
+        let fillers: Vec<([u8; 32], Vec<u8>)> =
+            (1..=3u8).map(|i| make_chunk(&vec![i; 4096])).collect();
+        for (addr, wire) in &fillers {
+            cache.put(*addr, wire.clone()).await.unwrap();
+        }
+        assert!(
+            cache.get(pinned.0).await.unwrap().is_some(),
+            "pinned chunk survives an eviction sweep even as the LRU-oldest row"
+        );
+        assert!(
+            cache.used_bytes() <= 9 * 1024,
+            "unpinned bytes still respect the cap"
+        );
+
+        // Pin bookkeeping is queryable.
+        assert!(cache.has_pin(pinned.0.to_vec()).await.unwrap());
+        assert_eq!(cache.list_pins().await.unwrap(), vec![pinned.0.to_vec()]);
+        let members = cache.pin_members(None).await.unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].1, vec![pinned.0]);
+
+        // Unpin → evictable again: keep it LRU-oldest and overflow.
+        assert!(cache.unpin(pinned.0.to_vec()).await.unwrap());
+        assert!(!cache.unpin(pinned.0.to_vec()).await.unwrap(), "idempotent");
+        assert!(!cache.has_pin(pinned.0.to_vec()).await.unwrap());
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute(
+                "UPDATE chunks SET last_access = 0 WHERE address = ?1",
+                rparams![&pinned.0[..]],
+            )
+            .unwrap();
+        }
+        let more: Vec<([u8; 32], Vec<u8>)> =
+            (10..=12u8).map(|i| make_chunk(&vec![i; 4096])).collect();
+        for (addr, wire) in &more {
+            cache.put(*addr, wire.clone()).await.unwrap();
+        }
+        assert!(
+            cache.get(pinned.0).await.unwrap().is_none(),
+            "after unpin the (backdated) chunk is evicted like any other row"
+        );
+    }
+
+    /// Pins are `SQLite` rows: they survive a close + reopen, and the
+    /// budget backfill keeps treating pinned bytes as out-of-budget.
+    #[tokio::test]
+    async fn pins_survive_reopen() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("pin-persist.sqlite");
+        let (addr, wire) = make_chunk(b"pinned across restarts");
+        {
+            let cache = DiskChunkCache::open(&path, 1 << 20).unwrap();
+            cache
+                .pin_collection(addr.to_vec(), vec![(addr, wire.clone())])
+                .await
+                .unwrap();
+        }
+        let cache = DiskChunkCache::open(&path, 1 << 20).unwrap();
+        assert!(cache.has_pin(addr.to_vec()).await.unwrap());
+        assert_eq!(cache.list_pins().await.unwrap(), vec![addr.to_vec()]);
+        assert_eq!(cache.get(addr).await.unwrap(), Some(wire));
+        assert_eq!(
+            cache.used_bytes(),
+            0,
+            "backfill keeps pinned bytes out of the budget"
+        );
+    }
+
+    /// Two pins sharing a chunk: the shared chunk stays pin-protected
+    /// until the *last* covering pin is removed (refcount semantics,
+    /// like bee's pinstore).
+    #[tokio::test]
+    async fn shared_chunk_stays_pinned_until_last_pin_drops() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("pin-shared.sqlite");
+        let cache = DiskChunkCache::open(&path, 1 << 20).unwrap();
+        let shared = make_chunk(b"shared leaf");
+        let root_a = make_chunk(b"root a");
+        let root_b = make_chunk(b"root b");
+        cache
+            .pin_collection(
+                root_a.0.to_vec(),
+                vec![(root_a.0, root_a.1.clone()), (shared.0, shared.1.clone())],
+            )
+            .await
+            .unwrap();
+        cache
+            .pin_collection(
+                root_b.0.to_vec(),
+                vec![(root_b.0, root_b.1.clone()), (shared.0, shared.1.clone())],
+            )
+            .await
+            .unwrap();
+        cache.unpin(root_a.0.to_vec()).await.unwrap();
+
+        let pin_count: i64 = {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.query_row(
+                "SELECT pin_count FROM chunks WHERE address = ?1",
+                rparams![&shared.0[..]],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(pin_count, 1, "one covering pin left");
+        cache.unpin(root_b.0.to_vec()).await.unwrap();
+        let pin_count: i64 = {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.query_row(
+                "SELECT pin_count FROM chunks WHERE address = ?1",
+                rparams![&shared.0[..]],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(pin_count, 0, "evictable again after the last unpin");
     }
 
     #[tokio::test]

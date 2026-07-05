@@ -486,6 +486,17 @@ fn ack_to_response(ack: ControlAck) -> Response {
         ControlAck::Accounting(_) => Response::Error {
             message: "accounting snapshots are only supported by ant-gateway".to_string(),
         },
+        // The pin surface (bee `/pins`) and the per-bucket postage
+        // counters are gateway HTTP endpoints; the Unix-socket protocol
+        // doesn't expose the commands that produce these acks.
+        ControlAck::PinAdded { .. }
+        | ControlAck::PinRemoved { .. }
+        | ControlAck::PinPresent { .. }
+        | ControlAck::PinList { .. }
+        | ControlAck::PinCheck { .. }
+        | ControlAck::PostageBuckets(_) => Response::Error {
+            message: "pin / postage-bucket queries are only supported by ant-gateway".to_string(),
+        },
         // The Unix-socket protocol used by `antctl` doesn't expose feed
         // reads today; the control surface is just for renderers and
         // ops tooling, and feed lookup lives on the gateway HTTP API.

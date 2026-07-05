@@ -256,6 +256,175 @@ pub async fn stamp(State(handle): State<GatewayHandle>, Path(id): Path<String>) 
     }
 }
 
+/// Bee's `postageBatchResponse` (`GET /batches`, `GET /batches/{id}`),
+/// field order as declared in `bee/pkg/api/postage.go`. `value` is
+/// bee's `bigint.BigInt`, which marshals as a decimal string.
+#[derive(Debug, Serialize)]
+struct BatchEntry {
+    #[serde(rename = "batchID")]
+    batch_id: String,
+    value: String,
+    start: u64,
+    owner: String,
+    depth: u8,
+    #[serde(rename = "bucketDepth")]
+    bucket_depth: u8,
+    immutable: bool,
+    #[serde(rename = "batchTTL")]
+    batch_ttl: i64,
+}
+
+/// `GET /batches` — bee lists **every** batch on the network from its
+/// chain-event-synced batchstore. Ant deliberately has no postage
+/// event sync (all chain interaction is direct RPC reads), so the
+/// global enumeration is not implementable without importing bee's
+/// whole listener/batchstore subsystem; ant honestly returns bee's
+/// shape with an empty list rather than fabricating entries. Single
+/// batches remain individually addressable via `GET /batches/{id}`
+/// (below), which *is* answerable from direct contract reads.
+pub async fn batches(State(_handle): State<GatewayHandle>) -> Response {
+    json_ok(&serde_json::json!({ "batches": [] }))
+}
+
+/// `GET /batches/{id}` — light single-batch lookup: bee reads its
+/// synced batchstore; ant reads the `PostageStamp` contract views over
+/// the configured RPC (`batchOwner` / `batchDepth` / `batchBucketDepth`
+/// / `batchImmutableFlag` / `remainingBalance`). Differences from bee,
+/// by design (no event sync):
+///
+/// * `start` (creation block) is not a contract view — reported as `0`.
+/// * without a configured RPC every batch is bee's 404
+///   `"batch not found"`.
+pub async fn batch(State(handle): State<GatewayHandle>, Path(id): Path<String>) -> Response {
+    let mut reasons = Vec::new();
+    let Some(batch_id) = crate::error::parse_hex_param::<32>("batch_id", &id, &mut reasons) else {
+        return crate::error::params_error(crate::error::ParamKind::Path, reasons);
+    };
+    let Some(chain) = handle.chain.clone() else {
+        return json_error(StatusCode::NOT_FOUND, "batch not found");
+    };
+    let result = tokio::time::timeout(STAMPS_ENRICH_TIMEOUT, async {
+        let meta = chain.reader.batch_meta(batch_id).await?;
+        // A never-created batch reads as all-zero views on chain; bee's
+        // batchstore would return storage.ErrNotFound → 404.
+        if meta.owner == [0u8; 20] {
+            return Err("batch not found".to_string());
+        }
+        let remaining = chain.reader.batch_remaining_balance(batch_id).await?;
+        let total_out = chain.reader.total_amount().await.unwrap_or(0);
+        let price = chain.reader.current_price().await.unwrap_or(0);
+        Ok::<_, String>(BatchEntry {
+            batch_id: hex::encode(batch_id),
+            value: remaining.saturating_add(total_out).to_string(),
+            start: 0,
+            owner: hex::encode(meta.owner),
+            depth: meta.depth,
+            bucket_depth: meta.bucket_depth,
+            immutable: meta.immutable,
+            batch_ttl: batch_ttl_secs(remaining, price),
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(entry)) => json_ok(&entry),
+        Ok(Err(e)) if e == "batch not found" => {
+            json_error(StatusCode::NOT_FOUND, "batch not found")
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(target: "ant_gateway", error = %e, "batch lookup failed");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "unable to get batch")
+        }
+        Err(_) => json_error(StatusCode::GATEWAY_TIMEOUT, "batch lookup timed out"),
+    }
+}
+
+/// `GET /stamps/{id}/buckets` — bee's `postageGetStampBucketsHandler`:
+/// the per-bucket collision counters of a registered batch's stamp
+/// issuer, `{depth, bucketDepth, bucketUpperBound, buckets:
+/// [{bucketID, collisions}]}`. Unknown batch → bee's
+/// `404 "issuer does not exist"`.
+pub async fn stamp_buckets(
+    State(handle): State<GatewayHandle>,
+    Path(id): Path<String>,
+) -> Response {
+    let mut reasons = Vec::new();
+    let Some(batch_id) = crate::error::parse_hex_param::<32>("batch_id", &id, &mut reasons) else {
+        return crate::error::params_error(crate::error::ParamKind::Path, reasons);
+    };
+
+    let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
+    if handle
+        .commands
+        .send(ControlCommand::PostageBuckets {
+            batch_id,
+            ack: ack_tx,
+        })
+        .await
+        .is_err()
+    {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node loop is no longer accepting commands",
+        );
+    }
+    let ack = match tokio::time::timeout(POSTAGE_STATUS_TIMEOUT, ack_rx).await {
+        Ok(Ok(ack)) => ack,
+        Ok(Err(_)) => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "node loop dropped the bucket request",
+            )
+        }
+        Err(_) => return json_error(StatusCode::GATEWAY_TIMEOUT, "bucket request timed out"),
+    };
+    match ack {
+        ControlAck::PostageBuckets(view) => {
+            // Bee's field order: depth, bucketDepth, bucketUpperBound,
+            // buckets (Go struct declaration order).
+            #[derive(Serialize)]
+            struct Bucket {
+                #[serde(rename = "bucketID")]
+                bucket_id: u32,
+                collisions: u32,
+            }
+            #[derive(Serialize)]
+            struct Body {
+                depth: u8,
+                #[serde(rename = "bucketDepth")]
+                bucket_depth: u8,
+                #[serde(rename = "bucketUpperBound")]
+                bucket_upper_bound: u32,
+                buckets: Vec<Bucket>,
+            }
+            json_ok(&Body {
+                depth: view.depth,
+                bucket_depth: view.bucket_depth,
+                bucket_upper_bound: view.bucket_upper_bound,
+                buckets: view
+                    .collisions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &collisions)| Bucket {
+                        bucket_id: i as u32,
+                        collisions,
+                    })
+                    .collect(),
+            })
+        }
+        ControlAck::Error { message } => {
+            if message.contains("issuer does not exist") {
+                json_error(StatusCode::NOT_FOUND, "issuer does not exist")
+            } else {
+                json_error(StatusCode::INTERNAL_SERVER_ERROR, "get issuer failed")
+            }
+        }
+        other => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unexpected node ack for postage buckets: {other:?}"),
+        ),
+    }
+}
+
 fn json_ok<T: Serialize>(value: &T) -> Response {
     use axum::response::IntoResponse;
     axum::Json(value).into_response()

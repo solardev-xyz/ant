@@ -2775,7 +2775,248 @@ fn handle_control_command(
         ControlCommand::AccountingSnapshot { ack } => {
             let _ = ack.send(ControlAck::Accounting(build_accounting_snapshot(state)));
         }
+        // Bee `/pins` parity ("pin-light"): the pin store rides on the
+        // persistent disk chunk cache, so every pin command requires it.
+        ControlCommand::PinAdd { reference, ack } => {
+            let Some(disk_cache) = state.disk_cache.clone() else {
+                let _ = ack.send(pin_cache_disabled());
+                return;
+            };
+            // Fetch-then-pin through the normal cache-first /
+            // network-fallback fetcher: pinning cold content pulls it
+            // in, exactly like bee's pin handler traversing via
+            // `storer.Download(true)`.
+            let peers_rx = state.peers_watch.subscribe();
+            let cache = state.cache_for_request(false);
+            let control = control.clone();
+            tokio::spawn(async move {
+                let fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx)
+                    .with_cache(cache)
+                    .with_disk_cache(disk_cache.clone());
+                let reply = pin_add(&fetcher, &disk_cache, &reference).await;
+                let _ = ack.send(reply);
+            });
+        }
+        ControlCommand::PinRemove { reference, ack } => {
+            let Some(disk_cache) = state.disk_cache.clone() else {
+                let _ = ack.send(pin_cache_disabled());
+                return;
+            };
+            tokio::spawn(async move {
+                let reply = match disk_cache.unpin(reference).await {
+                    Ok(was_pinned) => ControlAck::PinRemoved { was_pinned },
+                    Err(e) => ControlAck::Error {
+                        message: format!("unpin failed: {e}"),
+                    },
+                };
+                let _ = ack.send(reply);
+            });
+        }
+        ControlCommand::PinHas { reference, ack } => {
+            let Some(disk_cache) = state.disk_cache.clone() else {
+                let _ = ack.send(pin_cache_disabled());
+                return;
+            };
+            tokio::spawn(async move {
+                let reply = match disk_cache.has_pin(reference).await {
+                    Ok(pinned) => ControlAck::PinPresent { pinned },
+                    Err(e) => ControlAck::Error {
+                        message: format!("pin lookup failed: {e}"),
+                    },
+                };
+                let _ = ack.send(reply);
+            });
+        }
+        ControlCommand::PinList { ack } => {
+            let Some(disk_cache) = state.disk_cache.clone() else {
+                let _ = ack.send(pin_cache_disabled());
+                return;
+            };
+            tokio::spawn(async move {
+                let reply = match disk_cache.list_pins().await {
+                    Ok(references) => ControlAck::PinList { references },
+                    Err(e) => ControlAck::Error {
+                        message: format!("pin listing failed: {e}"),
+                    },
+                };
+                let _ = ack.send(reply);
+            });
+        }
+        ControlCommand::PinCheck { reference, ack } => {
+            let Some(disk_cache) = state.disk_cache.clone() else {
+                let _ = ack.send(pin_cache_disabled());
+                return;
+            };
+            tokio::spawn(async move {
+                let reply = pin_check(&disk_cache, reference).await;
+                let _ = ack.send(reply);
+            });
+        }
+        ControlCommand::PostageBuckets { batch_id, ack } => {
+            // Bee `postageGetStampBucketsHandler`: per-bucket collision
+            // counters of a *registered* issuer. An unknown batch (or a
+            // node without an upload runtime) is bee's 404 "issuer does
+            // not exist"; the gateway substring-matches the message.
+            let Some(upload) = upload else {
+                let _ = ack.send(ControlAck::Error {
+                    message: "issuer does not exist (uploads not configured)".into(),
+                });
+                return;
+            };
+            let issuers = match upload.issuers.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let reply = match issuers.get(&batch_id) {
+                Some(issuer) => ControlAck::PostageBuckets(ant_control::PostageBucketsView {
+                    depth: issuer.batch_depth(),
+                    bucket_depth: issuer.bucket_depth(),
+                    bucket_upper_bound: issuer.bucket_upper_bound(),
+                    collisions: issuer.bucket_counts().to_vec(),
+                }),
+                None => ControlAck::Error {
+                    message: format!("issuer does not exist: 0x{}", hex::encode(batch_id)),
+                },
+            };
+            let _ = ack.send(reply);
+        }
     }
+}
+
+/// Shared "no disk cache" pin error — pin state persists in the `SQLite`
+/// cache, so a daemon started without one cannot pin.
+fn pin_cache_disabled() -> ControlAck {
+    ControlAck::Error {
+        message: "pinning requires the disk chunk cache; pass --disk-cache-bytes > 0 at startup"
+            .into(),
+    }
+}
+
+/// Traverse the (plain or encrypted) content tree at `reference`,
+/// fetch every chunk via `fetcher` (cache-first, network fallback),
+/// and record the pin collection in the disk cache.
+async fn pin_add(
+    fetcher: &ant_retrieval::RoutingFetcher,
+    disk_cache: &Arc<ant_retrieval::DiskChunkCache>,
+    reference: &[u8],
+) -> ControlAck {
+    // Idempotence first, like bee's HasPin check: an already-pinned
+    // root replies without re-traversing.
+    match disk_cache.has_pin(reference.to_vec()).await {
+        Ok(true) => {
+            return ControlAck::PinAdded {
+                already_pinned: true,
+            }
+        }
+        Ok(false) => {}
+        Err(e) => {
+            return ControlAck::Error {
+                message: format!("pin lookup failed: {e}"),
+            }
+        }
+    }
+    let addrs = match reference.len() {
+        32 => {
+            let root: [u8; 32] = reference.try_into().expect("length checked");
+            ant_retrieval::traverse_chunk_addresses(fetcher, root, STEWARDSHIP_MAX_FILE_BYTES).await
+        }
+        len if len == ant_retrieval::ENC_REF_SIZE => {
+            let root: [u8; ant_retrieval::ENC_REF_SIZE] =
+                reference.try_into().expect("length checked");
+            ant_retrieval::traverse_encrypted_chunk_addresses(
+                fetcher,
+                root,
+                STEWARDSHIP_MAX_FILE_BYTES,
+            )
+            .await
+        }
+        len => {
+            return ControlAck::Error {
+                message: format!("invalid pin reference length: {len} bytes"),
+            }
+        }
+    };
+    let addrs = match addrs {
+        Ok(a) => a,
+        Err(e) => {
+            return ControlAck::Error {
+                message: format!("pin traversal failed: {e}"),
+            }
+        }
+    };
+    // Fetch every member (interiors are cache-hot from the traversal;
+    // leaves may come from the network — that's the fetch-then-pin).
+    type Fetched = Result<Vec<([u8; 32], Vec<u8>)>, String>;
+    let fetched: Fetched = futures::stream::iter(addrs)
+        .map(|addr| async move {
+            fetcher
+                .fetch(addr)
+                .await
+                .map(|wire| (addr, wire))
+                .map_err(|e| format!("fetch {}: {e}", hex::encode(addr)))
+        })
+        .buffer_unordered(STEWARDSHIP_CONCURRENCY)
+        .fold(Ok(Vec::new()), |acc, item| async move {
+            match (acc, item) {
+                (Ok(mut v), Ok(pair)) => {
+                    v.push(pair);
+                    Ok(v)
+                }
+                (Err(e), _) | (_, Err(e)) => Err(e),
+            }
+        })
+        .await;
+    let members = match fetched {
+        Ok(m) => m,
+        Err(message) => return ControlAck::Error { message },
+    };
+    match disk_cache.pin_collection(reference.to_vec(), members).await {
+        Ok(newly) => ControlAck::PinAdded {
+            already_pinned: !newly,
+        },
+        Err(e) => ControlAck::Error {
+            message: format!("pin store failed: {e}"),
+        },
+    }
+}
+
+/// Pin-integrity check (bee `PinIntegrity.Check`): for each pin (or
+/// just `reference`), count recorded members, members missing from the
+/// local store, and members whose stored bytes fail CAC/SOC
+/// validation.
+async fn pin_check(
+    disk_cache: &Arc<ant_retrieval::DiskChunkCache>,
+    reference: Option<Vec<u8>>,
+) -> ControlAck {
+    let per_pin = match disk_cache.pin_members(reference).await {
+        Ok(m) => m,
+        Err(e) => {
+            return ControlAck::Error {
+                message: format!("pin members read failed: {e}"),
+            }
+        }
+    };
+    let mut stats = Vec::with_capacity(per_pin.len());
+    for (reference, members) in per_pin {
+        let mut stat = ant_control::PinCheckStat {
+            reference,
+            total: members.len() as u64,
+            ..Default::default()
+        };
+        for addr in members {
+            match disk_cache.get(addr).await {
+                Ok(Some(wire)) => {
+                    if !(ant_crypto::cac_valid(&addr, &wire) || ant_crypto::soc_valid(&addr, &wire))
+                    {
+                        stat.invalid += 1;
+                    }
+                }
+                Ok(None) | Err(_) => stat.missing += 1,
+            }
+        }
+        stats.push(stat);
+    }
+    ControlAck::PinCheck { stats }
 }
 
 /// Assemble the per-peer settlement/balance snapshot for
