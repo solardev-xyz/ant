@@ -270,6 +270,40 @@ session push latencies rather than handshake counts.
   which is exactly Experiment 2's cap. The two are one mechanism:
   settle what you spend (1) + never outspend a peer's refresh (2).
 
+### Experiment 2: per-peer latency-aware in-flight cap — **KEEP (provisional n=1 at 256 MiB; small-size confirmation pending)**
+
+- **Hypothesis**: without a per-peer cap, 32 concurrent chunks stack
+  on the same closest peers; even with pseudosettle (exp 1), the
+  early burst outruns per-peer refresh budgets (450 K PLUR/s light)
+  → overdraft-class offenses → escalating storer blocklists → the
+  residual tail hang. Cap concurrent pushes per peer (latency-aware:
+  fast <200 ms ⇒ 2×base, slow ≥2 s ⇒ base/2) to spread spend across
+  refresh budgets. Hoverfly's biggest lever (2.6×, overdrafts 18→0%).
+- **Change**: `ant-retrieval::push_load::PushLoadTracker` shared via
+  `SwarmState`, at-cap peers dropped from `next_push_peer` ranking
+  (soft fall-through), begin/end + latency EWMA hooks in the dispatch
+  macro. `ANT_PUSH_INFLIGHT_CAP=<base>`; `ANT_PUSH_CONCURRENCY=<n>`
+  exists for the width re-test (not yet exercised).
+- **Method**: 256 MiB ×1 with `ANT_PUSH_PSEUDOSETTLE=1,
+  ANT_PUSH_INFLIGHT_CAP=4` (window 17:59–18:27Z), controls = the two
+  same-day 256 runs (baseline; exp1-only).
+- **Results** (256 MiB, same-day):
+  | arm | outcome | effective KiB/s | data phase | hard failures | tail |
+  |---|---|---|---|---|---|
+  | baseline | stall-aborted | 82.4 | collapse →0 by min 18 | 159 801 | 221 frozen ∞ |
+  | + pseudosettle | stall-aborted | 82.9 | ~190 plateau, 100 % @ ~min 18 | 86 474 | 1 frozen ∞ |
+  | + pseudosettle + cap4 | **completed** | **160.8** | 564→255, 100 % @ ~min 12 (~355 KiB/s) | **53 325** | 518 tree/manifest chunks landed in ~15 min |
+- **Decision**: **KEEP** (with exp 1; the two are one mechanism —
+  settle what you spend + never outspend a peer's refresh). First
+  full 256 MiB completion of the lab; reference
+  `0xaf4d0d7a…`. Effective 161 KiB/s ≈ 1.95× the committed baseline
+  cell (82.4, which never completed). Residual sore spot: the
+  post-data tree/manifest tail still grinds (~15 min) — candidates:
+  interleave tree pushes with data (job-manager change), or exp 5's
+  AOR-aware candidate ordering. Pending: 8 MiB A/B for a clean
+  interleaved small-size confirmation + uniform-vs-latency-aware cap
+  comparison when budget allows.
+
 ### Experiment 4: identify-push session accelerator — **NO CHANGE NEEDED (closed on measurements)**
 
 - **Hypothesis** (hoverfly, transport.rs `prep_connection`): without
