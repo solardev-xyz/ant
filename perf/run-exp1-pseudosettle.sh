@@ -10,8 +10,12 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 B=./target/release/perf_bench
 
-echo "=== exp1 phase 1: 32 MiB x5 interleaved A/B ==="
-$B upload --size-mib 32 --runs 5 \
+# Budget note (2026-07-05 17:00Z): utilization 0.469 after the big
+# baselines; ~100K chunks to the 0.6 warn line. 3 pairs at 32 MiB
+# (49K) + one 256 MiB treated run (66K) is the affordable decisive
+# set; anything bigger waits for a user-funded batch.
+echo "=== exp1 phase 1: 32 MiB x3 interleaved A/B ==="
+$B upload --size-mib 32 --runs 3 \
   --label exp1-off \
   --label-b exp1-pseudosettle --env-b ANT_PUSH_PSEUDOSETTLE=1
 

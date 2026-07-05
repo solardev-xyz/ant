@@ -144,8 +144,24 @@ wall-clock windows per run in the JSONs.
 |---|---|---|---|---|
 | 1 MiB ×5 | 5/5 ok | 152.3 (35.8–232.7) | 7 (4–29) | 0 |
 | 32 MiB ×5 | 5/5 ok | **489.2 (470.8–534.7)** | 67 (61–70) | 0 |
-| 256 MiB | _tonight_ | | | |
-| 512 MiB | _tonight_ | | | |
+| 256 MiB ×1 | **stall-aborted** | 82.4 effective | 3180 | 676 |
+| 512 MiB ×1 | **terminated at 50.7 %** | 51.2 effective | 5193 | 21 550 |
+
+**256 MiB**: decay 459 → 79 KiB/s over 18 min, then tail FROZEN 34 min
+at 65 833/66 054 chunks (bytes 100 %; the 221 post-data tree/manifest
+chunks unlandable) → stall-abort. 159 801 hard failures ≈ 3.7 failed
+attempts per chunk.
+
+**512 MiB**: decay per-5-min window 395 → 180 → 109 → 24 → … → 0,
+with brief churn-reset revivals (0/0/0/3/12/71/0 KiB/s); crept at
+~14 KiB/s around the 235–260 MiB mark — the goal's "fails at
+~250 MiB+" profile exactly. Terminated deliberately at 87 min /
+50.7 % (5 h of grind ahead, ~65 K stamps, zero information value):
+**856 813 hard failures + 857 871 same-peer retries for 66 482 landed
+chunks ≈ 13 failed attempts per chunk.** Both runs: 0 literal
+"overdraft", 0 timeouts — it's all bee-side connection kills
+(`io: connection is closed` / `unexpected EOF`), i.e. debt
+enforcement at SO_LINGER=0.
 
 Window 2026-07-05T14:10–14:17Z, 64–100 peers at start. 1 MiB is
 startup/manifest dominated (run 1 at 35.8 was the fresh-daemon cold
