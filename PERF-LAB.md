@@ -8,13 +8,47 @@ Every experiment: Hypothesis → Change → Method → Results → Decision
 ## STATUS
 
 - **Current experiment**: #0 — harness bring-up (perf_bench)
-- **Phase**: implementing
-- **Next action**: compile `perf_bench`, seed the lab issuer state from
-  the leftover smoke-run counter files under
-  `/tmp/ant-mainnet-smoke-*/postage/`, then run a 1 MiB shakedown
-  upload and commit harness + first result.
+- **Phase**: benchmarking (shakedown)
+- **Next action**: evaluate the 1 MiB shakedown result
+  (`perf/results/shakedown-upload-1mib-*`), fix any harness issues,
+  then start the budget-adjusted baseline plan below.
 - **In-flight hypotheses**: none yet.
-- **Long-running processes**: none.
+- **Long-running processes**: possibly a `perf_bench upload … --label
+  shakedown` (check `pgrep -af 'antd|perf_bench'`).
+
+### ⚠ Batch budget vs. the full matrix (2026-07-05 arithmetic)
+
+Lab issuer seeded 2026-07-05: fill floor 2 (offset), max 3, ratio
+0.094, worst-case remaining 1.9 M chunks. Stochastic reality: for
+random addresses over 65 536 buckets, max-bucket fill ≈ mean +
+sqrt(2·mean·ln 65536). The **0.8 hard-stop** (fill 25.6) is reached at
+≈ 600 K more chunks ≈ **2.3 GiB of uploads**; the 0.6 warn line at
+≈ 370 K ≈ 1.4 GiB.
+
+The goal's full protocol needs far more than that: baselines 5×256 MiB
+(330 K) + 5×512 MiB attempts (~5×64 K = 320 K even failing at
+~250 MiB) + A/B experiment runs + final 256 MiB before/after + 3
+consecutive successful 512 MiB runs (400 K) ≈ **1.3–1.5 M chunks ≈ 2×
+the whole remaining budget**. A new/topped-up/diluted batch is an
+on-chain spending decision = **user-only** (goal stop-conditions).
+
+**Budget-adjusted plan** (autonomous, keeps every verdict honest but
+buys headroom for the experiments — flag to the user for a second
+batch to run the full-fat matrix):
+
+1. Free/cheap baselines first: warmup ×5 (0 slots), download ×5
+   (0 slots), feed-setup + feed ×5 (~120 slots), upload 1 MiB ×5
+   (~1.3 K), 32 MiB ×5 (~41 K).
+2. Big cells at n=1 for now: 256 MiB ×1 (~66 K), 512 MiB ×1 (expected
+   stall ~250 MiB, ~64 K, aborted by the stall guard) — enough to
+   characterize the stall; more repeats only if budget allows at end
+   or user funds a batch.
+3. Experiment A/B verdicts at 8 MiB ×5/arm (~20 K per experiment)
+   unless the technique specifically needs bigger files; 32 MiB
+   confirmation only for the winner(s).
+4. The 3×512 MiB success requirement (~400 K chunks) is **not
+   fundable** from this batch after the above — needs the user.
+   Recommend: second depth-21+ batch (or dilute to 22+).
 
 ### Operational invariants (read before touching anything)
 

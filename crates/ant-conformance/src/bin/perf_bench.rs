@@ -816,8 +816,15 @@ async fn upload_one_run(
     let mut last_bytes = 0u64;
     let outcome: String;
     let mut terminal: Option<ant_control::UploadJobView> = None;
+    // 1 s polls keep the completion-time error ≤ ~10 % on the small
+    // cells; 5 s is plenty above 32 MiB (multi-minute runs).
+    let poll = if cfg.size_mib <= 32 {
+        Duration::from_secs(1)
+    } else {
+        Duration::from_secs(5)
+    };
     loop {
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(poll).await;
         let jid = job_id.clone();
         let view = match control(antd.socket.clone(), move || Request::UploadStatus {
             job_id: jid,
@@ -910,6 +917,9 @@ async fn upload_one_run(
         "peers_at_end": peers_end,
         "outcome": outcome,
         "duration_secs": duration,
+        "job_reported_secs": terminal
+            .as_ref()
+            .map(|v| v.last_update_unix.saturating_sub(v.created_at_unix)),
         "throughput_kib_s": throughput_kibs,
         "bytes_pushed": bytes_done,
         "chunks_pushed": terminal.as_ref().map_or(0, |v| v.chunks_pushed),

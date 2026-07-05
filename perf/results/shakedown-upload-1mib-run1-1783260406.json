@@ -1,0 +1,57 @@
+{
+  "antd_bin": "/home/florian/claude/ant/crates/ant-conformance/../../target/release/antd",
+  "bytes_pushed": 1048576,
+  "chunks_pushed": 262,
+  "chunks_requeued": 0,
+  "chunks_total": 260,
+  "content_seed": 9584873468469749134,
+  "duration_secs": 10.00684296,
+  "ended_utc": "2026-07-05T14:06:46Z",
+  "git_commit": "7d2880f",
+  "issued_chunks_after": 131410,
+  "issued_chunks_before": 131148,
+  "label": "shakedown",
+  "last_error": null,
+  "log_histogram": {
+    "exhausted_events": 0,
+    "no_peer_events": 0,
+    "overdraft_mentions": 0,
+    "push_hard_failures": 0,
+    "push_timeouts": 0,
+    "same_peer_retries": 0,
+    "shallow_accepted": 0,
+    "shallow_receipts": 0
+  },
+  "outcome": "completed",
+  "peer_warmup_secs": 0.503633075,
+  "peers_at_end": 244,
+  "peers_at_start": 61,
+  "peers_min": 30,
+  "progress_curve": [
+    {
+      "bytes_pushed": 389120,
+      "chunks_pushed": 95,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 5.005167525
+    },
+    {
+      "bytes_pushed": 1048576,
+      "chunks_pushed": 262,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "completed",
+      "t_secs": 10.00683939
+    }
+  ],
+  "reference": "0x5abbca09a8968fa92373983f2ecc2c5b4f23fabf27af3b9d5d4eb43829f8b749",
+  "run": 1,
+  "size_mib": 1,
+  "started_utc": "2026-07-05T14:06:33Z",
+  "suite": "upload",
+  "throughput_kib_s": 102.32997600673849,
+  "utilization_ratio_after": 0.125,
+  "utilization_ratio_before": 0.09375,
+  "worst_case_remaining_after": 1835008
+}
