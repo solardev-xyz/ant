@@ -7,31 +7,26 @@ Every experiment: Hypothesis → Change → Method → Results → Decision
 
 ## STATUS
 
-- **Current experiment**: 512 MiB completion proof #1 of 3
-  (kept exp 1+2 config, batch 2)
-- **Phase**: benchmarking
-- **Next action**: when `exp12-512-proof1` lands (result
-  `perf/results/exp12-512-proof1-*`), transcribe; if completed, run
-  proofs #2 and #3 back-to-back (`--batch 2`, same env). Then exp 5
-  (AOR receipt routing — implement env-gated, A/B at 8 MiB ×5 on
-  batch 1) and exp 6(b) (finder phase instrumentation → adopt-or-
-  close). Then flip the kept experiment defaults ON (pseudosettle +
-  cap without env vars), final gate (task 9), PR summary table.
-- **Scoreboard**: exp 1 KEEP · exp 2 KEEP (provisional n=1 at 256;
-  first-ever full 256 MiB completion, 27 min) · exp 3 REVERT
-  (−30 %) · exp 4 NO CHANGE (already implemented) · exp 6(a) KEEP
-  (0/27 → 27/27) · exp 5, 6(b) open.
-- **Batches**: batch 1 (`1decad4e…`, immutable) at utilization
-  0.656 — small runs only (8 MiB A/Bs), hard-stop 0.8. Batch 2
-  (`7fb5cb0b…`, depth 21 MUTABLE, user-funded 2026-07-05 evening,
-  creds in `.env` as *_2) fresh at 0.0 — reserved for the 512×3
-  proof + 256 confirmations. `--batch 2` selects it (issuer .bin
-  chain-verified + adopted in `perf/state/postage/`).
-- **Long-running processes**: `exp12-512-proof1` upload (port 3633,
-  started ~18:57Z, task bp39gp699).
-- **Binaries**: `target/release/antd` = HEAD (exp 1/2 env-gated,
-  feed fix active, exp 3 vendor reverted).
-  `perf/state/antd-baseline-bin` = pre-experiment snapshot.
+- **Current experiment**: none — all six closed (see Final summary)
+- **Phase**: close-out; overnight baseline backfill running
+- **Next action**: when `perf/run-baseline-backfill.sh` finishes
+  (4×256 + 4×512 pre-lab-binary baseline runs on batch 2, ~10 h,
+  each expected to stall-abort like the originals — this completes
+  DoD #1's ≥5-runs-per-cell for the big cells), transcribe the
+  medians+spread into the Baselines table (`summarize.py --label
+  baseline256bf` / `baseline512bf`), commit results, refresh the PR
+  table. Everything else is DONE: smoke 18/18 (2026-07-05 22:0xZ,
+  batch 2, defaults-on binary), conformance + differential green,
+  bee-js 32/32, full CI gate green, 512×3 proof complete.
+  Open follow-ups for future rounds: tree-tail interleaving in the
+  job manager; full-node advertisement A/B (hoverfly's 10× refresh
+  budget); SWAP-cheque regime (needs spending decisions).
+- **Batches**: batch 1 (immutable) 0.69 — small cells only; batch 2
+  (mutable) ~580 K issued. Both issuer .bins in
+  `perf/state/postage/` (PRECIOUS).
+- **Binaries**: `target/release/antd` = HEAD, kept experiments
+  default ON. Snapshots in `perf/state/`: `antd-baseline-bin`
+  (pre-experiment), `antd-exp12-bin` (proof binary), `bee-bin`.
 
 ### ⚠ Batch budget vs. the full matrix (2026-07-05 arithmetic)
 
@@ -461,6 +456,61 @@ _(further experiments use the same template)_
 - **Method** (exact commands, sizes, run counts, time window, peers):
 - **Results**:
 - **Decision**: KEEP / REVERT —
+
+## Final summary (2026-07-05, campaign day 1 close-out)
+
+### Scoreboard — all six techniques closed
+
+| # | Technique | Verdict | Numbers |
+|---|---|---|---|
+| 1 | Push-side pseudosettle (reframed slow-storer cluster) | **KEEP → default ON** | 256 MiB: collapse-to-0 → ~190 KiB/s plateau; failures −46 %; frozen tail 221 → 1 |
+| 2 | Per-peer latency-aware in-flight cap | **KEEP → default ON** | first-ever full 256 completion; failures −67 % vs baseline; enabled all three 512 completions |
+| 3 | Concurrent substream upgrades | **REVERT** | −30 % median at 8 MiB (286 vs 410); vendored patch removed |
+| 4 | Identify-push session accelerator | **NO CHANGE** | already implemented; 30+ handshaked peers in ≤1.8 s, cold TTFB 0.12–0.37 s |
+| 5 | Storage-radius receipt routing | **REVERT** | 407 vs 421 KiB/s (noise); ordering can't matter at capped concurrency |
+| 6 | Feed head-finding | **KEEP ×2 / not-adopt ×1** | (a) wrapped-CAC serve: cold 0/27 → 27/27; (b) hint: warm flat 1.6 s at any depth; k-ary finder declined on window-quantization analysis |
+
+### Baseline → end state
+
+| Metric | Baseline (pre-lab) | End state (defaults on) |
+|---|---|---|
+| 512 MiB upload | fails ~250 MiB (87 min → 50.7 %, ~14 KiB/s crawl) | **completes 3/3** (33/59/54 min; 268/147/161 KiB/s) |
+| 256 MiB upload | never completes (frozen tail) | **completes** (median 156 KiB/s effective, n=2) |
+| 32 MiB upload | 489 KiB/s median | ~490 KiB/s (unchanged; wall not hit at this size) |
+| Failed push attempts / chunk (512) | ~13 | ~1.4 |
+| Cold feed resolution | 0 % (404) | 100 %, 1.6–4.3 s |
+| Warm feed poll (head 100) | 4.0 s (=cold) | **1.6 s** |
+| Cold download TTFB / third-party 55 MiB | 0.12–0.37 s / 685 KiB/s | unchanged (not touched) |
+
+### DoD #4: quantified ceiling (the 2× branch was not reached — structural case)
+
+Best achieved at 256 MiB: completed-run median **155.9 KiB/s
+effective = 1.89×** the committed baseline cell (82.4 KiB/s — which
+never completed; on a completion basis the improvement is
+unbounded). Why the remaining gap is structural for a cheque-less
+light client:
+
+1. **Per-peer refresh budget bounds the plateau.** Bee credits a
+   light peer 450 K PLUR/s; deep-PO chunk prices are ~210–240 K PLUR,
+   so a settled peer sustains ~2 chunks/s. With the ~60–100
+   BZZ-handshaked peers a non-citizen pool holds, the sustainable
+   aggregate is a few hundred KiB/s — exactly the measured 190–400
+   KiB/s data-phase plateaus. More throughput needs either SWAP
+   cheques (spending; out of lab scope) or full-node advertisement
+   (hoverfly's 10× budget trick — their data, untested here).
+2. **Citizenship churn.** ~100 % of session deaths are bee-side RSTs
+   (kademlia prune of non-public non-citizens + debt enforcement);
+   the tail neighbourhoods carry blocklist scars from the run's own
+   early burst, making the last few hundred tree chunks the dominant
+   variance source (4–35 min across the three 512 proofs).
+   A co-located full bee holds ~131 stable neighbours instead
+   (hoverfly's structural framing, reproduced by our RST forensics).
+
+### Batch ledger (end of day)
+
+Batch 1 (immutable `1decad4e…`): utilization 0.69 — small-cell A/Bs
+only from here. Batch 2 (mutable `7fb5cb0b…`): ~580 K chunks issued
+(3× 512 proofs + 2× 256) — plenty of headroom for future rounds.
 
 ## Experiment queue
 
