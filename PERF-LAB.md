@@ -228,6 +228,35 @@ session push latencies rather than handshake counts.
 - **Results**: _(pending)_
 - **Decision**: _(pending)_
 
+### Experiment 6(a): serve feed wrapped CAC from the SOC — **KEEP**
+
+- **Hypothesis**: cold feed resolution 404s because ant re-fetches a
+  v2 update's wrapped CAC by address from the network, where it never
+  exists standalone (bee serves it straight from the SOC).
+- **Change**: `fetcher.put_recovered(inner_cac_addr, wire[97..])` at
+  `decode_sequence_update` success in the resolver — one hook covers
+  GetFeed, the /bzz feed-manifest walk, and traversal. Unflagged
+  (read-path bug fix); regression test
+  `get_feed_seeds_wrapped_v2_cac_into_cache`. Commit `19caab5`-era
+  (exp code commit).
+- **Method**: `perf_bench feed --runs 3` per arm, arm A = pre-fix
+  binary snapshot (`perf/state/antd-baseline-bin`, from the running
+  baseline process), arm B = fixed build; same topics (heads
+  0/10/100), back-to-back windows 16:15–16:20Z, fresh daemon per run,
+  ports 3733/3743. Interleaving waived: outcome is categorical and
+  the wrapped CACs can never become network-retrievable (only the
+  SOCs replicate), so time drift can't flip arm A.
+- **Results**: arm A **0/27 ok** (median attempt 10.6 s, all 404
+  after successful head resolution); arm B **27/27 ok**, resolved
+  indices exact (0 / 0xa / 0x64), cold medians **1.61 / 2.48 /
+  4.33 s** for heads 0/10/100, warm ≈ cold.
+- **Decision**: **KEEP.** 0 % → 100 % cold feed resolution; also
+  removes ~6–9 s of doomed network fetch per resolution. Note for
+  6(b): the remaining latency is quantised at multiples of the 800 ms
+  speculative-probe deadline (2×/3×/5× for heads 0/10/100) — the
+  finder's phases serialise deadline windows; that's the next lever,
+  together with warm-path hint caching (warm == cold today).
+
 _(further experiments use the same template)_
 
 ### Experiment N: name
