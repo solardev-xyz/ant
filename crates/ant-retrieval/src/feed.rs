@@ -498,14 +498,32 @@ pub async fn resolve_sequence_feed_full(
     fetcher: &dyn ChunkFetcher,
     feed: &Feed,
 ) -> Result<FeedResolution, FeedError> {
+    resolve_sequence_feed_after(fetcher, feed, 0).await
+}
+
+/// [`resolve_sequence_feed_full`] with an explicit anchor index — the
+/// `?after=N` query parameter of `GET /feeds/{owner}/{topic}`. Bee's
+/// `asyncFinder.At(ctx, at, after)` starts by fetching the update at
+/// index `after` and answers `404 "no update found"` when that index is
+/// absent — even if earlier updates exist; when present, the search for
+/// the latest update proceeds from there. `after = 0` is the plain
+/// "latest" lookup.
+pub async fn resolve_sequence_feed_after(
+    fetcher: &dyn ChunkFetcher,
+    feed: &Feed,
+    after: u64,
+) -> Result<FeedResolution, FeedError> {
     let mut probed: u64 = 0;
 
-    // Phase 0 — anchor on index 0 (unbounded: it must resolve).
-    let (mut latest_index, mut latest) = match probe(fetcher, feed, 0, &mut probed, None).await? {
-        ProbeOutcome::Present(u) => (0u64, u),
-        ProbeOutcome::Absent => return Err(FeedError::NoUpdates { probed }),
-        ProbeOutcome::Transient(e) => return Err(FeedError::Fetch(e)),
-    };
+    // Phase 0 — anchor on index `after` (unbounded: it must resolve;
+    // bee's anchor fetch is likewise bounded only by the request
+    // context).
+    let (mut latest_index, mut latest) =
+        match probe(fetcher, feed, after, &mut probed, None).await? {
+            ProbeOutcome::Present(u) => (after, u),
+            ProbeOutcome::Absent => return Err(FeedError::NoUpdates { probed }),
+            ProbeOutcome::Transient(e) => return Err(FeedError::Fetch(e)),
+        };
 
     loop {
         // Phase 1 — exponential bracket. `lo` is known present, `hi` is
@@ -581,20 +599,40 @@ pub async fn resolve_sequence_feed_full(
         }))
         .await;
         let mut higher: Option<(u64, DecodedUpdate)> = None;
+        let mut lowest_transient: Option<u64> = None;
         for (i, outcome) in outcomes {
-            if let ProbeOutcome::Present(u) = outcome? {
-                match higher {
+            match outcome? {
+                ProbeOutcome::Present(u) => match higher {
                     Some((found, _)) if found <= i => {}
                     _ => higher = Some((i, u)),
+                },
+                ProbeOutcome::Transient(_) => {
+                    lowest_transient = Some(lowest_transient.map_or(i, |t| t.min(i)));
                 }
+                ProbeOutcome::Absent => {}
             }
         }
         match higher {
-            Some((i, u)) => {
+            // Contiguous next index: unambiguous — the bracket was
+            // truncated by a transient miss and the feed continues.
+            Some((i, u)) if i == latest_index + 1 => {
                 latest_index = i;
                 latest = u;
             }
-            None => break,
+            // A NON-contiguous hit is adopted only when a *transient*
+            // miss below it could have hidden the intermediate
+            // updates. When every lower probe is a definitive
+            // "not found" the gap is real, and bee's contiguity-based
+            // finder treats the feed as ended at `latest_index` — a
+            // sequence writer never skips indices, so e.g. {0, 2}
+            // resolves to 0 on both clients (pinned by the
+            // tests/feeds_matrix.rs differential; adopting the orphan
+            // update forked ant's answer from bee's).
+            Some((i, u)) if lowest_transient.is_some_and(|t| t < i) => {
+                latest_index = i;
+                latest = u;
+            }
+            _ => break,
         }
     }
 
@@ -1439,6 +1477,81 @@ mod tests {
             resolution.index, 3,
             "must look past a transient hole and return the latest update, not a stale one",
         );
+    }
+
+    /// A DEFINITIVE gap (index 1 is a clean "not found", not a
+    /// transient failure) ends the feed at index 0 even when an orphan
+    /// update exists at index 2 — bee's contiguity-shaped behavior,
+    /// pinned differentially by `tests/feeds_matrix.rs` (`gap-0-2`).
+    /// Sequence writers never skip indices, so an orphan past a
+    /// definitive gap is not "the latest"; only a *transient* miss (a
+    /// flaky peer hiding a real update) lets the look-ahead adopt a
+    /// non-contiguous hit — see `transient_hole_does_not_return_stale_update`.
+    #[tokio::test]
+    async fn definitive_gap_ends_the_feed() {
+        let secret: [u8; 32] = [16u8; 32];
+        let owner = deterministic_eth_address(&secret);
+        let topic: [u8; 32] = [0x24u8; 32];
+        let feed = Feed {
+            owner,
+            topic,
+            kind: FeedType::Sequence,
+        };
+
+        let mut fetcher = MapFetcher::new();
+        for i in [0u64, 2] {
+            let r = [0x40u8 + i as u8; 32];
+            let (addr, wire) = make_sequence_update_v1(&secret, &owner, &topic, i, &r);
+            fetcher.insert(addr, wire);
+            fetcher.insert(r, cac_new(b"update content").unwrap().1);
+        }
+
+        let resolution = resolve_sequence_feed_full(&fetcher, &feed).await.unwrap();
+        assert_eq!(
+            resolution.index, 0,
+            "a definitive gap at index 1 ends the feed at 0 (bee parity), \
+             even though an orphan update exists at index 2",
+        );
+    }
+
+    /// `?after=N` anchor semantics (bee's `asyncFinder.At(_, at, after)`):
+    /// the finder starts at `after` — absent means "no update found"
+    /// even when earlier updates exist; present means the latest search
+    /// proceeds from there.
+    #[tokio::test]
+    async fn after_anchor_semantics() {
+        let secret: [u8; 32] = [17u8; 32];
+        let owner = deterministic_eth_address(&secret);
+        let topic: [u8; 32] = [0x25u8; 32];
+        let feed = Feed {
+            owner,
+            topic,
+            kind: FeedType::Sequence,
+        };
+
+        let mut fetcher = MapFetcher::new();
+        for i in [1u64, 2] {
+            let r = [0x50u8 + i as u8; 32];
+            let (addr, wire) = make_sequence_update_v1(&secret, &owner, &topic, i, &r);
+            fetcher.insert(addr, wire);
+            fetcher.insert(r, cac_new(b"update content").unwrap().1);
+        }
+
+        // No index 0: the default lookup misses its anchor.
+        assert!(matches!(
+            resolve_sequence_feed_after(&fetcher, &feed, 0).await,
+            Err(FeedError::NoUpdates { .. })
+        ));
+        // Re-anchored at 1, the finder walks to the true latest (2).
+        let r = resolve_sequence_feed_after(&fetcher, &feed, 1)
+            .await
+            .unwrap();
+        assert_eq!(r.index, 2);
+        // Anchored above the head: absent anchor, "no update found".
+        assert!(matches!(
+            resolve_sequence_feed_after(&fetcher, &feed, 3).await,
+            Err(FeedError::NoUpdates { .. })
+        ));
     }
 
     /// Regression for the "`BAD_GATEWAY` on a healthy feed" failure mode:

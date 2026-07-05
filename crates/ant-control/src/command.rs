@@ -465,6 +465,12 @@ pub enum ControlCommand {
     GetFeed {
         owner: [u8; 20],
         topic: [u8; 32],
+        /// Anchor index for the lookup — the `?after=N` query parameter
+        /// of bee's `GET /feeds/{owner}/{topic}`: the finder starts at
+        /// this index (absent ⇒ "no update found", even if earlier
+        /// updates exist) and searches for the latest update from
+        /// there. `0` is the plain "latest" lookup.
+        after: u64,
         ack: oneshot::Sender<ControlAck>,
     },
     /// Gateway read-only settlement/balance endpoints (`GET /balances`,
