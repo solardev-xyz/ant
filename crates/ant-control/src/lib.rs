@@ -20,7 +20,8 @@ pub use activity::{ActiveRequestGuard, GatewayActivity, GatewayActivityHandle};
 // Windows too. Only the Unix domain-socket transport (`serve`, client)
 // is gated.
 pub use command::{
-    streaming_ack_channel, ControlAck, ControlCommand, ManifestEntryInfo, StreamRange,
+    streaming_ack_channel, ControlAck, ControlCommand, ManifestEntryInfo, PinCheckStat,
+    PostageBucketsView, StreamRange,
 };
 pub use protocol::{
     AccountingSnapshotView, CacheInfo, DiskCacheInfo, ExternalAddressInfo, GatewayRequestInfo,

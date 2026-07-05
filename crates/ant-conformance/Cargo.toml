@@ -24,5 +24,12 @@ k256.workspace = true
 reqwest = { version = "0.12.23", default-features = false }
 tokio.workspace = true
 
+[dev-dependencies]
+# WebSocket client for the /chunks/stream conformance test (the
+# differential Step model is plain HTTP; the WS flow gets its own
+# integration test driving both backends). Loopback only — no TLS.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake"] }
+futures = "0.3.31"
+
 [lints]
 workspace = true

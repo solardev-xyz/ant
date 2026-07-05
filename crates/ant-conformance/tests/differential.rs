@@ -190,6 +190,8 @@ struct Scenario {
 const COMPARED_HEADERS: &[&str] = &[
     "content-type",
     "content-disposition",
+    "content-range",
+    "accept-ranges",
     "etag",
     "swarm-feed-index",
     "swarm-feed-index-next",
@@ -261,6 +263,39 @@ fn kind_of(v: &Value) -> &'static str {
     }
 }
 
+/// Normalize a `multipart/byteranges` response: the boundary is random
+/// per response (Go mints 30 random bytes), so replace it — in the
+/// `Content-Type` header value and everywhere in the body — with the
+/// fixed token `BOUNDARY`. Everything else (part framing, per-part
+/// headers, part payloads) then compares byte-for-byte.
+fn normalize_multipart(
+    headers: &reqwest::header::HeaderMap,
+    body: &[u8],
+) -> (Option<String>, Vec<u8>) {
+    let Some(ct) = headers.get("content-type").and_then(|v| v.to_str().ok()) else {
+        return (None, body.to_vec());
+    };
+    let Some(boundary) = ct.strip_prefix("multipart/byteranges; boundary=") else {
+        return (None, body.to_vec());
+    };
+    let needle = boundary.as_bytes();
+    let mut out = Vec::with_capacity(body.len());
+    let mut i = 0;
+    while i < body.len() {
+        if body[i..].starts_with(needle) {
+            out.extend_from_slice(b"BOUNDARY");
+            i += needle.len();
+        } else {
+            out.push(body[i]);
+            i += 1;
+        }
+    }
+    (
+        Some("multipart/byteranges; boundary=BOUNDARY".to_string()),
+        out,
+    )
+}
+
 fn observe(
     status: u16,
     headers: &reqwest::header::HeaderMap,
@@ -268,10 +303,14 @@ fn observe(
     step_volatile: &[&str],
     step_volatile_headers: &[&str],
 ) -> Observation {
+    let (normalized_ct, body_owned) = normalize_multipart(headers, body);
+    let body = body_owned.as_slice();
     let mut kept = BTreeMap::new();
     for name in COMPARED_HEADERS {
         if let Some(v) = headers.get(*name) {
-            let val = if PRESENCE_ONLY_HEADERS.contains(name) {
+            let val = if *name == "content-type" && normalized_ct.is_some() {
+                normalized_ct.clone().expect("checked is_some")
+            } else if PRESENCE_ONLY_HEADERS.contains(name) {
                 "<present>".to_string()
             } else if step_volatile_headers.contains(name) {
                 // Shape-preserving mask, like step-volatile JSON keys.
@@ -361,10 +400,27 @@ async fn run_step(client: &reqwest::Client, backend: &mut Backend, step: &Step) 
     if !body.is_empty() {
         req = req.body(body);
     }
-    let resp = req
-        .send()
-        .await
-        .unwrap_or_else(|e| panic!("{}: {} {} failed: {e}", backend.name, step.method, url));
+    // A backend can wedge the request entirely (bee's broken
+    // encrypted-feed path sometimes never returns headers: the joiner
+    // chases a garbage decrypted span until the client timeout). Fold
+    // that into an observable "status 0" observation instead of
+    // killing the run — the affected steps carry registry entries.
+    let resp = match req.send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            eprintln!(
+                "NOTE {}: {} {} failed to complete: {e}",
+                backend.name, step.method, url
+            );
+            return observe(
+                0,
+                &reqwest::header::HeaderMap::new(),
+                format!("<request error: {e}>").as_bytes(),
+                step.volatile,
+                step.volatile_headers,
+            );
+        }
+    };
     let status = resp.status().as_u16();
     let headers = resp.headers().clone();
     // A backend can violate HTTP by advertising a Content-Length it
@@ -1140,6 +1196,196 @@ fn scenarios() -> Vec<Scenario> {
                     .header("swarm-postage-batch-id", batch)
                     .header("swarm-redundancy-level", "256")
                     .body(&b"x"[..]),
+            ],
+        },
+        // Local pinning (bee pkg/api/pin.go): full lifecycle, plus the
+        // swarm-pin upload header on /bytes, /bzz, /soc, and an
+        // encrypted-reference pin. `POST /chunks` + swarm-pin is a
+        // *registered* divergence: bee's chunkUploadHandler doesn't
+        // parse Swarm-Pin at all; ant honors it (pin-light is the
+        // point of ant's local store).
+        Scenario {
+            name: "pins",
+            steps: vec![
+                Step::new("upload", "POST", "/bytes")
+                    .header("content-type", "application/octet-stream")
+                    .header("swarm-postage-batch-id", batch)
+                    .body(b"pin differential payload\n".repeat(600))
+                    .extract("reference", "pin_ref"),
+                Step::new("pin", "POST", "/pins/{pin_ref}"),
+                Step::new("get-pin", "GET", "/pins/{pin_ref}"),
+                Step::new("list", "GET", "/pins"),
+                Step::new("double-pin", "POST", "/pins/{pin_ref}"),
+                // swarm-pin on upload: the root must show up in /pins.
+                Step::new("upload-bytes-pinned", "POST", "/bytes")
+                    .header("content-type", "application/octet-stream")
+                    .header("swarm-postage-batch-id", batch)
+                    .header("swarm-pin", "true")
+                    .body(&b"pinned-at-upload bytes payload"[..])
+                    .extract("reference", "pin_up_ref"),
+                Step::new("get-upload-pin", "GET", "/pins/{pin_up_ref}"),
+                Step::new("upload-bzz-pinned", "POST", "/bzz?name=pinned.txt")
+                    .header("content-type", "text/plain")
+                    .header("swarm-postage-batch-id", batch)
+                    .header("swarm-pin", "true")
+                    .body(&b"pinned bzz single file\n"[..])
+                    .extract("reference", "pin_bzz_ref"),
+                Step::new("get-bzz-pin", "GET", "/pins/{pin_bzz_ref}"),
+                Step::new("list-after-upload-pins", "GET", "/pins"),
+                Step::new("unpin", "DELETE", "/pins/{pin_ref}"),
+                Step::new("get-pin-after-unpin", "GET", "/pins/{pin_ref}"),
+                Step::new("unpin-again", "DELETE", "/pins/{pin_ref}"),
+                Step::new("pin-missing", "POST", format!("/pins/{missing_ref}")),
+                Step::new("pin-bad-ref", "POST", "/pins/zznothex"),
+                // Encrypted reference (128-hex): bee pins by traversing
+                // the decrypting joiner; the stored chunks live under
+                // the ciphertext addresses. Values are random per
+                // upload → masked shape-preserving.
+                Step::new("upload-encrypted", "POST", "/bytes")
+                    .header("content-type", "application/octet-stream")
+                    .header("swarm-postage-batch-id", batch)
+                    .header("swarm-encrypt", "true")
+                    .body(b"encrypted pin differential payload\n".repeat(300))
+                    .extract("reference", "pin_enc_ref")
+                    .volatile(&["reference"]),
+                Step::new("pin-encrypted", "POST", "/pins/{pin_enc_ref}"),
+                Step::new("get-pin-encrypted", "GET", "/pins/{pin_enc_ref}")
+                    .volatile(&["reference"]),
+                Step::new("unpin-encrypted", "DELETE", "/pins/{pin_enc_ref}"),
+                // Registered divergence: ant honors swarm-pin on
+                // POST /chunks, bee ignores it there.
+                Step::new("upload-chunk-pinned", "POST", "/chunks")
+                    .header("content-type", "application/octet-stream")
+                    .header("swarm-postage-batch-id", batch)
+                    .header("swarm-pin", "true")
+                    .body({
+                        let payload = b"pinned chunk payload".to_vec();
+                        let mut wire = (payload.len() as u64).to_le_bytes().to_vec();
+                        wire.extend_from_slice(&payload);
+                        wire
+                    })
+                    .extract("reference", "pin_chunk_ref"),
+                Step::new("get-chunk-pin", "GET", "/pins/{pin_chunk_ref}"),
+            ],
+        },
+        // HTTP Range mechanics on a multi-chunk /bytes file: bee serves
+        // through Go's http.ServeContent, so this pins Go's exact
+        // semantics — clamping, suffix ranges, the two 416 shapes
+        // (text/plain bodies!), multipart/byteranges for a multi-range,
+        // and HEAD ignoring Range outright.
+        Scenario {
+            name: "range-mechanics",
+            steps: vec![
+                Step::new("upload", "POST", "/bytes")
+                    .header("content-type", "application/octet-stream")
+                    .header("swarm-postage-batch-id", batch)
+                    // 12000 deterministic bytes → 3 leaves + 1 root.
+                    .body((0..12000usize).map(|i| ((i * 7) % 251) as u8).collect::<Vec<u8>>())
+                    .extract("reference", "range_ref"),
+                Step::new("range-prefix", "GET", "/bytes/{range_ref}")
+                    .header("range", "bytes=0-99"),
+                Step::new("range-mid", "GET", "/bytes/{range_ref}")
+                    .header("range", "bytes=5000-8191"),
+                Step::new("range-suffix", "GET", "/bytes/{range_ref}")
+                    .header("range", "bytes=-100"),
+                Step::new("range-open-ended", "GET", "/bytes/{range_ref}")
+                    .header("range", "bytes=500-"),
+                Step::new("range-last-byte", "GET", "/bytes/{range_ref}")
+                    .header("range", "bytes=11999-11999"),
+                Step::new("range-end-clamped", "GET", "/bytes/{range_ref}")
+                    .header("range", "bytes=0-999999"),
+                // Starts at/after the end → 416 + Content-Range: bytes */N.
+                Step::new("range-at-end", "GET", "/bytes/{range_ref}")
+                    .header("range", "bytes=12000-"),
+                Step::new("range-past-end", "GET", "/bytes/{range_ref}")
+                    .header("range", "bytes=99999999-"),
+                // Malformed → Go's bare "invalid range" 416.
+                Step::new("range-malformed", "GET", "/bytes/{range_ref}")
+                    .header("range", "bytes=abc"),
+                Step::new("range-wrong-unit", "GET", "/bytes/{range_ref}")
+                    .header("range", "items=0-5"),
+                Step::new("range-backwards", "GET", "/bytes/{range_ref}")
+                    .header("range", "bytes=5-2"),
+                // Multi-range → 206 multipart/byteranges (boundary
+                // normalized by the harness).
+                Step::new("range-multi", "GET", "/bytes/{range_ref}")
+                    .header("range", "bytes=0-1,5-9"),
+                Step::new("range-multi-trailing-comma", "GET", "/bytes/{range_ref}")
+                    .header("range", "bytes=0-1,"),
+                // HEAD never applies Range (bee's bytesHeadHandler).
+                Step::new("head-with-range", "HEAD", "/bytes/{range_ref}")
+                    .header("range", "bytes=0-99"),
+                // The same tour on /bzz/{ref}/path.
+                Step::new("upload-bzz", "POST", "/bzz?name=ranged.bin")
+                    .header("content-type", "application/octet-stream")
+                    .header("swarm-postage-batch-id", batch)
+                    .body((0..12000usize).map(|i| ((i * 11) % 251) as u8).collect::<Vec<u8>>())
+                    .extract("reference", "range_bzz_ref"),
+                Step::new("bzz-range-prefix", "GET", "/bzz/{range_bzz_ref}/ranged.bin")
+                    .header("range", "bytes=0-99"),
+                Step::new("bzz-range-suffix", "GET", "/bzz/{range_bzz_ref}/ranged.bin")
+                    .header("range", "bytes=-100"),
+                Step::new("bzz-range-past-end", "GET", "/bzz/{range_bzz_ref}/ranged.bin")
+                    .header("range", "bytes=99999999-"),
+                Step::new("bzz-range-malformed", "GET", "/bzz/{range_bzz_ref}/ranged.bin")
+                    .header("range", "bytes=oops"),
+                Step::new("bzz-range-multi", "GET", "/bzz/{range_bzz_ref}/ranged.bin")
+                    .header("range", "bytes=0-1,5-9"),
+                Step::new("bzz-head-with-range", "HEAD", "/bzz/{range_bzz_ref}/ranged.bin")
+                    .header("range", "bytes=0-99"),
+                // And on an ENCRYPTED reference (both backends support
+                // ranged encrypted reads — buffered decrypt + slice).
+                Step::new("upload-encrypted", "POST", "/bytes")
+                    .header("content-type", "application/octet-stream")
+                    .header("swarm-postage-batch-id", batch)
+                    .header("swarm-encrypt", "true")
+                    .body((0..12000usize).map(|i| ((i * 13) % 251) as u8).collect::<Vec<u8>>())
+                    .extract("reference", "range_enc_ref")
+                    .volatile(&["reference"]),
+                Step::new("enc-range-prefix", "GET", "/bytes/{range_enc_ref}")
+                    .header("range", "bytes=0-99")
+                    .volatile_headers(&["etag"]),
+                Step::new("enc-range-suffix", "GET", "/bytes/{range_enc_ref}")
+                    .header("range", "bytes=-100")
+                    .volatile_headers(&["etag"]),
+                Step::new("enc-range-past-end", "GET", "/bytes/{range_enc_ref}")
+                    .header("range", "bytes=99999999-"),
+                Step::new("enc-range-multi", "GET", "/bytes/{range_enc_ref}")
+                    .header("range", "bytes=0-1,5-9")
+                    .volatile_headers(&["etag"]),
+            ],
+        },
+        // Per-bucket postage counters (bee postageGetStampBucketsHandler).
+        // A batch id that never stamped anything reports all-zero
+        // collisions with the accept-all mock geometry (depth 24,
+        // bucketDepth 6) on both rigs.
+        Scenario {
+            name: "stamps-buckets",
+            steps: vec![
+                Step::new(
+                    "buckets-fresh-batch",
+                    "GET",
+                    "/stamps/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc/buckets",
+                ),
+                Step::new("buckets-bad-id", "GET", "/stamps/zznothex/buckets"),
+            ],
+        },
+        // Network batch listing/lookup. Ant deliberately has no postage
+        // event sync (direct RPC reads only): the global list is
+        // honestly empty and a chain-less rig 404s the single-batch
+        // lookup — both registered divergences with design notes. The
+        // unknown-batch and malformed-id shapes match bee exactly.
+        Scenario {
+            name: "batches",
+            steps: vec![
+                Step::new("list", "GET", "/batches"),
+                Step::new("get-known", "GET", "/batches/{batch}"),
+                Step::new(
+                    "get-unknown",
+                    "GET",
+                    "/batches/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                ),
+                Step::new("get-bad-id", "GET", "/batches/zznothex"),
             ],
         },
         Scenario {

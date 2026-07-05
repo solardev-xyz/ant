@@ -52,6 +52,31 @@ fields masked):
   test**. When you change gateway behavior, either make it match bee or
   register it with a precise note.
 
+Scenarios (`crates/ant-conformance/tests/differential.rs`): `bytes`,
+`chunks`, `bzz-file`, `bzz-collection`, `encryption`, `soc`,
+`feeds-timeline`, `tags`, `stewardship-envelope`, `redundancy`,
+`pins` (bee `pkg/api/pin.go` lifecycle + `swarm-pin` upload header,
+incl. an encrypted-reference pin), `range-mechanics` (Go
+`http.ServeContent` parity on `/bytes`, `/bzz`, and an encrypted
+reference: clamping, suffix/open-ended ranges, both 416 shapes,
+`multipart/byteranges` with the boundary normalized by the harness,
+HEAD ignoring Range), `stamps-buckets` (`GET /stamps/{id}/buckets`),
+`batches` (`GET /batches`; ant's no-event-sync subset is a registered
+divergence), and `settlements`.
+
+`GET /pins/check` is **not** in the differential: bee's
+`pinIntegrityHandler` needs a real `storer.PinIntegrity` (transactional
+store + sharky) that the api mocks can't provide — beemock would panic.
+Its NDJSON shape is pinned by `crates/ant-gateway/tests/pins.rs`
+instead.
+
+The `/chunks/stream` WebSocket upload (bee `pkg/api/chunk_stream.go`)
+is exercised by `crates/ant-conformance/tests/chunk_stream.rs`, which
+drives both backends over a live WebSocket (the differential Step model
+is plain HTTP): same frames in, bee's empty-binary acks out, pre-signed
+stamp mode, tag interaction, and bee's exact close codes/reasons on
+protocol errors.
+
 The differential test (`crates/ant-conformance/tests/differential.rs`)
 runs as part of `cargo test -p ant-conformance` and **skips with a
 notice if the beemock binary is missing** (e.g. CI without Go).

@@ -32,6 +32,8 @@ mod chain;
 #[cfg(feature = "chain")]
 pub mod chainreader;
 #[cfg(feature = "http-api")]
+mod chunk_stream;
+#[cfg(feature = "http-api")]
 mod cors;
 #[cfg(feature = "http-api")]
 mod error;
@@ -39,6 +41,8 @@ mod error;
 mod fallback;
 #[cfg(feature = "http-api")]
 mod handle;
+#[cfg(feature = "http-api")]
+mod pins;
 #[cfg(feature = "http-api")]
 mod retrieval;
 #[cfg(feature = "http-api")]
@@ -55,7 +59,7 @@ mod stewardship;
 mod tags;
 
 #[cfg(feature = "http-api")]
-pub use chain::{ChainContext, ChainReader, ChainWriter};
+pub use chain::{BatchMetaView, ChainContext, ChainReader, ChainWriter};
 #[cfg(feature = "http-api")]
 pub use cors::CorsConfig;
 #[cfg(feature = "http-api")]

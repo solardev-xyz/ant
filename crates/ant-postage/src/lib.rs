@@ -434,8 +434,19 @@ impl StampIssuer {
         }
     }
 
-    fn bucket_upper_bound(&self) -> u32 {
+    /// Max collisions per bucket: `2^(batch_depth - bucket_depth)`.
+    /// Public because bee's `GET /stamps/{id}/buckets` surfaces it as
+    /// `bucketUpperBound`.
+    #[must_use]
+    pub fn bucket_upper_bound(&self) -> u32 {
         1u32 << u32::from(self.batch_depth - self.bucket_depth)
+    }
+
+    /// Raw per-bucket collision counters, indexed by bucket id. Backs
+    /// bee's `GET /stamps/{id}/buckets` (`issuer.Buckets()`).
+    #[must_use]
+    pub fn bucket_counts(&self) -> &[u32] {
+        &self.buckets
     }
 
     /// True if the collision bucket the chunk at `addr` maps to is

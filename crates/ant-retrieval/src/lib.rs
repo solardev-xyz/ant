@@ -96,7 +96,7 @@ pub use rs_encode::{
     replica_chunks, split_bytes_with_redundancy, RedundantSplitResult, RedundantSplitter,
 };
 pub use splitter::{split_bytes, SplitChunk, SplitResult, StreamingSplitter, BRANCHES};
-pub use traversal::{traverse_chunk_addresses, TraversalError};
+pub use traversal::{traverse_chunk_addresses, traverse_encrypted_chunk_addresses, TraversalError};
 
 use ant_crypto::{cac_valid, soc_valid, CHUNK_SIZE, SOC_HEADER_SIZE, SPAN_SIZE};
 use async_trait::async_trait;

@@ -44,6 +44,9 @@ use tokio::task::JoinHandle;
 /// CAC (`span(8 LE) ‖ payload`).
 const SOC_HEADER: usize = 32 + 65;
 
+/// Pin membership rows: `(pinned root reference, member addresses)`.
+type PinRows = Vec<(Vec<u8>, Vec<[u8; 32]>)>;
+
 /// Shared in-memory chunk store backing the `MemNode`.
 ///
 /// Keys are 32-byte chunk addresses; values are the chunk **wire
@@ -60,6 +63,12 @@ const SOC_HEADER: usize = 32 + 65;
 #[derive(Clone, Default)]
 pub struct MemChunkStore {
     chunks: Arc<Mutex<HashMap<[u8; 32], Vec<u8>>>>,
+    /// Pin registry: `(root reference, member addresses)` in
+    /// pin-creation order — the in-memory analogue of the production
+    /// disk cache's `pins` / `pin_members` tables. `MemNode` never
+    /// evicts, so no per-chunk refcount is needed; membership is kept
+    /// so `/pins/check` can report bee's integrity rows.
+    pins: Arc<Mutex<PinRows>>,
 }
 
 impl MemChunkStore {
@@ -90,6 +99,18 @@ impl MemChunkStore {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.lock().is_empty()
+    }
+
+    fn lock_pins(&self) -> std::sync::MutexGuard<'_, PinRows> {
+        self.pins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Pinned root references in pin-creation order.
+    #[must_use]
+    pub fn pinned(&self) -> Vec<Vec<u8>> {
+        self.lock_pins().iter().map(|(r, _)| r.clone()).collect()
     }
 }
 
@@ -124,11 +145,15 @@ struct MemPostage {
     issuers: Mutex<HashMap<[u8; 32], ant_postage::StampIssuer>>,
 }
 
-/// Batch geometry for lazily-created issuers: bee's default bucket
-/// depth (16) with enough headroom (depth 24) that a conformance run
-/// never saturates a bucket.
+/// Batch geometry for lazily-created issuers, matching the fallback
+/// issuer bee's `mockpost.WithAcceptAll` mints for **any** batch id:
+/// `postage.NewStampIssuer(..., batchDepth: 24, bucketDepth: 6, ...)`
+/// (`pkg/postage/mock/service.go`). Beemock stamps and reports
+/// `GET /stamps/{id}/buckets` with that geometry, so `MemNode` mirrors
+/// it — 64 buckets of `2^18` slots is also ample headroom for a
+/// conformance run.
 const MEM_BATCH_DEPTH: u8 = 24;
-const MEM_BUCKET_DEPTH: u8 = 16;
+const MEM_BUCKET_DEPTH: u8 = 6;
 
 impl MemPostage {
     fn new() -> Self {
@@ -142,6 +167,32 @@ impl MemPostage {
             secret,
             owner,
             issuers: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Bucket snapshot for `GET /stamps/{id}/buckets`, mirroring
+    /// beemock's `mockpost.WithAcceptAll`: **any** batch id resolves
+    /// to an issuer (lazily created with the mock geometry), so the
+    /// endpoint never 404s on the mem rig. A batch that has stamped
+    /// nothing reports all-zero collisions, exactly like the fresh
+    /// issuer bee's mock mints per call.
+    fn buckets(&self, batch_id: [u8; 32]) -> ant_control::PostageBucketsView {
+        let mut issuers = self
+            .issuers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let issuer = match issuers.entry(batch_id) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => e.insert(
+                ant_postage::StampIssuer::new(batch_id, MEM_BATCH_DEPTH, MEM_BUCKET_DEPTH, false)
+                    .expect("mem issuer geometry is valid"),
+            ),
+        };
+        ant_control::PostageBucketsView {
+            depth: issuer.batch_depth(),
+            bucket_depth: issuer.bucket_depth(),
+            bucket_upper_bound: issuer.bucket_upper_bound(),
+            collisions: issuer.bucket_counts().to_vec(),
         }
     }
 
@@ -879,6 +930,114 @@ async fn handle_command(store: &MemChunkStore, postage: &MemPostage, cmd: Contro
             let _ = ack.send(ControlAck::Accounting(
                 ant_control::AccountingSnapshotView::default(),
             ));
+        }
+        // ---- pins: wired for real against the in-memory store --------
+        // `MemNode`'s pin model mirrors the production disk cache: pin
+        // = traverse (plain or encrypted) + record membership; the
+        // store itself never evicts, so the "exempt from eviction"
+        // invariant is trivially true here.
+        ControlCommand::PinAdd { reference, ack } => {
+            if store.lock_pins().iter().any(|(r, _)| *r == reference) {
+                let _ = ack.send(ControlAck::PinAdded {
+                    already_pinned: true,
+                });
+                return;
+            }
+            let addrs = match reference.len() {
+                32 => {
+                    let root: [u8; 32] = reference.as_slice().try_into().expect("len checked");
+                    ant_retrieval::traverse_chunk_addresses(store, root, DEFAULT_MAX_FILE_BYTES)
+                        .await
+                }
+                64 => {
+                    let root: [u8; 64] = reference.as_slice().try_into().expect("len checked");
+                    ant_retrieval::traverse_encrypted_chunk_addresses(
+                        store,
+                        root,
+                        DEFAULT_MAX_FILE_BYTES,
+                    )
+                    .await
+                }
+                n => {
+                    let _ = ack.send(ControlAck::Error {
+                        message: format!("invalid pin reference length: {n} bytes"),
+                    });
+                    return;
+                }
+            };
+            let reply = match addrs {
+                Ok(addrs) => {
+                    // Every member must be present locally (leaves are
+                    // listed, not fetched, by the traversal).
+                    match addrs.iter().find(|a| store.get(a).is_none()) {
+                        None => {
+                            store.lock_pins().push((reference, addrs));
+                            ControlAck::PinAdded {
+                                already_pinned: false,
+                            }
+                        }
+                        Some(addr) => ControlAck::Error {
+                            message: format!("fetch {}: chunk not found", hex::encode(addr)),
+                        },
+                    }
+                }
+                Err(e) => ControlAck::Error {
+                    message: format!("pin traversal failed: {e}"),
+                },
+            };
+            let _ = ack.send(reply);
+        }
+        ControlCommand::PinRemove { reference, ack } => {
+            let mut pins = store.lock_pins();
+            let before = pins.len();
+            pins.retain(|(r, _)| *r != reference);
+            let _ = ack.send(ControlAck::PinRemoved {
+                was_pinned: pins.len() < before,
+            });
+        }
+        ControlCommand::PinHas { reference, ack } => {
+            let pinned = store.lock_pins().iter().any(|(r, _)| *r == reference);
+            let _ = ack.send(ControlAck::PinPresent { pinned });
+        }
+        ControlCommand::PinList { ack } => {
+            let _ = ack.send(ControlAck::PinList {
+                references: store.pinned(),
+            });
+        }
+        ControlCommand::PinCheck { reference, ack } => {
+            let entries: PinRows = store
+                .lock_pins()
+                .iter()
+                .filter(|(r, _)| reference.as_ref().is_none_or(|want| r == want))
+                .cloned()
+                .collect();
+            let mut stats = Vec::new();
+            for (r, members) in entries {
+                let mut stat = ant_control::PinCheckStat {
+                    reference: r,
+                    total: members.len() as u64,
+                    ..Default::default()
+                };
+                for addr in members {
+                    match store.get(&addr) {
+                        Some(wire) => {
+                            if !(ant_crypto::cac_valid(&addr, &wire)
+                                || ant_crypto::soc_valid(&addr, &wire))
+                            {
+                                stat.invalid += 1;
+                            }
+                        }
+                        None => stat.missing += 1,
+                    }
+                }
+                stats.push(stat);
+            }
+            let _ = ack.send(ControlAck::PinCheck { stats });
+        }
+        // Bucket counters, mirroring beemock's accept-all mock postage
+        // service (see [`MemPostage::buckets`]).
+        ControlCommand::PostageBuckets { batch_id, ack } => {
+            let _ = ack.send(ControlAck::PostageBuckets(postage.buckets(batch_id)));
         }
         ControlCommand::VerifyChunksPresent {
             addresses,

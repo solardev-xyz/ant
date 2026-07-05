@@ -104,6 +104,10 @@ const SWARM_COLLECTION: HeaderName = HeaderName::from_static("swarm-collection")
 /// chunk under a fresh random key, 64-byte references, and a 128-hex
 /// `reference` in the response (bee `SwarmEncryptHeader`).
 const SWARM_ENCRYPT: HeaderName = HeaderName::from_static("swarm-encrypt");
+
+/// Bee's `Swarm-Pin` upload header: also pin the uploaded content
+/// locally alongside the upload.
+const SWARM_PIN: HeaderName = HeaderName::from_static("swarm-pin");
 /// Bee request header: name of the manifest entry that should resolve
 /// when the user requests `bzz://<root>/` (no path). Mirrored on the
 /// root manifest's `/` fork as `website-index-document` metadata.
@@ -482,6 +486,10 @@ pub async fn download_soc(
     let span = u64::from_le_bytes(span_masked);
     if span as usize == wrapped.len() - 8 {
         let mut resp = soc_body_response(head_only, wrapped[8..].to_vec());
+        // Bee's full-deref path serves through http.ServeContent, which
+        // stamps `Accept-Ranges: bytes` (the root-chunk path doesn't).
+        resp.headers_mut()
+            .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
         apply_soc_headers(&mut resp, &signature);
         set_etag(&mut resp, wrapped_addr);
         return resp;
@@ -587,7 +595,7 @@ pub(crate) fn parse_postage_batch_header(headers: &HeaderMap) -> Result<[u8; 32]
 /// the lowercased field and `want redundancy level to be between 0
 /// and 4` (`pkg/api/validation.go`).
 #[allow(clippy::result_large_err)]
-fn parse_redundancy_level_header(headers: &HeaderMap) -> Result<u8, Response> {
+pub(crate) fn parse_redundancy_level_header(headers: &HeaderMap) -> Result<u8, Response> {
     let Some(raw) = headers
         .get(&SWARM_REDUNDANCY_LEVEL)
         .and_then(|v| v.to_str().ok())
@@ -718,6 +726,10 @@ pub async fn upload_chunk(
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
+    let pin = match parse_pin_header(&headers) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
 
     // Pre-signed stamp: check the signature actually covers this chunk
     // before pushing. Bee surfaces the presigned stamper's
@@ -768,6 +780,16 @@ pub async fn upload_chunk(
                 .or_else(|| reference.strip_prefix("0X"))
                 .unwrap_or(reference.as_str())
                 .to_string();
+            if pin {
+                let mut address = [0u8; 32];
+                if hex::decode_to_slice(&stripped, &mut address).is_ok() {
+                    if let Err(resp) =
+                        pin_uploaded_reference(&handle, address.to_vec(), timeout).await
+                    {
+                        return resp;
+                    }
+                }
+            }
             let mut resp = json_response(
                 StatusCode::CREATED,
                 &serde_json::json!({ "reference": stripped }),
@@ -899,6 +921,11 @@ pub async fn upload_soc(
         Err(resp) => return resp,
     };
 
+    let pin = match parse_pin_header(&headers) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+
     // Pre-signed stamp: check the signature covers the SOC's
     // owner-bound address. Bee's soc handler surfaces the presigned
     // stamper's rejection at Put time as `400 "chunk write error"`.
@@ -947,6 +974,12 @@ pub async fn upload_soc(
                 .or_else(|| reference.strip_prefix("0X"))
                 .unwrap_or(reference.as_str())
                 .to_string();
+            if pin {
+                if let Err(resp) = pin_uploaded_reference(&handle, address.to_vec(), timeout).await
+                {
+                    return resp;
+                }
+            }
             // SOC writes are mutable at the address level (the owner can
             // sign a new payload at the same id), so don't apply the
             // immutable cache headers `upload_chunk` uses.
@@ -1037,6 +1070,10 @@ pub async fn upload_bzz(
         Ok(e) => e,
         Err(resp) => return resp,
     };
+    let pin = match parse_pin_header(&headers) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
 
     let timeout = request_timeout(&headers, DEFAULT_REQUEST_TIMEOUT);
 
@@ -1073,6 +1110,11 @@ pub async fn upload_bzz(
     if let Err(err_resp) = push_replica_socs(&handle, &assembled.replicas, batch_id, timeout).await
     {
         return err_resp;
+    }
+    if pin {
+        if let Err(resp) = pin_uploaded_reference(&handle, assembled.root.clone(), timeout).await {
+            return resp;
+        }
     }
 
     let reference_hex = hex::encode(&assembled.root);
@@ -1184,6 +1226,10 @@ pub async fn upload_bytes(
         Ok(e) => e,
         Err(resp) => return resp,
     };
+    let pin = match parse_pin_header(&headers) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
 
     let timeout = request_timeout(&headers, DEFAULT_REQUEST_TIMEOUT);
     let guard = handle
@@ -1218,6 +1264,15 @@ pub async fn upload_bytes(
         }
         if let Err(err_resp) = push_replica_socs(&handle, &replicas, batch_id, timeout).await {
             return err_resp;
+        }
+        if pin {
+            // Bee records the pin under the full (64-byte) encrypted
+            // reference the response returns.
+            if let Err(resp) =
+                pin_uploaded_reference(&handle, split.root_ref.to_vec(), timeout).await
+            {
+                return resp;
+            }
         }
 
         let mut resp = json_response(
@@ -1257,6 +1312,11 @@ pub async fn upload_bytes(
     }
     if let Err(err_resp) = push_replica_socs(&handle, &replicas, batch_id, timeout).await {
         return err_resp;
+    }
+    if pin {
+        if let Err(resp) = pin_uploaded_reference(&handle, split.root.to_vec(), timeout).await {
+            return resp;
+        }
     }
 
     let reference_hex = hex::encode(split.root);
@@ -1893,34 +1953,51 @@ pub async fn bytes(
         };
 
     let total = started.total_bytes;
-    let parsed_range = match raw_range.as_deref() {
-        None => None,
-        Some(raw) => match parse_single_range(raw, total) {
-            Ok(r) => r,
-            Err(RangeError::Multi) => {
+    // Range semantics are Go's `http.ServeContent` (bee serves through
+    // it). HEAD ignores Range entirely: bee routes `HEAD /bytes` to
+    // `bytesHeadHandler`, which never looks at the header and answers
+    // `200` with the full length.
+    let parsed = if head_only {
+        GoRanges::Full
+    } else {
+        parse_go_ranges(raw_range.as_deref(), total)
+    };
+    let parsed_range = match parsed {
+        GoRanges::Invalid => {
+            started.cancel();
+            return go_range_not_satisfiable(None, None);
+        }
+        GoRanges::NoOverlap => {
+            started.cancel();
+            return go_range_not_satisfiable(Some(total), None);
+        }
+        GoRanges::Full => None,
+        GoRanges::Single { start, length } => {
+            if length == 0 {
                 started.cancel();
-                return json_error(
-                    StatusCode::RANGE_NOT_SATISFIABLE,
-                    "multi-range requests not supported",
-                );
-            }
-            Err(RangeError::Unsatisfiable) => {
-                started.cancel();
-                let mut resp = json_error(
-                    StatusCode::RANGE_NOT_SATISFIABLE,
-                    "range not satisfiable for this resource",
-                );
-                let cr = format!("bytes */{total}");
-                if let Ok(v) = HeaderValue::from_str(&cr) {
-                    resp.headers_mut().insert(header::CONTENT_RANGE, v);
-                }
+                let content_type = query
+                    .filename()
+                    .and_then(content_type_from_extension)
+                    .unwrap_or("application/octet-stream");
+                let mut resp = zero_length_partial_response(start, total, content_type);
+                set_etag(&mut resp, reference);
                 return resp;
             }
-            Err(RangeError::Malformed) => {
-                started.cancel();
-                return json_error(StatusCode::BAD_REQUEST, "malformed Range header");
-            }
-        },
+            Some((start, start + length - 1))
+        }
+        GoRanges::Multi(ranges) => {
+            // Multipart: collect the whole body from the already-live
+            // full stream once, then slice each part like Go seeks
+            // the underlying reader.
+            let content_type = sniff_content_type(&started.first_bytes, query.filename());
+            let full = match started.collect_body().await {
+                Ok(b) => b,
+                Err(message) => return map_retrieval_error(message),
+            };
+            let mut resp = multipart_byteranges_response(&ranges, total, content_type, &full, None);
+            set_etag(&mut resp, reference);
+            return resp;
+        }
     };
 
     // No Range, or Range covers the whole object: serve the in-flight
@@ -2051,30 +2128,34 @@ async fn serve_encrypted_bytes(
     };
     let total = data.len() as u64;
 
-    let parsed_range = match raw_range {
-        None => None,
-        Some(raw) => match parse_single_range(raw, total) {
-            Ok(r) => r,
-            Err(RangeError::Multi) => {
-                return json_error(
-                    StatusCode::RANGE_NOT_SATISFIABLE,
-                    "multi-range requests not supported",
-                );
-            }
-            Err(RangeError::Unsatisfiable) => {
-                let mut resp = json_error(
-                    StatusCode::RANGE_NOT_SATISFIABLE,
-                    "range not satisfiable for this resource",
-                );
-                if let Ok(v) = HeaderValue::from_str(&format!("bytes */{total}")) {
-                    resp.headers_mut().insert(header::CONTENT_RANGE, v);
-                }
+    // Go `ServeContent` range semantics; HEAD ignores Range (bee's
+    // headers-only handlers never reach `ServeContent`).
+    let parsed = if head_only {
+        GoRanges::Full
+    } else {
+        parse_go_ranges(raw_range, total)
+    };
+    let parsed_range = match parsed {
+        GoRanges::Invalid => return go_range_not_satisfiable(None, None),
+        GoRanges::NoOverlap => return go_range_not_satisfiable(Some(total), None),
+        GoRanges::Full => None,
+        GoRanges::Single { start, length } => {
+            if length == 0 {
+                let content_type = filename
+                    .and_then(content_type_from_extension)
+                    .unwrap_or("application/octet-stream");
+                let mut resp = zero_length_partial_response(start, total, content_type);
+                set_etag(&mut resp, enc_ref);
                 return resp;
             }
-            Err(RangeError::Malformed) => {
-                return json_error(StatusCode::BAD_REQUEST, "malformed Range header");
-            }
-        },
+            Some((start, start + length - 1))
+        }
+        GoRanges::Multi(ranges) => {
+            let content_type = sniff_content_type(&data, filename);
+            let mut resp = multipart_byteranges_response(&ranges, total, content_type, &data, None);
+            set_etag(&mut resp, enc_ref);
+            return resp;
+        }
     };
 
     match parsed_range {
@@ -2226,34 +2307,13 @@ async fn bzz_inner(
     };
 
     let total = started.total_bytes;
-    let parsed_range = match raw_range.as_deref() {
-        None => None,
-        Some(raw) => match parse_single_range(raw, total) {
-            Ok(r) => r,
-            Err(RangeError::Multi) => {
-                started.cancel();
-                return json_error(
-                    StatusCode::RANGE_NOT_SATISFIABLE,
-                    "multi-range requests not supported",
-                );
-            }
-            Err(RangeError::Unsatisfiable) => {
-                started.cancel();
-                let mut resp = json_error(
-                    StatusCode::RANGE_NOT_SATISFIABLE,
-                    "range not satisfiable for this resource",
-                );
-                let cr = format!("bytes */{total}");
-                if let Ok(v) = HeaderValue::from_str(&cr) {
-                    resp.headers_mut().insert(header::CONTENT_RANGE, v);
-                }
-                return resp;
-            }
-            Err(RangeError::Malformed) => {
-                started.cancel();
-                return json_error(StatusCode::BAD_REQUEST, "malformed Range header");
-            }
-        },
+    // Go `ServeContent` range semantics; HEAD ignores Range (bee's
+    // `bzzHeadHandler` runs headers-only and never reaches
+    // `ServeContent`).
+    let parsed = if head_only {
+        GoRanges::Full
+    } else {
+        parse_go_ranges(raw_range.as_deref(), total)
     };
 
     let content_type = started
@@ -2270,6 +2330,52 @@ async fn bzz_inner(
     // re-fetch — the exact "feed never updates" failure. Downgrade to
     // `no-cache` for these.
     let mutable = started.mutable;
+
+    let parsed_range = match parsed {
+        GoRanges::Invalid => {
+            started.cancel();
+            return go_range_not_satisfiable(None, filename.as_deref());
+        }
+        GoRanges::NoOverlap => {
+            started.cancel();
+            return go_range_not_satisfiable(Some(total), filename.as_deref());
+        }
+        GoRanges::Full => None,
+        GoRanges::Single { start, length } => {
+            if length == 0 {
+                started.cancel();
+                let mut resp = zero_length_partial_response(start, total, &content_type);
+                if let Some(r) = data_ref {
+                    set_etag(&mut resp, r);
+                }
+                if mutable {
+                    set_mutable_cache_headers(&mut resp);
+                }
+                return resp;
+            }
+            Some((start, start + length - 1))
+        }
+        GoRanges::Multi(ranges) => {
+            let full = match started.collect_body().await {
+                Ok(b) => b,
+                Err(message) => return map_retrieval_error(message),
+            };
+            let mut resp = multipart_byteranges_response(
+                &ranges,
+                total,
+                &content_type,
+                &full,
+                filename.as_deref(),
+            );
+            if let Some(r) = data_ref {
+                set_etag(&mut resp, r);
+            }
+            if mutable {
+                set_mutable_cache_headers(&mut resp);
+            }
+            return resp;
+        }
+    };
 
     if parsed_range.is_none() {
         let mut resp = streaming_response(
@@ -2426,6 +2532,32 @@ impl Started {
     /// across the brief window where two streams are active.
     const fn take_activity_guard(&mut self) -> Option<ActiveRequestGuard> {
         self.activity_guard.take()
+    }
+
+    /// Drain the remaining stream into one buffer (used by the
+    /// `multipart/byteranges` path, which needs random access to the
+    /// full body like Go's seekable reader). Applies the same stall
+    /// timeout the streaming body uses; errors come back as the node's
+    /// message for `map_retrieval_error`.
+    async fn collect_body(mut self) -> Result<Vec<u8>, String> {
+        let mut out = self.first_chunk.take().unwrap_or_default();
+        loop {
+            match tokio::time::timeout(BODY_STALL_TIMEOUT, self.rx.recv()).await {
+                Err(_) => {
+                    return Err(
+                        "stream stalled: a chunk could not be retrieved from the network".into(),
+                    )
+                }
+                Ok(Some(ControlAck::BytesChunk { data })) => out.extend_from_slice(&data),
+                Ok(Some(ControlAck::StreamDone) | None) => return Ok(out),
+                Ok(Some(ControlAck::Progress(_))) => {}
+                Ok(Some(ControlAck::Error { message })) => return Err(message),
+                Ok(Some(other)) => {
+                    warn!(target: "ant_gateway", ?other, "unexpected ack while buffering body");
+                    return Err("unexpected node ack".into());
+                }
+            }
+        }
     }
 
     /// Hand back the response body. For `HEAD` we want an empty body
@@ -2910,6 +3042,68 @@ fn parse_encrypt_header(headers: &HeaderMap) -> Result<bool, Response> {
     }
 }
 
+/// Parse bee's `Swarm-Pin` request header (absent → `false`), with the
+/// same Go `strconv.ParseBool` semantics as `Swarm-Encrypt`.
+#[allow(clippy::result_large_err)]
+fn parse_pin_header(headers: &HeaderMap) -> Result<bool, Response> {
+    let Some(raw) = headers.get(&SWARM_PIN) else {
+        return Ok(false);
+    };
+    match raw.to_str().map(str::trim) {
+        Ok("1" | "t" | "T" | "true" | "TRUE" | "True") => Ok(true),
+        Ok("0" | "f" | "F" | "false" | "FALSE" | "False") => Ok(false),
+        _ => Err(params_error(
+            ParamKind::Header,
+            vec![Reason {
+                field: "Swarm-Pin".to_string(),
+                error: "invalid syntax".to_string(),
+            }],
+        )),
+    }
+}
+
+/// Record a local pin for a just-uploaded root reference (bee's
+/// `Swarm-Pin: true` upload behaviour: the upload session's chunks are
+/// pinned when `putter.Done` runs). The chunks were pushed a moment
+/// ago and sit in the node's local caches, so the pin traversal is a
+/// cheap local walk. Failure maps to bee's 500 for a failed `Done`.
+async fn pin_uploaded_reference(
+    handle: &GatewayHandle,
+    reference: Vec<u8>,
+    timeout: Duration,
+) -> Result<(), Response> {
+    let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
+    let cmd = ControlCommand::PinAdd {
+        reference,
+        ack: ack_tx,
+    };
+    if handle.commands.send(cmd).await.is_err() {
+        return Err(node_unavailable());
+    }
+    match tokio::time::timeout(timeout, ack_rx).await {
+        Ok(Ok(ControlAck::PinAdded { .. })) => Ok(()),
+        Ok(Ok(ControlAck::Error { message })) => {
+            warn!(target: "ant_gateway", %message, "pin-on-upload failed");
+            Err(json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "done split failed",
+            ))
+        }
+        Ok(Ok(other)) => {
+            warn!(target: "ant_gateway", ?other, "unexpected ack from PinAdd (upload)");
+            Err(json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "unexpected node ack",
+            ))
+        }
+        Ok(Err(_)) => Err(node_unavailable()),
+        Err(_) => Err(json_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "pin-on-upload timed out",
+        )),
+    }
+}
+
 /// Parse the `{owner}` + `{id|topic}` path pair of `/soc` and `/feeds`
 /// bee-shaped, collecting every malformed segment into one
 /// `invalid path params` response like bee's `mapStructure` does.
@@ -2985,9 +3179,14 @@ fn streaming_response(
     let _ = resp
         .headers_mut()
         .insert(header::CONTENT_LENGTH, HeaderValue::from(total_bytes));
-    let _ = resp
-        .headers_mut()
-        .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    // `Accept-Ranges: bytes` comes from Go's `ServeContent`, which only
+    // the GET paths reach — bee's HEAD handlers (`bytesHeadHandler`,
+    // `downloadHandler` headers-only) never set it.
+    if !head_only {
+        let _ = resp
+            .headers_mut()
+            .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    }
     if let Some(name) = filename {
         if let Some(v) = content_disposition(name) {
             resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
@@ -3263,52 +3462,268 @@ fn content_type_from_extension(filename: &str) -> Option<&'static str> {
     }
 }
 
-#[derive(Debug)]
-enum RangeError {
-    Multi,
-    Unsatisfiable,
-    Malformed,
+/// Outcome of parsing a `Range` header with **Go `net/http`
+/// semantics** — bee serves every download through
+/// `http.ServeContent`, so its Range behaviour (including the odd
+/// corners) is exactly Go's `parseRange` + `serveContent`:
+///
+/// * no header, an all-empty range set (`bytes=`), a range set whose
+///   summed length exceeds the resource, or any range against an
+///   empty resource → serve the **full body, 200**;
+/// * a syntactically bad header (wrong unit, missing `-`, non-numeric
+///   bounds, `start > end`, negative suffix) → **416** with the
+///   text/plain body `invalid range` and *no* `Content-Range`;
+/// * only past-the-end ranges → **416** with `Content-Range:
+///   bytes */{total}` and the body `invalid range: failed to overlap`;
+/// * exactly one satisfiable range → **206** with `Content-Range`;
+/// * several satisfiable ranges → **206** `multipart/byteranges`.
+#[derive(Debug, PartialEq, Eq)]
+enum GoRanges {
+    Full,
+    /// `(start, length)`. `length` can be `0` (Go emits a zero-length
+    /// 206 for `bytes=-0`).
+    Single {
+        start: u64,
+        length: u64,
+    },
+    Multi(Vec<(u64, u64)>),
+    NoOverlap,
+    Invalid,
 }
 
-/// Parse a `Range: bytes=START-END` header.
-///
-/// Returns `Ok(None)` when the header is structurally a `bytes=...`
-/// range but covers the whole resource (no narrowing) or is missing the
-/// `bytes=` unit (RFC 9110 §14.2 says we "must ignore" unknown units).
-/// `Ok(Some((start, end)))` is inclusive on both ends, ready for slice
-/// indexing.
-fn parse_single_range(raw: &str, total: u64) -> Result<Option<(u64, u64)>, RangeError> {
-    let raw = raw.trim();
-    let Some(rest) = raw.strip_prefix("bytes=") else {
-        return Ok(None);
+/// Go `textproto.TrimString`: strip leading/trailing spaces and tabs.
+fn go_trim(s: &str) -> &str {
+    s.trim_matches([' ', '\t'])
+}
+
+/// Mirror of Go's `net/http` `parseRange` plus the range-set decisions
+/// `serveContent` makes on its result (empty-file quirk, sum-overflow
+/// fallback). See [`GoRanges`].
+fn parse_go_ranges(raw: Option<&str>, total: u64) -> GoRanges {
+    let Some(s) = raw else {
+        return GoRanges::Full;
     };
-    if rest.contains(',') {
-        return Err(RangeError::Multi);
-    }
-    let (start_s, end_s) = rest.split_once('-').ok_or(RangeError::Malformed)?;
-    if start_s.is_empty() {
-        // `bytes=-N` → suffix range, last N bytes.
-        let n: u64 = end_s.parse().map_err(|_| RangeError::Malformed)?;
-        if n == 0 || total == 0 {
-            return Err(RangeError::Unsatisfiable);
+    let Some(rest) = s.strip_prefix("bytes=") else {
+        return GoRanges::Invalid;
+    };
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    let mut no_overlap = false;
+    for ra in rest.split(',') {
+        let ra = go_trim(ra);
+        if ra.is_empty() {
+            continue;
         }
-        let n = n.min(total);
-        return Ok(Some((total - n, total - 1)));
+        let Some((start_s, end_s)) = ra.split_once('-') else {
+            return GoRanges::Invalid;
+        };
+        let (start_s, end_s) = (go_trim(start_s), go_trim(end_s));
+        if start_s.is_empty() {
+            // Suffix range `-N`: the last N bytes. Go rejects an empty
+            // or negative suffix ("invalid range").
+            if end_s.is_empty() || end_s.starts_with('-') {
+                return GoRanges::Invalid;
+            }
+            let Ok(n) = end_s.parse::<i64>() else {
+                return GoRanges::Invalid;
+            };
+            if n < 0 {
+                return GoRanges::Invalid;
+            }
+            let n = (n as u64).min(total);
+            ranges.push((total - n, n));
+        } else {
+            let Ok(start) = start_s.parse::<i64>() else {
+                return GoRanges::Invalid;
+            };
+            if start < 0 {
+                return GoRanges::Invalid;
+            }
+            let start = start as u64;
+            if start >= total {
+                // Starts after the end: doesn't overlap; Go keeps
+                // scanning the rest of the set.
+                no_overlap = true;
+                continue;
+            }
+            let length = if end_s.is_empty() {
+                total - start
+            } else {
+                let Ok(end) = end_s.parse::<i64>() else {
+                    return GoRanges::Invalid;
+                };
+                if end < 0 || start as i64 > end {
+                    return GoRanges::Invalid;
+                }
+                let end = (end as u64).min(total.saturating_sub(1));
+                end - start + 1
+            };
+            ranges.push((start, length));
+        }
     }
-    let start: u64 = start_s.parse().map_err(|_| RangeError::Malformed)?;
-    let end: u64 = if end_s.is_empty() {
+    if no_overlap && ranges.is_empty() {
+        // `serveContent`: an empty resource ignores the Range header
+        // entirely rather than 416ing.
         if total == 0 {
-            return Err(RangeError::Unsatisfiable);
+            return GoRanges::Full;
         }
-        total - 1
-    } else {
-        end_s.parse().map_err(|_| RangeError::Malformed)?
-    };
-    if start > end || start >= total {
-        return Err(RangeError::Unsatisfiable);
+        return GoRanges::NoOverlap;
     }
-    let end = end.min(total - 1);
-    Ok(Some((start, end)))
+    let sum: u64 = ranges.iter().map(|r| r.1).sum();
+    if sum > total {
+        // Go treats an over-committing range set as an attack / dumb
+        // client and serves the whole body.
+        return GoRanges::Full;
+    }
+    match ranges.len() {
+        0 => GoRanges::Full,
+        1 => GoRanges::Single {
+            start: ranges[0].0,
+            length: ranges[0].1,
+        },
+        _ => GoRanges::Multi(ranges),
+    }
+}
+
+/// Go `http.Error` shape for the two 416s `ServeContent` produces:
+/// `text/plain; charset=utf-8` + `X-Content-Type-Options: nosniff`,
+/// body = message + `\n`. `total = Some(_)` is the no-overlap flavour,
+/// which additionally carries `Content-Range: bytes */{total}`.
+fn go_range_not_satisfiable(total: Option<u64>, filename: Option<&str>) -> Response {
+    let msg = match total {
+        Some(_) => "invalid range: failed to overlap",
+        None => "invalid range",
+    };
+    let mut resp = Response::new(Body::from(format!("{msg}\n")));
+    *resp.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+    let h = resp.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    h.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    if let Some(t) = total {
+        if let Ok(v) = HeaderValue::from_str(&format!("bytes */{t}")) {
+            h.insert(header::CONTENT_RANGE, v);
+        }
+    }
+    // Bee sets Content-Disposition (from the manifest filename) before
+    // ServeContent runs; Go's serveError only strips Cache-Control /
+    // Content-Encoding / Etag / Last-Modified, so the disposition
+    // survives on bee's /bzz 416s. (/bytes never has one.)
+    if let Some(name) = filename {
+        if let Some(v) = content_disposition(name) {
+            h.insert(header::CONTENT_DISPOSITION, v);
+        }
+    }
+    // Keep the router's charset middleware away from the text body.
+    resp.extensions_mut().insert(VerbatimContentType);
+    resp
+}
+
+/// `Content-Range: bytes {start}-{end}/{total}` for a `(start, length)`
+/// range. Formats through i128 so Go's zero-length quirk
+/// (`bytes N-(N-1)/N` for `bytes=-0`) renders instead of underflowing.
+fn go_content_range(start: u64, length: u64, total: u64) -> String {
+    format!(
+        "bytes {start}-{}/{total}",
+        i128::from(start) + i128::from(length) - 1
+    )
+}
+
+/// Random multipart boundary, shaped like Go's
+/// `multipart.Writer.Boundary()`: 60 hex characters. Sourced from a
+/// keccak over process-unique state — boundaries need uniqueness, not
+/// cryptographic unpredictability.
+fn random_boundary() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut seed = Vec::with_capacity(32);
+    seed.extend_from_slice(&std::process::id().to_le_bytes());
+    seed.extend_from_slice(&COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    seed.extend_from_slice(&now.to_le_bytes());
+    hex::encode(&ant_crypto::keccak256(&seed)[..30])
+}
+
+/// Assemble a `multipart/byteranges` 206 exactly the way Go's
+/// `serveContent` + `mime/multipart.Writer` do: each part opens with
+/// `--boundary`, carries `Content-Range` then `Content-Type` (Go sorts
+/// the MIME header keys), and the body closes with `--boundary--`.
+/// `full_body` is the complete resource; parts are sliced from it
+/// (Go seeks the underlying reader per range).
+fn multipart_byteranges_response(
+    ranges: &[(u64, u64)],
+    total: u64,
+    content_type: &str,
+    full_body: &[u8],
+    filename: Option<&str>,
+) -> Response {
+    let boundary = random_boundary();
+    let mut body: Vec<u8> = Vec::new();
+    for (i, &(start, length)) in ranges.iter().enumerate() {
+        if i == 0 {
+            body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        } else {
+            body.extend_from_slice(format!("\r\n--{boundary}\r\n").as_bytes());
+        }
+        body.extend_from_slice(
+            format!(
+                "Content-Range: {}\r\nContent-Type: {content_type}\r\n\r\n",
+                go_content_range(start, length, total)
+            )
+            .as_bytes(),
+        );
+        let s = usize::try_from(start)
+            .unwrap_or(usize::MAX)
+            .min(full_body.len());
+        let e = usize::try_from(start.saturating_add(length))
+            .unwrap_or(usize::MAX)
+            .min(full_body.len());
+        body.extend_from_slice(&full_body[s..e]);
+    }
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+    let len = body.len();
+    let mut resp = Response::new(Body::from(body));
+    *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+    resp.extensions_mut().insert(VerbatimContentType);
+    let h = resp.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(&format!("multipart/byteranges; boundary={boundary}")) {
+        h.insert(header::CONTENT_TYPE, v);
+    }
+    h.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    if let Some(name) = filename {
+        if let Some(v) = content_disposition(name) {
+            h.insert(header::CONTENT_DISPOSITION, v);
+        }
+    }
+    set_immutable_cache_headers(&mut resp);
+    resp
+}
+
+/// Zero-length single range (Go's `bytes=-0`): a 206 with an empty
+/// body and the quirky `Content-Range: bytes N-(N-1)/N`.
+fn zero_length_partial_response(start: u64, total: u64, content_type: &str) -> Response {
+    let mut resp = Response::new(Body::empty());
+    *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+    resp.extensions_mut().insert(VerbatimContentType);
+    let h = resp.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(content_type) {
+        h.insert(header::CONTENT_TYPE, v);
+    }
+    h.insert(header::CONTENT_LENGTH, HeaderValue::from(0u64));
+    h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    if let Ok(v) = HeaderValue::from_str(&go_content_range(start, 0, total)) {
+        h.insert(header::CONTENT_RANGE, v);
+    }
+    set_immutable_cache_headers(&mut resp);
+    resp
 }
 
 pub(crate) fn node_unavailable() -> Response {
@@ -3526,30 +3941,35 @@ pub async fn download_feed(
             .get(header::RANGE)
             .and_then(|v| v.to_str().ok())
             .map(String::from);
-        let parsed_range = match raw_range.as_deref() {
-            None => None,
-            Some(raw) => match parse_single_range(raw, total) {
-                Ok(r) => r,
-                Err(RangeError::Multi) => {
-                    return json_error(
-                        StatusCode::RANGE_NOT_SATISFIABLE,
-                        "multi-range requests not supported",
-                    );
-                }
-                Err(RangeError::Unsatisfiable) => {
-                    let mut resp = json_error(
-                        StatusCode::RANGE_NOT_SATISFIABLE,
-                        "range not satisfiable for this resource",
-                    );
-                    if let Ok(v) = HeaderValue::from_str(&format!("bytes */{total}")) {
-                        resp.headers_mut().insert(header::CONTENT_RANGE, v);
-                    }
+        let parsed = if head_only {
+            GoRanges::Full
+        } else {
+            parse_go_ranges(raw_range.as_deref(), total)
+        };
+        let parsed_range = match parsed {
+            GoRanges::Invalid => return go_range_not_satisfiable(None, None),
+            GoRanges::NoOverlap => return go_range_not_satisfiable(Some(total), None),
+            GoRanges::Full => None,
+            GoRanges::Single { start, length } => {
+                if length == 0 {
+                    let mut resp =
+                        zero_length_partial_response(start, total, "application/octet-stream");
+                    apply_feed_headers(&mut resp, reference, index, &signature, v2, true);
                     return resp;
                 }
-                Err(RangeError::Malformed) => {
-                    return json_error(StatusCode::BAD_REQUEST, "malformed Range header");
-                }
-            },
+                Some((start, start + length - 1))
+            }
+            GoRanges::Multi(ranges) => {
+                let mut resp = multipart_byteranges_response(
+                    &ranges,
+                    total,
+                    "application/octet-stream",
+                    &data,
+                    None,
+                );
+                apply_feed_headers(&mut resp, reference, index, &signature, v2, true);
+                return resp;
+            }
         };
 
         let mut resp = match parsed_range {
@@ -3568,6 +3988,11 @@ pub async fn download_feed(
                 let _ = resp
                     .headers_mut()
                     .insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+                // Bee's feed content goes through http.ServeContent →
+                // `Accept-Ranges: bytes`.
+                let _ = resp
+                    .headers_mut()
+                    .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
                 resp
             }
             Some((start, end)) => {
@@ -3591,6 +4016,9 @@ pub async fn download_feed(
                 let _ = resp
                     .headers_mut()
                     .insert(header::CONTENT_LENGTH, HeaderValue::from(body_len));
+                let _ = resp
+                    .headers_mut()
+                    .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
                 if let Ok(v) = HeaderValue::from_str(&format!("bytes {start}-{end}/{total}")) {
                     resp.headers_mut().insert(header::CONTENT_RANGE, v);
                 }
@@ -3682,34 +4110,46 @@ pub async fn download_feed(
     };
 
     let total = started.total_bytes;
-    let parsed_range = match raw_range.as_deref() {
-        None => None,
-        Some(raw) => match parse_single_range(raw, total) {
-            Ok(r) => r,
-            Err(RangeError::Multi) => {
+    let parsed = if head_only {
+        GoRanges::Full
+    } else {
+        parse_go_ranges(raw_range.as_deref(), total)
+    };
+    let parsed_range = match parsed {
+        GoRanges::Invalid => {
+            started.cancel();
+            return go_range_not_satisfiable(None, None);
+        }
+        GoRanges::NoOverlap => {
+            started.cancel();
+            return go_range_not_satisfiable(Some(total), None);
+        }
+        GoRanges::Full => None,
+        GoRanges::Single { start, length } => {
+            if length == 0 {
                 started.cancel();
-                return json_error(
-                    StatusCode::RANGE_NOT_SATISFIABLE,
-                    "multi-range requests not supported",
-                );
-            }
-            Err(RangeError::Unsatisfiable) => {
-                started.cancel();
-                let mut resp = json_error(
-                    StatusCode::RANGE_NOT_SATISFIABLE,
-                    "range not satisfiable for this resource",
-                );
-                let cr = format!("bytes */{total}");
-                if let Ok(v) = HeaderValue::from_str(&cr) {
-                    resp.headers_mut().insert(header::CONTENT_RANGE, v);
-                }
+                let mut resp =
+                    zero_length_partial_response(start, total, "application/octet-stream");
+                apply_feed_headers(&mut resp, reference, index, &signature, v2, true);
                 return resp;
             }
-            Err(RangeError::Malformed) => {
-                started.cancel();
-                return json_error(StatusCode::BAD_REQUEST, "malformed Range header");
-            }
-        },
+            Some((start, start + length - 1))
+        }
+        GoRanges::Multi(ranges) => {
+            let full = match started.collect_body().await {
+                Ok(b) => b,
+                Err(message) => return map_retrieval_error(message),
+            };
+            let mut resp = multipart_byteranges_response(
+                &ranges,
+                total,
+                "application/octet-stream",
+                &full,
+                None,
+            );
+            apply_feed_headers(&mut resp, reference, index, &signature, v2, true);
+            return resp;
+        }
     };
 
     if parsed_range.is_none() {
@@ -3864,41 +4304,76 @@ mod humantime {
 mod tests {
     use super::*;
 
+    /// Go `parseRange` parity, case by case (matches Go 1.26's
+    /// `net/http` — bee serves ranges via `http.ServeContent`).
     #[test]
-    fn parses_full_range() {
-        assert_eq!(parse_single_range("bytes=0-9", 1024).unwrap(), Some((0, 9)));
-    }
-
-    #[test]
-    fn parses_open_ended() {
+    fn go_range_parity() {
+        use GoRanges::{Full, Invalid, Multi, NoOverlap, Single};
+        // Plain single ranges.
         assert_eq!(
-            parse_single_range("bytes=10-", 1024).unwrap(),
-            Some((10, 1023))
+            parse_go_ranges(Some("bytes=0-9"), 1024),
+            Single {
+                start: 0,
+                length: 10
+            }
         );
-    }
-
-    #[test]
-    fn parses_suffix() {
         assert_eq!(
-            parse_single_range("bytes=-100", 1024).unwrap(),
-            Some((924, 1023))
+            parse_go_ranges(Some("bytes=10-"), 1024),
+            Single {
+                start: 10,
+                length: 1014
+            }
         );
-    }
-
-    #[test]
-    fn rejects_multi_range() {
-        assert!(matches!(
-            parse_single_range("bytes=0-10,20-30", 1024),
-            Err(RangeError::Multi)
-        ));
-    }
-
-    #[test]
-    fn rejects_unsatisfiable() {
-        assert!(matches!(
-            parse_single_range("bytes=2000-3000", 1024),
-            Err(RangeError::Unsatisfiable)
-        ));
+        assert_eq!(
+            parse_go_ranges(Some("bytes=-100"), 1024),
+            Single {
+                start: 924,
+                length: 100
+            }
+        );
+        // End clamped to size-1.
+        assert_eq!(
+            parse_go_ranges(Some("bytes=0-999999"), 1024),
+            Single {
+                start: 0,
+                length: 1024
+            }
+        );
+        // Exactly-at-end / past-end starts → noOverlap 416.
+        assert_eq!(parse_go_ranges(Some("bytes=1024-"), 1024), NoOverlap);
+        assert_eq!(parse_go_ranges(Some("bytes=2000-3000"), 1024), NoOverlap);
+        // Malformed → Go's "invalid range" 416.
+        assert_eq!(parse_go_ranges(Some("bytes=abc"), 1024), Invalid);
+        assert_eq!(parse_go_ranges(Some("items=0-5"), 1024), Invalid);
+        assert_eq!(parse_go_ranges(Some("bytes=5-2"), 1024), Invalid);
+        assert_eq!(parse_go_ranges(Some("bytes=--5"), 1024), Invalid);
+        // Multi-range → multipart; a trailing comma is skipped.
+        assert_eq!(
+            parse_go_ranges(Some("bytes=0-1,5-9"), 1024),
+            Multi(vec![(0, 2), (5, 5)])
+        );
+        assert_eq!(
+            parse_go_ranges(Some("bytes=0-1,"), 1024),
+            Single {
+                start: 0,
+                length: 2
+            }
+        );
+        // Over-committing set is ignored (Go serves the full body).
+        assert_eq!(parse_go_ranges(Some("bytes=0-,0-"), 10), Full);
+        // Empty resource ignores any range.
+        assert_eq!(parse_go_ranges(Some("bytes=5-9"), 0), Full);
+        // Suffix -0 is Go's zero-length 206.
+        assert_eq!(
+            parse_go_ranges(Some("bytes=-0"), 100),
+            Single {
+                start: 100,
+                length: 0
+            }
+        );
+        assert_eq!(go_content_range(100, 0, 100), "bytes 100-99/100");
+        // No header at all.
+        assert_eq!(parse_go_ranges(None, 100), Full);
     }
 
     #[test]

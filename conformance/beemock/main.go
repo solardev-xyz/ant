@@ -176,8 +176,28 @@ func main() {
 	// panics — a mock artifact real bee (whose batchstore returns the
 	// on-chain batch) never exhibits. Owner is this node's address so
 	// stamps minted by our own POST /envelope validate.
+	// Exists is scoped to the advertised batch (not accept-all): real
+	// bee's batchstore only knows chain-synced batches, so an unknown
+	// id must produce storage.ErrNotFound → 404 "batch not found" on
+	// GET /batches/{id} (the accept-all mock would return the WithBatch
+	// batch for ANY id — a mock artifact real bee never exhibits, same
+	// category as the unknown-peer fixes below). Every conformance
+	// scenario stamps against the advertised id, so uploads keep
+	// working.
+	// The mock's zero-value ChainState carries nil big.Ints, which the
+	// real postageGetAllBatchesHandler dereferences in estimateBatchTTL
+	// (nil CurrentPrice → panic → connection reset). Real bee always
+	// has a chain-synced state; zeros give bee's "unpriced chain"
+	// answer, batchTTL = -1.
 	batchStore := mockbatchstore.New(
-		mockbatchstore.WithAcceptAllExistsFunc(),
+		mockbatchstore.WithChainState(&postage.ChainState{
+			Block:        0,
+			TotalAmount:  big.NewInt(0),
+			CurrentPrice: big.NewInt(0),
+		}),
+		mockbatchstore.WithExistsFunc(func(id []byte) (bool, error) {
+			return bytes.Equal(id, batchID), nil
+		}),
 		mockbatchstore.WithBatch(&postage.Batch{
 			ID:          batchID,
 			Value:       big.NewInt(100_000_000),
