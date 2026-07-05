@@ -73,6 +73,19 @@ impl ChainReader for AntChainReader {
             .await
             .map_err(|e| e.to_string())
     }
+
+    async fn batch_meta(&self, batch_id: [u8; 32]) -> Result<crate::BatchMetaView, String> {
+        let meta =
+            ant_chain::fetch_postage_batch_meta(&self.client, &self.postage_contract, &batch_id)
+                .await
+                .map_err(|e| e.to_string())?;
+        Ok(crate::BatchMetaView {
+            owner: meta.batch_owner_eth,
+            depth: meta.depth,
+            bucket_depth: meta.bucket_depth,
+            immutable: meta.immutable,
+        })
+    }
 }
 
 /// Default postage bucket depth (bee's constant). A batch's `depth` must

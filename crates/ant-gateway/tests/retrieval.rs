@@ -230,7 +230,7 @@ async fn bzz_trailing_slash_resolves_to_manifest_root() {
 
 /// Multi-range requests are rejected with 416 (PLAN.md D.2.3).
 #[tokio::test]
-async fn bzz_multi_range_rejected_416() {
+async fn bzz_multi_range_serves_multipart_byteranges() {
     let router = handle_with_fixture_node();
     let uri = format!("/bzz/{MANIFEST_ROOT}/13/4358/2645.png");
     let resp = send(
@@ -243,7 +243,78 @@ async fn bzz_multi_range_rejected_416() {
             .unwrap(),
     )
     .await;
+    // Go's http.ServeContent (what bee serves through) answers a
+    // multi-range request with 206 multipart/byteranges.
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    let ct = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        ct.starts_with("multipart/byteranges; boundary="),
+        "content type: {ct}"
+    );
+    let boundary = ct
+        .strip_prefix("multipart/byteranges; boundary=")
+        .unwrap()
+        .to_string();
+    assert_eq!(boundary.len(), 60, "Go-shaped 60-hex boundary");
+    let body = body_bytes(resp).await;
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("Content-Range: bytes 0-99/18604"), "{text}");
+    assert!(
+        text.contains("Content-Range: bytes 200-299/18604"),
+        "{text}"
+    );
+    assert!(text.ends_with(&format!("\r\n--{boundary}--\r\n")), "{text}");
+}
+
+/// Go `ServeContent` 416 parity: a range past the end is a text/plain
+/// "invalid range: failed to overlap" with `Content-Range: bytes */N`;
+/// a malformed header is "invalid range" without one.
+#[tokio::test]
+async fn range_416_matches_go_servecontent() {
+    let router = handle_with_fixture_node();
+    let uri = format!("/bytes/{DATA_REF}");
+    let resp = send(
+        router.clone(),
+        Request::builder()
+            .method(Method::GET)
+            .uri(&uri)
+            .header(header::RANGE, "bytes=99999999-")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(
+        resp.headers().get(header::CONTENT_RANGE).unwrap(),
+        &format!("bytes */{BODY_LEN}")
+    );
+    assert_eq!(
+        resp.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/plain; charset=utf-8"
+    );
+    assert_eq!(
+        body_bytes(resp).await,
+        b"invalid range: failed to overlap\n"
+    );
+
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::GET)
+            .uri(&uri)
+            .header(header::RANGE, "bytes=oops")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert!(resp.headers().get(header::CONTENT_RANGE).is_none());
+    assert_eq!(body_bytes(resp).await, b"invalid range\n");
 }
 
 /// `GET /bytes/{addr}` joins the multi-chunk tree directly without a
@@ -376,7 +447,9 @@ async fn bytes_head_omits_body() {
         resp.headers().get(header::CONTENT_LENGTH).unwrap(),
         BODY_LEN.to_string().as_str(),
     );
-    assert_eq!(resp.headers().get(header::ACCEPT_RANGES).unwrap(), "bytes",);
+    // Bee's `bytesHeadHandler` never reaches ServeContent, so no
+    // `Accept-Ranges` on HEAD (GET carries it).
+    assert!(resp.headers().get(header::ACCEPT_RANGES).is_none());
     let bytes = body_bytes(resp).await;
     assert!(bytes.is_empty(), "HEAD must not carry a body");
 }

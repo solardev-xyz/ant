@@ -26,9 +26,9 @@ use std::collections::HashSet;
 
 use thiserror::Error;
 
-use crate::joiner::{enumerate_chunk_tree, JoinError, JoinOptions};
+use crate::joiner::{enumerate_chunk_tree, subtrie_section, JoinError, JoinOptions};
 use crate::mantaray::{ManifestError, Node};
-use crate::{join_with_options, ChunkFetcher};
+use crate::{join_with_options, ChunkFetcher, ENC_REF_SIZE};
 use ant_crypto::{soc_valid, CHUNK_SIZE, SPAN_SIZE};
 
 #[derive(Debug, Error)]
@@ -196,6 +196,235 @@ async fn traverse_manifest(
     Ok(())
 }
 
+/// Enumerate every **stored chunk address** of the encrypted content
+/// tree rooted at the 64-byte reference `root_ref` (`address ‖
+/// decryption key`). Chunks of an encrypted upload are stored under
+/// the BMT address of their *ciphertext* — the "addr half" of each
+/// 64-byte child reference — so that is what this yields (the key half
+/// never leaves the reference). Parity chunks of a redundancy-encoded
+/// tree ride along as bare 32-byte references and are emitted too.
+///
+/// Encrypted mantaray manifests are walked like
+/// [`traverse_chunk_addresses`] walks plain ones: a single-chunk root
+/// whose *decrypted* bytes parse as a manifest is descended fork by
+/// fork (fork/entry references are 64 bytes there), covering each
+/// node's own chunk tree and every value entry's file tree.
+///
+/// Interior nodes are fetched (and decrypted) to learn their children;
+/// leaves are listed but not fetched, mirroring the plain traversal.
+pub async fn traverse_encrypted_chunk_addresses(
+    fetcher: &dyn ChunkFetcher,
+    root_ref: [u8; ENC_REF_SIZE],
+    max_bytes: usize,
+) -> Result<Vec<[u8; 32]>, TraversalError> {
+    let mut out = Vec::new();
+    let mut emitted = HashSet::new();
+
+    // Manifest probe, mirroring the plain traversal: only a
+    // single-chunk root can be a mantaray root node. The node bytes
+    // are ciphertext, so the probe needs the decrypted payload.
+    let (span, payload) = fetch_and_decrypt(fetcher, &root_ref).await?;
+    if span <= CHUNK_SIZE as u64 && (span as usize) <= payload.len() {
+        match Node::unmarshal(&payload[..span as usize]) {
+            Ok(_) => {
+                traverse_encrypted_manifest(fetcher, root_ref, max_bytes, &mut out, &mut emitted)
+                    .await?;
+                return Ok(out);
+            }
+            Err(ManifestError::NotAManifest | ManifestError::TooShort(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    push_encrypted_tree(fetcher, root_ref, max_bytes, &mut out, &mut emitted).await?;
+    Ok(out)
+}
+
+/// Fetch the stored (ciphertext) chunk behind a 64-byte reference and
+/// decrypt it, returning the plaintext span and payload.
+async fn fetch_and_decrypt(
+    fetcher: &dyn ChunkFetcher,
+    node_ref: &[u8; ENC_REF_SIZE],
+) -> Result<(u64, Vec<u8>), TraversalError> {
+    let addr: [u8; 32] = node_ref[..32].try_into().expect("64-byte reference");
+    let key: [u8; 32] = node_ref[32..].try_into().expect("64-byte reference");
+    let wire = fetcher
+        .fetch(addr)
+        .await
+        .map_err(|source| TraversalError::Fetch {
+            addr: hex::encode(addr),
+            source,
+        })?;
+    let (span_raw, payload) =
+        ant_crypto::decrypt_chunk_parts(&wire, &key).map_err(|e| TraversalError::Fetch {
+            addr: hex::encode(addr),
+            source: format!("decrypt: {e}").into(),
+        })?;
+    let (_, plain_span) = crate::rs::decode_span(span_raw);
+    Ok((u64::from_le_bytes(plain_span), payload))
+}
+
+/// Enumerate the encrypted span tree rooted at `node_ref` into `out`
+/// (stored addresses: addr halves of data refs + bare parity refs).
+/// Interior nodes are fetched + decrypted; leaves are listed only.
+async fn push_encrypted_tree(
+    fetcher: &dyn ChunkFetcher,
+    root_ref: [u8; ENC_REF_SIZE],
+    max_bytes: usize,
+    out: &mut Vec<[u8; 32]>,
+    emitted: &mut HashSet<[u8; 32]>,
+) -> Result<(), TraversalError> {
+    // Stack of refs still to expand as *interior or unknown* nodes.
+    let mut stack: Vec<[u8; ENC_REF_SIZE]> = vec![root_ref];
+    while let Some(node_ref) = stack.pop() {
+        let addr: [u8; 32] = node_ref[..32].try_into().expect("64-byte reference");
+        if !emitted.insert(addr) {
+            continue;
+        }
+        out.push(addr);
+
+        let key: [u8; 32] = node_ref[32..].try_into().expect("64-byte reference");
+        let wire = fetcher
+            .fetch(addr)
+            .await
+            .map_err(|source| TraversalError::Fetch {
+                addr: hex::encode(addr),
+                source,
+            })?;
+        let (span_raw, payload) =
+            ant_crypto::decrypt_chunk_parts(&wire, &key).map_err(|e| TraversalError::Fetch {
+                addr: hex::encode(addr),
+                source: format!("decrypt: {e}").into(),
+            })?;
+        let (level, plain_span) = crate::rs::decode_span(span_raw);
+        let span = u64::from_le_bytes(plain_span);
+        if span > max_bytes as u64 {
+            return Err(JoinError::TooLarge {
+                span,
+                cap: max_bytes,
+            }
+            .into());
+        }
+        // Leaf: nothing below it.
+        if span <= CHUNK_SIZE as u64 {
+            continue;
+        }
+        // Intermediate: `shards` 64-byte data refs then `parities`
+        // bare 32-byte parity refs (see `join_encrypted_into`).
+        let (shards, parities) = crate::rs::reference_count_enc(span, level);
+        let needed = shards * ENC_REF_SIZE + parities * 32;
+        if needed > payload.len() {
+            return Err(JoinError::MalformedChunk {
+                offset: 0,
+                detail: format!(
+                    "encrypted intermediate needs {needed} reference bytes, payload has {}",
+                    payload.len()
+                ),
+            }
+            .into());
+        }
+        let branching = crate::rs::max_enc_shards(level) as u64;
+        let branch_size = subtrie_section(shards, span, branching);
+        let mut remaining = span;
+        for i in 0..shards {
+            if remaining == 0 {
+                break;
+            }
+            let child: [u8; ENC_REF_SIZE] = payload[i * ENC_REF_SIZE..(i + 1) * ENC_REF_SIZE]
+                .try_into()
+                .expect("slice length");
+            let child_span = branch_size.min(remaining);
+            if child_span <= CHUNK_SIZE as u64 {
+                // Data leaf: list its stored address without fetching.
+                let child_addr: [u8; 32] = child[..32].try_into().expect("slice length");
+                if emitted.insert(child_addr) {
+                    out.push(child_addr);
+                }
+            } else {
+                stack.push(child);
+            }
+            remaining -= child_span;
+        }
+        let parity_base = shards * ENC_REF_SIZE;
+        for i in 0..parities {
+            let parity_addr: [u8; 32] = payload[parity_base + i * 32..parity_base + (i + 1) * 32]
+                .try_into()
+                .expect("slice length");
+            if emitted.insert(parity_addr) {
+                out.push(parity_addr);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Walk an encrypted mantaray trie: every node's own (encrypted) chunk
+/// tree, every 64-byte value entry's file tree, forks descended
+/// iteratively with a visited set. The rare legacy 32-byte entry in an
+/// otherwise-encrypted manifest falls back to the plain traversal.
+async fn traverse_encrypted_manifest(
+    fetcher: &dyn ChunkFetcher,
+    root_ref: [u8; ENC_REF_SIZE],
+    max_bytes: usize,
+    out: &mut Vec<[u8; 32]>,
+    emitted: &mut HashSet<[u8; 32]>,
+) -> Result<(), TraversalError> {
+    let mut visited = HashSet::new();
+    let mut stack: Vec<[u8; ENC_REF_SIZE]> = vec![root_ref];
+    while let Some(node_ref) = stack.pop() {
+        if !visited.insert(node_ref) {
+            continue;
+        }
+        // The manifest node is itself a (usually single-chunk) swarm
+        // file; its chunk tree is part of the content.
+        push_encrypted_tree(fetcher, node_ref, max_bytes, out, emitted).await?;
+        let (span, payload) = fetch_and_decrypt(fetcher, &node_ref).await?;
+        if span > payload.len() as u64 {
+            return Err(JoinError::MalformedChunk {
+                offset: 0,
+                detail: format!(
+                    "manifest node span {span} exceeds payload {}",
+                    payload.len()
+                ),
+            }
+            .into());
+        }
+        let node = Node::unmarshal(&payload[..span as usize])?;
+
+        // Value entry (64-byte in an encrypted manifest; bee skips the
+        // all-zero sentinel of metadata-only nodes).
+        if node.entry.iter().any(|&b| b != 0) {
+            if node.entry.len() == ENC_REF_SIZE {
+                let entry: [u8; ENC_REF_SIZE] =
+                    node.entry.as_slice().try_into().expect("length checked");
+                push_encrypted_tree(fetcher, entry, max_bytes, out, emitted).await?;
+            } else if node.entry.len() == 32 {
+                let entry: [u8; 32] = node.entry.as_slice().try_into().expect("length checked");
+                if !emitted.contains(&entry) {
+                    let entry_wire =
+                        fetcher
+                            .fetch(entry)
+                            .await
+                            .map_err(|source| TraversalError::Fetch {
+                                addr: hex::encode(entry),
+                                source,
+                            })?;
+                    push_tree(fetcher, entry, &entry_wire, max_bytes, out, emitted).await?;
+                }
+            }
+        }
+
+        for fork in node.forks.values() {
+            if let Ok(child) = <[u8; ENC_REF_SIZE]>::try_from(fork.child_ref.as_slice()) {
+                if child.iter().any(|&b| b != 0) {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,6 +569,75 @@ mod tests {
         assert!(traverse_chunk_addresses(&store, split.root, CAP)
             .await
             .is_err());
+    }
+
+    /// Encrypted `/bytes` tree (with redundancy): the traversal lists
+    /// exactly the stored ciphertext addresses the encrypted splitter
+    /// produced — addr halves of the 64-byte refs plus parities.
+    #[tokio::test]
+    async fn encrypted_traversal_lists_stored_addresses() {
+        let store = MapFetcher::new();
+        let body: Vec<u8> = (0..40_000usize).map(|i| ((i * 13) % 251) as u8).collect();
+        let split = crate::split_bytes_encrypted(&body, 2);
+        for c in &split.chunks {
+            store.insert(c.address, c.wire.clone());
+        }
+        let addrs = traverse_encrypted_chunk_addresses(&store, split.root_ref, CAP)
+            .await
+            .unwrap();
+        let got: HashSet<_> = addrs.iter().copied().collect();
+        let want: HashSet<_> = split.chunks.iter().map(|c| c.address).collect();
+        assert_eq!(got, want, "stored ciphertext + parity addresses");
+        assert_eq!(addrs.len(), got.len(), "no duplicates");
+        assert!(got.contains(&split.root_address()), "root addr half listed");
+    }
+
+    /// A single-chunk encrypted upload traverses to just its stored
+    /// address (the addr half of the reference).
+    #[tokio::test]
+    async fn encrypted_single_chunk() {
+        let store = MapFetcher::new();
+        let split = crate::split_bytes_encrypted(b"tiny encrypted payload", 0);
+        for c in &split.chunks {
+            store.insert(c.address, c.wire.clone());
+        }
+        let addrs = traverse_encrypted_chunk_addresses(&store, split.root_ref, CAP)
+            .await
+            .unwrap();
+        assert_eq!(addrs, vec![split.root_address()]);
+    }
+
+    /// Encrypted single-file manifest: traversal covers the manifest
+    /// node's stored chunks *and* the (encrypted) file data tree.
+    #[tokio::test]
+    async fn encrypted_manifest_traversal_covers_nodes_and_data() {
+        let store = MapFetcher::new();
+        let body = vec![0x5au8; 4096 * 2 + 17];
+        let data = crate::split_bytes_encrypted(&body, 0);
+        for c in &data.chunks {
+            store.insert(c.address, c.wire.clone());
+        }
+        let manifest = crate::manifest_writer::build_single_file_manifest_encrypted(
+            "secret.txt",
+            Some("text/plain"),
+            &data.root_ref,
+            0,
+        )
+        .expect("manifest");
+        for c in &manifest.chunks {
+            store.insert(c.address, c.wire.clone());
+        }
+        let root_ref: [u8; ENC_REF_SIZE] = manifest.root_ref;
+        let addrs = traverse_encrypted_chunk_addresses(&store, root_ref, CAP)
+            .await
+            .unwrap();
+        let got: HashSet<_> = addrs.iter().copied().collect();
+        for c in &manifest.chunks {
+            assert!(got.contains(&c.address), "manifest node chunk missing");
+        }
+        for c in &data.chunks {
+            assert!(got.contains(&c.address), "data chunk missing");
+        }
     }
 
     /// Missing root is an error the callers map to `isRetrievable:

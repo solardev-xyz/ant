@@ -19,7 +19,7 @@ use tracing::Instrument;
 use crate::fallback::not_implemented;
 use crate::handle::GatewayHandle;
 use crate::retrieval::GATEWAY_MAX_UPLOAD_BYTES;
-use crate::{chain, retrieval, settlements, stamps, status, stewardship, tags};
+use crate::{chain, chunk_stream, pins, retrieval, settlements, stamps, status, stewardship, tags};
 
 const SERVER_HEADER: &str = concat!("ant-gateway/", env!("CARGO_PKG_VERSION"));
 
@@ -49,6 +49,28 @@ pub fn build(handle: GatewayHandle) -> Router {
         // fallback pending live-mainnet validation.
         .route("/stamps", get(stamps::stamps))
         .route("/stamps/{id}", get(stamps::stamp))
+        // Per-bucket collision counters of a registered batch (bee
+        // `postageGetStampBucketsHandler`).
+        .route("/stamps/{id}/buckets", get(stamps::stamp_buckets))
+        // Network batch listing / lookup (bee `postageGetAllBatchesHandler`
+        // / `postageGetBatchHandler`). Ant has no postage event sync, so
+        // the global list is honestly empty and the single-batch lookup
+        // reads the PostageStamp contract views over the configured RPC.
+        .route("/batches", get(stamps::batches))
+        .route("/batches/{id}", get(stamps::batch))
+        // Local pinning ("pin-light", bee `pkg/api/pin.go` shapes): pins
+        // live in the persistent disk chunk cache and are exempt from
+        // eviction, giving mobile an offline-first durable store.
+        .route("/pins", get(pins::pin_list))
+        .route("/pins/check", get(pins::pin_check))
+        .route(
+            "/pins/{reference}",
+            get(pins::pin_get)
+                .post(pins::pin_post)
+                .delete(pins::pin_delete),
+        )
+        // WebSocket chunk-upload stream (bee `chunk_stream.go`).
+        .route("/chunks/stream", get(chunk_stream::chunk_stream))
         // On-chain postage mutation (PLAN.md J.5 B2/B3): buy / topup /
         // dilute. `501` when no funded wallet key is configured.
         .route("/stamps/{amount}/{depth}", post(chain::buy_stamp))

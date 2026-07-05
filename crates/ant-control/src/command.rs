@@ -473,6 +473,56 @@ pub enum ControlCommand {
         after: u64,
         ack: oneshot::Sender<ControlAck>,
     },
+    /// Gateway `POST /pins/{reference}` — pin a content tree into the
+    /// node's local store (bee `pinRootHash`). The node traverses the
+    /// tree rooted at `reference` (32-byte plain or 64-byte
+    /// `address ‖ decryption-key` encrypted reference), fetches every
+    /// chunk through the normal cache-first/network-fallback fetcher
+    /// (bee's `storer.Download(true)` getter — pinning cold content
+    /// pulls it in), and marks every chunk pin-protected in the disk
+    /// cache. The ack is [`ControlAck::PinAdded`]; a tree with
+    /// unreachable chunks fails with an `Error` whose message contains
+    /// `not found`, which the gateway maps to bee's 404
+    /// "pin collection failed".
+    PinAdd {
+        reference: Vec<u8>,
+        ack: oneshot::Sender<ControlAck>,
+    },
+    /// Gateway `DELETE /pins/{reference}` — drop a pin (bee
+    /// `unpinRootHash`). Clears the pin flags recorded by
+    /// [`ControlCommand::PinAdd`]; chunks whose last pin is removed
+    /// become evictable again. Ack is [`ControlAck::PinRemoved`].
+    PinRemove {
+        reference: Vec<u8>,
+        ack: oneshot::Sender<ControlAck>,
+    },
+    /// Gateway `GET /pins/{reference}` — is this root pinned? Ack is
+    /// [`ControlAck::PinPresent`].
+    PinHas {
+        reference: Vec<u8>,
+        ack: oneshot::Sender<ControlAck>,
+    },
+    /// Gateway `GET /pins` — list every pinned root reference in
+    /// insertion order. Ack is [`ControlAck::PinList`].
+    PinList { ack: oneshot::Sender<ControlAck> },
+    /// Gateway `GET /pins/check[?ref=…]` — bee's pin-integrity check:
+    /// for each pinned root (or just `reference` when given), report
+    /// how many member chunks the pin recorded, how many are missing
+    /// from the local store, and how many are present but fail
+    /// validation. Ack is [`ControlAck::PinCheck`].
+    PinCheck {
+        reference: Option<Vec<u8>>,
+        ack: oneshot::Sender<ControlAck>,
+    },
+    /// Gateway `GET /stamps/{id}/buckets` — per-bucket collision
+    /// counters of a registered postage batch (bee
+    /// `postageGetStampBucketsHandler`). Ack is
+    /// [`ControlAck::PostageBuckets`], or `Error` containing
+    /// `issuer does not exist` for an unregistered batch.
+    PostageBuckets {
+        batch_id: [u8; 32],
+        ack: oneshot::Sender<ControlAck>,
+    },
     /// Gateway read-only settlement/balance endpoints (`GET /balances`,
     /// `/consumed`, `/settlements`, `/timesettlements`,
     /// `/chequebook/cheque` and their `/{peer}` variants): snapshot the
@@ -585,6 +635,33 @@ pub enum ControlAck {
     /// Per-peer settlement/balance snapshot. Terminal ack on
     /// `AccountingSnapshot`.
     Accounting(AccountingSnapshotView),
+    /// Terminal ack on `PinAdd`. `already_pinned` distinguishes bee's
+    /// idempotent 200 "OK" (root already pinned) from the fresh 201
+    /// "Created".
+    PinAdded {
+        already_pinned: bool,
+    },
+    /// Terminal ack on `PinRemove`. `was_pinned = false` maps to bee's
+    /// 404 on unpinning an unknown root.
+    PinRemoved {
+        was_pinned: bool,
+    },
+    /// Terminal ack on `PinHas`.
+    PinPresent {
+        pinned: bool,
+    },
+    /// Terminal ack on `PinList`: every pinned root reference (32 bytes
+    /// plain, 64 bytes for an encrypted reference) in pin-creation
+    /// order.
+    PinList {
+        references: Vec<Vec<u8>>,
+    },
+    /// Terminal ack on `PinCheck`: one integrity row per inspected pin.
+    PinCheck {
+        stats: Vec<PinCheckStat>,
+    },
+    /// Terminal ack on `PostageBuckets`.
+    PostageBuckets(PostageBucketsView),
     /// Successful feed resolution: the reference the latest update points
     /// at, the sequence index it lived at, the SOC signature of that
     /// update chunk, and whether it resolved as v2 (the wrapped CAC is
@@ -622,6 +699,32 @@ pub enum ControlAck {
     Error {
         message: String,
     },
+}
+
+/// One row of a pin-integrity check (`GET /pins/check`), mirroring
+/// bee's `PinIntegrityResponse`: the pinned root, how many member
+/// chunks the pin recorded, how many of those are missing from the
+/// local store, and how many are present but fail CAC/SOC validation.
+#[derive(Debug, Clone, Default)]
+pub struct PinCheckStat {
+    /// Pinned root reference (32 bytes, or 64 for an encrypted ref).
+    pub reference: Vec<u8>,
+    pub total: u64,
+    pub missing: u64,
+    pub invalid: u64,
+}
+
+/// Per-bucket collision counters of a postage batch issuer, mirroring
+/// bee's `postageStampBucketsResponse` (`GET /stamps/{id}/buckets`).
+/// `collisions[i]` is the fill of bucket `i`; the gateway renders it as
+/// bee's `[{bucketID, collisions}]` array.
+#[derive(Debug, Clone, Default)]
+pub struct PostageBucketsView {
+    pub depth: u8,
+    pub bucket_depth: u8,
+    /// `2^(depth - bucket_depth)` — max collisions per bucket.
+    pub bucket_upper_bound: u32,
+    pub collisions: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

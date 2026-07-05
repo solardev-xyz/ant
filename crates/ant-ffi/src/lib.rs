@@ -768,6 +768,12 @@ async fn attempt_download(
                 | ControlAck::FeedNotFound
                 | ControlAck::Envelope { .. }
                 | ControlAck::Retrievable { .. }
+                | ControlAck::PinAdded { .. }
+                | ControlAck::PinRemoved { .. }
+                | ControlAck::PinPresent { .. }
+                | ControlAck::PinList { .. }
+                | ControlAck::PinCheck { .. }
+                | ControlAck::PostageBuckets(_)
                 | ControlAck::NotReady { .. },
             )) => {}
             Ok(None) => {

@@ -1078,7 +1078,7 @@ fn effective_payload_size(payload: &[u8]) -> usize {
 /// `branch_size` bytes; the last child holds the remainder. The branching
 /// factor is 128 for plain trees and the level's `maxShards` for
 /// redundancy-encoded trees (full nodes hold that many data refs).
-const fn subtrie_section(refs: usize, subtree_span: u64, branching: u64) -> u64 {
+pub(crate) const fn subtrie_section(refs: usize, subtree_span: u64, branching: u64) -> u64 {
     let refs = refs as u64;
     let mut branch_size = CHUNK_SIZE as u64;
     loop {
