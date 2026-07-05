@@ -107,10 +107,3 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
-
-# Perf-lab Experiment 3: vendored libp2p-stream with keyed concurrent
-# outbound substream upgrades (upstream serialises them behind a single
-# pending_upgrade slot). Behaviour is upstream-identical unless
-# ANT_SUBSTREAM_UPGRADE_CAP is set (see vendor/libp2p-stream).
-[patch.crates-io]
-libp2p-stream = { path = "vendor/libp2p-stream" }

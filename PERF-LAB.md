@@ -304,6 +304,29 @@ session push latencies rather than handshake counts.
   interleaved small-size confirmation + uniform-vs-latency-aware cap
   comparison when budget allows.
 
+### Experiment 3: concurrent substream upgrades — **REVERT**
+
+- **Hypothesis** (hoverfly, 1.8× there): stock libp2p-stream
+  serialises outbound substream upgrades behind one `pending_upgrade`
+  slot per connection; keying them (≤64 in flight) should cut
+  per-chunk negotiation RTTs.
+- **Change**: vendored libp2p-stream 0.4.0-alpha with the keyed patch
+  (`ANT_SUBSTREAM_UPGRADE_CAP`, default 1 = upstream-identical),
+  workspace `[patch.crates-io]`.
+- **Method**: 8 MiB ×5 interleaved pairs on top of the kept
+  exp 1+2 config (window 18:29–18:41Z); arm A cap 1, arm B cap 64.
+- **Results**: cap 1 = **410 median (324–532)** KiB/s, fails med 65;
+  cap 64 = **286 median (199–408)** KiB/s, fails med 91. 5/5
+  completed both arms. −30 % median, more failures.
+- **Decision**: **REVERT** (vendor patch removed entirely). Ant runs
+  ONE shared libp2p swarm for all peers — hoverfly's win came from
+  per-session swarms where the serialized slot throttled a whole
+  session's pipeline; on ant's stack, with the per-peer cap bounding
+  concurrent pushes per connection anyway, wide upgrade windows only
+  add negotiation/yamux contention. (Their own notebook's
+  "single-swarm collapses under concurrent substream load" is the
+  same physics from the other side.)
+
 ### Experiment 4: identify-push session accelerator — **NO CHANGE NEEDED (closed on measurements)**
 
 - **Hypothesis** (hoverfly, transport.rs `prep_connection`): without
