@@ -113,8 +113,16 @@ batch to run the full-fat matrix):
 
 Methodology guards: fresh random content per run (seed recorded);
 medians + spreads; A/B arms interleaved in one invocation
-(`--antd-bin-b`); wall-clock window + peer count recorded in every
-result JSON; utilization checked before/after every upload run.
+(`--antd-bin-b` / `--env-b`); wall-clock window + peer count recorded
+in every result JSON; utilization checked before/after every upload
+run.
+
+**Bee reference uploads are OFF the table on this batch**: bee keeps
+its own stamperstore and would issue `(bucket, index)` from 0 on the
+same immutable batch — colliding with the lab issuer. A bee upload
+reference row needs a second batch (user decision). Bee *download*
+reference (ultra-light, no stamps) remains feasible and is planned
+alongside the final gate's smoke run.
 
 ## Baselines
 
@@ -184,7 +192,43 @@ session push latencies rather than handshake counts.
 
 ## Experiments
 
-_(template)_
+### Experiment 1: cheque-less push-side pseudosettle (the stall fix)
+
+- **Hypothesis**: ant's large-upload stall is unsettled push debt.
+  Without a chequebook there is NO settlement on the push path (the
+  only `PushsyncSettlement` impl was the SWAP service; the
+  pseudosettle driver only walks retrieval-side `Accounting` rows —
+  ant's own startup log says "outbound SWAP settlement DISABLED —
+  uploads will stall after ~20 K chunks"). Bee debits every pushed
+  chunk in the same per-peer ledger and, past
+  threshold+tolerance, kills connections (SO_LINGER=0 ⇒ everything
+  surfaces as resets, never "overdraft"). Mirroring push debits into
+  the shared `Accounting` — so the existing pseudosettle driver
+  time-settles upload peers exactly like bee's own light nodes do —
+  should remove the decay/stall. Free: no cheques, no chain, no BZZ.
+- **Baseline evidence (2026-07-05, committed 256 MiB run)**:
+  throughput decayed 370 → ~145 KiB/s within the run; then the tail
+  FROZE at 65 833/66 054 chunks (bytes 100 %, last 221 tree/manifest
+  chunks unlandable for 30+ min → stall-abort). Failure taxonomy from
+  the (fixed) log capture: 200 730 × `io: connection is closed`,
+  34 335 × `io: unexpected end of file`, 5 475 × dial `no addresses`,
+  0 × literal "overdraft", 2 904 shallow receipts. ≈3.7 failed
+  attempts per landed chunk. Same-peer transient retry fired 118 141×
+  (the 150 ms retry is nearly always doomed — the connection is gone).
+- **Change**: `ant-p2p::push_pseudosettle::PushPseudosettle`
+  (implements `PushsyncSettlement` over the shared `Accounting`,
+  firing the driver's HotHint via the existing threshold logic),
+  wired as fallback in `push_with_stamp`/`push_soc_with_stamp` when
+  no chequebook is configured. Env-gated `ANT_PUSH_PSEUDOSETTLE=1`
+  for the A/B (one build, both arms). Commits: _(pending)_
+- **Method**: `perf/run-exp1-pseudosettle.sh` — 32 MiB ×5 interleaved
+  A/B, then 256 MiB ×1 on the treated arm vs today's baseline curve;
+  stall verdict = tail completes (esp. the post-data tree/manifest
+  chunks) + failed-attempts-per-chunk collapse.
+- **Results**: _(pending)_
+- **Decision**: _(pending)_
+
+_(further experiments use the same template)_
 
 ### Experiment N: name
 
