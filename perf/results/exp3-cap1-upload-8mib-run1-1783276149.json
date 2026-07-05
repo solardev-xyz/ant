@@ -1,0 +1,170 @@
+{
+  "antd_bin": "/home/florian/claude/ant/crates/ant-conformance/../../target/release/antd",
+  "bytes_pushed": 8388608,
+  "chunks_pushed": 2068,
+  "chunks_requeued": 0,
+  "chunks_total": 2066,
+  "content_seed": 17675155326893813695,
+  "duration_secs": 25.258499403,
+  "ended_utc": "2026-07-05T18:29:09Z",
+  "git_commit": "5ef68e9",
+  "issued_chunks_after": 484606,
+  "issued_chunks_before": 482539,
+  "job_reported_secs": 25,
+  "label": "exp3-cap1",
+  "last_error": null,
+  "log_histogram": {
+    "exhausted_events": 0,
+    "no_peer_events": 0,
+    "overdraft_mentions": 0,
+    "push_hard_failures": 42,
+    "push_timeouts": 0,
+    "same_peer_retries": 28,
+    "shallow_accepted": 0,
+    "shallow_receipts": 56
+  },
+  "outcome": "completed",
+  "peer_warmup_secs": 0.503553816,
+  "peers_at_end": 248,
+  "peers_at_start": 93,
+  "peers_min": 30,
+  "progress_curve": [
+    {
+      "bytes_pushed": 409600,
+      "chunks_pushed": 100,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 1.3710240169999999
+    },
+    {
+      "bytes_pushed": 438272,
+      "chunks_pushed": 107,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 4.770884691
+    },
+    {
+      "bytes_pushed": 3506176,
+      "chunks_pushed": 856,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 9.894972412
+    },
+    {
+      "bytes_pushed": 4231168,
+      "chunks_pushed": 1033,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 13.212356901
+    },
+    {
+      "bytes_pushed": 4231168,
+      "chunks_pushed": 1033,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 14.238030196
+    },
+    {
+      "bytes_pushed": 4403200,
+      "chunks_pushed": 1075,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 15.239829741
+    },
+    {
+      "bytes_pushed": 4403200,
+      "chunks_pushed": 1075,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 16.241713916
+    },
+    {
+      "bytes_pushed": 4403200,
+      "chunks_pushed": 1075,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 17.242785082
+    },
+    {
+      "bytes_pushed": 4403200,
+      "chunks_pushed": 1075,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 18.244676718
+    },
+    {
+      "bytes_pushed": 4403200,
+      "chunks_pushed": 1075,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 19.245466594
+    },
+    {
+      "bytes_pushed": 5922816,
+      "chunks_pushed": 1446,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 20.24740739
+    },
+    {
+      "bytes_pushed": 5922816,
+      "chunks_pushed": 1446,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 21.249616567
+    },
+    {
+      "bytes_pushed": 5922816,
+      "chunks_pushed": 1446,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 22.251742722
+    },
+    {
+      "bytes_pushed": 8388608,
+      "chunks_pushed": 2067,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 23.2537349
+    },
+    {
+      "bytes_pushed": 8388608,
+      "chunks_pushed": 2067,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 24.255604176
+    },
+    {
+      "bytes_pushed": 8388608,
+      "chunks_pushed": 2068,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "completed",
+      "t_secs": 25.258495143
+    }
+  ],
+  "reference": "0x22929b4be596d51e3efc63516b2b99af7e5128c5b2ab719f49c496c3131278e5",
+  "run": 1,
+  "size_mib": 8,
+  "started_utc": "2026-07-05T18:28:41Z",
+  "suite": "upload",
+  "throughput_kib_s": 324.3264720241861,
+  "utilization_ratio_after": 0.65625,
+  "utilization_ratio_before": 0.65625,
+  "worst_case_remaining_after": 720896
+}

@@ -1,0 +1,210 @@
+{
+  "antd_bin": "/home/florian/claude/ant/crates/ant-conformance/../../target/release/antd",
+  "bytes_pushed": 8388608,
+  "chunks_pushed": 2068,
+  "chunks_requeued": 0,
+  "chunks_total": 2066,
+  "content_seed": 17560578171674789728,
+  "duration_secs": 28.660832136,
+  "ended_utc": "2026-07-05T18:34:01Z",
+  "git_commit": "5ef68e9",
+  "issued_chunks_after": 503209,
+  "issued_chunks_before": 501142,
+  "job_reported_secs": 28,
+  "label": "exp3-upgrades64",
+  "last_error": null,
+  "log_histogram": {
+    "exhausted_events": 0,
+    "no_peer_events": 0,
+    "overdraft_mentions": 0,
+    "push_hard_failures": 89,
+    "push_timeouts": 0,
+    "same_peer_retries": 43,
+    "shallow_accepted": 0,
+    "shallow_receipts": 66
+  },
+  "outcome": "completed",
+  "peer_warmup_secs": 0.522870918,
+  "peers_at_end": 243,
+  "peers_at_start": 97,
+  "peers_min": 30,
+  "progress_curve": [
+    {
+      "bytes_pushed": 36864,
+      "chunks_pushed": 9,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 2.320011941
+    },
+    {
+      "bytes_pushed": 454656,
+      "chunks_pushed": 111,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 4.59764012
+    },
+    {
+      "bytes_pushed": 1671168,
+      "chunks_pushed": 408,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 7.6524745119999995
+    },
+    {
+      "bytes_pushed": 2297856,
+      "chunks_pushed": 561,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 8.95374557
+    },
+    {
+      "bytes_pushed": 2297856,
+      "chunks_pushed": 561,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 10.670733132
+    },
+    {
+      "bytes_pushed": 5468160,
+      "chunks_pushed": 1335,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 13.63394252
+    },
+    {
+      "bytes_pushed": 6938624,
+      "chunks_pushed": 1694,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 14.635729244
+    },
+    {
+      "bytes_pushed": 7380992,
+      "chunks_pushed": 1802,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 15.637615678
+    },
+    {
+      "bytes_pushed": 7380992,
+      "chunks_pushed": 1802,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 16.638546102
+    },
+    {
+      "bytes_pushed": 7380992,
+      "chunks_pushed": 1802,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 17.640565745
+    },
+    {
+      "bytes_pushed": 8290304,
+      "chunks_pushed": 2024,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 18.64268418
+    },
+    {
+      "bytes_pushed": 8290304,
+      "chunks_pushed": 2024,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 19.643601453
+    },
+    {
+      "bytes_pushed": 8388608,
+      "chunks_pushed": 2061,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 20.645323768
+    },
+    {
+      "bytes_pushed": 8388608,
+      "chunks_pushed": 2061,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 21.647285191
+    },
+    {
+      "bytes_pushed": 8388608,
+      "chunks_pushed": 2061,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 22.649087216
+    },
+    {
+      "bytes_pushed": 8388608,
+      "chunks_pushed": 2061,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 23.6507531
+    },
+    {
+      "bytes_pushed": 8388608,
+      "chunks_pushed": 2061,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 24.652704956
+    },
+    {
+      "bytes_pushed": 8388608,
+      "chunks_pushed": 2061,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 25.65550928
+    },
+    {
+      "bytes_pushed": 8388608,
+      "chunks_pushed": 2061,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 26.657724266
+    },
+    {
+      "bytes_pushed": 8388608,
+      "chunks_pushed": 2065,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 27.65968486
+    },
+    {
+      "bytes_pushed": 8388608,
+      "chunks_pushed": 2068,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "completed",
+      "t_secs": 28.660827546
+    }
+  ],
+  "reference": "0xd0e0d24c66b069160a8311e77e62bdda674d1c14ff500a1a72400bcee2e4e3af",
+  "run": 5,
+  "size_mib": 8,
+  "started_utc": "2026-07-05T18:33:29Z",
+  "suite": "upload",
+  "throughput_kib_s": 285.8256159879698,
+  "utilization_ratio_after": 0.65625,
+  "utilization_ratio_before": 0.65625,
+  "worst_case_remaining_after": 720896
+}

@@ -320,18 +320,47 @@ where
     .map_err(|e| e.to_string())?
 }
 
-async fn postage_status(socket: &Path) -> Option<ant_control::PostageStatusView> {
-    match control(socket.to_path_buf(), || Request::PostageStatus).await {
-        Ok(Response::PostageStatus(v)) => Some(v),
-        _ => None,
-    }
+/// Minimal issuer view for a SPECIFIC batch. The control socket's
+/// `PostageStatus` reports an arbitrary issuer when several are
+/// registered (`HashMap` order) and `PostageList` is gateway-only, so
+/// with two lab batches on disk the utilization guard goes through
+/// `GET /stamps` and matches on the batch id.
+struct BatchView {
+    issued_like_max_fill: u32,
+    bucket_capacity: u32,
+    worst_case_remaining: u64,
 }
 
-fn utilization_ratio(v: &ant_control::PostageStatusView) -> f64 {
+async fn postage_status_for(
+    client: &reqwest::Client,
+    api: &str,
+    batch_hex: &str,
+) -> Option<BatchView> {
+    let r = client.get(format!("{api}/stamps")).send().await.ok()?;
+    let body = r.bytes().await.ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
+    for st in v["stamps"].as_array()? {
+        if st["batchID"].as_str()? .eq_ignore_ascii_case(batch_hex) {
+            let max_fill = st["utilization"].as_u64()? as u32;
+            let depth = st["depth"].as_u64()? as u32;
+            let bucket_depth = st["bucketDepth"].as_u64()? as u32;
+            let cap = 1u32 << (depth - bucket_depth);
+            let buckets = 1u64 << bucket_depth;
+            return Some(BatchView {
+                issued_like_max_fill: max_fill,
+                bucket_capacity: cap,
+                worst_case_remaining: u64::from(cap.saturating_sub(max_fill)) * buckets,
+            });
+        }
+    }
+    None
+}
+
+fn utilization_ratio(v: &BatchView) -> f64 {
     if v.bucket_capacity == 0 {
         return 0.0;
     }
-    f64::from(v.bucket_fill_max) / f64::from(v.bucket_capacity)
+    f64::from(v.issued_like_max_fill) / f64::from(v.bucket_capacity)
 }
 
 // ---------------------------------------------------------------------------
@@ -676,14 +705,24 @@ struct UploadArm {
 
 async fn upload(args: &Args) {
     let env = load_env();
+    // `--batch 2` selects the second lab batch (SWARM_BATCH_ID_2 /
+    // SWARM_OWNER_PRIVATE_KEY_2) — provided by the user on 2026-07-05
+    // for the big-proof runs after batch 1 crossed the 0.6 warn line.
+    // The stamp key must match the batch owner (the daemon signs with
+    // one key), so both are selected together.
+    let (batch_var, key_var) = if args.str_or("batch", "1") == "2" {
+        ("SWARM_BATCH_ID_2", "SWARM_OWNER_PRIVATE_KEY_2")
+    } else {
+        ("SWARM_BATCH_ID", "SWARM_OWNER_PRIVATE_KEY")
+    };
     let batch_hex = env
-        .get("SWARM_BATCH_ID")
-        .expect("SWARM_BATCH_ID missing from .env")
+        .get(batch_var)
+        .unwrap_or_else(|| panic!("{batch_var} missing from .env"))
         .trim_start_matches("0x")
         .to_lowercase();
     let key_hex = env
-        .get("SWARM_OWNER_PRIVATE_KEY")
-        .expect("SWARM_OWNER_PRIVATE_KEY missing from .env")
+        .get(key_var)
+        .unwrap_or_else(|| panic!("{key_var} missing from .env"))
         .trim_start_matches("0x")
         .to_string();
 
@@ -798,25 +837,22 @@ async fn upload_one_run(
     }
 
     // Pre-run issuer view (also proves the shared postage state loaded).
-    let pre = postage_status(&antd.socket).await;
+    let pre = postage_status_for(client, &antd.api, cfg.batch_hex).await;
     let Some(pre) = pre else {
         eprintln!("PostageStatus failed — is the lab postage state seeded + symlinked?");
         return None;
     };
-    assert!(
-        pre.enabled,
-        "daemon has no postage issuer — seeding/symlink broken"
-    );
+
     let pre_ratio = utilization_ratio(&pre);
     if pre_ratio >= UTILIZATION_STOP {
         eprintln!("refusing run: utilization {pre_ratio:.3} ≥ {UTILIZATION_STOP}");
         return Some(pre_ratio);
     }
     let chunks_needed = cfg.size_mib * 256 + 64; // data + generous tree/manifest overhead
-    if pre.worst_case_remaining_chunks < chunks_needed {
+    if pre.worst_case_remaining < chunks_needed {
         eprintln!(
             "refusing run: worst-case remaining {} chunks < needed ~{chunks_needed}",
-            pre.worst_case_remaining_chunks
+            pre.worst_case_remaining
         );
         return Some(pre_ratio);
     }
@@ -948,7 +984,7 @@ async fn upload_one_run(
     }
     let duration = started.elapsed().as_secs_f64();
     let peers_end = peer_count(client, &antd.api).await;
-    let post = postage_status(&antd.socket).await;
+    let post = postage_status_for(client, &antd.api, cfg.batch_hex).await;
 
     let bytes_total = cfg.size_mib * 1024 * 1024;
     let bytes_done = terminal.as_ref().map_or(0, |v| v.bytes_pushed);
@@ -988,11 +1024,11 @@ async fn upload_one_run(
         "chunks_requeued": terminal.as_ref().map_or(0, |v| v.chunks_requeued),
         "last_error": terminal.as_ref().and_then(|v| v.last_error.clone()),
         "reference": terminal.as_ref().and_then(|v| v.reference.clone()),
-        "issued_chunks_before": pre.issued_chunks,
-        "issued_chunks_after": post.as_ref().map(|v| v.issued_chunks),
+        "max_bucket_fill_before": pre.issued_like_max_fill,
+        "max_bucket_fill_after": post.as_ref().map(|v| v.issued_like_max_fill),
         "utilization_ratio_before": pre_ratio,
         "utilization_ratio_after": post_ratio,
-        "worst_case_remaining_after": post.as_ref().map(|v| v.worst_case_remaining_chunks),
+        "worst_case_remaining_after": post.as_ref().map(|v| v.worst_case_remaining),
         "log_histogram": hist,
         "progress_curve": curve,
     });
