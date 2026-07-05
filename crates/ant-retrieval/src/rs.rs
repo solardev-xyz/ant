@@ -30,8 +30,14 @@
 //! (64-byte references) use the separate encrypted erasure tables
 //! ([`get_enc_parities`] / [`max_enc_shards`]); their write side is
 //! [`crate::enc_split`] and their read side [`crate::joiner`]'s
-//! `join_encrypted` (traversal only — parity *recovery* of encrypted
-//! trees is not implemented).
+//! `join_encrypted`, which routes data-child fetches of redundant
+//! nodes through an [`RsDecoder`] in encrypted mode
+//! ([`RsDecoder::new_encrypted`]): parities are Reed-Solomon encodings
+//! of the children's *ciphertext* wires (every stored encrypted chunk
+//! is exactly 4104 bytes), so recovery reconstructs the ciphertext,
+//! CAC-validates it against the 32-byte address half of the child's
+//! 64-byte reference, and only then does the joiner decrypt with the
+//! key half.
 //!
 //! The Reed-Solomon backend is the `reed-solomon-erasure` crate, which
 //! uses the same Backblaze/klauspost matrix construction as bee's
@@ -443,9 +449,18 @@ fn recovered_wire_len(shard: &[u8]) -> Option<usize> {
 /// caches a network fetch would.
 pub struct RsDecoder {
     /// All child references of the node: `shard_cnt` data refs followed
-    /// by parity refs.
+    /// by parity refs. For encrypted trees these are the 32-byte
+    /// *address halves* of the 64-byte data references plus the bare
+    /// 32-byte parity references — the decoder never sees a key.
     addrs: Vec<[u8; 32]>,
     shard_cnt: usize,
+    /// Encrypted-tree mode: shards are the children's *ciphertext*
+    /// wires, which are all exactly [`CHUNK_WITH_SPAN_SIZE`] bytes (the
+    /// encrypted splitter pads every stored chunk), so a reconstructed
+    /// shard is returned whole — its span bytes are ciphertext and
+    /// cannot (and need not) drive a truncation like the plain path's
+    /// [`recovered_wire_len`].
+    encrypted: bool,
     /// `None` until the recovery sweep runs; then the terminal outcome.
     recovered: Mutex<Option<Result<Vec<Vec<u8>>, String>>>,
 }
@@ -459,6 +474,26 @@ impl RsDecoder {
         Self {
             addrs,
             shard_cnt,
+            encrypted: false,
+            recovered: Mutex::new(None),
+        }
+    }
+
+    /// [`RsDecoder::new`] for an **encrypted** intermediate node: `addrs`
+    /// holds the 32-byte address halves of the node's 64-byte data
+    /// references followed by its bare 32-byte parity references.
+    /// Recovery runs entirely in ciphertext space (bee's redundancy
+    /// getter is encryption-agnostic the same way: `file.ChunkAddresses`
+    /// strips the key halves before the decoder ever sees the refs);
+    /// the caller decrypts a returned wire with the key half of the
+    /// reference it followed.
+    #[must_use]
+    pub fn new_encrypted(addrs: Vec<[u8; 32]>, shard_cnt: usize) -> Self {
+        debug_assert!(shard_cnt >= 1 && shard_cnt < addrs.len());
+        Self {
+            addrs,
+            shard_cnt,
+            encrypted: true,
             recovered: Mutex::new(None),
         }
     }
@@ -567,12 +602,19 @@ impl RsDecoder {
                 let mut wire = shards[i]
                     .take()
                     .ok_or("reconstruct left a data shard empty")?;
-                let len = recovered_wire_len(&wire)
-                    .ok_or_else(|| format!("recovered shard {i} has an undecodable span"))?;
-                if len > wire.len() {
-                    return Err(format!("recovered shard {i} shorter than its span implies"));
+                if !self.encrypted {
+                    // Plain trees: the shard was zero-padded to 4104 for
+                    // the RS matrix; its own (plaintext) span says where
+                    // the real chunk ends. Encrypted trees skip this —
+                    // every stored ciphertext wire is exactly 4104 bytes
+                    // and the span bytes are ciphertext.
+                    let len = recovered_wire_len(&wire)
+                        .ok_or_else(|| format!("recovered shard {i} has an undecodable span"))?;
+                    if len > wire.len() {
+                        return Err(format!("recovered shard {i} shorter than its span implies"));
+                    }
+                    wire.truncate(len);
                 }
-                wire.truncate(len);
                 if !cac_valid(&self.addrs[i], &wire) {
                     return Err(format!(
                         "recovered shard {i} failed CAC validation against {} \
