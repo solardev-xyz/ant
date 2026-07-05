@@ -1,0 +1,44 @@
+{
+  "antd_bin": "/home/florian/claude/ant/crates/ant-conformance/../../target/release/antd",
+  "api_up": true,
+  "api_up_secs": 1.513631749,
+  "git_commit": "a477213",
+  "label": "baseline",
+  "milestones": [
+    {
+      "peers": 1,
+      "secs": 0.00029327
+    },
+    {
+      "peers": 5,
+      "secs": 0.252516238
+    },
+    {
+      "peers": 10,
+      "secs": 0.252516448
+    },
+    {
+      "peers": 20,
+      "secs": 0.252516538
+    },
+    {
+      "peers": 30,
+      "secs": 0.252516638
+    },
+    {
+      "peers": 50,
+      "secs": 0.252517338
+    },
+    {
+      "peers": 75,
+      "secs": 0.252517428
+    }
+  ],
+  "peers_at_end": 88,
+  "peers_target": 30,
+  "run": 4,
+  "secs_to_target": 0.252517618,
+  "started_utc": "2026-07-05T14:10:22Z",
+  "suite": "warmup",
+  "target_reached": true
+}

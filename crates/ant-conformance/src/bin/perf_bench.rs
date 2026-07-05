@@ -1041,8 +1041,10 @@ async fn fetch_timed(
     kind: &str,
     reference: &str,
 ) -> serde_json::Value {
+    // For `bzz` the reference is used verbatim so callers can pass
+    // `<ref>/`, `<ref>/path/inside.bin`, or a percent-encoded path.
     let url = match kind {
-        "bzz" => format!("{api}/bzz/{reference}/"),
+        "bzz" => format!("{api}/bzz/{reference}"),
         _ => format!("{api}/bytes/{reference}"),
     };
     let start = Instant::now();

@@ -7,14 +7,19 @@ Every experiment: Hypothesis → Change → Method → Results → Decision
 
 ## STATUS
 
-- **Current experiment**: #0 — harness bring-up (perf_bench)
-- **Phase**: benchmarking (shakedown)
-- **Next action**: evaluate the 1 MiB shakedown result
-  (`perf/results/shakedown-upload-1mib-*`), fix any harness issues,
-  then start the budget-adjusted baseline plan below.
+- **Current experiment**: #0 — baselines (cheap cells)
+- **Phase**: benchmarking
+- **Next action**: when `perf/run-baselines-cheap.sh` finishes
+  (warmup ×5 → upload 1 MiB ×5 → 32 MiB ×5 → feed-setup → feed ×5 →
+  download ×5), transcribe median tables into "Baselines" below,
+  commit results, open the PR. Then run 256 MiB ×1 and 512 MiB ×1
+  (stall characterization) overnight. Meanwhile: Experiment 1 recon
+  (PLAN.md GGUF stall history around lines 700–930).
 - **In-flight hypotheses**: none yet.
-- **Long-running processes**: possibly a `perf_bench upload … --label
-  shakedown` (check `pgrep -af 'antd|perf_bench'`).
+- **Long-running processes**: `perf/run-baselines-cheap.sh` in the
+  background (spawns one antd at a time on ports 3633–3641; kills
+  each after its run). Shakedown result already committed:
+  1 MiB = 102 KiB/s, clean histogram.
 
 ### ⚠ Batch budget vs. the full matrix (2026-07-05 arithmetic)
 
