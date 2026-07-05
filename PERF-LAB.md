@@ -384,6 +384,29 @@ session push latencies rather than handshake counts.
   finder's phases serialise deadline windows; that's the next lever,
   together with warm-path hint caching (warm == cold today).
 
+### Experiment 6(b): feed head-finding cost model — **hint KEPT; gallop/k-ary NOT ADOPTED (measured argument)**
+
+- **Warm-path hint (adopted)**: sequence feeds are append-only, so
+  the daemon now anchors at `max(after, last-resolved-index)` per
+  `(owner, topic)` with a one-shot unhinted retry on error. Measured
+  (feed ×5, 19:19–19:21Z): warm resolution **flat 1.60 s at every
+  head** vs 1.60/2.41/4.02 s before — 2.5× at head 100, and the win
+  grows with feed depth. Cold unchanged by design. 15/15 ok.
+- **Hoverfly's concurrent gallop + k-ary narrowing (not adopted)**:
+  ant's post-6(a) resolution latencies are quantised at exact
+  multiples of the 800 ms speculative-probe deadline (2×/3×/5×
+  windows for heads 0/10/100) — the cost driver is the number of
+  *sequential deadline windows*, not probe count. At the benchmark
+  matrix's head sizes, k-ary(8)+gallop reduces the window count by
+  ≤1 (e.g. head 100: 5→4) — under the ~0.8 s noise floor — while
+  replacing the subtlest code in the resolver. Method rule applies:
+  ties/noise → prefer the simpler codebase. Would be worth revisiting
+  only for feeds with heads in the thousands (log₂ vs log₈ sequential
+  windows), which nothing in ant's production surface produces today.
+- **Experiment 6 verdict overall**: **KEPT 6(a) (wrapped-CAC serve,
+  0 → 100 % cold) + 6(b) hint (warm 2.5× at depth); k-ary finder
+  NOT ADOPTED on measurements.**
+
 _(further experiments use the same template)_
 
 ### Experiment N: name
