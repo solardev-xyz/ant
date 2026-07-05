@@ -228,6 +228,33 @@ session push latencies rather than handshake counts.
 - **Results**: _(pending)_
 - **Decision**: _(pending)_
 
+### Experiment 4: identify-push session accelerator — **NO CHANGE NEEDED (closed on measurements)**
+
+- **Hypothesis** (hoverfly, transport.rs `prep_connection`): without
+  actively pushing identify (+`add_external_address(observed)`) after
+  connect and awaiting the ack before the BZZ handshake, bee waits out
+  libp2p's ~7–10 s idle-identify interval per session (hoverfly
+  pre-fix: 128-session fill ≈ 15 min; post-fix ≈ 5 s).
+- **Check first** (the goal mandates it): ant already implements the
+  mechanism — `ant-p2p::behaviour` has an explicit
+  wait-for-identify → open-BZZ pipeline (`PendingPeer::identify_started`,
+  "Opening our BZZ stream before identify has round-tripped makes bee
+  stall for the full 10 s, then disconnect"), plus
+  `our_identify_useful_for_bee` push heuristics and external-address
+  promotion from observed addrs.
+- **Measurements** (committed baseline results):
+  - Session warm-up ×5: 30+ BZZ-handshaked peers 0.25–1.76 s after
+    API-up; ~95 peers steady state within the same few seconds. No
+    multi-second per-session tail exists at all.
+  - Cold downloads on fresh daemons (fresh connections, first-ever
+    streams): TTFB medians 0.12–0.37 s across 4 refs ×5 runs — a
+    ~7–10 s idle-identify wait would be unmissable here.
+- **Decision**: **NO CHANGE** (kept as-is). The technique's win is
+  already banked in ant's connection pipeline; there is nothing left
+  to accelerate at the session-establishment layer. Closed without a
+  code change — the numbers say the ceiling is elsewhere (accounting
+  and per-peer scheduling, see exps 1–2).
+
 ### Experiment 6(a): serve feed wrapped CAC from the SOC — **KEEP**
 
 - **Hypothesis**: cold feed resolution 404s because ant re-fetches a
