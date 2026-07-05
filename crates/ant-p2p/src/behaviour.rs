@@ -850,9 +850,6 @@ struct SwarmState {
     /// only when `ANT_PUSH_INFLIGHT_CAP` is set — one build serves
     /// both A/B benchmark arms.
     push_load: Option<Arc<ant_retrieval::PushLoadTracker>>,
-    /// Receipt-derived AOR estimates (perf-lab Experiment 5), `Some`
-    /// only when `ANT_PUSH_AOR_SORT` is set.
-    push_aor: Option<Arc<ant_retrieval::AorBook>>,
     /// Last successfully-resolved sequence-feed index per
     /// `(owner, topic)` (perf-lab Experiment 6b). Sequence feeds are
     /// append-only, so a previously-resolved index is always a valid
@@ -937,7 +934,6 @@ impl SwarmState {
             credit_ledger: None,
             push_skip: ant_retrieval::PushSkipCache::new(),
             push_load: ant_retrieval::PushLoadTracker::from_env().map(Arc::new),
-            push_aor: ant_retrieval::AorBook::from_env().map(Arc::new),
             feed_hints: Arc::new(std::sync::Mutex::new(HashMap::new())),
             hot_hint: None,
             known_dialable: HashMap::new(),
@@ -3217,7 +3213,6 @@ fn push_with_stamp(
     let accounting = state.accounting.clone();
     let push_skip = state.push_skip.clone();
     let push_load = state.push_load.clone();
-    let push_aor = state.push_aor.clone();
     let disk_cache = state.disk_cache.clone();
     let mem_cache = state.chunk_cache.clone();
     let neighborhood_dial = state.neighborhood_dial_tx.clone();
@@ -3249,9 +3244,6 @@ fn push_with_stamp(
             .with_network_id(network_id);
         if let Some(load) = push_load {
             fetcher = fetcher.with_push_load(load);
-        }
-        if let Some(aor) = push_aor {
-            fetcher = fetcher.with_push_aor(aor);
         }
         if let Some(tx) = neighborhood_dial {
             fetcher = fetcher.with_neighborhood_dialer(tx);
@@ -3306,7 +3298,6 @@ fn push_soc_with_stamp(
     let accounting = state.accounting.clone();
     let push_skip = state.push_skip.clone();
     let push_load = state.push_load.clone();
-    let push_aor = state.push_aor.clone();
     let disk_cache = state.disk_cache.clone();
     let mem_cache = state.chunk_cache.clone();
     let neighborhood_dial = state.neighborhood_dial_tx.clone();
@@ -3362,9 +3353,6 @@ fn push_soc_with_stamp(
             .with_network_id(network_id);
         if let Some(load) = push_load {
             fetcher = fetcher.with_push_load(load);
-        }
-        if let Some(aor) = push_aor {
-            fetcher = fetcher.with_push_aor(aor);
         }
         if let Some(tx) = neighborhood_dial {
             fetcher = fetcher.with_neighborhood_dialer(tx);

@@ -1,0 +1,178 @@
+{
+  "antd_bin": "/home/florian/claude/ant/crates/ant-conformance/../../target/release/antd",
+  "bytes_pushed": 8388608,
+  "chunks_pushed": 2068,
+  "chunks_requeued": 0,
+  "chunks_total": 2066,
+  "content_seed": 10098785417174180817,
+  "duration_secs": 23.064849465,
+  "ended_utc": "2026-07-05T20:33:20Z",
+  "git_commit": "d740152",
+  "job_reported_secs": 22,
+  "label": "exp5-off",
+  "last_error": null,
+  "log_histogram": {
+    "exhausted_events": 0,
+    "no_peer_events": 0,
+    "overdraft_mentions": 0,
+    "push_hard_failures": 79,
+    "push_timeouts": 0,
+    "same_peer_retries": 42,
+    "shallow_accepted": 0,
+    "shallow_receipts": 105
+  },
+  "max_bucket_fill_after": 22,
+  "max_bucket_fill_before": 22,
+  "outcome": "completed",
+  "peer_warmup_secs": 0.00072856,
+  "peers_at_end": 232,
+  "peers_at_start": 99,
+  "peers_min": 30,
+  "progress_curve": [
+    {
+      "bytes_pushed": 253952,
+      "chunks_pushed": 62,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 2.802201883
+    },
+    {
+      "bytes_pushed": 958464,
+      "chunks_pushed": 234,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 4.033324714
+    },
+    {
+      "bytes_pushed": 1097728,
+      "chunks_pushed": 268,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 5.062539271
+    },
+    {
+      "bytes_pushed": 1097728,
+      "chunks_pushed": 268,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 6.379889008
+    },
+    {
+      "bytes_pushed": 3026944,
+      "chunks_pushed": 739,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 9.463185361
+    },
+    {
+      "bytes_pushed": 3219456,
+      "chunks_pushed": 786,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 10.695189032
+    },
+    {
+      "bytes_pushed": 4255744,
+      "chunks_pushed": 1039,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 13.044904346
+    },
+    {
+      "bytes_pushed": 4255744,
+      "chunks_pushed": 1039,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 14.046700682
+    },
+    {
+      "bytes_pushed": 4255744,
+      "chunks_pushed": 1039,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 15.048810438
+    },
+    {
+      "bytes_pushed": 4255744,
+      "chunks_pushed": 1039,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 16.051139453
+    },
+    {
+      "bytes_pushed": 4255744,
+      "chunks_pushed": 1039,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 17.053070009
+    },
+    {
+      "bytes_pushed": 4255744,
+      "chunks_pushed": 1039,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 18.054694715
+    },
+    {
+      "bytes_pushed": 4255744,
+      "chunks_pushed": 1039,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 19.056362511
+    },
+    {
+      "bytes_pushed": 8388608,
+      "chunks_pushed": 2067,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 20.058166997
+    },
+    {
+      "bytes_pushed": 8388608,
+      "chunks_pushed": 2067,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 21.060105673
+    },
+    {
+      "bytes_pushed": 8388608,
+      "chunks_pushed": 2067,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 22.063011589
+    },
+    {
+      "bytes_pushed": 8388608,
+      "chunks_pushed": 2068,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "completed",
+      "t_secs": 23.064843235
+    }
+  ],
+  "reference": "0xac835da146a44e0b35b75f986c3e3ce7557c27c975aaa5242ed6ae3f7850cbc2",
+  "run": 4,
+  "size_mib": 8,
+  "started_utc": "2026-07-05T20:32:52Z",
+  "suite": "upload",
+  "throughput_kib_s": 355.1724893080719,
+  "utilization_ratio_after": 0.6875,
+  "utilization_ratio_before": 0.6875,
+  "worst_case_remaining_after": 655360
+}

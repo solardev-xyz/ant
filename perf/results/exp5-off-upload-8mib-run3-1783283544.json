@@ -1,0 +1,162 @@
+{
+  "antd_bin": "/home/florian/claude/ant/crates/ant-conformance/../../target/release/antd",
+  "bytes_pushed": 8388608,
+  "chunks_pushed": 2068,
+  "chunks_requeued": 0,
+  "chunks_total": 2066,
+  "content_seed": 7557425171073511315,
+  "duration_secs": 19.452391931,
+  "ended_utc": "2026-07-05T20:32:24Z",
+  "git_commit": "d740152",
+  "job_reported_secs": 19,
+  "label": "exp5-off",
+  "last_error": null,
+  "log_histogram": {
+    "exhausted_events": 0,
+    "no_peer_events": 0,
+    "overdraft_mentions": 0,
+    "push_hard_failures": 148,
+    "push_timeouts": 0,
+    "same_peer_retries": 67,
+    "shallow_accepted": 0,
+    "shallow_receipts": 106
+  },
+  "max_bucket_fill_after": 21,
+  "max_bucket_fill_before": 21,
+  "outcome": "completed",
+  "peer_warmup_secs": 0.00080519,
+  "peers_at_end": 226,
+  "peers_at_start": 98,
+  "peers_min": 30,
+  "progress_curve": [
+    {
+      "bytes_pushed": 315392,
+      "chunks_pushed": 77,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 1.913753185
+    },
+    {
+      "bytes_pushed": 315392,
+      "chunks_pushed": 77,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 3.144672453
+    },
+    {
+      "bytes_pushed": 315392,
+      "chunks_pushed": 77,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 4.948855341
+    },
+    {
+      "bytes_pushed": 315392,
+      "chunks_pushed": 77,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 8.02529813
+    },
+    {
+      "bytes_pushed": 315392,
+      "chunks_pushed": 77,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 9.088128438
+    },
+    {
+      "bytes_pushed": 315392,
+      "chunks_pushed": 77,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 10.138045987
+    },
+    {
+      "bytes_pushed": 315392,
+      "chunks_pushed": 77,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 11.141734312
+    },
+    {
+      "bytes_pushed": 315392,
+      "chunks_pushed": 77,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 12.367982381000001
+    },
+    {
+      "bytes_pushed": 315392,
+      "chunks_pushed": 77,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 13.442032541
+    },
+    {
+      "bytes_pushed": 315392,
+      "chunks_pushed": 77,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 14.444047476
+    },
+    {
+      "bytes_pushed": 315392,
+      "chunks_pushed": 77,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 15.445623601
+    },
+    {
+      "bytes_pushed": 315392,
+      "chunks_pushed": 77,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 16.447768064999998
+    },
+    {
+      "bytes_pushed": 315392,
+      "chunks_pushed": 77,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 17.449574752
+    },
+    {
+      "bytes_pushed": 8335360,
+      "chunks_pushed": 2035,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 18.450905956
+    },
+    {
+      "bytes_pushed": 8388608,
+      "chunks_pushed": 2068,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "completed",
+      "t_secs": 19.452390201
+    }
+  ],
+  "reference": "0x9a144bbe53621b44f1ddbb158a64b10fc9ecb71a9a0eafe0998b14d8f272ca23",
+  "run": 3,
+  "size_mib": 8,
+  "started_utc": "2026-07-05T20:32:01Z",
+  "suite": "upload",
+  "throughput_kib_s": 421.13072927267865,
+  "utilization_ratio_after": 0.65625,
+  "utilization_ratio_before": 0.65625,
+  "worst_case_remaining_after": 720896
+}

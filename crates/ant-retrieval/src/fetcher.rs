@@ -195,7 +195,6 @@ pub struct RoutingFetcher {
     /// legacy per-chunk-only skip behaviour for unit tests.
     push_skip: Option<PushSkipCache>,
     push_load: Option<std::sync::Arc<crate::PushLoadTracker>>,
-    push_aor: Option<std::sync::Arc<crate::push_load::AorBook>>,
     /// Swarm network id used to derive the storer overlay when
     /// verifying a pushsync receipt's signature (see
     /// [`crate::pushsync::push_chunk_to_peer`]). `Some(1)` on mainnet;
@@ -249,7 +248,6 @@ impl RoutingFetcher {
             pushsync_settlement: None,
             push_skip: None,
             push_load: None,
-            push_aor: None,
             push_network_id: None,
             neighborhood_dial: None,
         }
@@ -298,17 +296,6 @@ impl RoutingFetcher {
     #[must_use]
     pub fn with_push_load(mut self, load: std::sync::Arc<crate::PushLoadTracker>) -> Self {
         self.push_load = Some(load);
-        self
-    }
-
-    /// Attach the receipt-derived AOR book (perf-lab Experiment 5).
-    /// When set, `next_push_peer` ranks candidates into hoverfly's
-    /// 3 buckets — confirmed in-AOR storers, unknown, confirmed
-    /// forwarders — by descending proximity within each bucket, and
-    /// every verified receipt teaches the book.
-    #[must_use]
-    pub fn with_push_aor(mut self, aor: std::sync::Arc<crate::push_load::AorBook>) -> Self {
-        self.push_aor = Some(aor);
         self
     }
 
@@ -578,13 +565,6 @@ impl RoutingFetcher {
             .copied()
             .collect();
         drop(live);
-        // AOR bucket sort (Experiment 5): confirmed in-AOR storers,
-        // then unknown, then confirmed forwarders; proximity-desc
-        // within buckets. Falls back to plain proximity order when the
-        // book is disabled. Applied BEFORE the cap/skip filters remove
-        // candidates so classification never sees an empty list.
-        let aor = self.push_aor.clone();
-
         // Per-peer in-flight cap (Experiment 2): drop saturated peers
         // from the ranking so concurrent chunks fan out to lower-PO
         // peers instead of stacking debt on the same closest storers.
@@ -604,17 +584,7 @@ impl RoutingFetcher {
                 ranked = unsaturated;
             }
         }
-        ranked.sort_by(|(pa, a), (pb, b)| {
-            // Bucket first (when the AOR book is on), XOR distance
-            // within the bucket. XOR-distance ascending == proximity
-            // descending, so the closest peer of the best class leads.
-            if let Some(book) = aor.as_ref() {
-                let ca = book.classify(pa, crate::pushsync::proximity(chunk_addr, a));
-                let cb = book.classify(pb, crate::pushsync::proximity(chunk_addr, b));
-                if ca != cb {
-                    return ca.cmp(&cb);
-                }
-            }
+        ranked.sort_by(|(_, a), (_, b)| {
             for i in 0..32 {
                 let da = a[i] ^ chunk_addr[i];
                 let db = b[i] ^ chunk_addr[i];
@@ -746,12 +716,7 @@ impl RoutingFetcher {
 
         // In-flight pushsync attempts. Each yields
         // `(peer, overlay, chunk_price, result)`.
-        type Attempt = (
-            PeerId,
-            Overlay,
-            u64,
-            Result<crate::pushsync::PushReceiptInfo, PushSyncError>,
-        );
+        type Attempt = (PeerId, Overlay, u64, Result<(), PushSyncError>);
         let inflight = FuturesUnordered::<
             std::pin::Pin<Box<dyn std::future::Future<Output = Attempt> + Send>>,
         >::new();
@@ -847,17 +812,9 @@ impl RoutingFetcher {
                 biased;
                 Some((peer, overlay, price, res)) = inflight.next() => {
                     match res {
-                        Ok(info) => {
+                        Ok(()) => {
                             if let Some(s) = self.pushsync_settlement.as_ref() {
                                 s.note_pushsync(peer, price).await;
-                            }
-                            if let Some(aor) = self.push_aor.as_ref() {
-                                aor.record_receipt(
-                                    peer,
-                                    &overlay,
-                                    &info.storer_overlay,
-                                    info.storage_radius,
-                                );
                             }
                             // A peer that just accepted a chunk is healthy
                             // right now: clear any cool-down so the next
