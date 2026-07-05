@@ -340,7 +340,7 @@ async fn postage_status_for(
     let body = r.bytes().await.ok()?;
     let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
     for st in v["stamps"].as_array()? {
-        if st["batchID"].as_str()? .eq_ignore_ascii_case(batch_hex) {
+        if st["batchID"].as_str()?.eq_ignore_ascii_case(batch_hex) {
             let max_fill = st["utilization"].as_u64()? as u32;
             let depth = st["depth"].as_u64()? as u32;
             let bucket_depth = st["bucketDepth"].as_u64()? as u32;

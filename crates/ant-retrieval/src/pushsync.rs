@@ -104,6 +104,20 @@ pub(crate) struct PbPushReceipt {
 /// upload would falsely report success while the content never became
 /// retrievable. Pass `None` to skip verification (unit tests with a
 /// mock peer that can't produce real signatures).
+/// Verified facts from an accepted (deep) pushsync receipt, surfaced
+/// so the dispatcher can maintain per-peer area-of-responsibility
+/// estimates (perf-lab Experiment 5). `storer_overlay` is the overlay
+/// recovered from the receipt signature — the node that actually
+/// stored the chunk, not necessarily the peer we dialed.
+#[derive(Debug, Clone, Copy)]
+pub struct PushReceiptInfo {
+    pub storer_overlay: [u8; 32],
+    /// Proximity of the storer to the chunk.
+    pub po: u8,
+    /// The storer's advertised storage radius at receipt time.
+    pub storage_radius: u32,
+}
+
 pub async fn push_chunk_to_peer(
     control: &mut Control,
     peer: PeerId,
@@ -111,7 +125,7 @@ pub async fn push_chunk_to_peer(
     wire_span_payload: &[u8],
     stamp_binary: &[u8; ant_postage::STAMP_SIZE],
     network_id: Option<u64>,
-) -> Result<(), PushSyncError> {
+) -> Result<PushReceiptInfo, PushSyncError> {
     push_chunk_to_peer_with_timeout(
         control,
         peer,
@@ -148,7 +162,7 @@ pub async fn push_chunk_to_peer_with_timeout(
     stamp_binary: &[u8; ant_postage::STAMP_SIZE],
     network_id: Option<u64>,
     attempt_timeout: Duration,
-) -> Result<(), PushSyncError> {
+) -> Result<PushReceiptInfo, PushSyncError> {
     tokio::time::timeout(
         attempt_timeout,
         push_chunk_inner(
@@ -171,7 +185,7 @@ async fn push_chunk_inner(
     wire_span_payload: &[u8],
     stamp_binary: &[u8; ant_postage::STAMP_SIZE],
     network_id: Option<u64>,
-) -> Result<(), PushSyncError> {
+) -> Result<PushReceiptInfo, PushSyncError> {
     let proto = StreamProtocol::new(PROTOCOL_PUSH);
     let mut stream = control
         .open_stream(peer, proto)
@@ -219,10 +233,16 @@ async fn push_chunk_inner(
     }
 
     if let Some(network_id) = network_id {
-        verify_receipt(&rep_addr, &receipt, network_id)?;
+        return verify_receipt(&rep_addr, &receipt, network_id);
     }
 
-    Ok(())
+    // Unverified path (tests / mock peers): synthesize a maximally
+    // uninformative deep receipt so callers need no special case.
+    Ok(PushReceiptInfo {
+        storer_overlay: rep_addr,
+        po: 31,
+        storage_radius: receipt.storage_radius,
+    })
 }
 
 /// Verify a pushsync receipt the way bee's `pushsync.checkReceipt`
@@ -244,7 +264,7 @@ fn verify_receipt(
     chunk_addr: &[u8; 32],
     receipt: &PbPushReceipt,
     network_id: u64,
-) -> Result<(), PushSyncError> {
+) -> Result<PushReceiptInfo, PushSyncError> {
     let signature: [u8; 65] = receipt
         .signature
         .as_slice()
@@ -268,7 +288,11 @@ fn verify_receipt(
             storage_radius: receipt.storage_radius,
         });
     }
-    Ok(())
+    Ok(PushReceiptInfo {
+        storer_overlay,
+        po,
+        storage_radius: receipt.storage_radius,
+    })
 }
 
 /// XOR-distance proximity order between two 32-byte addresses, matching
