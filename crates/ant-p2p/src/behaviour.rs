@@ -78,6 +78,10 @@ pub struct UploadRuntime {
 }
 
 /// Map a [`ant_postage::BucketStats`] snapshot to the control-plane
+/// Shared last-resolved sequence-feed indices, keyed by
+/// `(owner, topic)` (perf-lab Experiment 6b).
+type FeedHints = Arc<std::sync::Mutex<HashMap<([u8; 20], [u8; 32]), u64>>>;
+
 /// [`ant_control::PostageStatusView`] reported over `PostageStatus` /
 /// `PostageList`.
 fn postage_status_view(stats: &ant_postage::BucketStats) -> ant_control::PostageStatusView {
@@ -855,7 +859,7 @@ struct SwarmState {
     /// anchor: warm re-polls gallop from it instead of re-walking the
     /// whole sequence (measured: warm == cold at up to 4.3 s without
     /// this). In-memory only — a restart just pays one cold walk.
-    feed_hints: Arc<std::sync::Mutex<HashMap<([u8; 20], [u8; 32]), u64>>>,
+    feed_hints: FeedHints,
     /// Clone of the shared pseudosettle hot-hint sender, retained so a
     /// runtime [`ControlCommand::EnablePushsyncSwap`] can wire it into
     /// a freshly-built [`crate::PushsyncSwap`] the same way startup
