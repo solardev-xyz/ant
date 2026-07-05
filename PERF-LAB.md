@@ -355,6 +355,30 @@ session push latencies rather than handshake counts.
   code change — the numbers say the ceiling is elsewhere (accounting
   and per-peer scheduling, see exps 1–2).
 
+### Experiment 5: storage-radius receipt routing — **REVERT (noise-level)**
+
+- **Hypothesis** (hoverfly +28 % at pool 256): rank push candidates
+  as confirmed in-AOR storers → unknown → confirmed forwarders using
+  receipt-derived per-peer radius estimates, pre-filtered by the
+  exp 2 cap (hoverfly measured 1.6× REGRESSION without pre-filter).
+- **Change**: `PushReceiptInfo` surfaced from `push_chunk_to_peer*`
+  (recovered storer overlay, PO, storage radius), `AorBook` shared
+  like the load tracker, 3-bucket comparator in `next_push_peer`,
+  env-gated `ANT_PUSH_AOR_SORT=1` (commit `ebba882`).
+- **Method**: 8 MiB ×5 interleaved pairs on top of kept exp 1+2
+  (window 20:30–20:36Z; some extra n from the aborted earlier
+  attempt), batch 1.
+- **Results**: off median **421** KiB/s (227–591, n=7); aor median
+  **407** KiB/s (223–484, n=5). Failure medians 79 vs 58.
+  Distributions overlap completely.
+- **Decision**: **REVERT** (commit reverted; method rule: ties →
+  simpler codebase). Consistent with hoverfly's own JIT-AOR negative:
+  AOR ordering pays when high concurrency stacks pushes across a big
+  pool; ant post-exp-2 caps per-peer stacking at 4 and runs 32 wide —
+  candidate order barely matters when the walk rarely goes past the
+  first peer. Revisit only if `ANT_PUSH_CONCURRENCY` is ever raised
+  substantially.
+
 ### Experiment 6(a): serve feed wrapped CAC from the SOC — **KEEP**
 
 - **Hypothesis**: cold feed resolution 404s because ant re-fetches a
