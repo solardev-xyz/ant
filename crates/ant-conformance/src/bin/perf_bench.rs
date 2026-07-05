@@ -870,6 +870,13 @@ async fn upload_one_run(
     } else {
         Duration::from_secs(5)
     };
+    // A single failed poll must not kill a healthy multi-minute run:
+    // the daemon's control responder can miss the client's 5 s read
+    // deadline under swarm-loop load (seen live: one broken-pipe poll
+    // aborted an otherwise-healthy arm-B run 12 s in). Only give up
+    // after several consecutive failures.
+    let mut poll_failures = 0u32;
+    const MAX_POLL_FAILURES: u32 = 5;
     loop {
         tokio::time::sleep(poll).await;
         let jid = job_id.clone();
@@ -878,9 +885,16 @@ async fn upload_one_run(
         })
         .await
         {
-            Ok(Response::UploadJob(v)) => v,
+            Ok(Response::UploadJob(v)) => {
+                poll_failures = 0;
+                v
+            }
             other => {
-                eprintln!("UploadStatus failed: {other:?}");
+                poll_failures += 1;
+                eprintln!("UploadStatus failed ({poll_failures}/{MAX_POLL_FAILURES}): {other:?}");
+                if poll_failures < MAX_POLL_FAILURES {
+                    continue;
+                }
                 outcome = "status-error".to_string();
                 break;
             }
