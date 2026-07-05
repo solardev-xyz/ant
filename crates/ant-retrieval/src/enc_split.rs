@@ -571,4 +571,130 @@ mod tests {
             assert!(ant_crypto::soc_valid(&r.address, &r.wire));
         }
     }
+
+    /// Decrypt-walk an encrypted tree and collect, per intermediate
+    /// node, its data children's 32-byte address halves and its parity
+    /// count — the geometry the joiner's recovery path relies on.
+    fn collect_enc_nodes(
+        chunks: &HashMap<[u8; 32], Vec<u8>>,
+        node_ref: [u8; ENC_REF_SIZE],
+        out: &mut Vec<(Vec<[u8; 32]>, usize)>,
+    ) {
+        let addr: [u8; 32] = node_ref[..32].try_into().unwrap();
+        let key: [u8; 32] = node_ref[32..].try_into().unwrap();
+        let (span_raw, payload) = ant_crypto::decrypt_chunk_parts(&chunks[&addr], &key).unwrap();
+        let (level, plain) = crate::rs::decode_span(span_raw);
+        let span = u64::from_le_bytes(plain);
+        if span <= CHUNK_SIZE as u64 {
+            return;
+        }
+        let (shards, parities) = crate::rs::reference_count_enc(span, level);
+        let mut data = Vec::with_capacity(shards);
+        for i in 0..shards {
+            let child: [u8; ENC_REF_SIZE] = payload[i * ENC_REF_SIZE..(i + 1) * ENC_REF_SIZE]
+                .try_into()
+                .unwrap();
+            data.push(child[..32].try_into().unwrap());
+            collect_enc_nodes(chunks, child, out);
+        }
+        out.push((data, parities));
+    }
+
+    /// Read-path recovery over our own writer's output: at every level,
+    /// delete up to `parityCnt` data children per intermediate node
+    /// (first and last shard included) and the joiner must still decode
+    /// the exact payload by reconstructing the missing ciphertext wires
+    /// from the parities.
+    #[tokio::test]
+    async fn join_encrypted_recovers_missing_data_chunks() {
+        for level in 1..=MAX_LEVEL {
+            let shards = max_enc_shards(level);
+            let payload = det(CHUNK_SIZE * (shards + 2) + 100);
+            let result = split_bytes_encrypted(&payload, level);
+            let chunks: HashMap<[u8; 32], Vec<u8>> = result
+                .chunks
+                .iter()
+                .map(|c| (c.address, c.wire.clone()))
+                .collect();
+            let mut nodes = Vec::new();
+            collect_enc_nodes(&chunks, result.root_ref, &mut nodes);
+            assert!(nodes.len() >= 2, "level {level}: want a multi-node tree");
+
+            let mut store = chunks.clone();
+            for (data, parities) in &nodes {
+                assert!(*parities > 0, "level {level}: node without parities");
+                let k = (*parities).min(data.len());
+                // k indices spread over the node, first and last included.
+                for j in 0..k {
+                    let i = if k == 1 {
+                        0
+                    } else {
+                        j * (data.len() - 1) / (k - 1)
+                    };
+                    store.remove(&data[i]);
+                }
+            }
+            assert!(store.len() < chunks.len());
+
+            let fetcher = MapFetcher { chunks: store };
+            let back = join_encrypted(&fetcher, result.root_ref, 1 << 30)
+                .await
+                .unwrap_or_else(|e| panic!("level {level}: recovery join failed: {e}"));
+            assert_eq!(back, payload, "level {level}");
+        }
+    }
+
+    /// Losing more than `parityCnt` data children of one node is a
+    /// terminal `Recovery` error, not a hang or garbage output.
+    #[tokio::test]
+    async fn join_encrypted_over_loss_is_terminal() {
+        let level = 1;
+        let payload = det(CHUNK_SIZE * 10 + 5);
+        let result = split_bytes_encrypted(&payload, level);
+        let chunks: HashMap<[u8; 32], Vec<u8>> = result
+            .chunks
+            .iter()
+            .map(|c| (c.address, c.wire.clone()))
+            .collect();
+        let mut nodes = Vec::new();
+        collect_enc_nodes(&chunks, result.root_ref, &mut nodes);
+        let (data, parities) = &nodes[0];
+        assert!(data.len() > *parities);
+        let mut store = chunks;
+        for addr in data.iter().take(parities + 1) {
+            store.remove(addr);
+        }
+        let fetcher = MapFetcher { chunks: store };
+        let err = join_encrypted(&fetcher, result.root_ref, 1 << 30)
+            .await
+            .expect_err("over-loss must fail");
+        assert!(
+            matches!(err, crate::JoinError::Recovery { .. }),
+            "expected Recovery, got {err:?}"
+        );
+    }
+
+    /// A lost encrypted root is recovered from its dispersed replicas:
+    /// the replica SOC wraps the *encrypted* root chunk, keyed on the
+    /// root's 32-byte address half.
+    #[tokio::test]
+    async fn join_encrypted_recovers_root_from_replicas() {
+        let level = 2;
+        let payload = det(CHUNK_SIZE * 3 + 11);
+        let result = split_bytes_encrypted(&payload, level);
+        let mut store: HashMap<[u8; 32], Vec<u8>> = result
+            .chunks
+            .iter()
+            .map(|c| (c.address, c.wire.clone()))
+            .collect();
+        store.remove(&result.root_address());
+        for r in replica_chunks(&result.root_address(), &result.root_wire, level) {
+            store.insert(r.address, r.wire);
+        }
+        let fetcher = MapFetcher { chunks: store };
+        let back = join_encrypted(&fetcher, result.root_ref, 1 << 30)
+            .await
+            .expect("replica fallback join");
+        assert_eq!(back, payload);
+    }
 }

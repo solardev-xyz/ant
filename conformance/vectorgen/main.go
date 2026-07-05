@@ -799,6 +799,13 @@ func encryptionVectors() any {
 		// encrypted + RS level 1: 74 leaves > 59 maxEncShards -> two
 		// intermediate nodes with parities + level-encoded spans
 		encTreeVector("medium-300k", 1, 300*1024),
+		// encrypted + RS level 2: 75 leaves > 53 maxEncShards -> two
+		// intermediate nodes under a redundant root
+		encTreeVector("strong-300k", 2, 300*1024),
+		// encrypted + RS level 4: 30 leaves > 20 maxEncShards -> two
+		// intermediate nodes under a redundant root, with the paranoid
+		// parity ratio (more parities than data refs per node)
+		encTreeVector("paranoid-120k", 4, 120*1024),
 	}
 	return map[string]any{
 		"description": "swarm content encryption: chunkCases pin bee's pkg/encryption primitives with injected keys and zero ciphertext padding (byte-exact for ant's encryptor); treeCases freeze whole encrypted trees from bee's real pipeline (random keys, frozen once generated) that ant's decrypting joiner must reproduce, incl. one encrypted+RS composition",

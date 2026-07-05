@@ -1055,7 +1055,13 @@ async fn stream_encrypted_via_store(
 ) -> Result<(), String> {
     let addr: [u8; 32] = enc_ref[..32].try_into().expect("64-byte ref");
     let key: [u8; 32] = enc_ref[32..].try_into().expect("64-byte ref");
-    let root_wire = store.fetch(addr).await.map_err(|e| e.to_string())?;
+    // Root fetch with dispersed-replica fallback: replicas of an
+    // encrypted root are keyed on its 32-byte address half and wrap the
+    // encrypted root chunk, so the span prologue survives root loss just
+    // like the buffered `join_encrypted` read does.
+    let root_wire = ant_retrieval::fetch_root_with_replicas(store, addr)
+        .await
+        .map_err(|e| e.to_string())?;
     let (span, _) = ant_crypto::decrypt_chunk_parts(&root_wire, &key).map_err(|e| e.to_string())?;
     let (_, plain) = ant_retrieval::rs::decode_span(span);
     let total = u64::from_le_bytes(plain);
