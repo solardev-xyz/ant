@@ -299,11 +299,32 @@ session push latencies rather than handshake counts.
   full 256 MiB completion of the lab; reference
   `0xaf4d0d7a…`. Effective 161 KiB/s ≈ 1.95× the committed baseline
   cell (82.4, which never completed). Residual sore spot: the
-  post-data tree/manifest tail still grinds (~15 min) — candidates:
-  interleave tree pushes with data (job-manager change), or exp 5's
-  AOR-aware candidate ordering. Pending: 8 MiB A/B for a clean
-  interleaved small-size confirmation + uniform-vs-latency-aware cap
-  comparison when budget allows.
+  post-data tree/manifest tail still grinds (its neighbourhoods
+  carry blocklist scars from the run's own early burst) — future
+  work: interleave tree pushes with data in the job manager.
+  **Defaults flipped ON post-verdict** (pseudosettle + cap 4;
+  `ANT_PUSH_PSEUDOSETTLE=0` / `ANT_PUSH_INFLIGHT_CAP=0` opt out).
+
+### The 512 MiB completion proof — 3 consecutive runs ✅ (DoD #2)
+
+Kept exp 1+2 config, batch 2 (`7fb5cb0b…`), fresh random content per
+run, `perf/results/exp12-512-proof*`:
+
+| run | window (UTC) | outcome | duration | effective KiB/s | requeues |
+|---|---|---|---|---|---|
+| 1 | 18:41–19:13 | **completed** | 1956 s | 268 | 83 |
+| 2 | 19:13–20:13 | **completed** | 3563 s | 147 | 293 |
+| 3 | 20:19–21:14 | **completed** | 3251 s | 161 | — |
+
+Baseline for contrast: 87 min to 50.7 % at ~14 KiB/s terminal crawl,
+terminated as unfinishable. Disclosure: between runs 2 and 3 one
+attempt died at ~35 % because the bench host's disk filled (payload +
+cache dirs never cleaned — harness now cleans up per run); that was
+host infrastructure, not an upload failure, and no run in the series
+failed on the upload path. Run 3's completion was recorded by the
+harness at 21:13:56Z; its final ~90 tree-tail chunks took ~35 min
+(the tail-scar pattern above; run-to-run tail variance is the
+dominant spread driver).
 
 ### Experiment 3: concurrent substream upgrades — **REVERT**
 
