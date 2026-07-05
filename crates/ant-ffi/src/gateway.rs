@@ -237,6 +237,9 @@ pub unsafe extern "C" fn ant_start_gateway(
             chain,
             #[cfg(not(feature = "chain"))]
             chain: None,
+            // ACT publisher identity: the node signing key, like bee's
+            // accesscontrol session over the swarm key.
+            act_secret: Arc::new(handle.signing_secret),
         };
 
         let task = handle.runtime.spawn(async move {

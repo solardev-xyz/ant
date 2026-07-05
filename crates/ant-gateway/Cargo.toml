@@ -17,6 +17,9 @@ bytes = "1.11.1"
 futures = "0.3.31"
 hex.workspace = true
 hyper = { workspace = true, optional = true }
+# secp256k1 public-key handling for the ACT (access control) surface:
+# `swarm-act-publisher` parsing and grantee-list keys.
+k256 = { workspace = true, optional = true }
 primitive-types = { version = "0.14.0", default-features = false, optional = true }
 serde.workspace = true
 serde_json.workspace = true
@@ -46,7 +49,14 @@ tower = { version = "0.5.3", features = ["util"] }
 # closure — out of their dependency graph entirely.
 [features]
 default = ["http-api"]
-http-api = ["dep:axum", "dep:hyper", "dep:tower", "dep:ant-crypto", "dep:ant-postage"]
+http-api = [
+  "dep:axum",
+  "dep:hyper",
+  "dep:k256",
+  "dep:tower",
+  "dep:ant-crypto",
+  "dep:ant-postage",
+]
 chain = ["http-api", "dep:ant-chain", "dep:anyhow", "dep:primitive-types"]
 
 [lints]

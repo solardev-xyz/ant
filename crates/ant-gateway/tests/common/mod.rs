@@ -23,6 +23,11 @@
 
 #![allow(dead_code)]
 
+/// Fixed ACT publisher secret for the gateway test fixtures — any
+/// valid secp256k1 scalar works; tests that exercise the ACT surface
+/// derive the matching public key from this.
+pub const TEST_ACT_SECRET: [u8; 32] = [0xa7; 32];
+
 use ant_control::{
     ControlAck, ControlCommand, GatewayActivity, IdentityInfo, PeerConnectionInfo, PeerInfo,
     RetrievalInfo, RoutingInfo, StatusSnapshot, StreamRange, PROTOCOL_VERSION,
@@ -198,6 +203,7 @@ pub fn status_only_router(snapshot: StatusSnapshot) -> Router {
         tags: Arc::new(TagRegistry::new()),
         cors: Arc::new(CorsConfig::default()),
         chain: None,
+        act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
     };
     build_router(handle)
 }
@@ -237,6 +243,7 @@ pub fn status_router_with_chain(
         tags: Arc::new(TagRegistry::new()),
         cors: Arc::new(CorsConfig::default()),
         chain: Some(chain),
+        act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
     };
     build_router(handle)
 }
@@ -259,6 +266,7 @@ pub fn status_router_with_cors(snapshot: StatusSnapshot, cors: CorsConfig) -> Ro
         tags: Arc::new(TagRegistry::new()),
         cors: Arc::new(cors),
         chain: None,
+        act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
     };
     build_router(handle)
 }
@@ -296,6 +304,7 @@ pub fn handle_with_fixture_node() -> Router {
         tags: Arc::new(TagRegistry::new()),
         cors: Arc::new(CorsConfig::default()),
         chain: None,
+        act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
     };
     build_router(handle)
 }
@@ -925,6 +934,7 @@ where
         tags: Arc::new(TagRegistry::new()),
         cors: Arc::new(CorsConfig::default()),
         chain: None,
+        act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
     };
     build_router(handle)
 }

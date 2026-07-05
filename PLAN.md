@@ -2495,7 +2495,7 @@ Methods listed are the ones we serve; bee's other methods on the same path retur
 | `/pins`, `/pins/check`, `/pins/{ref}` | GET, POST, DELETE | B | Local pin set. |
 | `/stewardship/{address}` | GET, PUT | B | Reupload helper; uses `ant-pushsync`. |
 | `/envelope/{address}` | POST | B | Stamp envelope for already-existing chunks. |
-| `/grantee`, `/grantee/{address}` | * | — | **501** — ACT (Appendix B). |
+| `/grantee`, `/grantee/{address}` | POST, GET, PATCH | B | ACT grantee lists (bee `pkg/api/accesscontrol.go`); `swarm-act*` headers on the upload/download endpoints. |
 | `/pss/*`, `/gsoc/*` | * | — | **501** — Appendix B. |
 | `/transactions`, `/transactions/{hash}` | * | — | **501** — admin/restricted API. |
 | `/reservestate`, `/chainstate`, `/redistributionstate`, `/stake/*` | * | — | **501** — full-node only (Appendix B). |

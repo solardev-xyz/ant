@@ -5,6 +5,8 @@ use thiserror::Error;
 pub enum CryptoError {
     #[error("invalid secp256k1 secret key")]
     InvalidSecretKey(#[from] k256::elliptic_curve::Error),
+    #[error("invalid secp256k1 public key")]
+    InvalidPublicKey,
     #[error("signing failed: {0}")]
     Sign(#[from] ecdsa::Error),
     #[error("bad signature")]

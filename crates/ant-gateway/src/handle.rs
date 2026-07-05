@@ -95,4 +95,12 @@ pub struct GatewayHandle {
     /// balances then report the bee zero-stub and the chain-state
     /// endpoints fall to `501`, matching bee with no configured backend.
     pub chain: Option<Arc<ChainContext>>,
+    /// The node's secp256k1 signing secret, used as the ACT
+    /// **publisher** identity — exactly bee, whose access-control
+    /// session is `accesscontrol.NewDefaultSession(swarmPrivateKey)`
+    /// (`cmd/bee/cmd/start.go`). Every `swarm-act` upload and
+    /// `/grantee` mutation derives its session keys from this secret,
+    /// and `identity.public_key_hex` must be its public key so clients
+    /// can read the publisher from `GET /addresses`.
+    pub act_secret: Arc<[u8; 32]>,
 }
