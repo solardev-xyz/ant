@@ -3530,8 +3530,11 @@ async fn stream_encrypted_body(
     let key: [u8; 32] = enc_ref[32..].try_into().expect("64-byte ref");
 
     // Total size from the (decrypted) root span — needed for the stream
-    // prologue and for HEAD without joining the whole tree.
-    let root_wire = match fetcher.fetch(addr).await {
+    // prologue and for HEAD without joining the whole tree. The root
+    // fetch falls back to the root's dispersed replicas (keyed on the
+    // 32-byte address half; the replica wraps the *encrypted* root
+    // chunk), like the buffered `join_encrypted` path.
+    let root_wire = match ant_retrieval::fetch_root_with_replicas(fetcher, addr).await {
         Ok(w) => w,
         Err(e) => {
             let _ = ack

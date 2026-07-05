@@ -1111,10 +1111,20 @@ const fn subtrie_section(refs: usize, subtree_span: u64, branching: u64) -> u64 
 /// (`level | 0x80` in the top byte) are handled like bee's
 /// `DecryptChunkData`: the intermediate's payload is `shards` 64-byte
 /// data references followed by `parities` 32-byte parity references
-/// (encrypted-erasure-table geometry); the data references are followed
-/// and the parity references skipped. Parity *recovery* of encrypted
-/// trees — reconstructing a missing data child from parities — is not
-/// implemented; a missing chunk fails the join.
+/// (encrypted-erasure-table geometry). When a data child of such a node
+/// cannot be fetched, it is Reed-Solomon **recovered** from the node's
+/// remaining siblings + parities through a per-node
+/// [`crate::rs::RsDecoder`] in encrypted mode: parities were computed
+/// over the children's *ciphertext* wires, so recovery reconstructs the
+/// ciphertext, CAC-validates it against the address half of the child's
+/// 64-byte reference, feeds it back via
+/// [`ChunkFetcher::put_recovered`], and only then decrypts with the key
+/// half. Over-loss (more than `parityCnt` unreachable children of one
+/// node) is a terminal [`JoinError::Recovery`]. The root chunk fetch
+/// additionally falls back to the root's dispersed replicas
+/// ([`crate::rs::fetch_root_with_replicas`], keyed on the 32-byte
+/// address half — the replica wraps the *encrypted* root chunk), like
+/// bee wrapping the root getter in `replicas.NewGetter`.
 ///
 /// Unlike [`join`] this is a buffered, in-order full download — no range
 /// or streaming. It backs encrypted feed content and the gateway's
@@ -1127,8 +1137,24 @@ pub async fn join_encrypted(
     max_bytes: usize,
 ) -> Result<Vec<u8>, JoinError> {
     let mut out = Vec::new();
-    join_encrypted_into(fetcher, root_ref, max_bytes, &mut out).await?;
+    join_encrypted_into(fetcher, root_ref, EncFetch::Root, max_bytes, &mut out).await?;
     Ok(out)
+}
+
+/// How an encrypted node's *stored* (ciphertext) wire is fetched.
+enum EncFetch {
+    /// The tree root: direct fetch with dispersed-replica fallback
+    /// (replicas are keyed on the root's 32-byte address half; bee's
+    /// joiner likewise wraps only the root getter in
+    /// `replicas.NewGetter`).
+    Root,
+    /// Child of a non-redundant node: direct fetch, a miss fails the
+    /// join.
+    Plain,
+    /// Data shard `index` of a redundancy-encoded parent: fetched
+    /// through the parent's shared [`crate::rs::RsDecoder`], which
+    /// recovers the ciphertext wire from siblings + parities on a miss.
+    Shard(std::sync::Arc<crate::rs::RsDecoder>, usize),
 }
 
 /// Recursive worker for [`join_encrypted`]. Boxed because the recursion is
@@ -1136,6 +1162,7 @@ pub async fn join_encrypted(
 fn join_encrypted_into<'a>(
     fetcher: &'a dyn ChunkFetcher,
     node_ref: [u8; ENCRYPTED_REF_SIZE],
+    via: EncFetch,
     max_bytes: usize,
     out: &'a mut Vec<u8>,
 ) -> Pin<Box<dyn Future<Output = Result<(), JoinError>> + Send + 'a>> {
@@ -1145,13 +1172,31 @@ fn join_encrypted_into<'a>(
         let mut key = [0u8; ant_crypto::KEY_LENGTH];
         key.copy_from_slice(&node_ref[32..]);
 
-        let stored = fetcher
-            .fetch(addr)
-            .await
-            .map_err(|source| JoinError::FetchChunk {
-                addr: hex::encode(addr),
-                source,
-            })?;
+        // Fetch the stored *ciphertext* wire. Recovery (the `Shard` arm)
+        // and the replica fallback both validate the wire against `addr`
+        // before it is handed back; decryption with `key` only happens
+        // after that.
+        let stored = match via {
+            EncFetch::Root => crate::rs::fetch_root_with_replicas(fetcher, addr)
+                .await
+                .map_err(|source| JoinError::FetchChunk {
+                    addr: hex::encode(addr),
+                    source,
+                })?,
+            EncFetch::Plain => {
+                fetcher
+                    .fetch(addr)
+                    .await
+                    .map_err(|source| JoinError::FetchChunk {
+                        addr: hex::encode(addr),
+                        source,
+                    })?
+            }
+            EncFetch::Shard(decoder, index) => decoder
+                .fetch_data_shard(fetcher, index)
+                .await
+                .map_err(|detail| JoinError::Recovery { detail })?,
+        };
         let (span_raw, payload) = ant_crypto::decrypt_chunk_parts(&stored, &key).map_err(|e| {
             JoinError::MalformedChunk {
                 offset: out.len() as u64,
@@ -1205,6 +1250,27 @@ fn join_encrypted_into<'a>(
                 ),
             });
         }
+        // Redundancy-encoded node: share one ciphertext-space decoder
+        // across this node's data children. Its address list is the
+        // 32-byte address halves of the 64-byte data refs followed by
+        // the bare 32-byte parity refs — exactly bee's
+        // `file.ChunkAddresses(payload, parities, 64)`.
+        let decoder = (parities > 0).then(|| {
+            let mut all: Vec<[u8; 32]> = Vec::with_capacity(shards + parities);
+            for i in 0..shards {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&payload[i * ENCRYPTED_REF_SIZE..i * ENCRYPTED_REF_SIZE + 32]);
+                all.push(a);
+            }
+            let parity_base = shards * ENCRYPTED_REF_SIZE;
+            for i in 0..parities {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&payload[parity_base + i * 32..parity_base + (i + 1) * 32]);
+                all.push(a);
+            }
+            std::sync::Arc::new(crate::rs::RsDecoder::new_encrypted(all, shards))
+        });
+
         let branching = crate::rs::max_enc_shards(level) as u64;
         let branch_size = subtrie_section(shards, span, branching);
         let mut remaining = span;
@@ -1214,7 +1280,11 @@ fn join_encrypted_into<'a>(
             }
             let mut child = [0u8; ENCRYPTED_REF_SIZE];
             child.copy_from_slice(&payload[i * ENCRYPTED_REF_SIZE..(i + 1) * ENCRYPTED_REF_SIZE]);
-            join_encrypted_into(fetcher, child, max_bytes, out).await?;
+            let via = match &decoder {
+                Some(d) => EncFetch::Shard(d.clone(), i),
+                None => EncFetch::Plain,
+            };
+            join_encrypted_into(fetcher, child, via, max_bytes, out).await?;
             remaining = remaining.saturating_sub(branch_size.min(remaining));
         }
         Ok(())
