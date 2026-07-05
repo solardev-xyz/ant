@@ -137,6 +137,52 @@ _(template)_
 5. Storage-radius receipt routing
 6. Feed head-finding cost model
 
+### Recon notes (2026-07-05, code reading ahead of the experiments)
+
+- **Ant's push path today** (`ant-retrieval::fetcher::push_stamped_chunk`):
+  closest-first with a 5 s preemptive hedge, per-chunk skip list,
+  `MAX_PUSH_ERRORS = 32`, shallow receipts accepted after
+  `MAX_SHALLOW_ATTEMPTS = 12` + neighbourhood-deepening dials. Job
+  manager (`ant-node::uploads`): `MAX_PUSH_CONCURRENCY = 32`,
+  `PUSH_TIMEOUT = 120 s`, unbounded requeue (never fails on
+  transients) + `stalled` flag; the bounded "exhausted N retries"
+  error is only the *heal/re-push* path (`PER_CHUNK_RETRY_BUDGET =
+  8`, was 5 in the goal-era logs).
+- **Exp 2 is applicable**: no per-peer in-flight cap anywhere on the
+  push path — 32 concurrent chunks can stack on the same closest
+  peers. No latency EWMA either.
+- **Exp 3 is applicable**: stock `libp2p-stream 0.4.0-alpha` (which
+  ant uses for every protocol stream, incl. pushsync) has a single
+  `pending_upgrade` slot per connection — outbound substream upgrades
+  are serialized exactly as hoverfly found; their keyed-upgrades patch
+  (`hoverfly/src/protocols/stream_pool/handler.rs`) is the reference.
+- **Exp 4 likely already implemented**: `ant-p2p::behaviour` has a
+  wait-for-identify → open-BZZ pipeline, identify-push usefulness
+  heuristics, and external-address plumbing ("Opening our BZZ stream
+  before identify has round-tripped makes bee stall for the full
+  10 s, then disconnect" — their words). Baseline warm-up is
+  consistent with it working: 30–75 BZZ-handshaked peers within
+  ~2 s of process start, 5/5 runs. Experiment reduces to verifying
+  fresh-session push latency shows no ~10 s idle-identify tail.
+- **Exp 6 baseline**: ant's `resolve_sequence_feed` already does
+  exponential bracket + binary search + parallel look-ahead
+  (phases 1–3). Hoverfly's edge, if any, is concurrent k-ary
+  narrowing + anchor re-probing against false-absents on cold pools.
+- **Settlement config**: the lab (like the smoke) has NO chequebook —
+  push settlement hook (`PushsyncSettlement`, SWAP cheques) is
+  disabled; the daemon relies on pseudosettle/tolerance. Production
+  runs cheques + pseudosettle. The goal's "reliably fails at
+  ~250 MiB" symptom (PLAN.md phase 7b, GGUF post-mortem) predates
+  phases 7b–7d; the current branch already completed a 256 MiB
+  mainnet upload once (0.3.14-era, with cheques). Tonight's 256/512
+  baselines establish what the *cheque-less* lab config does today.
+- **Extra queue candidate** (from hoverfly "What hoverfly is"):
+  ant advertises `full_node = false` in the BZZ handshake
+  (`handshake_outbound`); hoverfly measured light advertisement as a
+  5–6× throughput regression (450 K vs 4.5 M PLUR/s per-peer refresh)
+  and ships `full_node = true`. Cheap flag experiment IF budget
+  remains after the six.
+
 Additions from reading hoverfly (candidates, only if queue 1–6 close
 with budget left): wide dial-fill window decoupled from pool size;
 address-space-spread peer selection; peerlist freshness (skip-cache
