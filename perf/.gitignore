@@ -1,3 +1,4 @@
 # perf-lab operational state (issuer counters are PRECIOUS, see PERF-LAB.md)
 state/
+!state/feeds.json
 results/*.antd.log
