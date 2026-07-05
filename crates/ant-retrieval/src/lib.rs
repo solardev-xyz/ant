@@ -70,9 +70,9 @@ pub use enc_split::{
     split_bytes_encrypted, split_bytes_encrypted_with_keys, EncryptedSplitResult, ENC_REF_SIZE,
 };
 pub use feed::{
-    feed_from_metadata, resolve_sequence_feed, resolve_sequence_feed_full, sequence_update_address,
-    sequence_update_id, Feed, FeedError, FeedResolution, FeedType, FEED_OWNER_KEY, FEED_TOPIC_KEY,
-    FEED_TYPE_KEY,
+    feed_from_metadata, resolve_sequence_feed, resolve_sequence_feed_after,
+    resolve_sequence_feed_full, sequence_update_address, sequence_update_id, Feed, FeedError,
+    FeedResolution, FeedType, FEED_OWNER_KEY, FEED_TOPIC_KEY, FEED_TYPE_KEY,
 };
 pub use fetcher::{Overlay, RoutingFetcher};
 pub use joiner::{

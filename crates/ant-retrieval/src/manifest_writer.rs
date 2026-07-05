@@ -40,7 +40,7 @@
 //! transparently — bee's reader walks the chain identically to a
 //! single-fork prefix.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use ant_crypto::{cac_new, CHUNK_SIZE};
 use thiserror::Error;
@@ -62,6 +62,7 @@ const VERSION_HASH_31: [u8; 31] = [
 ];
 
 const NODE_TYPE_VALUE: u8 = 2;
+const NODE_TYPE_EDGE: u8 = 4;
 const NODE_TYPE_PATH_SEPARATOR: u8 = 8;
 const NODE_TYPE_WITH_METADATA: u8 = 16;
 
@@ -314,17 +315,15 @@ fn build_collection_trie(
     if files.is_empty() {
         return Err(ManifestWriteError::EmptyPath);
     }
-    let mut seen_paths: BTreeSet<&str> = BTreeSet::new();
     for f in files {
         if f.path.is_empty() {
             return Err(ManifestWriteError::EmptyPath);
         }
-        if !seen_paths.insert(f.path.as_str()) {
-            // Duplicate path. We treat it as an empty-path error —
-            // there's no clean way to "merge" two distinct data refs
-            // at the same logical location.
-            return Err(ManifestWriteError::EmptyPath);
-        }
+        // Duplicate paths are allowed: bee's mantaray `Add` simply
+        // overwrites the entry at the existing node, so within one
+        // upload the LAST write wins (a tar may legally repeat a
+        // member name). `trie_insert` mirrors that by overwriting
+        // `own_data_ref`/`own_metadata` when the path already exists.
         if f.data_ref.len() != ref_size {
             return Err(ManifestWriteError::RefWidth {
                 have: f.data_ref.len(),
@@ -476,10 +475,9 @@ struct TrieNode {
     /// Marker present iff this node represents the empty-stub fork
     /// for the website-index-document anchor. Distinct from
     /// `own_data_ref` because the empty stub carries refsize=0x00,
-    /// not 0x20+entry. Carried only as a build-time marker (the
-    /// fork insertion path inspects it via the surrounding fork's
-    /// `metadata_override`); no read-back at serialization time.
-    #[allow(dead_code)]
+    /// not 0x20+entry — but it is still a bee *value* node
+    /// (`makeValue` on a zero-length entry), so the parent fork's
+    /// type byte carries the value bit.
     value: Option<EmptyValue>,
     /// Outgoing forks keyed by the byte that distinguishes them.
     forks: BTreeMap<u8, TrieFork>,
@@ -700,7 +698,28 @@ fn serialize_node_payload(
         let child_ref = child_refs
             .get(k)
             .expect("child_refs populated for every fork above");
-        let bytes = serialize_fork_to_bytes(&fork.prefix, child_ref, &meta, fork.path_separator)?;
+        // The fork's type byte is bee's *child node* type
+        // (`marshal.go` writes `f.nodeType`): value iff an entry ends
+        // at the child (including the zero-length entry of the "/"
+        // anchor, bee's `makeValue` on an empty entry), edge iff the
+        // child has forks of its own, plus the metadata and
+        // path-separator flags. A split intermediate is edge-only —
+        // writing a value bit there (or omitting the edge bit)
+        // changes the node bytes and forks the manifest reference.
+        let mut node_type = 0u8;
+        if fork.child.own_data_ref.is_some() || fork.child.value.is_some() {
+            node_type |= NODE_TYPE_VALUE;
+        }
+        if !fork.child.forks.is_empty() {
+            node_type |= NODE_TYPE_EDGE;
+        }
+        if !meta.is_empty() {
+            node_type |= NODE_TYPE_WITH_METADATA;
+        }
+        if fork.path_separator {
+            node_type |= NODE_TYPE_PATH_SEPARATOR;
+        }
+        let bytes = serialize_fork_to_bytes(&fork.prefix, child_ref, &meta, node_type)?;
         p.extend_from_slice(&bytes);
     }
 
@@ -724,7 +743,7 @@ fn serialize_fork_to_bytes(
     prefix: &[u8],
     child_ref: &[u8],
     metadata: &BTreeMap<String, String>,
-    path_separator: bool,
+    node_type: u8,
 ) -> Result<Vec<u8>, ManifestWriteError> {
     if prefix.is_empty() || prefix.len() > MAX_FILENAME_BYTES {
         return Err(ManifestWriteError::SegmentTooLong {
@@ -733,13 +752,6 @@ fn serialize_fork_to_bytes(
         });
     }
     let mut bytes = Vec::with_capacity(64);
-    let mut node_type = NODE_TYPE_VALUE;
-    if !metadata.is_empty() {
-        node_type |= NODE_TYPE_WITH_METADATA;
-    }
-    if path_separator {
-        node_type |= NODE_TYPE_PATH_SEPARATOR;
-    }
     bytes.push(node_type);
     bytes.push(prefix.len() as u8);
     bytes.extend_from_slice(prefix);
@@ -747,9 +759,19 @@ fn serialize_fork_to_bytes(
     bytes.extend_from_slice(child_ref);
     if !metadata.is_empty() {
         let meta_json = encode_metadata(metadata);
-        let pad = match (meta_json.len() + 2) % 32 {
-            0 => 0,
-            r => 32 - r,
+        // Bee's padding (marshal.go `fork.bytes`): bring (json + the
+        // 2-byte length prefix) up to a multiple of 32 — with the
+        // quirk that when the total already IS a multiple of 32 and
+        // exceeds 32, Go computes `32 - x%32` with `x%32 == 0` and
+        // appends a FULL EXTRA 32 newlines; only an exact total of 32
+        // gets no padding. Bug-compatible on purpose: the manifest
+        // reference depends on these bytes (caught by the manifest
+        // differential fuzz on any metadata whose JSON is 32k-2 long).
+        let with_size = meta_json.len() + 2;
+        let pad = match with_size.cmp(&32) {
+            std::cmp::Ordering::Less => 32 - with_size,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 32 - with_size % 32,
         };
         let mut padded = meta_json.into_bytes();
         padded.extend(std::iter::repeat_n(b'\n', pad));
@@ -763,10 +785,13 @@ fn serialize_fork_to_bytes(
 // --- internal helpers ---
 
 /// Stable JSON encoding for mantaray fork metadata: flat string→string
-/// object, `BTreeMap` order, no whitespace, escape `"` and `\`. Bee
-/// itself uses `encoding/json` which produces the same wire bytes for
-/// the keys and values we ever emit (no nested objects, no Unicode
-/// surrogates, no NUL bytes).
+/// object, `BTreeMap` order (Go's `json.Marshal` sorts map keys), no
+/// whitespace. Escaping mirrors Go's `encoding/json` exactly — bee
+/// marshals with the default HTML-escaping encoder, so the characters
+/// `<`, `>` and `&` are emitted as six-byte `\u00XX` escape sequences
+/// (and U+2028/U+2029 as `\u2028`/`\u2029`); diverging here changes
+/// the node bytes and therefore the manifest reference for any
+/// filename containing those characters.
 fn encode_metadata(meta: &BTreeMap<String, String>) -> String {
     let mut out = String::from("{");
     let mut first = true;
@@ -793,6 +818,14 @@ fn push_json_escaped(out: &mut String, s: &str) {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            // Go's default encoder HTML-escapes these three even in
+            // regular strings (encoding/json `htmlSafeSet`).
+            '<' => out.push_str("\\u003c"),
+            '>' => out.push_str("\\u003e"),
+            '&' => out.push_str("\\u0026"),
+            // Go escapes the JS line separators (U+2028/U+2029) too.
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
             c if (c as u32) < 0x20 => {
                 use std::fmt::Write;
                 write!(out, "\\u{:04x}", c as u32).expect("writing to String");
@@ -861,7 +894,7 @@ mod tests {
     use crate::mantaray::{list_manifest, lookup_path, ManifestError};
     use crate::ChunkFetcher;
     use async_trait::async_trait;
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
     use std::error::Error;
 
     /// Golden references produced by bee itself (via the beemock
@@ -1332,19 +1365,28 @@ mod tests {
         assert_eq!(rb.content_type.as_deref(), Some("text/html"));
     }
 
-    /// Duplicate paths in the input list are rejected — there's no
-    /// reasonable resolution if the same logical path points at two
-    /// different data refs.
-    #[test]
-    fn duplicate_paths_rejected() {
-        let f = ManifestFile {
+    /// Duplicate paths in the input list follow bee's mantaray `Add`
+    /// semantics: the entry at the node is overwritten, so the LAST
+    /// write wins and the manifest equals one built from only the
+    /// final occurrence (caught by the manifest differential fuzz —
+    /// bee accepts tars with repeated member names).
+    #[tokio::test]
+    async fn duplicate_paths_last_write_wins() {
+        let mk = |b: u8| ManifestFile {
             path: "dup.txt".to_string(),
-            content_type: None,
-            data_ref: vec![0u8; 32],
+            content_type: Some("text/plain".to_string()),
+            data_ref: vec![b; 32],
         };
-        let err =
-            build_collection_manifest(&[f.clone(), f], None, IndexAnchor::ZeroEntry).unwrap_err();
-        assert!(matches!(err, ManifestWriteError::EmptyPath));
+        let dup = build_collection_manifest(&[mk(1), mk(2)], None, IndexAnchor::ZeroEntry).unwrap();
+        let only_last = build_collection_manifest(&[mk(2)], None, IndexAnchor::ZeroEntry).unwrap();
+        assert_eq!(dup.root, only_last.root);
+
+        let mut fetcher = MapFetcher::new();
+        for c in &dup.chunks {
+            fetcher.ingest(c);
+        }
+        let r = lookup_path(&fetcher, &dup.root, "dup.txt").await.unwrap();
+        assert_eq!(r.data_ref, vec![2u8; 32]);
     }
 
     /// A feed manifest built by [`build_feed_manifest`] must be
@@ -1512,5 +1554,16 @@ mod tests {
         m.insert("Filename".to_string(), "hello.txt".to_string());
         let s = encode_metadata(&m);
         assert_eq!(s, r#"{"Content-Type":"text/plain","Filename":"hello.txt"}"#);
+    }
+
+    /// Go's `json.Marshal` (bee's encoder) HTML-escapes `<`, `>`, `&`;
+    /// ant must emit identical bytes or the manifest reference forks
+    /// on filenames containing them.
+    #[test]
+    fn metadata_encoding_matches_go_html_escaping() {
+        let mut m = BTreeMap::new();
+        m.insert("Filename".to_string(), "a&b<c>d.txt".to_string());
+        let s = encode_metadata(&m);
+        assert_eq!(s, r#"{"Filename":"a\u0026b\u003cc\u003ed.txt"}"#);
     }
 }

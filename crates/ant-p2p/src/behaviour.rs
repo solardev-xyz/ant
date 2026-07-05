@@ -2722,10 +2722,15 @@ fn handle_control_command(
         ControlCommand::PutChunkLocal { wire, ack } => {
             handle_put_chunk_local(state, wire, ack);
         }
-        ControlCommand::GetFeed { owner, topic, ack } => {
+        ControlCommand::GetFeed {
+            owner,
+            topic,
+            after,
+            ack,
+        } => {
             // Feed reads share their fetch path with `GetBytes`: spin up a
             // routing-aware fetcher backed by the live peer-snapshot
-            // watch and let `resolve_sequence_feed_full` walk the
+            // watch and let `resolve_sequence_feed_after` walk the
             // sequence indices. Wire in the node's mem + disk caches so a
             // just-signed update we stashed before pushsync (see `PushSoc`)
             // is visible to "latest" resolution immediately — without the
@@ -2749,7 +2754,9 @@ fn handle_control_command(
                     topic,
                     kind: ant_retrieval::FeedType::Sequence,
                 };
-                let reply = match ant_retrieval::resolve_sequence_feed_full(&fetcher, &feed).await {
+                let reply = match ant_retrieval::resolve_sequence_feed_after(&fetcher, &feed, after)
+                    .await
+                {
                     Ok(resolution) => ControlAck::FeedResolved {
                         reference: resolution.reference,
                         index: resolution.index,
@@ -6801,6 +6808,7 @@ mod tests {
             ControlCommand::GetFeed {
                 owner,
                 topic,
+                after: 0,
                 ack: ack_tx,
             },
         );
@@ -6893,6 +6901,7 @@ mod tests {
             ControlCommand::GetFeed {
                 owner,
                 topic,
+                after: 0,
                 ack: ack_tx,
             },
         );

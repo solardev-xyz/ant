@@ -28,7 +28,7 @@ use ant_gateway::testkit::build_router;
 use ant_gateway::{CorsConfig, GatewayHandle, GatewayIdentity, TagRegistry};
 use ant_retrieval::{
     join_to_sender_range, join_with_options, list_manifest, lookup_path,
-    resolve_sequence_feed_full, ByteRange, ChunkFetcher, Feed, FeedError, FeedType, JoinOptions,
+    resolve_sequence_feed_after, ByteRange, ChunkFetcher, Feed, FeedError, FeedType, JoinOptions,
     DEFAULT_MAX_FILE_BYTES,
 };
 use async_trait::async_trait;
@@ -666,7 +666,12 @@ async fn handle_command(store: &MemChunkStore, postage: &MemPostage, cmd: Contro
             let _ = ack.send(reply).await;
         }
         // ---- feeds: wired for real, unlike the gateway fixture -------
-        ControlCommand::GetFeed { owner, topic, ack } => {
+        ControlCommand::GetFeed {
+            owner,
+            topic,
+            after,
+            ack,
+        } => {
             // Same resolution path production runs in `ant-p2p`'s
             // `GetFeed` handler, with the in-memory store standing in
             // for the `RoutingFetcher`; the ack shape is identical.
@@ -675,7 +680,7 @@ async fn handle_command(store: &MemChunkStore, postage: &MemPostage, cmd: Contro
                 topic,
                 kind: FeedType::Sequence,
             };
-            let reply = match resolve_sequence_feed_full(store, &feed).await {
+            let reply = match resolve_sequence_feed_after(store, &feed, after).await {
                 Ok(resolution) => ControlAck::FeedResolved {
                     reference: resolution.reference,
                     index: resolution.index,
