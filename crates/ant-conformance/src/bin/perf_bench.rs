@@ -189,6 +189,9 @@ struct AntdSpec {
     upload_capable: bool,
     stamp_key_hex: Option<String>,
     log_level: &'static str,
+    /// Extra env vars for this daemon (experiment toggles, so one
+    /// binary can serve both A/B arms: `--env-b ANT_X=1`).
+    extra_env: Vec<(String, String)>,
 }
 
 impl AntdSpec {
@@ -231,6 +234,9 @@ impl AntdSpec {
             cmd.env("STORAGE_STAMP_PRIVATE_KEY", k);
         } else {
             cmd.env_remove("STORAGE_STAMP_PRIVATE_KEY");
+        }
+        for (k, v) in &self.extra_env {
+            cmd.env(k, v);
         }
         let child = cmd.spawn().expect("spawn antd");
         Antd {
@@ -428,6 +434,18 @@ fn default_antd_bin() -> PathBuf {
     repo_root().join("target/release/antd")
 }
 
+/// Parse `--env "K=V,K2=V2"` into pairs. Empty/missing → no extra env.
+fn parse_env_list(spec: Option<&str>) -> Vec<(String, String)> {
+    spec.map_or_else(Vec::new, |s| {
+        s.split(',')
+            .filter_map(|kv| {
+                kv.split_once('=')
+                    .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            })
+            .collect()
+    })
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let Some(cmd) = argv.first().map(String::as_str) else {
@@ -605,6 +623,7 @@ async fn warmup(args: &Args) {
             upload_capable: false,
             stamp_key_hex: None,
             log_level: "warn",
+            extra_env: Vec::new(),
         };
         let spawn_at = Instant::now();
         let antd = spec.spawn("warmup");
@@ -643,6 +662,7 @@ async fn warmup(args: &Args) {
 struct UploadArm {
     label: String,
     bin: PathBuf,
+    env: Vec<(String, String)>,
 }
 
 async fn upload(args: &Args) {
@@ -670,11 +690,18 @@ async fn upload(args: &Args) {
         bin: args
             .get("antd-bin")
             .map_or_else(default_antd_bin, PathBuf::from),
+        env: parse_env_list(args.get("env")),
     }];
-    if let Some(b) = args.get("antd-bin-b") {
+    // Arm B exists when either --antd-bin-b or --env-b is given; the
+    // binary defaults to arm A's, so a flag-gated change in ONE build
+    // can serve both arms.
+    if args.get("antd-bin-b").is_some() || args.get("env-b").is_some() {
         arms.push(UploadArm {
             label: args.str_or("label-b", "candidate").to_string(),
-            bin: PathBuf::from(b),
+            bin: args
+                .get("antd-bin-b")
+                .map_or_else(|| arms[0].bin.clone(), PathBuf::from),
+            env: parse_env_list(args.get("env-b")),
         });
     }
 
@@ -743,6 +770,7 @@ async fn upload_one_run(
         upload_capable: true,
         stamp_key_hex: Some(cfg.key_hex.to_string()),
         log_level: "warn",
+        extra_env: arm.env.clone(),
     };
     let antd = spec.spawn("upload");
     if !wait_http_ok(client, &format!("{}/health", antd.api), Duration::from_mins(2)).await {
@@ -993,6 +1021,7 @@ async fn download(args: &Args) {
             upload_capable: false,
             stamp_key_hex: None,
             log_level: "warn",
+            extra_env: Vec::new(),
         };
         let antd = spec.spawn("download");
         if !wait_http_ok(&client, &format!("{}/health", antd.api), Duration::from_mins(2)).await {
@@ -1133,6 +1162,7 @@ async fn feed_setup(args: &Args) {
         upload_capable: true,
         stamp_key_hex: Some(key_hex.clone()),
         log_level: "warn",
+        extra_env: Vec::new(),
     };
     let antd = spec.spawn("feedsetup");
     assert!(
@@ -1229,6 +1259,7 @@ async fn feed_bench(args: &Args) {
             upload_capable: false,
             stamp_key_hex: None,
             log_level: "warn",
+            extra_env: Vec::new(),
         };
         let antd = spec.spawn("feed");
         if !wait_http_ok(&client, &format!("{}/health", antd.api), Duration::from_mins(2)).await {
