@@ -7,8 +7,11 @@ Every experiment: Hypothesis → Change → Method → Results → Decision
 
 ## STATUS
 
-- **Current experiment**: none — all six closed (see Final summary)
-- **Phase**: CAMPAIGN CLOSED (pending only user decisions)
+- **Current experiment**: ROUND 2 — exp 8 (dispatch width × cap,
+  running), exp 7 (full-node advertisement, implementing), exp 9
+  (tree-tail interleave, queued)
+- **Phase**: round 2 benchmarking (user funded batches 3 = mutable
+  d22 and 4 = mutable d23 on 2026-07-06; `--batch 3/4`)
 - **State (2026-07-06 morning)**: overnight backfill brought the 256
   baseline cell to n=4 (median 78.5 effective, 1/4 completing), then
   **batch 2 crossed the 0.8 utilization hard-stop (0.844)** and the

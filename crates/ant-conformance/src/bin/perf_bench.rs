@@ -705,15 +705,17 @@ struct UploadArm {
 
 async fn upload(args: &Args) {
     let env = load_env();
-    // `--batch 2` selects the second lab batch (SWARM_BATCH_ID_2 /
-    // SWARM_OWNER_PRIVATE_KEY_2) — provided by the user on 2026-07-05
-    // for the big-proof runs after batch 1 crossed the 0.6 warn line.
-    // The stamp key must match the batch owner (the daemon signs with
-    // one key), so both are selected together.
-    let (batch_var, key_var) = if args.str_or("batch", "1") == "2" {
-        ("SWARM_BATCH_ID_2", "SWARM_OWNER_PRIVATE_KEY_2")
-    } else {
-        ("SWARM_BATCH_ID", "SWARM_OWNER_PRIVATE_KEY")
+    // `--batch N` selects lab batch N (SWARM_BATCH_ID_N /
+    // SWARM_OWNER_PRIVATE_KEY_N pairs in .env; the daemon signs with
+    // one key, so id+key travel together). Ledger: 1 = original
+    // immutable depth-21 (0.69, small cells only), 2 = mutable d21
+    // (0.844, STOPPED), 3 = mutable d22, 4 = mutable d23 (round 2,
+    // user-funded 2026-07-06).
+    let (batch_var, key_var) = match args.str_or("batch", "1") {
+        "2" => ("SWARM_BATCH_ID_2", "SWARM_OWNER_PRIVATE_KEY_2"),
+        "3" => ("SWARM_BATCH_ID_3", "SWARM_OWNER_PRIVATE_KEY_3"),
+        "4" => ("SWARM_BATCH_ID_4", "SWARM_OWNER_PRIVATE_KEY_4"),
+        _ => ("SWARM_BATCH_ID", "SWARM_OWNER_PRIVATE_KEY"),
     };
     let batch_hex = env
         .get(batch_var)
