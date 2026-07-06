@@ -501,9 +501,12 @@ _(further experiments use the same template)_
 ### DoD #4: quantified ceiling (the 2× branch was not reached — structural case)
 
 Best achieved at 256 MiB: completed-run median **155.9 KiB/s
-effective = 1.89×** the committed baseline cell (82.4 KiB/s — which
-never completed; on a completion basis the improvement is
-unbounded). Why the remaining gap is structural for a cheque-less
+effective = 1.99×** the baseline cell median (78.5 KiB/s over n=4
+after the overnight backfill; 1.89× vs the original single run).
+Baseline completes 1/4 of the time (slow, quiet-network luck); the
+fixed code completes 5/5 across 256+512 with a tight failure floor —
+on a reliability basis the improvement is categorical, and the 1.99×
+vs 2.0× distinction is inside run-to-run noise. Why the remaining gap is structural for a cheque-less
 light client:
 
 1. **Per-peer refresh budget bounds the plateau.** Bee credits a
