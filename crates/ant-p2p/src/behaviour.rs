@@ -77,6 +77,10 @@ pub struct UploadRuntime {
     pub postage_dir: PathBuf,
 }
 
+/// Shared last-resolved sequence-feed indices, keyed by
+/// `(owner, topic)` (perf-lab Experiment 6b).
+type FeedHints = Arc<std::sync::Mutex<HashMap<([u8; 20], [u8; 32]), u64>>>;
+
 /// Map a [`ant_postage::BucketStats`] snapshot to the control-plane
 /// [`ant_control::PostageStatusView`] reported over `PostageStatus` /
 /// `PostageList`.
@@ -846,6 +850,13 @@ struct SwarmState {
     /// only when `ANT_PUSH_INFLIGHT_CAP` is set — one build serves
     /// both A/B benchmark arms.
     push_load: Option<Arc<ant_retrieval::PushLoadTracker>>,
+    /// Last successfully-resolved sequence-feed index per
+    /// `(owner, topic)` (perf-lab Experiment 6b). Sequence feeds are
+    /// append-only, so a previously-resolved index is always a valid
+    /// anchor: warm re-polls gallop from it instead of re-walking the
+    /// whole sequence (measured: warm == cold at up to 4.3 s without
+    /// this). In-memory only — a restart just pays one cold walk.
+    feed_hints: FeedHints,
     /// Clone of the shared pseudosettle hot-hint sender, retained so a
     /// runtime [`ControlCommand::EnablePushsyncSwap`] can wire it into
     /// a freshly-built [`crate::PushsyncSwap`] the same way startup
@@ -923,6 +934,7 @@ impl SwarmState {
             credit_ledger: None,
             push_skip: ant_retrieval::PushSkipCache::new(),
             push_load: ant_retrieval::PushLoadTracker::from_env().map(Arc::new),
+            feed_hints: Arc::new(std::sync::Mutex::new(HashMap::new())),
             hot_hint: None,
             known_dialable: HashMap::new(),
             neighborhood_dial_tx: None,
@@ -2747,6 +2759,7 @@ fn handle_control_command(
             let cache = state.cache_for_request(false);
             let disk_cache = state.disk_cache_for_request(false);
             let control = control.clone();
+            let hints = state.feed_hints.clone();
             tokio::spawn(async move {
                 let mut builder =
                     ant_retrieval::RoutingFetcher::new(control, peers_rx).with_cache(cache);
@@ -2759,16 +2772,39 @@ fn handle_control_command(
                     topic,
                     kind: ant_retrieval::FeedType::Sequence,
                 };
-                let reply = match ant_retrieval::resolve_sequence_feed_after(&fetcher, &feed, after)
-                    .await
-                {
-                    Ok(resolution) => ControlAck::FeedResolved {
-                        reference: resolution.reference,
-                        index: resolution.index,
-                        signature: resolution.signature,
-                        v2: resolution.v2,
-                        decrypt_key: resolution.decrypt_key,
-                    },
+                // Experiment 6b: anchor at the best of the caller's
+                // `after` and the daemon's last-resolved index for this
+                // feed. Append-only sequence feeds can't regress, so a
+                // previously-resolved index is always present; if the
+                // hinted walk still errors transiently we retry once
+                // without the hint rather than surfacing a hint-induced
+                // failure for a feed that plain resolution could read.
+                let hint = hints
+                    .lock()
+                    .ok()
+                    .and_then(|h| h.get(&(owner, topic)).copied())
+                    .unwrap_or(0);
+                let anchor = after.max(hint);
+                let mut result =
+                    ant_retrieval::resolve_sequence_feed_after(&fetcher, &feed, anchor).await;
+                if result.is_err() && anchor > after {
+                    result =
+                        ant_retrieval::resolve_sequence_feed_after(&fetcher, &feed, after).await;
+                }
+                let reply = match result {
+                    Ok(resolution) => {
+                        if let Ok(mut h) = hints.lock() {
+                            let e = h.entry((owner, topic)).or_insert(0);
+                            *e = (*e).max(resolution.index);
+                        }
+                        ControlAck::FeedResolved {
+                            reference: resolution.reference,
+                            index: resolution.index,
+                            signature: resolution.signature,
+                            v2: resolution.v2,
+                            decrypt_key: resolution.decrypt_key,
+                        }
+                    }
                     Err(ant_retrieval::FeedError::NoUpdates { .. }) => ControlAck::FeedNotFound,
                     Err(e) => ControlAck::Error {
                         message: format!("feed lookup: {e}"),
@@ -7092,6 +7128,104 @@ mod tests {
             }
             other => panic!("expected the cached feed update to resolve, got {other:?}"),
         }
+    }
+
+    /// A **v2** feed resolution must leave the update's wrapped CAC in
+    /// the node's mem cache under its own address: bee serves the
+    /// wrapped chunk straight from the SOC, and for v2 updates that CAC
+    /// exists nowhere else on the network — without the seed, the
+    /// gateway's follow-up content fetch 404s on every node that didn't
+    /// author the update (perf-lab baseline: 0/45 cold resolutions).
+    #[tokio::test]
+    async fn get_feed_seeds_wrapped_v2_cac_into_cache() {
+        use k256::ecdsa::{SigningKey, VerifyingKey};
+
+        let secret: [u8; 32] = [9u8; 32];
+        let sk = SigningKey::from_bytes((&secret).into()).unwrap();
+        let owner = ant_crypto::ethereum_address_from_public_key(&VerifyingKey::from(&sk));
+        let topic: [u8; 32] = [0xccu8; 32];
+
+        // v2: the wrapped CAC is the content itself (length ≠ 48/80).
+        let content = b"wrapped v2 feed content, served from the SOC";
+        let (inner_addr, inner_wire) = ant_crypto::cac_new(content).unwrap();
+        let (soc_addr, wire) = feed_update_wrapping(&secret, &owner, &topic, 0, &inner_wire);
+
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Arc::new(
+            ant_retrieval::DiskChunkCache::open(dir.path().join("disk.sqlite"), 1 << 20).unwrap(),
+        );
+        disk.put(soc_addr, wire).await.unwrap();
+
+        let mut state = state_with_disk_cache(disk);
+        let mut peerstore = PeerStore::disabled();
+        let control = test_control();
+        let (ack_tx, ack_rx) = oneshot::channel();
+        handle_control_command(
+            &mut state,
+            &mut peerstore,
+            &control,
+            None,
+            0,
+            ControlCommand::GetFeed {
+                owner,
+                topic,
+                after: 0,
+                ack: ack_tx,
+            },
+        );
+        match ack_rx.await.unwrap() {
+            ControlAck::FeedResolved { reference, v2, .. } => {
+                assert!(v2, "wrapped-content update must classify as v2");
+                assert_eq!(reference, inner_addr);
+            }
+            other => panic!("expected v2 resolution, got {other:?}"),
+        }
+        let cached = state
+            .chunk_cache
+            .as_ref()
+            .expect("shared mem cache")
+            .get(&inner_addr);
+        assert_eq!(
+            cached.as_deref(),
+            Some(inner_wire.as_slice()),
+            "resolution must seed the wrapped CAC so the content fetch never hits the network"
+        );
+    }
+
+    /// Like [`feed_update_v1`] but wraps caller-supplied CAC wire (v2
+    /// updates wrap the content chunk itself).
+    fn feed_update_wrapping(
+        secret: &[u8; 32],
+        owner: &[u8; 20],
+        topic: &[u8; 32],
+        index: u64,
+        inner_cac_wire: &[u8],
+    ) -> ([u8; 32], Vec<u8>) {
+        let mut id_input = Vec::with_capacity(40);
+        id_input.extend_from_slice(topic);
+        id_input.extend_from_slice(&index.to_be_bytes());
+        let id = ant_crypto::keccak256(&id_input);
+
+        let inner_span: &[u8; 8] = inner_cac_wire[..8].try_into().unwrap();
+        let inner_cac_addr =
+            ant_crypto::bmt_hash_with_span(inner_span, &inner_cac_wire[8..]).unwrap();
+
+        let mut sig_input = Vec::with_capacity(64);
+        sig_input.extend_from_slice(&id);
+        sig_input.extend_from_slice(&inner_cac_addr);
+        let prehash = ant_crypto::keccak256(&sig_input);
+        let sig = ant_crypto::sign_handshake_data(secret, &prehash).unwrap();
+
+        let mut soc_addr_input = Vec::with_capacity(52);
+        soc_addr_input.extend_from_slice(&id);
+        soc_addr_input.extend_from_slice(owner);
+        let soc_addr = ant_crypto::keccak256(&soc_addr_input);
+
+        let mut wire = Vec::with_capacity(ant_crypto::SOC_HEADER_SIZE + inner_cac_wire.len());
+        wire.extend_from_slice(&id);
+        wire.extend_from_slice(&sig);
+        wire.extend_from_slice(inner_cac_wire);
+        (soc_addr, wire)
     }
 
     /// Build a v1 sequence feed-update SOC exactly the way a bee-compatible
