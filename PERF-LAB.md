@@ -8,8 +8,11 @@ Every experiment: Hypothesis → Change → Method → Results → Decision
 ## STATUS
 
 - **Current experiment**: ROUND 2 CLOSED — exp 8 KEEP (3.6×, width
-  128 default), exp 9 KEEP (patience default ON), exp 7 measured
-  2.5× (flag landed; default flip awaits the user's posture call).
+  128 default), exp 9 KEEP (patience default ON), exp 7 KEEP
+  (full-node advert default ON per owner's call; disclosure on
+  record in the exp section, the flag docs, and the PR — the network
+  may not welcome the posture; ANT_ADVERTISE_FULL_NODE=0 opts out).
+  Smoke 18/18 re-verified on the final defaults.
   Round-2 regression gate green (conformance 15/15 suites, smoke
   18/18 on the new defaults). End state: 256 MiB ≈ 560 KiB/s ≈ 7×
   baseline; 512 MiB in 15–17 min.
