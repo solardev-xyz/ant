@@ -115,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "ant-chain"
-version = "0.5.33"
+version = "0.5.34"
 dependencies = [
  "ant-crypto",
  "getrandom 0.3.4",
@@ -134,7 +134,7 @@ dependencies = [
 
 [[package]]
 name = "ant-conformance"
-version = "0.5.33"
+version = "0.5.34"
 dependencies = [
  "ant-control",
  "ant-crypto",
@@ -155,7 +155,7 @@ dependencies = [
 
 [[package]]
 name = "ant-control"
-version = "0.5.33"
+version = "0.5.34"
 dependencies = [
  "hex",
  "serde",
@@ -167,7 +167,7 @@ dependencies = [
 
 [[package]]
 name = "ant-crypto"
-version = "0.5.33"
+version = "0.5.34"
 dependencies = [
  "getrandom 0.3.4",
  "hex",
@@ -178,7 +178,7 @@ dependencies = [
 
 [[package]]
 name = "ant-ffi"
-version = "0.5.33"
+version = "0.5.34"
 dependencies = [
  "ant-chain",
  "ant-control",
@@ -204,7 +204,7 @@ dependencies = [
 
 [[package]]
 name = "ant-gateway"
-version = "0.5.33"
+version = "0.5.34"
 dependencies = [
  "ant-chain",
  "ant-control",
@@ -233,7 +233,7 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.5.33"
+version = "0.5.34"
 dependencies = [
  "ant-control",
  "ant-crypto",
@@ -253,7 +253,7 @@ dependencies = [
 
 [[package]]
 name = "ant-p2p"
-version = "0.5.33"
+version = "0.5.34"
 dependencies = [
  "ant-chain",
  "ant-control",
@@ -283,7 +283,7 @@ dependencies = [
 
 [[package]]
 name = "ant-postage"
-version = "0.5.33"
+version = "0.5.34"
 dependencies = [
  "ant-crypto",
  "hex",
@@ -297,7 +297,7 @@ dependencies = [
 
 [[package]]
 name = "ant-retrieval"
-version = "0.5.33"
+version = "0.5.34"
 dependencies = [
  "ant-crypto",
  "ant-postage",
@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "antctl"
-version = "0.5.33"
+version = "0.5.34"
 dependencies = [
  "ant-chain",
  "ant-control",
@@ -345,7 +345,7 @@ dependencies = [
 
 [[package]]
 name = "antd"
-version = "0.5.33"
+version = "0.5.34"
 dependencies = [
  "aes",
  "ant-chain",
@@ -381,7 +381,7 @@ dependencies = [
 
 [[package]]
 name = "antop"
-version = "0.5.33"
+version = "0.5.34"
 dependencies = [
  "ant-control",
  "anyhow",
