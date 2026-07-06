@@ -555,6 +555,28 @@ only from here. Batch 2 (mutable `7fb5cb0b…`): ~580 K chunks issued
   the n=4 baseline median** — DoD #4's original ≥2× branch is now
   met outright, retroactively.
 
+### Experiment 7 (round 2): full-node advertisement — **2.5×; default flip awaiting user sign-off**
+
+- **Hypothesis** (hoverfly "What hoverfly is"): advertising
+  `full_node = true` buys bee's 10× wider per-peer accounting budget
+  (4.5 M vs 450 K PLUR/s refresh) — the measured ceiling on ant's
+  plateau — at the risk of losing the light-node bin-saturation
+  bypass and of advertising a role we don't fully serve.
+- **Method**: 256 MiB ×2 interleaved pairs on batch 4 (window
+  11:08–12:05Z), both arms on the new width-128 default; arm B
+  `ANT_ADVERTISE_FULL_NODE=1`.
+- **Results**:
+  | arm | effective KiB/s | duration | hard failures | peers start→end |
+  |---|---|---|---|---|
+  | light (current default) | 233 / 221 | ~19 min | 26 937 | 98→153 |
+  | **full-node advert** | **547 / 569** | **~7.9 min** | **2 315** | 85→175 |
+- **Decision**: numbers say **KEEP (2.4–2.5×, failures −12×, more
+  peers retained — no bin-saturation penalty observed)**. Flag landed
+  (`ANT_ADVERTISE_FULL_NODE=1`), default stays light pending the
+  user's call on the posture question (advertising full-node while
+  storing nothing; hoverfly ships it, bee tolerates it, but it
+  changes ant's network identity for every downstream user).
+
 ## Experiment queue
 
 1. Slow-storer resilience cluster (the 512 MiB stall fix)
