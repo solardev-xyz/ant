@@ -574,12 +574,17 @@ only from here. Batch 2 (mutable `7fb5cb0b…`): ~580 K chunks issued
   |---|---|---|---|---|
   | light (current default) | 233 / 221 | ~19 min | 26 937 | 98→153 |
   | **full-node advert** | **547 / 569** | **~7.9 min** | **2 315** | 85→175 |
-- **Decision**: numbers say **KEEP (2.4–2.5×, failures −12×, more
-  peers retained — no bin-saturation penalty observed)**. Flag landed
-  (`ANT_ADVERTISE_FULL_NODE=1`), default stays light pending the
-  user's call on the posture question (advertising full-node while
-  storing nothing; hoverfly ships it, bee tolerates it, but it
-  changes ant's network identity for every downstream user).
+- **Decision**: **KEEP → DEFAULT ON** (2.4–2.5×, failures −12×, more
+  peers retained — no bin-saturation penalty observed). Flipped on
+  the project owner's explicit call, 2026-07-06, with this on-record
+  caveat: **ant thereby declares a role it does not serve** (no
+  reserve, no pullsync — a light client by Swarm's taxonomy), purely
+  to obtain bee's 10× full-node accounting budget. The network may
+  not welcome the posture; it works because bee currently tolerates
+  protocol-poor "full" peers (hoverfly ships the same), and it must
+  be revisited if bee ever gates full-node privileges on serving
+  storage. `ANT_ADVERTISE_FULL_NODE=0` restores honest light
+  advertisement.
 
 ### Experiment 9 (round 2): straggler patience — **KEEP → default ON**
 

@@ -275,27 +275,33 @@ where
     .await
 }
 
-/// Perf-lab Experiment 7: `ANT_ADVERTISE_FULL_NODE=1` makes every
-/// outbound BZZ handshake advertise `full_node = true`. Default stays
-/// `false` (honest light-node advertisement).
+/// Perf-lab Experiment 7, **DEFAULT ON** since 2026-07-06 (project
+/// owner's decision): every outbound BZZ handshake advertises
+/// `full_node = true`. `ANT_ADVERTISE_FULL_NODE=0` restores the
+/// honest light-node advertisement.
 ///
-/// Why this is worth testing (hoverfly's measured trade-off, their
-/// PERFORMANCE.md "What hoverfly is"): bee grants a *full* peer a 10×
-/// wider per-peer accounting budget (4.5 M vs 450 K PLUR/s refresh,
-/// 13.5 M vs 1.35 M payment threshold) — and the measured ceiling on
-/// ant's upload plateau is exactly the light refresh budget. The cost
-/// side: full peers do NOT bypass bee's kademlia bin-saturation gate
-/// (`Kad.Pick` short-circuits only for lights), so accepted-connection
-/// counts may drop; and it advertises a role we don't fully serve
-/// (no reserve, no pullsync — inbound protocol requests get honest
-/// `UnsupportedProtocol`). Read once per process.
+/// **Be clear about what this is**: ant stores no chunks, keeps no
+/// reserve and serves no pullsync — by Swarm's own taxonomy it is a
+/// light client. Advertising full-node status is a deliberate
+/// misdeclaration whose sole purpose is bee's 10× wider per-peer
+/// accounting budget for full peers (4.5 M vs 450 K PLUR/s refresh,
+/// 13.5 M vs 1.35 M payment threshold) — measured on mainnet as 2.5×
+/// upload throughput with 12× fewer connection kills (PERF-LAB.md
+/// exp 7). The Swarm network may not welcome this posture: it works
+/// today because bee tolerates protocol-poor "full" peers (inbound
+/// reserve/pullsync requests get an honest `UnsupportedProtocol`,
+/// exactly like hoverfly, which ships the same trade-off), but a
+/// future bee release could gate full-node privileges on actually
+/// serving storage — at which point this default must be revisited.
+/// Read once per process.
 fn advertise_full_node_from_env() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("ANT_ADVERTISE_FULL_NODE").is_ok_and(|v| {
+    *ON.get_or_init(|| match std::env::var("ANT_ADVERTISE_FULL_NODE") {
+        Err(_) => true,
+        Ok(v) => {
             let v = v.trim();
             !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
-        })
+        }
     })
 }
 
