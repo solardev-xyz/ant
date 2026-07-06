@@ -196,6 +196,8 @@ struct GetStartedView: View {
                         .foregroundStyle(.white)
                 }
                 if let addr = node.account?.ethAddress {
+                    AddressQRCode(address: addr, xdaiAmount: send)
+                        .frame(maxWidth: .infinity)
                     Button {
                         UIPasteboard.general.string = addr
                     } label: {

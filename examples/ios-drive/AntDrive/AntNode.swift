@@ -236,6 +236,36 @@ final class AntNode: ObservableObject {
         await refreshAll()
     }
 
+    /// Price extending the connected plan's lifetime by `days` (no
+    /// transaction). Returns the same payment information as a new-plan
+    /// quote, sized to the connected plan's depth.
+    func quoteTopUp(rpc: String, days: UInt64) async throws -> StorageQuote {
+        guard let h = handle else { throw AntError.notReady }
+        let json = try await Self.string(name: "price extension") { errPtr in
+            rpc.withCString { ant_storage_topup_quote(h, $0, days, errPtr) }
+        }
+        guard let q = DriveDecoder.quote(from: json) else {
+            throw AntError.op("could not read extension price")
+        }
+        return q
+    }
+
+    /// Extend the connected plan's lifetime, funding only with xDAI: the
+    /// node swaps the xBZZ shortfall itself, then tops the batch up
+    /// on-chain. Spends real funds. Publishes the refreshed validity.
+    func topUpStorage(rpc: String, amountPerChunk: String) async throws {
+        guard let h = handle else { throw AntError.notReady }
+        let json = try await Self.string(name: "extend storage") { errPtr in
+            rpc.withCString { crpc in
+                amountPerChunk.withCString { camt in
+                    ant_storage_topup_xdai(h, crpc, camt, errPtr)
+                }
+            }
+        }
+        if let v = DriveDecoder.validity(from: json) { validity = v }
+        await refreshAll()
+    }
+
     /// Auto-discover every storage plan the account owns on Gnosis.
     func discoverStorage(rpc: String) async throws {
         guard let h = handle else { throw AntError.notReady }

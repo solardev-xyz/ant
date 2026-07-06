@@ -473,6 +473,34 @@ char *ant_storage_validity(const AntHandle *handle,
                            char **out_err);
 
 /*
+ * Price a top-up (lifetime extension) of the CONNECTED storage plan:
+ * what extending it by `days` costs at the current postage price and
+ * whether the account's funds cover it. Returns the same JSON shape as
+ * ant_storage_quote (`depth` echoes the connected plan's depth; the
+ * cost scales with it because a top-up pays per chunk). Errors when no
+ * plan is connected. No transaction is sent. Requires the `chain`
+ * cargo feature.
+ */
+char *ant_storage_topup_quote(const AntHandle *handle,
+                              const char *gnosis_rpc,
+                              uint64_t days,
+                              char **out_err);
+
+/*
+ * Top up (extend the lifetime of) the connected storage plan, funding
+ * ONLY with xDAI: the node swaps the xBZZ shortfall on-chain if needed,
+ * then runs approve + PostageStamp.topUp. `amount_per_chunk` is the
+ * value from ant_storage_topup_quote so the charge matches the quote
+ * the user approved. Returns the refreshed ant_storage_validity JSON
+ * (the new expiry). SUBMITS REAL TRANSACTIONS AND SPENDS REAL FUNDS.
+ * Requires the `chain` cargo feature.
+ */
+char *ant_storage_topup_xdai(const AntHandle *handle,
+                             const char *gnosis_rpc,
+                             const char *amount_per_chunk,
+                             char **out_err);
+
+/*
  * Buy and activate a storage plan on Gnosis (approve + createBatch, then
  * register it for stamping). `amount_per_chunk` is the value from
  * ant_storage_quote so the charge matches the approved quote; `immutable`

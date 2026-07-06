@@ -10,6 +10,7 @@ struct StorageView: View {
 
     @AppStorage("gnosisRpc") private var rpc = ""
     @State private var showConnect = false
+    @State private var showExtend = false
     @State private var showKey = false
     @State private var exportedKey: String?
     @State private var banner: String?
@@ -47,6 +48,12 @@ struct StorageView: View {
         .preferredColorScheme(.dark)
         .overlay(alignment: .top) { bannerView }
         .sheet(isPresented: $showConnect) { connectSheet }
+        .sheet(isPresented: $showExtend) {
+            ExtendStorageSheet { message in
+                flash(message)
+                Task { await node.refreshValidity(rpc: rpc) }
+            }
+        }
         .sheet(isPresented: $showKey) { keySheet }
         .task {
             await node.refreshAll()
@@ -104,6 +111,9 @@ struct StorageView: View {
                         }
                         .font(.caption)
                         .foregroundStyle(v.remainingSeconds == 0 ? .orange : .white.opacity(0.6))
+                    }
+                    pillButton("Extend storage", icon: "clock.arrow.circlepath") {
+                        showExtend = true
                     }
                 } else {
                     Text("No storage plan")
@@ -370,5 +380,344 @@ struct StorageView: View {
             try? await Task.sleep(nanoseconds: 3_000_000_000)
             withAnimation { banner = nil }
         }
+    }
+}
+
+/// The "Extend storage" flow: pick how much longer the connected plan
+/// should last, see the all-in xDAI price for topping the batch up, pay
+/// (or use existing funds), and extend on-chain. Mirrors the Get Started
+/// payment flow — same quote shape, same waiting-for-payment poll and
+/// auto-execute when funds land.
+private struct ExtendStorageSheet: View {
+    @EnvironmentObject var node: AntNode
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage("gnosisRpc") private var rpc = ""
+
+    /// Called on success with a banner message for the Storage tab.
+    let onDone: (String) -> Void
+
+    private let defaultRpc = "https://rpc.gnosischain.com"
+
+    /// Durations the user can add to the plan.
+    private static let options: [(id: String, label: String, days: UInt64)] = [
+        ("m1", "1 month", 30),
+        ("m3", "3 months", 90),
+        ("m6", "6 months", 180),
+        ("y1", "1 year", 365),
+    ]
+
+    private enum Step { case pick, payment, extending }
+
+    @State private var step: Step = .pick
+    @State private var selectedDays: UInt64?
+    @State private var quote: StorageQuote?
+    @State private var quotes: [UInt64: StorageQuote] = [:]
+    @State private var loadingQuotes = false
+    @State private var error: String?
+    /// One-shot guard so funds-detected auto-extension fires only once
+    /// per payment session (a failure must not re-trigger a loop).
+    @State private var didAutoExtend = false
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                LiquidGlassBackground(palette: .network).ignoresSafeArea()
+                content
+            }
+            .navigationTitle("Extend storage")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    if step == .payment {
+                        Button("Back") {
+                            withAnimation { step = .pick; quote = nil; didAutoExtend = false }
+                        }
+                    } else if step == .pick {
+                        Button("Close") { dismiss() }
+                    }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+        .interactiveDismissDisabled(step == .extending)
+        .task { await loadQuotes() }
+    }
+
+    @ViewBuilder private var content: some View {
+        switch step {
+        case .pick: pickStep
+        case .payment: paymentStep
+        case .extending: extendingStep
+        }
+    }
+
+    // MARK: Step 1 — duration picker
+
+    private var pickStep: some View {
+        ScrollView {
+            VStack(spacing: 18) {
+                VStack(spacing: 8) {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .font(.system(size: 44))
+                        .foregroundStyle(.white)
+                    Text("Keep your files longer")
+                        .font(.system(.title2, design: .rounded).weight(.bold))
+                        .foregroundStyle(.white)
+                    if let v = node.validity, v.enabled {
+                        Text("Your storage is valid until \(v.expiryDateLabel). Extending adds time on top.")
+                            .font(.subheadline)
+                            .foregroundStyle(.white.opacity(0.7))
+                            .multilineTextAlignment(.center)
+                    }
+                }
+                .padding(.top, 12)
+
+                ForEach(Self.options, id: \.id) { option in
+                    optionCard(label: option.label, days: option.days)
+                }
+
+                if let error {
+                    Text(error)
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                        .multilineTextAlignment(.center)
+                }
+            }
+            .padding(20)
+        }
+    }
+
+    private func optionCard(label: String, days: UInt64) -> some View {
+        Button {
+            choose(days)
+        } label: {
+            GlassCard {
+                HStack(spacing: 14) {
+                    Text("+\(label)")
+                        .font(.title3.weight(.bold))
+                        .foregroundStyle(.white)
+                    Spacer()
+                    if let q = quotes[days] {
+                        let price = roundedUpXdai(q.xdaiToSendDisplay)
+                        Text(usdFromXdai(price) ?? "$\(price)")
+                            .font(.headline.weight(.bold))
+                            .foregroundStyle(.white)
+                    } else if loadingQuotes {
+                        ProgressView().tint(.white)
+                    } else {
+                        Image(systemName: "chevron.right").foregroundStyle(.white.opacity(0.6))
+                    }
+                }
+            }
+            .contentShape(.rect(cornerRadius: 28))
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: Step 2 — payment
+
+    @ViewBuilder private var paymentStep: some View {
+        if let quote {
+            VStack(spacing: 22) {
+                Spacer(minLength: 0)
+
+                if quote.sufficientFunds {
+                    Label("Payment received", systemImage: "checkmark.circle.fill")
+                        .font(.title3.weight(.semibold))
+                        .foregroundStyle(.green)
+                } else {
+                    sendCard(quote)
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small).tint(.white)
+                        Text("Waiting for payment…")
+                            .font(.subheadline)
+                            .foregroundStyle(.white.opacity(0.7))
+                    }
+                }
+
+                Spacer(minLength: 0)
+
+                Button { extend() } label: {
+                    Text("Extend")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .glassEffect(.regular.tint(.blue.opacity(quote.sufficientFunds ? 0.6 : 0.2)),
+                                     in: .capsule)
+                        .foregroundStyle(.white.opacity(quote.sufficientFunds ? 1 : 0.5))
+                }
+                .buttonStyle(.plain)
+                .disabled(!quote.sufficientFunds)
+
+                if let error {
+                    Text(error)
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                        .multilineTextAlignment(.center)
+                }
+            }
+            .padding(24)
+            .task { await pollForPayment() }
+        }
+    }
+
+    private func sendCard(_ quote: StorageQuote) -> some View {
+        let send = roundedUpXdai(quote.xdaiToSendDisplay)
+        return GlassCard {
+            VStack(spacing: 16) {
+                VStack(spacing: 2) {
+                    Text("Send")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.6))
+                    Text("\(send) xDAI")
+                        .font(.system(.largeTitle, design: .rounded).weight(.bold))
+                        .foregroundStyle(.white)
+                }
+                if let addr = node.account?.ethAddress {
+                    AddressQRCode(address: addr, xdaiAmount: send)
+                        .frame(maxWidth: .infinity)
+                    Button {
+                        UIPasteboard.general.string = addr
+                    } label: {
+                        HStack {
+                            Text(addr)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.white)
+                                .lineLimit(1).truncationMode(.middle)
+                            Spacer()
+                            Image(systemName: "doc.on.doc")
+                                .foregroundStyle(.white.opacity(0.85))
+                        }
+                        .padding(12)
+                        .background(.white.opacity(0.06), in: .rect(cornerRadius: 12))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    // MARK: Step 3 — extending
+
+    private var extendingStep: some View {
+        VStack(spacing: 18) {
+            ProgressView().controlSize(.large).tint(.white)
+            Text("Extending your storage…")
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(.white)
+            Text("Confirming your payment on the network. This can take up to a minute — please keep the app open.")
+                .font(.subheadline)
+                .foregroundStyle(.white.opacity(0.7))
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 32)
+        }
+    }
+
+    // MARK: actions
+
+    private var activeRpc: String {
+        let r = rpc.trimmingCharacters(in: .whitespaces)
+        return r.isEmpty ? defaultRpc : r
+    }
+
+    /// Fetch a quote for every duration so the picker shows each
+    /// option's all-in price up front. Best-effort per option.
+    private func loadQuotes() async {
+        loadingQuotes = true
+        defer { loadingQuotes = false }
+        let rpcURL = activeRpc
+        let drive = node
+        await withTaskGroup(of: (UInt64, StorageQuote?).self) { group in
+            for option in Self.options {
+                group.addTask {
+                    let q = try? await drive.quoteTopUp(rpc: rpcURL, days: option.days)
+                    return (option.days, q)
+                }
+            }
+            for await (days, q) in group {
+                if let q { quotes[days] = q }
+            }
+        }
+        if quotes.isEmpty {
+            error = "Couldn't reach the network to price extensions. Try again."
+        }
+    }
+
+    private func choose(_ days: UInt64) {
+        selectedDays = days
+        error = nil
+        didAutoExtend = false
+        if let cached = quotes[days] {
+            quote = cached
+            withAnimation { step = .payment }
+        } else {
+            Task {
+                do {
+                    let q = try await node.quoteTopUp(rpc: activeRpc, days: days)
+                    quote = q
+                    quotes[days] = q
+                    withAnimation { step = .payment }
+                } catch {
+                    self.error = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    /// While the payment step is on screen and unfunded, re-quote every
+    /// few seconds; when the incoming transfer lands, extend
+    /// automatically — no tap needed.
+    private func pollForPayment() async {
+        guard let days = selectedDays else { return }
+        while !Task.isCancelled {
+            if quote?.sufficientFunds == true { autoExtendIfFunded(); return }
+            try? await Task.sleep(nanoseconds: 6_000_000_000)
+            if Task.isCancelled { return }
+            guard let fresh = try? await node.quoteTopUp(rpc: activeRpc, days: days)
+            else { continue }
+            withAnimation {
+                quote = fresh
+                quotes[days] = fresh
+            }
+            if fresh.sufficientFunds { autoExtendIfFunded(); return }
+        }
+    }
+
+    private func autoExtendIfFunded() {
+        guard !didAutoExtend else { return }
+        didAutoExtend = true
+        extend()
+    }
+
+    private func extend() {
+        guard let quote else { return }
+        error = nil
+        withAnimation { step = .extending }
+        Task {
+            do {
+                try await node.topUpStorage(rpc: activeRpc, amountPerChunk: quote.amountPerChunk)
+                let until = node.validity.map { " — valid until \($0.expiryDateLabel)" } ?? ""
+                dismiss()
+                onDone("Storage extended\(until)")
+            } catch {
+                self.error = error.localizedDescription
+                withAnimation { step = .payment }
+            }
+        }
+    }
+
+    /// xDAI is a USD stablecoin (~$1), so its USD value is ~1:1.
+    private func usdFromXdai(_ xdai: String) -> String? {
+        guard let amount = Double(xdai) else { return nil }
+        return PriceOracle.formatUsd(amount)
+    }
+
+    /// Round the funding amount up to the next whole cent so the user
+    /// sends a clean figure with a hair of headroom — never less than
+    /// the quote requires.
+    private func roundedUpXdai(_ xdai: String) -> String {
+        guard let amount = Double(xdai) else { return xdai }
+        let cents = (amount * 100 - 1e-6).rounded(.up)
+        return String(format: "%.2f", max(0, cents) / 100)
     }
 }

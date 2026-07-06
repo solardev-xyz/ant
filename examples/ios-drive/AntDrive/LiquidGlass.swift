@@ -1,3 +1,4 @@
+import CoreImage.CIFilterBuiltins
 import SwiftUI
 
 /// Shared visual primitives for the Liquid Glass UI.
@@ -139,6 +140,70 @@ struct GlassCard<Content: View>: View {
             .padding(20)
             .frame(maxWidth: .infinity, alignment: .leading)
             .glassEffect(.regular, in: .rect(cornerRadius: radius))
+    }
+}
+
+/// A QR code for a payment request, rendered on a white tile so any
+/// wallet camera can pick it up against the dark glass UI. With an
+/// `xdaiAmount` it encodes an EIP-681 URI
+/// (`ethereum:<address>@100?value=<wei>`) so a scanning wallet
+/// pre-fills the recipient, the amount, and the Gnosis chain; without
+/// one it falls back to the plain `0x…` address. The address is always
+/// shown as copyable text next to the code for wallets that don't
+/// parse the URI form.
+struct AddressQRCode: View {
+    let address: String
+    /// Decimal xDAI amount to request (e.g. "0.15"); nil for address-only.
+    var xdaiAmount: String? = nil
+    var size: CGFloat = 160
+
+    var body: some View {
+        if let image = Self.generate(payload) {
+            Image(uiImage: image)
+                .interpolation(.none)
+                .resizable()
+                .scaledToFit()
+                .frame(width: size, height: size)
+                .padding(10)
+                .background(.white, in: .rect(cornerRadius: 12))
+        }
+    }
+
+    private var payload: String {
+        guard let xdaiAmount, let wei = Self.weiString(fromDecimal: xdaiAmount) else {
+            return address
+        }
+        // 100 is the Gnosis chain id; `value` is the native-token amount
+        // in wei, per EIP-681.
+        return "ethereum:\(address)@100?value=\(wei)"
+    }
+
+    /// Convert a decimal token amount ("0.15") to an exact integer wei
+    /// string (18 decimals) without floating-point round-off. Returns
+    /// nil for malformed input or a zero amount (a zero-value request
+    /// would just confuse the wallet).
+    static func weiString(fromDecimal s: String) -> String? {
+        let parts = s.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count <= 2, !parts.isEmpty else { return nil }
+        let whole = parts[0].isEmpty ? "0" : String(parts[0])
+        var frac = parts.count == 2 ? String(parts[1]) : ""
+        guard whole.allSatisfy(\.isNumber), frac.allSatisfy(\.isNumber),
+              frac.count <= 18 else { return nil }
+        frac += String(repeating: "0", count: 18 - frac.count)
+        let combined = (whole + frac).drop { $0 == "0" }
+        return combined.isEmpty ? nil : String(combined)
+    }
+
+    private static func generate(_ text: String) -> UIImage? {
+        let filter = CIFilter.qrCodeGenerator()
+        filter.message = Data(text.utf8)
+        filter.correctionLevel = "M"
+        guard let output = filter.outputImage else { return nil }
+        // Scale the tiny module grid up before rasterising so the PNG is
+        // crisp; `.interpolation(.none)` keeps the edges sharp on screen.
+        let scaled = output.transformed(by: CGAffineTransform(scaleX: 10, y: 10))
+        guard let cg = CIContext().createCGImage(scaled, from: scaled.extent) else { return nil }
+        return UIImage(cgImage: cg)
     }
 }
 

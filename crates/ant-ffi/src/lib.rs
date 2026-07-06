@@ -1950,6 +1950,85 @@ pub unsafe extern "C" fn ant_storage_validity(
     }
 }
 
+/// Price a top-up (lifetime extension) of the *connected* storage plan:
+/// what extending it by `days` costs at the current postage price, and
+/// whether the account's funds cover it. Same JSON shape as
+/// [`ant_storage_quote`] (`depth` is the connected plan's depth). Errors
+/// when no plan is connected. No transaction is sent. Requires the
+/// `chain` build feature.
+///
+/// # Safety
+///
+/// See [`ant_upload_start`]. `gnosis_rpc` must be a valid NUL-terminated
+/// UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn ant_storage_topup_quote(
+    handle: *const AntHandle,
+    gnosis_rpc: *const c_char,
+    days: u64,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_storage_topup_quote", || {
+            let h = handle.as_ref().ok_or_else(null_handle)?;
+            let rpc = cstr_to_string(gnosis_rpc)?;
+            #[cfg(feature = "chain")]
+            {
+                drive::storage_topup_quote(h, rpc, days).map_err(|e| e.to_string())
+            }
+            #[cfg(not(feature = "chain"))]
+            {
+                let _ = (h, rpc, days);
+                Err(
+                    "this build has no chain support (rebuild ant-ffi with --features chain)"
+                        .to_string(),
+                )
+            }
+        })
+    }
+}
+
+/// Top up (extend the lifetime of) the connected storage plan, funding
+/// **only with xDAI**: the node swaps the xBZZ shortfall on-chain if
+/// needed, then runs `approve` + `PostageStamp.topUp`. `amount_per_chunk`
+/// is the value returned by [`ant_storage_topup_quote`] (so the charge
+/// matches the quote the user approved). Returns the refreshed
+/// [`ant_storage_validity`] JSON (the new expiry). Submits real
+/// transactions and spends real funds. Requires the `chain` build
+/// feature.
+///
+/// # Safety
+///
+/// See [`ant_upload_start`]. `gnosis_rpc` and `amount_per_chunk` must be
+/// valid NUL-terminated UTF-8 strings.
+#[no_mangle]
+pub unsafe extern "C" fn ant_storage_topup_xdai(
+    handle: *const AntHandle,
+    gnosis_rpc: *const c_char,
+    amount_per_chunk: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_storage_topup_xdai", || {
+            let h = handle.as_ref().ok_or_else(null_handle)?;
+            let rpc = cstr_to_string(gnosis_rpc)?;
+            let amount = cstr_to_string(amount_per_chunk)?;
+            #[cfg(feature = "chain")]
+            {
+                drive::storage_topup_xdai(h, rpc, amount).map_err(|e| e.to_string())
+            }
+            #[cfg(not(feature = "chain"))]
+            {
+                let _ = (h, rpc, amount);
+                Err(
+                    "this build has no chain support (rebuild ant-ffi with --features chain)"
+                        .to_string(),
+                )
+            }
+        })
+    }
+}
+
 /// Buy and activate a storage plan on Gnosis (`approve` + `createBatch`,
 /// then register it so uploads can stamp against it). `amount_per_chunk`
 /// is the value returned by [`ant_storage_quote`] (so the charge matches

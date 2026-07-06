@@ -648,6 +648,191 @@ pub(crate) fn storage_quote(
     })
 }
 
+/// Price a top-up of the *connected* storage plan: how much it costs to
+/// extend its lifetime by `days` at the current postage price, and
+/// whether the account's xBZZ / xDAI funds cover it. Reads the batch
+/// depth from the local issuer (a top-up pays per chunk, so cost scales
+/// with the plan's size). Returns the same quote shape as
+/// [`storage_quote`]. No transaction is sent.
+#[cfg(feature = "chain")]
+pub(crate) fn storage_topup_quote(
+    h: &AntHandle,
+    rpc: String,
+    days: u64,
+) -> Result<String, DriveError> {
+    let cmd_tx = h.cmd_tx.clone();
+    let eth = h.eth;
+    h.runtime.block_on(async move {
+        let view = connected_plan(&cmd_tx).await?;
+        let client = ant_chain::ChainClient::new(rpc);
+        let price = client
+            .postage_last_price(ant_chain::GNOSIS_POSTAGE_STAMP)
+            .await
+            .map_err(|e| DriveError::Op(format!("read storage price: {e}")))?;
+        let bzz = client
+            .erc20_balance_of_lower128(ant_chain::GNOSIS_BZZ_TOKEN, &eth)
+            .await
+            .unwrap_or(0);
+        let xdai = client.eth_get_balance_lower128(&eth).await.unwrap_or(0);
+
+        let depth = view.batch_depth;
+        let blocks = (u128::from(days) * 86_400 / GNOSIS_BLOCK_SECS).max(1);
+        let amount_per_chunk = price.max(1).saturating_mul(blocks);
+        let total_plur = amount_per_chunk.saturating_mul(1u128 << depth);
+        let capacity_bytes = (1u64 << depth).saturating_mul(BYTES_PER_CHUNK);
+
+        let needed_bzz = total_plur.saturating_sub(bzz);
+        let swap_input = if needed_bzz > 0 {
+            buffered_swap_input(&client, needed_bzz).await?
+        } else {
+            0
+        };
+        let xdai_required = swap_input.saturating_add(GAS_RESERVE_WEI);
+        let xdai_to_send = xdai_required.saturating_sub(xdai);
+
+        to_json(&Quote {
+            depth,
+            days,
+            amount_per_chunk: amount_per_chunk.to_string(),
+            total_cost_plur: total_plur.to_string(),
+            total_cost_bzz: format_bzz(total_plur),
+            capacity_bytes,
+            account_bzz: bzz.to_string(),
+            account_bzz_display: format_bzz(bzz),
+            account_xdai: xdai.to_string(),
+            account_xdai_display: format_native(xdai),
+            needed_bzz: needed_bzz.to_string(),
+            needed_bzz_display: format_bzz(needed_bzz),
+            xdai_required: xdai_required.to_string(),
+            xdai_required_display: format_native(xdai_required),
+            xdai_to_send: xdai_to_send.to_string(),
+            xdai_to_send_display: format_native(xdai_to_send),
+            sufficient_funds: xdai >= xdai_required,
+        })
+    })
+}
+
+/// Top up (extend) the connected storage plan, funding **only with
+/// xDAI**: swap the xBZZ shortfall on-chain if needed, `approve` the
+/// postage contract for `amount_per_chunk × 2^depth`, then submit
+/// `PostageStamp.topUp`. `amount_per_chunk` is the value from
+/// [`storage_topup_quote`] so the charge matches the approved quote.
+/// The batch's depth doesn't change, so no re-registration is needed.
+/// Returns the refreshed [`storage_validity`] JSON so the caller can
+/// show the new expiry immediately.
+///
+/// Submits real Gnosis transactions and spends real funds, so the app
+/// gates it behind an explicit confirmation.
+#[cfg(feature = "chain")]
+pub(crate) fn storage_topup_xdai(
+    h: &AntHandle,
+    rpc: String,
+    amount_per_chunk: String,
+) -> Result<String, DriveError> {
+    let amount: u128 = amount_per_chunk
+        .trim()
+        .parse()
+        .map_err(|_| DriveError::Op("invalid top-up price".into()))?;
+    if amount == 0 {
+        return Err(DriveError::Op(
+            "top-up amount must be greater than zero".into(),
+        ));
+    }
+    let cmd_tx = h.cmd_tx.clone();
+    let secret = h.signing_secret;
+    let owner = h.eth;
+    let tx_rpc = rpc.clone();
+    h.runtime.block_on(async move {
+        use primitive_types::U256;
+
+        let view = connected_plan(&cmd_tx).await?;
+        let batch_id = parse_batch_id(&view.batch_id)?;
+        let depth = view.batch_depth;
+
+        let client = ant_chain::ChainClient::new(tx_rpc);
+        let wallet = ant_chain::tx::Wallet::new(secret, GNOSIS_CHAIN_ID)
+            .map_err(|e| DriveError::Op(format!("wallet: {e}")))?;
+        let postage = parse_addr(ant_chain::GNOSIS_POSTAGE_STAMP)?;
+        let bzz = parse_addr(ant_chain::GNOSIS_BZZ_TOKEN)?;
+
+        let total_plur = amount
+            .checked_mul(1u128 << depth)
+            .ok_or_else(|| DriveError::Op("top-up cost overflows".into()))?;
+
+        // 1) Cover the xBZZ shortfall by swapping xDAI, if any — the
+        //    same flow as storage_buy_xdai.
+        let have_bzz = client
+            .erc20_balance_of_lower128(ant_chain::GNOSIS_BZZ_TOKEN, &owner)
+            .await
+            .unwrap_or(0);
+        let needed_bzz = total_plur.saturating_sub(have_bzz);
+        if needed_bzz > 0 {
+            let xdai = client
+                .eth_get_balance_lower128(&owner)
+                .await
+                .map_err(|e| DriveError::Op(format!("read xDAI balance: {e}")))?;
+            let swap_input = buffered_swap_input(&client, needed_bzz).await?;
+            let required = swap_input.saturating_add(GAS_RESERVE_WEI);
+            if xdai < required {
+                return Err(DriveError::Op(format!(
+                    "not enough xDAI: send {} more xDAI to your account, then try again",
+                    format_native(required - xdai)
+                )));
+            }
+            let helper = wallet
+                .ensure_swap_helper(&client)
+                .await
+                .map_err(|e| DriveError::Op(format!("prepare swap: {e}")))?;
+            wallet
+                .swap_xdai_for_bzz(
+                    &client,
+                    &helper,
+                    &owner,
+                    U256::from(swap_input),
+                    U256::from(needed_bzz),
+                )
+                .await
+                .map_err(|e| DriveError::Op(format!("swap xDAI for xBZZ: {e}")))?;
+        }
+
+        // 2) Authorise + top up the batch on-chain.
+        wallet
+            .approve_bzz(&client, &bzz, &postage, U256::from(total_plur))
+            .await
+            .map_err(|e| DriveError::Op(format!("authorise payment: {e}")))?;
+        wallet
+            .top_up(&client, &postage, &batch_id, U256::from(amount))
+            .await
+            .map_err(|e| DriveError::Op(format!("extend storage: {e}")))?;
+        Ok(())
+    })?;
+    // Depth is unchanged, so the local issuer needs no update; return the
+    // fresh on-chain validity so the UI shows the new expiry right away.
+    storage_validity(h, rpc)
+}
+
+/// The local issuer view of the connected plan, or an error when no
+/// plan is connected — shared pre-check for the top-up quote/execute
+/// pair (both need the batch id + depth).
+#[cfg(feature = "chain")]
+async fn connected_plan(
+    cmd_tx: &mpsc::Sender<ControlCommand>,
+) -> Result<ant_control::PostageStatusView, DriveError> {
+    let (ack_tx, ack_rx) = oneshot::channel();
+    send(cmd_tx, ControlCommand::PostageStatus { ack: ack_tx }).await?;
+    let view = match recv_oneshot(ack_rx).await? {
+        ControlAck::PostageStatus(v) => v,
+        ControlAck::Error { message } => return Err(DriveError::Op(message)),
+        other => return Err(unexpected(&other)),
+    };
+    if !view.enabled || view.batch_id.is_empty() {
+        return Err(DriveError::Op(
+            "no storage plan is connected to extend".into(),
+        ));
+    }
+    Ok(view)
+}
+
 /// Remaining lifetime of the connected storage plan. Reads the batch's
 /// on-chain remaining per-chunk balance (`PostageStamp.remainingBalance`,
 /// i.e. normalised balance minus the cumulative outpayment) and the
