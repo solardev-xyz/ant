@@ -937,16 +937,17 @@ impl RoutingFetcher {
     }
 }
 
-/// Perf-lab Experiment 9 A/B toggle (`ANT_PUSH_STRAGGLER_PATIENCE=1`,
-/// default off until the verdict; same env var gates the job-level
-/// escalating backoff in `ant-node::uploads`). Read once per process.
+/// Perf-lab Experiment 9: DEFAULT ON since the verdict (see
+/// `ant-node::uploads::straggler_patience`, which the same env var
+/// gates). `ANT_PUSH_STRAGGLER_PATIENCE=0` opts out. Read once.
 fn straggler_patience() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("ANT_PUSH_STRAGGLER_PATIENCE").is_ok_and(|v| {
+    *ON.get_or_init(|| match std::env::var("ANT_PUSH_STRAGGLER_PATIENCE") {
+        Err(_) => true,
+        Ok(v) => {
             let v = v.trim();
             !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
-        })
+        }
     })
 }
 

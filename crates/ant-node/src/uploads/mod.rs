@@ -214,15 +214,18 @@ fn classic_backoff(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_millis(ms)
 }
 
-/// Perf-lab Experiment 9 A/B toggle (`ANT_PUSH_STRAGGLER_PATIENCE=1`).
-/// Default off until the verdict.
+/// Perf-lab Experiment 9: DEFAULT ON since the verdict (2026-07-06 —
+/// completed a 512 MiB upload in 17 min in the window where the
+/// control arm ground indefinitely; +26 % in a healthy window).
+/// `ANT_PUSH_STRAGGLER_PATIENCE=0` opts out (the A/B control arm).
 fn straggler_patience() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("ANT_PUSH_STRAGGLER_PATIENCE").is_ok_and(|v| {
+    *ON.get_or_init(|| match std::env::var("ANT_PUSH_STRAGGLER_PATIENCE") {
+        Err(_) => true,
+        Ok(v) => {
             let v = v.trim();
             !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
-        })
+        }
     })
 }
 

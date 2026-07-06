@@ -577,6 +577,31 @@ only from here. Batch 2 (mutable `7fb5cb0b…`): ~580 K chunks issued
   storing nothing; hoverfly ships it, bee tolerates it, but it
   changes ant's network identity for every downstream user).
 
+### Experiment 9 (round 2): straggler patience — **KEEP → default ON**
+
+- **Premise correction**: tree chunks already interleave with data
+  (the splitter emits completed parents inline) — the grinding tails
+  are retry stragglers whose ≤4–5 s requeue cadence refreshes bee's
+  escalating blocklists on their few closest storers, and a run's own
+  early traffic creates the scars.
+- **Change**: (a) requeue backoff escalates past attempt 8 (15 s,
+  then 30 s — happy-path P95 untouched); (b) a push walk exhausting
+  with zero receipts (pure connection kills) fires the neighbourhood
+  dial + bounded await-deeper before erroring back.
+- **Method**: 512 MiB single-arm runs in adjacent windows on batch 4
+  (interleaving is impractical at 80-min control runtimes);
+  pair 2 ran control-FIRST so window drift worked against the
+  hypothesis.
+- **Results**:
+  | window | control (patience off) | patience on |
+  |---|---|---|
+  | 1 (hostile, 12:03–13:57Z) | **ground**: 94.6 % at 83 min, cancelled (100 KiB/s eff) | **completed 17.2 min, 508 KiB/s** |
+  | 2 (recovered, 14:04–14:59Z) | completed 19.4 min, 451 KiB/s | **completed 15.4 min, 569 KiB/s** (+26 %) |
+- **Decision**: **KEEP → default ON** (`ANT_PUSH_STRAGGLER_PATIENCE=0`
+  opts out). In hostile windows it's the difference between finishing
+  and grinding indefinitely — resilience, the goal's headline ask;
+  in healthy windows it's neutral-to-positive.
+
 ## Experiment queue
 
 1. Slow-storer resilience cluster (the 512 MiB stall fix)
