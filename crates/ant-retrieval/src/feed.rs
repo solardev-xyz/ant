@@ -419,6 +419,22 @@ async fn probe_once(
         match fetched {
             Ok(wire) => {
                 let decoded = decode_sequence_update(&wire, addr, feed)?;
+                // Seed the update's wrapped CAC into the local store,
+                // exactly like a recovered RS shard. Bee's `resolveFeed`
+                // serves the wrapped chunk straight out of the SOC it
+                // fetched; a v2 update's content root exists ONLY inside
+                // that SOC — nobody pushes the bare CAC — so without
+                // this every follow-up fetch of the resolved reference
+                // 404s on any node that didn't author the update
+                // (perf-lab baseline: 0/45 cold feed resolutions, each
+                // failing AFTER a successful head resolution). Seeding
+                // at decode time covers every resolution path (GetFeed,
+                // the /bzz feed-manifest walk, traversal) in one place;
+                // decode already BMT-validated the inner CAC against
+                // the address we hand over.
+                fetcher
+                    .put_recovered(decoded.inner_cac_addr, &wire[SOC_HEADER_SIZE..])
+                    .await;
                 trace!(
                     target: "ant_retrieval::feed",
                     index,
