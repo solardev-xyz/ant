@@ -918,11 +918,36 @@ impl RoutingFetcher {
             );
             return Ok(());
         }
+        // Perf-lab Experiment 9 (straggler patience): a walk that dies
+        // with zero receipts — every candidate connection-killed — is
+        // the hostile-neighbourhood straggler signature. Before
+        // erroring back to the job's retry queue, ask the swarm to
+        // dial deeper toward this chunk and wait (bounded, ≤2.5 s) for
+        // anyone deeper than our current best to connect, so the NEXT
+        // attempt has a fresh storer instead of re-drawing the same
+        // blocklisted trio.
+        if straggler_patience() {
+            let target = self.best_connected_po(&chunk_addr).saturating_add(1);
+            self.dial_and_await_deeper(&chunk_addr, target).await;
+        }
         Err(PushSyncError::Remote(format!(
             "exhausted pushsync peers (last: {})",
             last_err.map_or_else(|| "unknown".to_string(), |e| e.to_string()),
         )))
     }
+}
+
+/// Perf-lab Experiment 9 A/B toggle (`ANT_PUSH_STRAGGLER_PATIENCE=1`,
+/// default off until the verdict; same env var gates the job-level
+/// escalating backoff in `ant-node::uploads`). Read once per process.
+fn straggler_patience() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("ANT_PUSH_STRAGGLER_PATIENCE").is_ok_and(|v| {
+            let v = v.trim();
+            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+        })
+    })
 }
 
 /// `true` for the one `PushSyncError` worth a single fast retry on a

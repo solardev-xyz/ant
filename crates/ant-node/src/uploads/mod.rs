@@ -182,8 +182,40 @@ const PER_CHUNK_RETRY_BUDGET: u32 = 8;
 /// this fix tried) avoids stretching the happy-path P95 by tens
 /// of seconds on busy uploads.
 fn backoff_for_retry(attempt: u32) -> std::time::Duration {
+    // Perf-lab Experiment 9 (straggler patience): a chunk that has
+    // already burned many walks is almost always blocked by
+    // bee-side blocklists on its few closest storers — and every
+    // further hammering round EXTENDS those blocklists (bee
+    // escalates repeat offenders). Backing far off after the early
+    // attempts lets the windows lapse instead of refreshing them.
+    // Escalation only kicks in past the classic 8-attempt curve, so
+    // the happy-path P95 is untouched.
+    if straggler_patience() {
+        let secs = match attempt {
+            0..=7 => return classic_backoff(attempt),
+            8..=11 => 15,
+            _ => 30,
+        };
+        return std::time::Duration::from_secs(secs);
+    }
+    classic_backoff(attempt)
+}
+
+fn classic_backoff(attempt: u32) -> std::time::Duration {
     let ms = 250u64.saturating_mul(1u64 << attempt.min(20)).min(4_000);
     std::time::Duration::from_millis(ms)
+}
+
+/// Perf-lab Experiment 9 A/B toggle (`ANT_PUSH_STRAGGLER_PATIENCE=1`).
+/// Default off until the verdict.
+fn straggler_patience() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("ANT_PUSH_STRAGGLER_PATIENCE").is_ok_and(|v| {
+            let v = v.trim();
+            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+        })
+    })
 }
 
 /// Longer pause inserted between re-pushes when the failure looks like
