@@ -6,6 +6,7 @@ pub mod dnsaddr;
 mod handshake;
 mod peerstore;
 pub mod pseudosettle;
+pub mod push_pseudosettle;
 pub mod pushsync_swap;
 pub mod routing;
 mod sinks;

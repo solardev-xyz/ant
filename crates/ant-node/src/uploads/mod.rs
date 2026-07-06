@@ -101,6 +101,31 @@ const CHUNK_SIZE: usize = 4096;
 /// set, not from raising this constant.
 const MAX_PUSH_CONCURRENCY: usize = 32;
 
+/// Effective in-flight push width: [`MAX_PUSH_CONCURRENCY`] unless the
+/// perf-lab override `ANT_PUSH_CONCURRENCY` is set (Experiment 2 pairs
+/// a higher total width with the per-peer in-flight cap in
+/// `ant-retrieval::push_load` — the 2026-05 finding that 256 collapses
+/// was measured WITHOUT a per-peer cap, so the pair must be re-tested
+/// together; see PERF-LAB.md). Read once per process.
+fn max_push_concurrency() -> usize {
+    /// Perf-lab exp 8 verdict (2026-07-06): with the per-peer
+    /// in-flight cap spreading load, width 128 measured 3.6× width 32
+    /// at 256 MiB (565/558 vs 157/154 KiB/s, interleaved pairs) with
+    /// 4× fewer failed attempts — the run finishes before per-peer
+    /// debt scars accumulate. The 2026-05 "256 collapses" finding
+    /// predates the cap; the historical 32 remains as
+    /// [`MAX_PUSH_CONCURRENCY`] for the bounded heal path.
+    const DEFAULT_PUSH_WIDTH: usize = 128;
+    static WIDTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WIDTH.get_or_init(|| {
+        std::env::var("ANT_PUSH_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_PUSH_WIDTH)
+    })
+}
+
 /// Re-checkpoint the on-disk job manifest every N successful pushes.
 /// Chosen so a crash loses ≤ ~250 chunks (~1 MB at 4 KiB chunks)
 /// without thrashing the disk: at peak push throughput (~5 K
@@ -165,8 +190,43 @@ const PER_CHUNK_RETRY_BUDGET: u32 = 8;
 /// this fix tried) avoids stretching the happy-path P95 by tens
 /// of seconds on busy uploads.
 fn backoff_for_retry(attempt: u32) -> std::time::Duration {
+    // Perf-lab Experiment 9 (straggler patience): a chunk that has
+    // already burned many walks is almost always blocked by
+    // bee-side blocklists on its few closest storers — and every
+    // further hammering round EXTENDS those blocklists (bee
+    // escalates repeat offenders). Backing far off after the early
+    // attempts lets the windows lapse instead of refreshing them.
+    // Escalation only kicks in past the classic 8-attempt curve, so
+    // the happy-path P95 is untouched.
+    if straggler_patience() {
+        let secs = match attempt {
+            0..=7 => return classic_backoff(attempt),
+            8..=11 => 15,
+            _ => 30,
+        };
+        return std::time::Duration::from_secs(secs);
+    }
+    classic_backoff(attempt)
+}
+
+fn classic_backoff(attempt: u32) -> std::time::Duration {
     let ms = 250u64.saturating_mul(1u64 << attempt.min(20)).min(4_000);
     std::time::Duration::from_millis(ms)
+}
+
+/// Perf-lab Experiment 9: DEFAULT ON since the verdict (2026-07-06 —
+/// completed a 512 MiB upload in 17 min in the window where the
+/// control arm ground indefinitely; +26 % in a healthy window).
+/// `ANT_PUSH_STRAGGLER_PATIENCE=0` opts out (the A/B control arm).
+fn straggler_patience() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("ANT_PUSH_STRAGGLER_PATIENCE") {
+        Err(_) => true,
+        Ok(v) => {
+            let v = v.trim();
+            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+    })
 }
 
 /// Longer pause inserted between re-pushes when the failure looks like
@@ -1572,7 +1632,7 @@ impl UploadManager {
             // the same: the retry channel outranks the fresh-chunk
             // channel).
             let now = tokio::time::Instant::now();
-            while in_flight.len() < MAX_PUSH_CONCURRENCY {
+            while in_flight.len() < max_push_concurrency() {
                 let Some(entry) = retries.pop_due(now) else {
                     break;
                 };
@@ -1590,7 +1650,7 @@ impl UploadManager {
             // in-flight completion, or — if all queues are empty
             // and the splitter is exhausted — break to the finish
             // step.
-            if in_flight.len() < MAX_PUSH_CONCURRENCY {
+            if in_flight.len() < max_push_concurrency() {
                 if let Some(leaf) = leaf_iter.next() {
                     bytes_emitted += leaf.len() as u64;
                     let chunks = splitter.push_leaf(leaf);
@@ -1636,7 +1696,7 @@ impl UploadManager {
                     )?;
                 }
                 () = tokio::time::sleep_until(next_due.unwrap_or(now)),
-                    if next_due.is_some() && in_flight.len() < MAX_PUSH_CONCURRENCY => {
+                    if next_due.is_some() && in_flight.len() < max_push_concurrency() => {
                     // Loop turn re-dispatches the due retry.
                 }
                 _ = live.tick.tick() => {
@@ -1979,7 +2039,7 @@ impl UploadManager {
                 return Ok(());
             }
             let now = tokio::time::Instant::now();
-            while in_flight.len() < MAX_PUSH_CONCURRENCY {
+            while in_flight.len() < max_push_concurrency() {
                 let Some(entry) = retries.pop_due(now) else {
                     break;
                 };
@@ -2004,7 +2064,7 @@ impl UploadManager {
                     )?;
                 }
                 () = tokio::time::sleep_until(next_due.unwrap_or(now)),
-                    if next_due.is_some() && in_flight.len() < MAX_PUSH_CONCURRENCY => {}
+                    if next_due.is_some() && in_flight.len() < max_push_concurrency() => {}
                 _ = live.tick.tick() => {
                     self.heartbeat(handle, requeued, live, &job_id);
                 }
