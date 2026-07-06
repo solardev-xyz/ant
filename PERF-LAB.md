@@ -7,11 +7,15 @@ Every experiment: Hypothesis → Change → Method → Results → Decision
 
 ## STATUS
 
-- **Current experiment**: ROUND 2 — exp 8 (dispatch width × cap,
-  running), exp 7 (full-node advertisement, implementing), exp 9
-  (tree-tail interleave, queued)
-- **Phase**: round 2 benchmarking (user funded batches 3 = mutable
-  d22 and 4 = mutable d23 on 2026-07-06; `--batch 3/4`)
+- **Current experiment**: ROUND 2 CLOSED — exp 8 KEEP (3.6×, width
+  128 default), exp 9 KEEP (patience default ON), exp 7 measured
+  2.5× (flag landed; default flip awaits the user's posture call).
+  Round-2 regression gate green (conformance 15/15 suites, smoke
+  18/18 on the new defaults). End state: 256 MiB ≈ 560 KiB/s ≈ 7×
+  baseline; 512 MiB in 15–17 min.
+- **Phase**: idle — next actions are user decisions (exp 7 default;
+  any round 3). Batches: 1 = 0.69, 2 = 0.844 (stopped), 3 (d22)
+  untouched, 4 (d23) ~2.0 M issued of 8.4 M.
 - **State (2026-07-06 morning)**: overnight backfill brought the 256
   baseline cell to n=4 (median 78.5 effective, 1/4 completing), then
   **batch 2 crossed the 0.8 utilization hard-stop (0.844)** and the
