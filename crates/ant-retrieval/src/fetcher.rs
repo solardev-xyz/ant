@@ -194,6 +194,7 @@ pub struct RoutingFetcher {
     /// across the per-chunk fetcher lifetime. `None` keeps the
     /// legacy per-chunk-only skip behaviour for unit tests.
     push_skip: Option<PushSkipCache>,
+    push_load: Option<std::sync::Arc<crate::PushLoadTracker>>,
     /// Swarm network id used to derive the storer overlay when
     /// verifying a pushsync receipt's signature (see
     /// [`crate::pushsync::push_chunk_to_peer`]). `Some(1)` on mainnet;
@@ -246,6 +247,7 @@ impl RoutingFetcher {
             counters: None,
             pushsync_settlement: None,
             push_skip: None,
+            push_load: None,
             push_network_id: None,
             neighborhood_dial: None,
         }
@@ -283,6 +285,17 @@ impl RoutingFetcher {
     #[must_use]
     pub fn with_push_skip(mut self, cache: PushSkipCache) -> Self {
         self.push_skip = Some(cache);
+        self
+    }
+
+    /// Attach the per-peer pushsync load tracker (perf-lab Experiment
+    /// 2). When set, `next_push_peer` skips peers at their
+    /// latency-aware concurrent-push cap — falling through to the
+    /// unfiltered ranking if EVERY candidate is saturated — and every
+    /// dispatch reports begin/end + latency into the tracker.
+    #[must_use]
+    pub fn with_push_load(mut self, load: std::sync::Arc<crate::PushLoadTracker>) -> Self {
+        self.push_load = Some(load);
         self
     }
 
@@ -552,6 +565,25 @@ impl RoutingFetcher {
             .copied()
             .collect();
         drop(live);
+        // Per-peer in-flight cap (Experiment 2): drop saturated peers
+        // from the ranking so concurrent chunks fan out to lower-PO
+        // peers instead of stacking debt on the same closest storers.
+        // Soft: if EVERY candidate is at cap, fall through unfiltered —
+        // a small peer set must still make progress.
+        if let Some(load) = self.push_load.as_ref() {
+            let unsaturated: Vec<(PeerId, Overlay)> = ranked
+                .iter()
+                .copied()
+                .filter(|(p, _)| !load.at_cap(p))
+                .collect();
+            if unsaturated.is_empty() {
+                if !ranked.is_empty() {
+                    load.note_saturated_fallthrough();
+                }
+            } else {
+                ranked = unsaturated;
+            }
+        }
         ranked.sort_by(|(_, a), (_, b)| {
             for i in 0..32 {
                 let da = a[i] ^ chunk_addr[i];
@@ -720,10 +752,18 @@ impl RoutingFetcher {
                 let wire = wire.clone();
                 let stamp = stamp.clone();
                 let delay_ms: u64 = $delay_ms;
+                // Load-book the dispatch SYNCHRONOUSLY so the very next
+                // `next_push_peer` (for a concurrent chunk) already sees
+                // this peer's in-flight count (Experiment 2).
+                let push_load = self.push_load.clone();
+                if let Some(load) = push_load.as_ref() {
+                    load.begin(peer);
+                }
                 inflight.push(Box::pin(async move {
                     if delay_ms > 0 {
                         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     }
+                    let started = std::time::Instant::now();
                     let r = push_chunk_to_peer_with_timeout(
                         &mut control,
                         peer,
@@ -734,6 +774,9 @@ impl RoutingFetcher {
                         DEFAULT_PUSHSYNC_TIMEOUT,
                     )
                     .await;
+                    if let Some(load) = push_load.as_ref() {
+                        load.end(&peer, started.elapsed());
+                    }
                     (peer, overlay, price, r)
                 }));
             }};
@@ -875,11 +918,37 @@ impl RoutingFetcher {
             );
             return Ok(());
         }
+        // Perf-lab Experiment 9 (straggler patience): a walk that dies
+        // with zero receipts — every candidate connection-killed — is
+        // the hostile-neighbourhood straggler signature. Before
+        // erroring back to the job's retry queue, ask the swarm to
+        // dial deeper toward this chunk and wait (bounded, ≤2.5 s) for
+        // anyone deeper than our current best to connect, so the NEXT
+        // attempt has a fresh storer instead of re-drawing the same
+        // blocklisted trio.
+        if straggler_patience() {
+            let target = self.best_connected_po(&chunk_addr).saturating_add(1);
+            self.dial_and_await_deeper(&chunk_addr, target).await;
+        }
         Err(PushSyncError::Remote(format!(
             "exhausted pushsync peers (last: {})",
             last_err.map_or_else(|| "unknown".to_string(), |e| e.to_string()),
         )))
     }
+}
+
+/// Perf-lab Experiment 9: DEFAULT ON since the verdict (see
+/// `ant-node::uploads::straggler_patience`, which the same env var
+/// gates). `ANT_PUSH_STRAGGLER_PATIENCE=0` opts out. Read once.
+fn straggler_patience() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("ANT_PUSH_STRAGGLER_PATIENCE") {
+        Err(_) => true,
+        Ok(v) => {
+            let v = v.trim();
+            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+    })
 }
 
 /// `true` for the one `PushSyncError` worth a single fast retry on a

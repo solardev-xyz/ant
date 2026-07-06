@@ -842,6 +842,10 @@ struct SwarmState {
     /// times across a multi-chunk upload. See
     /// [`ant_retrieval::PushSkipCache`] for the design rationale.
     push_skip: ant_retrieval::PushSkipCache,
+    /// Per-peer pushsync load tracker (perf-lab Experiment 2). `Some`
+    /// only when `ANT_PUSH_INFLIGHT_CAP` is set — one build serves
+    /// both A/B benchmark arms.
+    push_load: Option<Arc<ant_retrieval::PushLoadTracker>>,
     /// Clone of the shared pseudosettle hot-hint sender, retained so a
     /// runtime [`ControlCommand::EnablePushsyncSwap`] can wire it into
     /// a freshly-built [`crate::PushsyncSwap`] the same way startup
@@ -918,6 +922,7 @@ impl SwarmState {
             pushsync_swap: None,
             credit_ledger: None,
             push_skip: ant_retrieval::PushSkipCache::new(),
+            push_load: ant_retrieval::PushLoadTracker::from_env().map(Arc::new),
             hot_hint: None,
             known_dialable: HashMap::new(),
             neighborhood_dial_tx: None,
@@ -3169,7 +3174,9 @@ fn push_with_stamp(
     }
     let control = control.clone();
     let pushsync_swap = state.pushsync_swap.clone();
+    let accounting = state.accounting.clone();
     let push_skip = state.push_skip.clone();
+    let push_load = state.push_load.clone();
     let disk_cache = state.disk_cache.clone();
     let mem_cache = state.chunk_cache.clone();
     let neighborhood_dial = state.neighborhood_dial_tx.clone();
@@ -3199,11 +3206,23 @@ fn push_with_stamp(
         let mut fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx)
             .with_push_skip(push_skip)
             .with_network_id(network_id);
+        if let Some(load) = push_load {
+            fetcher = fetcher.with_push_load(load);
+        }
         if let Some(tx) = neighborhood_dial {
             fetcher = fetcher.with_neighborhood_dialer(tx);
         }
         if let Some(svc) = pushsync_swap {
             let s: Arc<dyn ant_retrieval::PushsyncSettlement> = svc;
+            fetcher = fetcher.with_pushsync_settlement(s);
+        } else if let Some(acc) =
+            accounting.filter(|_| crate::push_pseudosettle::PushPseudosettle::enabled_by_env())
+        {
+            // Experiment 1: cheque-less push settlement — mirror push
+            // debits into the shared Accounting so the pseudosettle
+            // driver time-settles upload peers (bee-light behaviour).
+            let s: Arc<dyn ant_retrieval::PushsyncSettlement> =
+                Arc::new(crate::push_pseudosettle::PushPseudosettle::new(acc));
             fetcher = fetcher.with_pushsync_settlement(s);
         }
         let reply = match fetcher.push_stamped_chunk(addr, wire, stamp).await {
@@ -3240,7 +3259,9 @@ fn push_soc_with_stamp(
     }
     let control = control.clone();
     let pushsync_swap = state.pushsync_swap.clone();
+    let accounting = state.accounting.clone();
     let push_skip = state.push_skip.clone();
+    let push_load = state.push_load.clone();
     let disk_cache = state.disk_cache.clone();
     let mem_cache = state.chunk_cache.clone();
     let neighborhood_dial = state.neighborhood_dial_tx.clone();
@@ -3294,11 +3315,23 @@ fn push_soc_with_stamp(
         let mut fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx)
             .with_push_skip(push_skip)
             .with_network_id(network_id);
+        if let Some(load) = push_load {
+            fetcher = fetcher.with_push_load(load);
+        }
         if let Some(tx) = neighborhood_dial {
             fetcher = fetcher.with_neighborhood_dialer(tx);
         }
         if let Some(svc) = pushsync_swap {
             let s: Arc<dyn ant_retrieval::PushsyncSettlement> = svc;
+            fetcher = fetcher.with_pushsync_settlement(s);
+        } else if let Some(acc) =
+            accounting.filter(|_| crate::push_pseudosettle::PushPseudosettle::enabled_by_env())
+        {
+            // Experiment 1: cheque-less push settlement — mirror push
+            // debits into the shared Accounting so the pseudosettle
+            // driver time-settles upload peers (bee-light behaviour).
+            let s: Arc<dyn ant_retrieval::PushsyncSettlement> =
+                Arc::new(crate::push_pseudosettle::PushPseudosettle::new(acc));
             fetcher = fetcher.with_pushsync_settlement(s);
         }
         let reply = match fetcher.push_stamped_chunk(address, wire, stamp).await {
