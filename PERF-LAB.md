@@ -140,8 +140,22 @@ wall-clock windows per run in the JSONs.
 |---|---|---|---|---|
 | 1 MiB ×5 | 5/5 ok | 152.3 (35.8–232.7) | 7 (4–29) | 0 |
 | 32 MiB ×5 | 5/5 ok | **489.2 (470.8–534.7)** | 67 (61–70) | 0 |
-| 256 MiB ×1 | **stall-aborted** | 82.4 effective | 3180 | 676 |
+| 256 MiB ×4 | **1/4 ok** (3 stall-aborted) | 78.5 (57.0–86.7) effective | 3350 (3024–4520) | — |
 | 512 MiB ×1 | **terminated at 50.7 %** | 51.2 effective | 5193 | 21 550 |
+
+256-cell census (original 2026-07-05 afternoon + 3 backfill runs
+overnight on batch 2, pre-lab binary): stall-aborted at 82.4 / 57.0 /
+74.5 KiB/s effective; ONE overnight run limped to completion at 86.7
+KiB/s in 50 min — quiet-network conditions occasionally let the
+unsettled-debt mode through, slowly (the fixed code completes the
+same cell at ~150–160 KiB/s median with zero failures to complete).
+**The 512 baseline cell stays n=1**: the fourth 256 backfill run and
+all four 512 backfill runs were refused by the utilization guard —
+batch 2 crossed the 0.8 hard-stop (0.844) mid-backfill, and batch 1
+sits at 0.69. Documenting a known-dead failure mode five times was
+judged not worth a third funded batch; the mode is triple-evidenced
+(256 cell n=4, the 512 n=1 forensics, and the goal-era production
+post-mortems in PLAN.md phase 7b).
 
 **256 MiB**: decay 459 → 79 KiB/s over 18 min, then tail FROZEN 34 min
 at 65 833/66 054 chunks (bytes 100 %; the 221 post-data tree/manifest
