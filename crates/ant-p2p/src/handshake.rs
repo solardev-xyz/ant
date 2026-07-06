@@ -269,10 +269,34 @@ where
         network_id,
         remote_peer_addrs,
         local_listen_addrs,
-        false,
+        advertise_full_node_from_env(),
         version,
     )
     .await
+}
+
+/// Perf-lab Experiment 7: `ANT_ADVERTISE_FULL_NODE=1` makes every
+/// outbound BZZ handshake advertise `full_node = true`. Default stays
+/// `false` (honest light-node advertisement).
+///
+/// Why this is worth testing (hoverfly's measured trade-off, their
+/// PERFORMANCE.md "What hoverfly is"): bee grants a *full* peer a 10×
+/// wider per-peer accounting budget (4.5 M vs 450 K PLUR/s refresh,
+/// 13.5 M vs 1.35 M payment threshold) — and the measured ceiling on
+/// ant's upload plateau is exactly the light refresh budget. The cost
+/// side: full peers do NOT bypass bee's kademlia bin-saturation gate
+/// (`Kad.Pick` short-circuits only for lights), so accepted-connection
+/// counts may drop; and it advertises a role we don't fully serve
+/// (no reserve, no pullsync — inbound protocol requests get honest
+/// `UnsupportedProtocol`). Read once per process.
+fn advertise_full_node_from_env() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("ANT_ADVERTISE_FULL_NODE").is_ok_and(|v| {
+            let v = v.trim();
+            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+        })
+    })
 }
 
 /// Like [`handshake_outbound`] but lets the caller pick the
