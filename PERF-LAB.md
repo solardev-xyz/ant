@@ -8,22 +8,24 @@ Every experiment: Hypothesis → Change → Method → Results → Decision
 ## STATUS
 
 - **Current experiment**: none — all six closed (see Final summary)
-- **Phase**: close-out; overnight baseline backfill running
-- **Next action**: when `perf/run-baseline-backfill.sh` finishes
-  (4×256 + 4×512 pre-lab-binary baseline runs on batch 2, ~10 h,
-  each expected to stall-abort like the originals — this completes
-  DoD #1's ≥5-runs-per-cell for the big cells), transcribe the
-  medians+spread into the Baselines table (`summarize.py --label
-  baseline256bf` / `baseline512bf`), commit results, refresh the PR
-  table. Everything else is DONE: smoke 18/18 (2026-07-05 22:0xZ,
-  batch 2, defaults-on binary), conformance + differential green,
-  bee-js 32/32, full CI gate green, 512×3 proof complete.
-  Open follow-ups for future rounds: tree-tail interleaving in the
-  job manager; full-node advertisement A/B (hoverfly's 10× refresh
-  budget); SWAP-cheque regime (needs spending decisions).
-- **Batches**: batch 1 (immutable) 0.69 — small cells only; batch 2
-  (mutable) ~580 K issued. Both issuer .bins in
-  `perf/state/postage/` (PRECIOUS).
+- **Phase**: CAMPAIGN CLOSED (pending only user decisions)
+- **State (2026-07-06 morning)**: overnight backfill brought the 256
+  baseline cell to n=4 (median 78.5 effective, 1/4 completing), then
+  **batch 2 crossed the 0.8 utilization hard-stop (0.844)** and the
+  guard refused all remaining runs — the goal's stop-condition now
+  gates ANY further big upload. Batch 1 is at 0.69. No uploads may
+  run without a user decision (third batch / dilute / accept the
+  documented n=1 512-baseline cell). Everything else in the
+  Definition of Done is complete: 512×3 completion proof, six closed
+  verdicts, feeds fixed, full gate green (smoke 18/18, bee-js 32/32,
+  differential clean), PR #25 current.
+- **Open follow-ups for future rounds**: tree-tail interleaving in
+  the job manager; full-node advertisement A/B (hoverfly's 10×
+  refresh budget); SWAP-cheque regime (spending decision);
+  same-peer-retry classification for dead connections.
+- **Batches**: batch 1 (immutable `1decad4e…`) 0.69; batch 2 (mutable
+  `7fb5cb0b…`) 0.844 — STOPPED. Issuer .bins in `perf/state/postage/`
+  (PRECIOUS).
 - **Binaries**: `target/release/antd` = HEAD, kept experiments
   default ON. Snapshots in `perf/state/`: `antd-baseline-bin`
   (pre-experiment), `antd-exp12-bin` (proof binary), `bee-bin`.
