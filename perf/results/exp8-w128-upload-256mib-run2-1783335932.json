@@ -1,0 +1,586 @@
+{
+  "antd_bin": "/home/florian/claude/ant/crates/ant-conformance/../../target/release/antd",
+  "bytes_pushed": 268435456,
+  "chunks_pushed": 66056,
+  "chunks_requeued": 0,
+  "chunks_total": 66054,
+  "content_seed": 15845689176459103060,
+  "duration_secs": 469.610368598,
+  "ended_utc": "2026-07-06T11:05:32Z",
+  "git_commit": "2fa257f",
+  "job_reported_secs": 469,
+  "label": "exp8-w128",
+  "last_error": null,
+  "log_histogram": {
+    "exhausted_events": 0,
+    "no_peer_events": 0,
+    "overdraft_mentions": 0,
+    "push_hard_failures": 15075,
+    "push_timeouts": 0,
+    "same_peer_retries": 13647,
+    "shallow_accepted": 0,
+    "shallow_receipts": 3186
+  },
+  "max_bucket_fill_after": 17,
+  "max_bucket_fill_before": 14,
+  "outcome": "completed",
+  "peer_warmup_secs": 0.000646251,
+  "peers_at_end": 174,
+  "peers_at_start": 99,
+  "peers_min": 30,
+  "progress_curve": [
+    {
+      "bytes_pushed": 106496,
+      "chunks_pushed": 26,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 7.559266433
+    },
+    {
+      "bytes_pushed": 3452928,
+      "chunks_pushed": 843,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 15.269555683
+    },
+    {
+      "bytes_pushed": 7499776,
+      "chunks_pushed": 1831,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 21.796524724
+    },
+    {
+      "bytes_pushed": 13934592,
+      "chunks_pushed": 3402,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 28.925885397000002
+    },
+    {
+      "bytes_pushed": 18673664,
+      "chunks_pushed": 4559,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 35.078474834
+    },
+    {
+      "bytes_pushed": 24223744,
+      "chunks_pushed": 5914,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 42.782644233
+    },
+    {
+      "bytes_pushed": 26501120,
+      "chunks_pushed": 6470,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 49.18150805
+    },
+    {
+      "bytes_pushed": 31956992,
+      "chunks_pushed": 7802,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 57.628238945
+    },
+    {
+      "bytes_pushed": 35454976,
+      "chunks_pushed": 8656,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 63.090917223
+    },
+    {
+      "bytes_pushed": 37347328,
+      "chunks_pushed": 9118,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 68.825915913
+    },
+    {
+      "bytes_pushed": 42938368,
+      "chunks_pushed": 10483,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 75.672188501
+    },
+    {
+      "bytes_pushed": 45445120,
+      "chunks_pushed": 11095,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 82.766303659
+    },
+    {
+      "bytes_pushed": 55508992,
+      "chunks_pushed": 13552,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 98.730599742
+    },
+    {
+      "bytes_pushed": 56844288,
+      "chunks_pushed": 13878,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 104.726758272
+    },
+    {
+      "bytes_pushed": 62521344,
+      "chunks_pushed": 15264,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 110.431139677
+    },
+    {
+      "bytes_pushed": 66342912,
+      "chunks_pushed": 16197,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 116.284984871
+    },
+    {
+      "bytes_pushed": 68603904,
+      "chunks_pushed": 16749,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 121.843070569
+    },
+    {
+      "bytes_pushed": 73936896,
+      "chunks_pushed": 18051,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 129.150992463
+    },
+    {
+      "bytes_pushed": 79118336,
+      "chunks_pushed": 19316,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 138.358121577
+    },
+    {
+      "bytes_pushed": 81653760,
+      "chunks_pushed": 19935,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 143.969203931
+    },
+    {
+      "bytes_pushed": 86523904,
+      "chunks_pushed": 21124,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 149.68919663
+    },
+    {
+      "bytes_pushed": 90562560,
+      "chunks_pushed": 22110,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 159.212644812
+    },
+    {
+      "bytes_pushed": 93691904,
+      "chunks_pushed": 22874,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 164.478603526
+    },
+    {
+      "bytes_pushed": 104296448,
+      "chunks_pushed": 25463,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 182.132442256
+    },
+    {
+      "bytes_pushed": 108400640,
+      "chunks_pushed": 26465,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 188.973390434
+    },
+    {
+      "bytes_pushed": 113070080,
+      "chunks_pushed": 27605,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 194.404774138
+    },
+    {
+      "bytes_pushed": 117362688,
+      "chunks_pushed": 28653,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 200.159542409
+    },
+    {
+      "bytes_pushed": 120184832,
+      "chunks_pushed": 29342,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 206.480671677
+    },
+    {
+      "bytes_pushed": 124170240,
+      "chunks_pushed": 30315,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 212.540657675
+    },
+    {
+      "bytes_pushed": 128217088,
+      "chunks_pushed": 31303,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 221.264916882
+    },
+    {
+      "bytes_pushed": 132136960,
+      "chunks_pushed": 32260,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 228.122505673
+    },
+    {
+      "bytes_pushed": 133881856,
+      "chunks_pushed": 32686,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 233.524699023
+    },
+    {
+      "bytes_pushed": 139730944,
+      "chunks_pushed": 34114,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 241.067806064
+    },
+    {
+      "bytes_pushed": 151617536,
+      "chunks_pushed": 37016,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 258.102604082
+    },
+    {
+      "bytes_pushed": 156004352,
+      "chunks_pushed": 38087,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 265.811965032
+    },
+    {
+      "bytes_pushed": 158175232,
+      "chunks_pushed": 38617,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 271.060858975
+    },
+    {
+      "bytes_pushed": 159145984,
+      "chunks_pushed": 38854,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 276.407356269
+    },
+    {
+      "bytes_pushed": 164642816,
+      "chunks_pushed": 40196,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 283.233073615
+    },
+    {
+      "bytes_pushed": 168214528,
+      "chunks_pushed": 41068,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 289.497001367
+    },
+    {
+      "bytes_pushed": 173522944,
+      "chunks_pushed": 42364,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 298.581187276
+    },
+    {
+      "bytes_pushed": 177418240,
+      "chunks_pushed": 43315,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 304.747324316
+    },
+    {
+      "bytes_pushed": 180948992,
+      "chunks_pushed": 44177,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 310.204850693
+    },
+    {
+      "bytes_pushed": 184733696,
+      "chunks_pushed": 45101,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 317.142237083
+    },
+    {
+      "bytes_pushed": 189095936,
+      "chunks_pushed": 46166,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 325.08316202
+    },
+    {
+      "bytes_pushed": 189681664,
+      "chunks_pushed": 46309,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 330.924504491
+    },
+    {
+      "bytes_pushed": 197173248,
+      "chunks_pushed": 48138,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 338.259221298
+    },
+    {
+      "bytes_pushed": 200355840,
+      "chunks_pushed": 48915,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 343.834206438
+    },
+    {
+      "bytes_pushed": 204058624,
+      "chunks_pushed": 49819,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 349.993128256
+    },
+    {
+      "bytes_pushed": 206303232,
+      "chunks_pushed": 50367,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 355.039442626
+    },
+    {
+      "bytes_pushed": 209731584,
+      "chunks_pushed": 51204,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 363.04212759
+    },
+    {
+      "bytes_pushed": 213307392,
+      "chunks_pushed": 52077,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 369.869196917
+    },
+    {
+      "bytes_pushed": 216702976,
+      "chunks_pushed": 52906,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 376.31769042
+    },
+    {
+      "bytes_pushed": 221249536,
+      "chunks_pushed": 54016,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 381.529944608
+    },
+    {
+      "bytes_pushed": 224382976,
+      "chunks_pushed": 54781,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 387.026598
+    },
+    {
+      "bytes_pushed": 227811328,
+      "chunks_pushed": 55618,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 392.25794729
+    },
+    {
+      "bytes_pushed": 231575552,
+      "chunks_pushed": 56537,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 399.991355123
+    },
+    {
+      "bytes_pushed": 231575552,
+      "chunks_pushed": 56537,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 405.896245161
+    },
+    {
+      "bytes_pushed": 239099904,
+      "chunks_pushed": 58374,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 412.21620367
+    },
+    {
+      "bytes_pushed": 241750016,
+      "chunks_pushed": 59021,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 417.267029519
+    },
+    {
+      "bytes_pushed": 243920896,
+      "chunks_pushed": 59551,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 423.511353368
+    },
+    {
+      "bytes_pushed": 249733120,
+      "chunks_pushed": 60970,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 430.361605767
+    },
+    {
+      "bytes_pushed": 253018112,
+      "chunks_pushed": 61772,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 437.019062565
+    },
+    {
+      "bytes_pushed": 254996480,
+      "chunks_pushed": 62255,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 442.075780225
+    },
+    {
+      "bytes_pushed": 258195456,
+      "chunks_pushed": 63036,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 447.69512825
+    },
+    {
+      "bytes_pushed": 263798784,
+      "chunks_pushed": 64404,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 454.134073721
+    },
+    {
+      "bytes_pushed": 265146368,
+      "chunks_pushed": 64733,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 459.60685247
+    },
+    {
+      "bytes_pushed": 268435456,
+      "chunks_pushed": 65537,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "running",
+      "t_secs": 464.608582203
+    },
+    {
+      "bytes_pushed": 268435456,
+      "chunks_pushed": 66056,
+      "chunks_requeued": 0,
+      "stalled": false,
+      "status": "completed",
+      "t_secs": 469.610364728
+    }
+  ],
+  "reference": "0xeff8cb562df0365c0043417365a7737ecaaf7c8b44f025252fd28583130720f1",
+  "run": 2,
+  "size_mib": 256,
+  "started_utc": "2026-07-06T10:57:35Z",
+  "suite": "upload",
+  "throughput_kib_s": 558.2159541805237,
+  "utilization_ratio_after": 0.1328125,
+  "utilization_ratio_before": 0.109375,
+  "worst_case_remaining_after": 7274496
+}

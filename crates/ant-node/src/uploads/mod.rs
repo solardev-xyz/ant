@@ -108,13 +108,21 @@ const MAX_PUSH_CONCURRENCY: usize = 32;
 /// was measured WITHOUT a per-peer cap, so the pair must be re-tested
 /// together; see PERF-LAB.md). Read once per process.
 fn max_push_concurrency() -> usize {
+    /// Perf-lab exp 8 verdict (2026-07-06): with the per-peer
+    /// in-flight cap spreading load, width 128 measured 3.6× width 32
+    /// at 256 MiB (565/558 vs 157/154 KiB/s, interleaved pairs) with
+    /// 4× fewer failed attempts — the run finishes before per-peer
+    /// debt scars accumulate. The 2026-05 "256 collapses" finding
+    /// predates the cap; the historical 32 remains as
+    /// [`MAX_PUSH_CONCURRENCY`] for the bounded heal path.
+    const DEFAULT_PUSH_WIDTH: usize = 128;
     static WIDTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *WIDTH.get_or_init(|| {
         std::env::var("ANT_PUSH_CONCURRENCY")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|&n| n > 0)
-            .unwrap_or(MAX_PUSH_CONCURRENCY)
+            .unwrap_or(DEFAULT_PUSH_WIDTH)
     })
 }
 

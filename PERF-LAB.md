@@ -534,6 +534,27 @@ Batch 1 (immutable `1decad4e…`): utilization 0.69 — small-cell A/Bs
 only from here. Batch 2 (mutable `7fb5cb0b…`): ~580 K chunks issued
 (3× 512 proofs + 2× 256) — plenty of headroom for future rounds.
 
+### Experiment 8 (round 2): dispatch width × per-peer cap — **KEEP → default width 128**
+
+- **Hypothesis**: the 2026-05 "width 256 collapses" finding predates
+  the per-peer cap; hoverfly's data says pool/width and cap scale
+  *together*. With cap 4 spreading load, width 32 under-uses the
+  ~60–100-peer pool (≤ 32 of up to ~400 safe concurrent slots).
+- **Method**: 256 MiB ×2 interleaved pairs on batch 4 (window
+  09:53–11:05Z, defaults arm vs `ANT_PUSH_CONCURRENCY=128`).
+- **Results**:
+  | arm | runs | effective KiB/s | duration | hard failures | requeues |
+  |---|---|---|---|---|---|
+  | w32 (old default) | 2/2 ok | 157 / 154 | 27.8 / 28.4 min | 77 117 | 152 |
+  | **w128** | 2/2 ok | **565 / 558** | **7.7 / 7.8 min** | 17 402 | 0 |
+- **Decision**: **KEEP — 3.6×**, default flipped to 128
+  (`ANT_PUSH_CONCURRENCY` still overrides). Fewer failures and zero
+  requeues at the higher width: the run completes before per-peer
+  debt/blocklist scars can form, which also collapses the tail-grind
+  problem. New end-state at 256 MiB: **~560 KiB/s effective = 7.2×
+  the n=4 baseline median** — DoD #4's original ≥2× branch is now
+  met outright, retroactively.
+
 ## Experiment queue
 
 1. Slow-storer resilience cluster (the 512 MiB stall fix)
