@@ -400,6 +400,25 @@ async fn main() -> Result<()> {
         .clone()
         .map_or_else(|| data_dir.join("antd.sock"), |p| expand_tilde(&p));
 
+    // Bind the control socket NOW, before anything else spawns: a bad
+    // path (deep data dirs exceed `sun_path`'s ~104-byte limit) must
+    // surface here — with a temp-dir fallback and, failing that, a
+    // warning — never as a fatal error seconds after the node started
+    // serving (issue #39). The accept loop is spawned after the node
+    // task below; connections made in between just wait in the backlog.
+    #[cfg(unix)]
+    let control_bound = if opt.no_control_socket {
+        None
+    } else {
+        bind_control_socket(&control_socket, &data_dir)
+    };
+    #[cfg(unix)]
+    let control_socket_display = control_bound
+        .as_ref()
+        .map_or_else(String::new, |b| b.socket_path().display().to_string());
+    #[cfg(not(unix))]
+    let control_socket_display = String::new();
+
     let started_at_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -420,7 +439,9 @@ async fn main() -> Result<()> {
         },
         listeners: Vec::new(),
         external_addresses: Vec::new(),
-        control_socket: control_socket.display().to_string(),
+        // The path the socket actually bound to (fallback-aware), not
+        // the intended one; empty when disabled or bind failed.
+        control_socket: control_socket_display,
         retrieval: RetrievalInfo::default(),
         // Chain init hasn't run yet; the swarm loop republishes the
         // real value as soon as it starts, and flips it to `true` when
@@ -633,29 +654,58 @@ async fn main() -> Result<()> {
             .with_late_chain(Some(late_chain_rx)),
     ));
 
-    // Serve the control socket immediately — it only needs the status
-    // watch and the command channel, and the swarm is already running.
-    // Waiting for chain init here (as the gateway must) made the whole
-    // warm bootstrap (0→100 peers in ~3 s) invisible to `antop`, which
-    // can only observe from the moment the socket exists. During the
-    // chain-init window, upload-affecting commands answer "not
-    // configured"; clients poll `StatusSnapshot::chain_ready` — not the
-    // socket's existence — for readiness.
+    // Serve the already-bound control socket immediately — it only
+    // needs the status watch and the command channel, and the swarm is
+    // already running. Waiting for chain init here (as the gateway
+    // must) made the whole warm bootstrap (0→100 peers in ~3 s)
+    // invisible to `antop`, which can only observe from the moment the
+    // socket answers. During the chain-init window, upload-affecting
+    // commands answer "not configured"; clients poll
+    // `StatusSnapshot::chain_ready` — not the socket's existence — for
+    // readiness.
     #[cfg(unix)]
-    let control_task = if opt.no_control_socket {
+    let control_task = control_bound.map(|bound| {
+        tokio::spawn(bound.serve(AGENT.to_string(), status_rx.clone(), Some(cmd_tx.clone())))
+    });
+
+    // Bind the public HTTP API immediately as well (issue #38): every
+    // snapshot-driven endpoint (`/health`, `/peers`, `/topology`,
+    // retrieval) works from t≈0, so API consumers (Freedom polls
+    // `/peers` every 500 ms) can watch the peer ramp instead of getting
+    // connection-refused for the whole chain-init window — which is
+    // unbounded against a slow RPC and was tripping Freedom's 60 s
+    // health deadline. Chain-derived wiring arrives via
+    // `gateway_chain_state` after chain init below; until then the
+    // affected endpoints answer a retryable `503` and
+    // `/health.chainReady` reports the progress.
+    let gateway_chain_state: Arc<std::sync::OnceLock<ant_gateway::GatewayChainState>> =
+        Arc::new(std::sync::OnceLock::new());
+    let api_addr = opt.api_addr;
+    let gateway_task = if opt.no_http_api {
         None
     } else {
-        tracing::info!(
-            target: "antd",
-            "control socket at {}",
-            control_socket.display(),
-        );
-        Some(tokio::spawn(ant_control::serve(
-            control_socket.clone(),
-            AGENT.to_string(),
-            status_rx.clone(),
-            Some(cmd_tx.clone()),
-        )))
+        let handle = GatewayHandle {
+            agent: Arc::new(AGENT.to_string()),
+            api_version: Arc::new(BEE_API_VERSION.to_string()),
+            identity: Arc::new(GatewayIdentity {
+                overlay_hex: hex::encode(overlay),
+                ethereum_hex: format!("0x{}", hex::encode(eth)),
+                public_key_hex: hex::encode(&public_key_compressed),
+                peer_id: peer_id.to_string(),
+            }),
+            status: status_rx.clone(),
+            commands: cmd_tx.clone(),
+            activity: gateway_activity.clone(),
+            chain_state: gateway_chain_state.clone(),
+            tags: Arc::new(TagRegistry::new()),
+            cors: Arc::new(ant_gateway::CorsConfig::new(
+                opt.cors_allowed_origins.iter(),
+            )),
+            // ACT publisher identity = the node's swarm key, exactly
+            // bee's `accesscontrol.NewDefaultSession(swarmPrivateKey)`.
+            act_secret: Arc::new(signing_secret),
+        };
+        Some(tokio::spawn(Gateway::serve(handle, api_addr)))
     };
 
     let upload = build_upload_runtime(
@@ -753,44 +803,27 @@ async fn main() -> Result<()> {
         )
     };
 
-    let gateway_handle = if opt.no_http_api {
-        None
-    } else {
-        Some(GatewayHandle {
-            agent: Arc::new(AGENT.to_string()),
-            api_version: Arc::new(BEE_API_VERSION.to_string()),
-            identity: Arc::new(GatewayIdentity {
-                overlay_hex: hex::encode(overlay),
-                ethereum_hex: format!("0x{}", hex::encode(eth)),
-                public_key_hex: hex::encode(&public_key_compressed),
-                peer_id: peer_id.to_string(),
-            }),
-            status: status_rx.clone(),
-            commands: cmd_tx.clone(),
-            activity: gateway_activity.clone(),
-            light_mode,
-            tags: Arc::new(TagRegistry::new()),
-            cors: Arc::new(ant_gateway::CorsConfig::new(
-                opt.cors_allowed_origins.iter(),
-            )),
-            chain: chain_ctx,
-            // ACT publisher identity = the node's swarm key, exactly
-            // bee's `accesscontrol.NewDefaultSession(swarmPrivateKey)`.
-            act_secret: Arc::new(signing_secret),
-        })
-    };
+    // Install the chain-derived wiring into the already-serving
+    // gateway: `/node`, `/wallet`, `/chequebook/*`, `/stamps` writes
+    // stop answering the chain-initializing `503` from here on, and
+    // `/health.chainReady` flips to `true`. `set` only fails if the
+    // slot were already filled, which nothing else does.
+    let _ = gateway_chain_state.set(ant_gateway::GatewayChainState {
+        light_mode,
+        chain: chain_ctx,
+    });
 
-    if opt.no_control_socket && gateway_handle.is_none() {
+    if opt.no_control_socket && opt.no_http_api {
         drop(cmd_tx);
         return join_node_task(node_task.await);
     }
 
-    let api_addr = opt.api_addr;
     let gateway_fut = async move {
-        match gateway_handle {
-            Some(handle) => Gateway::serve(handle, api_addr)
-                .await
-                .map_err(|e| anyhow::anyhow!("gateway: {e}")),
+        match gateway_task {
+            Some(task) => match task.await {
+                Ok(res) => res.map_err(|e| anyhow::anyhow!("gateway: {e}")),
+                Err(e) => Err(anyhow::anyhow!("gateway task: {e}")),
+            },
             None => std::future::pending::<Result<()>>().await,
         }
     };
@@ -798,9 +831,11 @@ async fn main() -> Result<()> {
     // The `antctl`/`antop` control socket is a Unix domain socket; it
     // only exists on Unix targets. On Windows antd runs the node loop +
     // HTTP gateway and operators drive it through the bee-shaped HTTP
-    // API instead. `--no-control-socket` forces that same path on Unix.
+    // API instead. `--no-control-socket` forces that same path on Unix,
+    // and so does a failed bind (issue #39): the daemon then runs on
+    // the node loop + HTTP API alone instead of exiting.
     #[cfg(unix)]
-    let serve_control = !opt.no_control_socket;
+    let serve_control = control_task.is_some();
     #[cfg(not(unix))]
     let serve_control = false;
 
@@ -833,6 +868,85 @@ async fn main() -> Result<()> {
     }
     #[cfg(not(unix))]
     unreachable!("serve_control is always false on non-unix targets")
+}
+
+/// Bind the control socket at its intended path, falling back to a
+/// short per-data-dir path in the system temp dir when that fails
+/// (deep data dirs — Electron `userData`, containers, CI workspaces —
+/// routinely exceed `sun_path`'s ~104-byte limit; issue #39). On
+/// fallback, a [`ant_control::SOCKET_POINTER_FILE`] in the data dir
+/// tells `antctl`/`antop` where the socket really is. Returns `None`
+/// (daemon runs without a control socket, WARN logged) only when both
+/// binds fail — never aborts the daemon.
+#[cfg(unix)]
+fn bind_control_socket(
+    intended: &Path,
+    data_dir: &Path,
+) -> Option<ant_control::BoundControlSocket> {
+    let pointer = data_dir.join(ant_control::SOCKET_POINTER_FILE);
+    match ant_control::bind(intended.to_path_buf()) {
+        Ok(bound) => {
+            // A pointer left over from an earlier fallback run would
+            // send clients to a dead socket now that the intended path
+            // works.
+            let _ = std::fs::remove_file(&pointer);
+            tracing::info!(
+                target: "antd",
+                "control socket at {}",
+                bound.socket_path().display(),
+            );
+            Some(bound)
+        }
+        Err(primary) => {
+            let fallback = fallback_control_socket_path(data_dir);
+            match ant_control::bind(fallback.clone()) {
+                Ok(bound) => {
+                    tracing::warn!(
+                        target: "antd",
+                        "control socket cannot bind at {} ({primary}); using fallback {} \
+                         (pointer file at {})",
+                        intended.display(),
+                        fallback.display(),
+                        pointer.display(),
+                    );
+                    if let Err(e) = std::fs::write(&pointer, format!("{}\n", fallback.display())) {
+                        tracing::warn!(
+                            target: "antd",
+                            "cannot write socket pointer file {}: {e}; pass --socket {} \
+                             to antctl/antop explicitly",
+                            pointer.display(),
+                            fallback.display(),
+                        );
+                    }
+                    Some(bound)
+                }
+                Err(secondary) => {
+                    tracing::warn!(
+                        target: "antd",
+                        "control socket disabled: bind failed at {} ({primary}) and at \
+                         fallback {} ({secondary}); antctl/antop will be unavailable, \
+                         the node and HTTP API are unaffected",
+                        intended.display(),
+                        fallback.display(),
+                    );
+                    let _ = std::fs::remove_file(&pointer);
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// Short, deterministic-per-run fallback socket path in the system
+/// temp dir: `antd-<hash-of-data-dir>.sock` stays under `sun_path`
+/// limits on every platform we ship. Clients don't need to recompute
+/// the hash — the pointer file carries the actual path.
+#[cfg(unix)]
+fn fallback_control_socket_path(data_dir: &Path) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    data_dir.hash(&mut h);
+    std::env::temp_dir().join(format!("antd-{:016x}.sock", h.finish()))
 }
 
 /// Flatten the spawned node loop's `JoinHandle` outcome into the

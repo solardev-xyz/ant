@@ -15,7 +15,9 @@
 
 use crate::{clear_out_err, write_out_err, AntHandle};
 use ant_control::GatewayActivity;
-use ant_gateway::{CorsConfig, Gateway, GatewayHandle, GatewayIdentity, TagRegistry};
+use ant_gateway::{
+    CorsConfig, Gateway, GatewayChainState, GatewayHandle, GatewayIdentity, TagRegistry,
+};
 use k256::ecdsa::SigningKey;
 use std::ffi::{c_char, CStr};
 use std::net::SocketAddr;
@@ -223,20 +225,26 @@ pub unsafe extern "C" fn ant_start_gateway(
             // Standalone activity registry: the gateway is the only
             // writer on iOS (no `antop` Retrieval tab consuming it).
             activity: GatewayActivity::new(),
-            light_mode,
             tags: Arc::new(TagRegistry::new()),
             // Freedom's dweb pages fetch/upload from an opaque (`null`)
             // origin, so the gateway must echo `null` in CORS — matches
             // bee started with `--cors-allowed-origins=null`.
             cors: Arc::new(CorsConfig::new(["null"])),
-            // On-chain reader/writer when built with `chain` and a
-            // Gnosis RPC was supplied (see `chain` above); otherwise
-            // `None`, so `/wallet` + `/chequebook` report bee zero-stubs
-            // and chain-state endpoints fall to 501.
-            #[cfg(feature = "chain")]
-            chain,
-            #[cfg(not(feature = "chain"))]
-            chain: None,
+            // The FFI path resolves its chain wiring before starting
+            // the gateway, so the slot is preset — no chain-init 503
+            // window here. On-chain reader/writer when built with the
+            // `chain` feature and a Gnosis RPC was supplied (see
+            // `chain` above); otherwise `None`, so `/wallet` +
+            // `/chequebook` report bee zero-stubs and chain-state
+            // endpoints fall to 501.
+            chain_state: GatewayChainState {
+                light_mode,
+                #[cfg(feature = "chain")]
+                chain,
+                #[cfg(not(feature = "chain"))]
+                chain: None,
+            }
+            .preset(),
             // ACT publisher identity: the node signing key, like bee's
             // accesscontrol session over the swarm key.
             act_secret: Arc::new(handle.signing_secret),

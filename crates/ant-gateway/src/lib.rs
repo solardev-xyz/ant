@@ -65,7 +65,7 @@ pub use chain::{BatchMetaView, ChainContext, ChainReader, ChainWriter};
 #[cfg(feature = "http-api")]
 pub use cors::CorsConfig;
 #[cfg(feature = "http-api")]
-pub use handle::{GatewayHandle, GatewayIdentity};
+pub use handle::{GatewayChainState, GatewayHandle, GatewayIdentity};
 #[cfg(feature = "http-api")]
 pub use tags::TagRegistry;
 

@@ -33,7 +33,9 @@ use ant_control::{
     RetrievalInfo, RoutingInfo, StatusSnapshot, StreamRange, PROTOCOL_VERSION,
 };
 use ant_gateway::testkit::build_router;
-use ant_gateway::{ChainContext, CorsConfig, GatewayHandle, GatewayIdentity, TagRegistry};
+use ant_gateway::{
+    ChainContext, CorsConfig, GatewayChainState, GatewayHandle, GatewayIdentity, TagRegistry,
+};
 use ant_retrieval::{
     join_to_sender_range, join_with_options, list_manifest, lookup_path, ByteRange, ChunkFetcher,
     JoinOptions, DEFAULT_MAX_FILE_BYTES,
@@ -200,10 +202,13 @@ pub fn status_only_router(snapshot: StatusSnapshot) -> Router {
         status: status_rx,
         commands: cmd_tx,
         activity: GatewayActivity::new(),
-        light_mode: false,
         tags: Arc::new(TagRegistry::new()),
         cors: Arc::new(CorsConfig::default()),
-        chain: None,
+        chain_state: GatewayChainState {
+            light_mode: false,
+            chain: None,
+        }
+        .preset(),
         act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
     };
     build_router(handle)
@@ -240,10 +245,13 @@ pub fn status_router_with_chain(
         status: status_rx,
         commands: cmd_tx,
         activity: GatewayActivity::new(),
-        light_mode: true,
         tags: Arc::new(TagRegistry::new()),
         cors: Arc::new(CorsConfig::default()),
-        chain: Some(chain),
+        chain_state: GatewayChainState {
+            light_mode: true,
+            chain: Some(chain),
+        }
+        .preset(),
         act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
     };
     build_router(handle)
@@ -263,10 +271,13 @@ pub fn status_router_with_cors(snapshot: StatusSnapshot, cors: CorsConfig) -> Ro
         status: status_rx,
         commands: cmd_tx,
         activity: GatewayActivity::new(),
-        light_mode: false,
         tags: Arc::new(TagRegistry::new()),
         cors: Arc::new(cors),
-        chain: None,
+        chain_state: GatewayChainState {
+            light_mode: false,
+            chain: None,
+        }
+        .preset(),
         act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
     };
     build_router(handle)
@@ -301,10 +312,13 @@ pub fn handle_with_fixture_node() -> Router {
         status: status_rx,
         commands: cmd_tx,
         activity: GatewayActivity::new(),
-        light_mode: true,
         tags: Arc::new(TagRegistry::new()),
         cors: Arc::new(CorsConfig::default()),
-        chain: None,
+        chain_state: GatewayChainState {
+            light_mode: true,
+            chain: None,
+        }
+        .preset(),
         act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
     };
     build_router(handle)
@@ -931,10 +945,13 @@ where
         status: status_rx,
         commands: cmd_tx,
         activity: GatewayActivity::new(),
-        light_mode: true,
         tags: Arc::new(TagRegistry::new()),
         cors: Arc::new(CorsConfig::default()),
-        chain: None,
+        chain_state: GatewayChainState {
+            light_mode: true,
+            chain: None,
+        }
+        .preset(),
         act_secret: std::sync::Arc::new(TEST_ACT_SECRET),
     };
     build_router(handle)

@@ -168,7 +168,10 @@ struct WalletBody {
 /// `walletAddress` + `chequebookContractAddress` so bee-js's
 /// `getWalletBalance()` parser is satisfied (issue #5).
 pub async fn wallet(State(handle): State<GatewayHandle>) -> Response {
-    let Some(chain) = handle.chain.clone() else {
+    let Some(chain) = handle.chain() else {
+        if handle.chain_state().is_none() {
+            return crate::error::chain_initializing();
+        }
         return Json(WalletBody {
             bzz_balance: "0".into(),
             native_token_balance: "0".into(),
@@ -209,14 +212,16 @@ struct ChequebookAddressBody {
 /// all-zero sentinel when none is configured (bee's "no chequebook"
 /// signal — Freedom keys "publish ready" off a non-zero value).
 pub async fn chequebook_address(State(handle): State<GatewayHandle>) -> Response {
-    let addr = handle
-        .chain
-        .as_ref()
-        .and_then(|c| c.chequebook)
-        .map_or_else(
-            || ZERO_ADDRESS.to_string(),
-            |a| format!("0x{}", hex::encode(a)),
-        );
+    // Freedom keys "publish ready" off a non-zero value, so during
+    // chain init a premature zero would read as "no chequebook";
+    // answer the retryable 503 instead.
+    if handle.chain_state().is_none() {
+        return crate::error::chain_initializing();
+    }
+    let addr = handle.chain().and_then(|c| c.chequebook).map_or_else(
+        || ZERO_ADDRESS.to_string(),
+        |a| format!("0x{}", hex::encode(a)),
+    );
     Json(ChequebookAddressBody {
         chequebook_address: addr,
     })
@@ -244,7 +249,10 @@ pub async fn chequebook_balance(State(handle): State<GatewayHandle>) -> Response
         })
         .into_response()
     };
-    let Some(chain) = handle.chain.clone() else {
+    let Some(chain) = handle.chain() else {
+        if handle.chain_state().is_none() {
+            return crate::error::chain_initializing();
+        }
         return zero();
     };
     let Some(cb) = chain.chequebook else {
@@ -296,7 +304,10 @@ struct StatusBody {
 /// node) so bee-js's `Status` parser sees every field it expects
 /// (PLAN.md A2). Falls to `501` when no chain is configured.
 pub async fn status(State(handle): State<GatewayHandle>) -> Response {
-    let Some(chain) = handle.chain.clone() else {
+    let Some(chain) = handle.chain() else {
+        if handle.chain_state().is_none() {
+            return crate::error::chain_initializing();
+        }
         return json_error(
             StatusCode::NOT_IMPLEMENTED,
             "status requires a configured chain RPC endpoint",
@@ -309,7 +320,9 @@ pub async fn status(State(handle): State<GatewayHandle>) -> Response {
     let connected = handle.status.borrow().peers.connected;
     Json(StatusBody {
         overlay: format!("0x{}", handle.identity.overlay_hex),
-        bee_mode: if handle.light_mode {
+        // The chain-initializing early-return above guarantees the
+        // chain state is resolved by the time we read `light_mode`.
+        bee_mode: if handle.chain_state().is_some_and(|s| s.light_mode) {
             "light"
         } else {
             "ultra-light"
@@ -346,7 +359,10 @@ struct ChainStateBody {
 /// (PLAN.md A3, reclassified from the full-node 501). Falls to `501`
 /// when no chain is configured.
 pub async fn chainstate(State(handle): State<GatewayHandle>) -> Response {
-    let Some(chain) = handle.chain.clone() else {
+    let Some(chain) = handle.chain() else {
+        if handle.chain_state().is_none() {
+            return crate::error::chain_initializing();
+        }
         return json_error(
             StatusCode::NOT_IMPLEMENTED,
             "chainstate requires a configured chain RPC endpoint",
@@ -400,9 +416,11 @@ where
 /// funded wallet is configured.
 #[allow(clippy::result_large_err)]
 fn writer(handle: &GatewayHandle) -> Result<std::sync::Arc<dyn ChainWriter>, Response> {
+    if handle.chain_state().is_none() {
+        return Err(crate::error::chain_initializing());
+    }
     handle
-        .chain
-        .as_ref()
+        .chain()
         .and_then(|c| c.writer.clone())
         .ok_or_else(|| {
             json_error(
@@ -492,7 +510,10 @@ pub async fn buy_stamp(
     Path((amount, depth)): Path<(String, u8)>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let Some(chain) = handle.chain.clone() else {
+    let Some(chain) = handle.chain() else {
+        if handle.chain_state().is_none() {
+            return crate::error::chain_initializing();
+        }
         return json_error(
             StatusCode::NOT_IMPLEMENTED,
             "on-chain writes require a configured wallet key + RPC endpoint",
