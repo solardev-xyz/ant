@@ -13,7 +13,9 @@ mod sinks;
 pub mod swap;
 mod underlay;
 
-pub use behaviour::{run, RunConfig, RunError, SwapConfig, UploadRuntime, DEFAULT_TARGET_PEERS};
+pub use behaviour::{
+    run, LateChainInit, RunConfig, RunError, SwapConfig, UploadRuntime, DEFAULT_TARGET_PEERS,
+};
 pub use handshake::{
     handshake_outbound, handshake_outbound_with_role, HandshakeError, HandshakeInfo,
     PROTOCOL_HANDSHAKE, PROTOCOL_HANDSHAKE_V14, PROTOCOL_HANDSHAKE_V15,

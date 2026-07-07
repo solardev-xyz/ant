@@ -530,27 +530,6 @@ async fn main() -> Result<()> {
     // a `Mutex<HashMap>` — well below a rounding error.
     let gateway_activity: Arc<GatewayActivity> = GatewayActivity::new();
 
-    let upload = build_upload_runtime(
-        opt.gnosis_rpc_url.clone(),
-        resolve_logs_rpc(&opt),
-        opt.postage_contract.clone(),
-        opt.postage_batch.clone(),
-        opt.postage_owner_key.clone(),
-        signing_secret,
-        eth,
-        data_dir.clone(),
-    )
-    .await
-    .map_err(|e| anyhow!("upload runtime: {e}"))?;
-
-    // The node is "light" (publish-capable) once it can stamp + pushsync
-    // uploads — i.e. whenever an upload runtime exists. With a chain RPC
-    // configured that's true even before any batch is bought, so Freedom
-    // (which gates its whole publish UI on `GET /node.beeMode == "light"`,
-    // PLAN.md J.4.1) can buy a batch at runtime and immediately upload.
-    // Captured before `upload` is moved into the node future below.
-    let light_mode = upload.is_some();
-
     // `antctl upload` job manager. Built unconditionally — listing
     // and inspecting jobs work even when no postage batch is
     // configured. Actually starting a new job will fail (with the
@@ -621,6 +600,55 @@ async fn main() -> Result<()> {
         events_tx: None,
     };
 
+    // Spawn the node loop BEFORE the chain init below. The swarm needs
+    // none of the chain state to bootstrap, and the startup Gnosis RPC
+    // reads (postage batch validation/rediscovery, chequebook
+    // resolution) cost seconds — serialized in front of `run_node` they
+    // were the dominant term of `time_to_first_peer_s` (~2.8 s of a
+    // 3.1 s cold start, measured 2026-07-07). The chain-derived inputs
+    // (`upload`, `pushsync_swap`) follow through `late_chain_tx`; until
+    // they arrive the loop treats uploads as unconfigured, which
+    // nothing can observe because the gateway and control socket still
+    // come up after chain init completes, exactly as before.
+    let (late_chain_tx, late_chain_rx) = mpsc::channel::<ant_node::LateChainInit>(1);
+    let mut node_task = tokio::spawn(run_node(
+        NodeConfig::mainnet_default(signing_secret, overlay_nonce, bootnodes, libp2p_keypair)
+            .with_status(status_tx)
+            .with_process_start(process_start)
+            .with_external_addrs(external_addrs)
+            .with_peerstore_path(peerstore_path)
+            .with_commands(cmd_rx)
+            .with_target_peers(opt.target_peers)
+            .with_per_request_chunk_cache(opt.per_request_chunk_cache)
+            .with_chunk_record_dir(chunk_record_dir)
+            .with_gateway_activity(Some(gateway_activity.clone()))
+            .with_disk_cache(disk_cache)
+            .with_swap(Some(swap_cfg))
+            .with_upload_manager(Some(upload_manager))
+            .with_late_chain(Some(late_chain_rx)),
+    ));
+
+    let upload = build_upload_runtime(
+        opt.gnosis_rpc_url.clone(),
+        resolve_logs_rpc(&opt),
+        opt.postage_contract.clone(),
+        opt.postage_batch.clone(),
+        opt.postage_owner_key.clone(),
+        signing_secret,
+        eth,
+        data_dir.clone(),
+    )
+    .await
+    .map_err(|e| anyhow!("upload runtime: {e}"))?;
+
+    // The node is "light" (publish-capable) once it can stamp + pushsync
+    // uploads — i.e. whenever an upload runtime exists. With a chain RPC
+    // configured that's true even before any batch is bought, so Freedom
+    // (which gates its whole publish UI on `GET /node.beeMode == "light"`,
+    // PLAN.md J.4.1) can buy a batch at runtime and immediately upload.
+    // Captured before `upload` is moved into the node loop below.
+    let light_mode = upload.is_some();
+
     // Outbound SWAP settlement (Phase 7b). Resolve the chequebook in
     // priority order: an operator-supplied `--chequebook` (+ `--swap-key`),
     // else a chequebook this node auto-deployed on an earlier start and
@@ -651,23 +679,16 @@ async fn main() -> Result<()> {
         );
     }
 
-    let node_fut = run_node(
-        NodeConfig::mainnet_default(signing_secret, overlay_nonce, bootnodes, libp2p_keypair)
-            .with_status(status_tx)
-            .with_process_start(process_start)
-            .with_external_addrs(external_addrs)
-            .with_peerstore_path(peerstore_path)
-            .with_commands(cmd_rx)
-            .with_target_peers(opt.target_peers)
-            .with_per_request_chunk_cache(opt.per_request_chunk_cache)
-            .with_chunk_record_dir(chunk_record_dir)
-            .with_gateway_activity(Some(gateway_activity.clone()))
-            .with_disk_cache(disk_cache)
-            .with_upload(upload)
-            .with_swap(Some(swap_cfg))
-            .with_pushsync_swap(pushsync_swap_cfg)
-            .with_upload_manager(Some(upload_manager)),
-    );
+    // Hand the chain-derived inputs to the already-running swarm loop.
+    // Capacity-1 channel and a single send: this never blocks. A send
+    // error means the node loop already exited — its JoinHandle in the
+    // select below will surface the reason.
+    let _ = late_chain_tx
+        .send(ant_node::LateChainInit {
+            upload,
+            pushsync_swap: pushsync_swap_cfg,
+        })
+        .await;
 
     // Chain context for the gateway's wallet / chequebook / status /
     // chainstate endpoints (PLAN.md J.5 A2/A3/D1/D2). Built only when a
@@ -731,7 +752,7 @@ async fn main() -> Result<()> {
 
     if opt.no_control_socket && gateway_handle.is_none() {
         drop(cmd_tx);
-        return node_fut.await.map_err(|e| anyhow::anyhow!("{e}"));
+        return join_node_task(node_task.await);
     }
 
     let api_addr = opt.api_addr;
@@ -756,7 +777,7 @@ async fn main() -> Result<()> {
     if !serve_control {
         drop(cmd_tx);
         return tokio::select! {
-            res = node_fut => res.map_err(|e| anyhow::anyhow!("{e}")),
+            res = &mut node_task => join_node_task(res),
             res = gateway_fut => res,
             () = shutdown_signal() => Ok(()),
         };
@@ -774,7 +795,7 @@ async fn main() -> Result<()> {
         );
 
         tokio::select! {
-            res = node_fut => res.map_err(|e| anyhow::anyhow!("{e}")),
+            res = &mut node_task => join_node_task(res),
             res = control_fut => match res {
                 Ok(()) => Ok(()),
                 Err(e) => Err(anyhow::anyhow!("control socket: {e}")),
@@ -785,6 +806,18 @@ async fn main() -> Result<()> {
     }
     #[cfg(not(unix))]
     unreachable!("serve_control is always false on non-unix targets")
+}
+
+/// Flatten the spawned node loop's `JoinHandle` outcome into the
+/// daemon's exit result: a task-level `JoinError` (panic/cancel) is as
+/// fatal as a `NodeError` from the loop itself.
+fn join_node_task(
+    res: Result<Result<(), ant_node::NodeError>, tokio::task::JoinError>,
+) -> Result<()> {
+    match res {
+        Ok(inner) => inner.map_err(|e| anyhow::anyhow!("{e}")),
+        Err(e) => Err(anyhow::anyhow!("node loop task: {e}")),
+    }
 }
 
 /// Resolve when the process receives `SIGTERM` or `SIGINT` (Ctrl-C).

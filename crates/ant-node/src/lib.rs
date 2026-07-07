@@ -4,6 +4,7 @@ pub mod uploads;
 
 use ant_control::{ControlCommand, GatewayActivity, StatusSnapshot};
 use ant_crypto::{OVERLAY_NONCE_LEN, SECP256K1_SECRET_LEN};
+pub use ant_p2p::LateChainInit;
 use ant_p2p::{run, PeerEthMap, PushsyncSwapConfig, RunConfig, SwapConfig, UploadRuntime};
 use libp2p::identity::Keypair;
 use libp2p::multiaddr::Multiaddr;
@@ -108,6 +109,12 @@ pub struct NodeConfig {
     /// `ant_p2p::handle_control_command` reject `Upload*` with a
     /// clear error.
     pub upload_manager: Option<UploadManager>,
+    /// One-shot channel delivering the chain-derived inputs (`upload`,
+    /// `pushsync_swap`) after the swarm loop is already running, so
+    /// the daemon's startup Gnosis RPC reads don't serialize in front
+    /// of the bootstrap dial (they were costing ~3 s of
+    /// `time_to_first_peer_s`). See [`ant_p2p::RunConfig::late_chain_rx`].
+    pub late_chain: Option<mpsc::Receiver<LateChainInit>>,
 }
 
 impl NodeConfig {
@@ -138,6 +145,7 @@ impl NodeConfig {
             swap: None,
             pushsync_swap: None,
             upload_manager: None,
+            late_chain: None,
         }
     }
 
@@ -227,6 +235,12 @@ impl NodeConfig {
         self.upload_manager = mgr;
         self
     }
+
+    #[must_use]
+    pub fn with_late_chain(mut self, rx: Option<mpsc::Receiver<LateChainInit>>) -> Self {
+        self.late_chain = rx;
+        self
+    }
 }
 
 /// Run the M1.0 node loop until the process is interrupted.
@@ -277,6 +291,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<(), NodeError> {
             c
         }),
         peer_eth,
+        late_chain_rx: cfg.late_chain,
     })
     .await?;
     Ok(())
