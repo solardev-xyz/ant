@@ -1557,6 +1557,15 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     // dropped to `None` after the single delivery (or on a closed
     // sender) so the arm goes inert instead of busy-polling.
     let mut late_chain_rx = cfg.late_chain_rx.take();
+    // Publish chain-init readiness: constructor-provided inputs mean
+    // the embedder resolved chain state before starting the loop (or
+    // has none to resolve); a pending late channel means `antctl`
+    // clients should treat upload-affecting answers as transient
+    // until this flips (see `StatusSnapshot::chain_ready`).
+    if let Some(s) = cfg.status.as_ref() {
+        let ready = late_chain_rx.is_none();
+        s.send_modify(|st| st.chain_ready = ready);
+    }
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
     let mut last_pipeline_sync = Instant::now()
@@ -1674,6 +1683,12 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
                 late_chain_rx = None;
                 if let Some(init) = init {
                     apply_late_chain_init(&mut state, &mut upload_rt, &control, init);
+                    // A dropped sender (init = None) means chain init
+                    // failed and the daemon is exiting — leave
+                    // `chain_ready` false rather than lie on the way down.
+                    if let Some(s) = cfg.status.as_ref() {
+                        s.send_modify(|st| st.chain_ready = true);
+                    }
                 }
             }
             _ = &mut shutdown => {

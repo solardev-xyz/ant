@@ -1113,6 +1113,12 @@ fn draw_connected_progress(frame: &mut Frame, area: TuiRect, s: &StatusSnapshot)
 fn peer_milestone_line(s: &StatusSnapshot) -> String {
     let n = s.peers.node_limit.max(1);
     let mut parts = Vec::new();
+    // The control socket opens before the daemon's startup Gnosis
+    // reads finish, so the peer ramp is visible live; flag the window
+    // where upload-affecting commands would answer "not configured".
+    if !s.chain_ready {
+        parts.push("chain init…".to_string());
+    }
     if let Some(t) = s.peers.time_to_first_peer_s {
         parts.push(format!("Time to first peer: {t:.3}s"));
     }

@@ -422,6 +422,10 @@ async fn main() -> Result<()> {
         external_addresses: Vec::new(),
         control_socket: control_socket.display().to_string(),
         retrieval: RetrievalInfo::default(),
+        // Chain init hasn't run yet; the swarm loop republishes the
+        // real value as soon as it starts, and flips it to `true` when
+        // the `LateChainInit` lands.
+        chain_ready: false,
     };
     let (status_tx, status_rx) = watch::channel(initial_snapshot);
 
@@ -607,9 +611,10 @@ async fn main() -> Result<()> {
     // were the dominant term of `time_to_first_peer_s` (~2.8 s of a
     // 3.1 s cold start, measured 2026-07-07). The chain-derived inputs
     // (`upload`, `pushsync_swap`) follow through `late_chain_tx`; until
-    // they arrive the loop treats uploads as unconfigured, which
-    // nothing can observe because the gateway and control socket still
-    // come up after chain init completes, exactly as before.
+    // they arrive the loop treats uploads as unconfigured
+    // (`StatusSnapshot::chain_ready = false` is the client-visible
+    // signal). The gateway still comes up after chain init — it needs
+    // `light_mode` and the chequebook address at construction.
     let (late_chain_tx, late_chain_rx) = mpsc::channel::<ant_node::LateChainInit>(1);
     let mut node_task = tokio::spawn(run_node(
         NodeConfig::mainnet_default(signing_secret, overlay_nonce, bootnodes, libp2p_keypair)
@@ -627,6 +632,31 @@ async fn main() -> Result<()> {
             .with_upload_manager(Some(upload_manager))
             .with_late_chain(Some(late_chain_rx)),
     ));
+
+    // Serve the control socket immediately — it only needs the status
+    // watch and the command channel, and the swarm is already running.
+    // Waiting for chain init here (as the gateway must) made the whole
+    // warm bootstrap (0→100 peers in ~3 s) invisible to `antop`, which
+    // can only observe from the moment the socket exists. During the
+    // chain-init window, upload-affecting commands answer "not
+    // configured"; clients poll `StatusSnapshot::chain_ready` — not the
+    // socket's existence — for readiness.
+    #[cfg(unix)]
+    let control_task = if opt.no_control_socket {
+        None
+    } else {
+        tracing::info!(
+            target: "antd",
+            "control socket at {}",
+            control_socket.display(),
+        );
+        Some(tokio::spawn(ant_control::serve(
+            control_socket.clone(),
+            AGENT.to_string(),
+            status_rx.clone(),
+            Some(cmd_tx.clone()),
+        )))
+    };
 
     let upload = build_upload_runtime(
         opt.gnosis_rpc_url.clone(),
@@ -785,20 +815,17 @@ async fn main() -> Result<()> {
 
     #[cfg(unix)]
     {
-        let control_path = control_socket.clone();
-        let control_fut =
-            ant_control::serve(control_path, AGENT.to_string(), status_rx, Some(cmd_tx));
-        tracing::info!(
-            target: "antd",
-            "control socket at {}",
-            control_socket.display(),
-        );
-
+        // The socket itself has been serving since right after the node
+        // spawn (see `control_task` above); here we only join its task
+        // into the daemon's exit conditions.
+        let mut control_task =
+            control_task.expect("serve_control implies the control task was spawned");
         tokio::select! {
             res = &mut node_task => join_node_task(res),
-            res = control_fut => match res {
-                Ok(()) => Ok(()),
-                Err(e) => Err(anyhow::anyhow!("control socket: {e}")),
+            res = &mut control_task => match res {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(anyhow::anyhow!("control socket: {e}")),
+                Err(e) => Err(anyhow::anyhow!("control socket task: {e}")),
             },
             res = gateway_fut => res,
             () = shutdown_signal() => Ok(()),
