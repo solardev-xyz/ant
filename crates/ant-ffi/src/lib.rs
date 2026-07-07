@@ -322,6 +322,9 @@ fn init_inner(data_dir: &Path) -> Result<AntHandle, FfiError> {
         external_addresses: Vec::new(),
         control_socket: String::new(),
         retrieval: RetrievalInfo::default(),
+        // The FFI path resolves chain state before starting the loop
+        // (no late-chain channel), so it is ready by construction.
+        chain_ready: true,
     };
     let (status_tx, status_rx) = watch::channel(initial_snapshot);
 

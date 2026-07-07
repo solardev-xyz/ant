@@ -551,6 +551,24 @@ pub struct StatusSnapshot {
     /// daemons leave this at the `#[serde(default)]` zero value.
     #[serde(default)]
     pub retrieval: RetrievalInfo,
+    /// Whether the daemon's startup chain init (postage batch
+    /// validation/rediscovery, chequebook resolution) has resolved.
+    /// `false` during the first seconds of an `antd` start: the swarm
+    /// loop and control socket come up before the Gnosis reads
+    /// complete, so `antop` can watch the peer-set ramp live.
+    /// Upload-affecting commands answer "not configured" until this
+    /// flips — scripts should poll it, not the socket's existence, as
+    /// the readiness signal. Old daemons never send the field (they
+    /// opened the socket only after chain init), so the missing-field
+    /// default is `true`.
+    #[serde(default = "chain_ready_missing_default")]
+    pub chain_ready: bool,
+}
+
+/// Missing-field default for [`StatusSnapshot::chain_ready`]: a daemon
+/// old enough not to send it was always chain-ready by construction.
+fn chain_ready_missing_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

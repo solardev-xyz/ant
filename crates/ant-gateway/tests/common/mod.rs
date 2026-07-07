@@ -158,6 +158,7 @@ pub fn snapshot_with_one_peer() -> StatusSnapshot {
         external_addresses: Vec::new(),
         control_socket: "/tmp/antd.sock".to_string(),
         retrieval: RetrievalInfo::default(),
+        chain_ready: true,
     }
 }
 
