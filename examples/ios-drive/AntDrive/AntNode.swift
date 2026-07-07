@@ -503,7 +503,10 @@ final class AntNode: ObservableObject {
         if let json = try? await Self.string(name: "list uploads", { errPtr in
             ant_upload_list(h, errPtr)
         }) {
-            jobs = Self.dedupedByContent(DriveDecoder.jobs(from: json))
+            let decoded = Self.dedupedByContent(DriveDecoder.jobs(from: json))
+            // Same dedup as the peer poll: the 1.5 s auto-refresh must
+            // not republish an unchanged list.
+            if decoded != jobs { jobs = decoded }
         }
     }
 
@@ -536,7 +539,8 @@ final class AntNode: ObservableObject {
         if let json = try? await Self.string(name: "storage status", { errPtr in
             ant_storage_status(h, errPtr)
         }) {
-            plan = DriveDecoder.plan(from: json)
+            let decoded = DriveDecoder.plan(from: json)
+            if decoded != plan { plan = decoded }
         }
     }
 
@@ -545,7 +549,8 @@ final class AntNode: ObservableObject {
         if let json = try? await Self.string(name: "account info", { errPtr in
             ant_account_info(h, errPtr)
         }) {
-            account = DriveDecoder.account(from: json)
+            let decoded = DriveDecoder.account(from: json)
+            if decoded != account { account = decoded }
         }
     }
 
@@ -567,7 +572,8 @@ final class AntNode: ObservableObject {
         if let json = try? await Self.string(name: "settlement status", { errPtr in
             ant_storage_settlement_status(h, errPtr)
         }) {
-            settlement = DriveDecoder.settlement(from: json)
+            let decoded = DriveDecoder.settlement(from: json)
+            if decoded != settlement { settlement = decoded }
         }
     }
 
@@ -581,7 +587,13 @@ final class AntNode: ObservableObject {
                 let count = Int(ant_peer_count(h))
                 await MainActor.run {
                     guard let self, self.handle == h else { return }
-                    self.peerCount = max(0, count)
+                    // Publish only real changes: an unconditional
+                    // re-assign fires objectWillChange every second,
+                    // re-rendering every observing view (a visible
+                    // glass shimmer) and tearing down open menus
+                    // mid-tap.
+                    let clamped = max(0, count)
+                    if self.peerCount != clamped { self.peerCount = clamped }
                 }
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
