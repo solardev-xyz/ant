@@ -202,6 +202,34 @@ pub struct RunConfig {
     /// pushsync settlement code only consults it when
     /// `pushsync_swap` is configured.
     pub peer_eth: crate::PeerEthMap,
+    /// One-shot delivery of the chain-derived inputs (`upload`,
+    /// `pushsync_swap`) resolved *after* the swarm loop has started.
+    /// `antd` spends seconds on Gnosis RPC at startup (postage batch
+    /// validation / rediscovery, chequebook resolution); serializing
+    /// those reads before the swarm start put their full latency into
+    /// `time_to_first_peer_s`. With this channel set, the daemon
+    /// starts the loop immediately and sends the resolved values once
+    /// — until then `upload` behaves as `None` ("uploads not
+    /// configured") and pushsync runs without outbound settlement,
+    /// which is fine because the daemon only opens its API surfaces
+    /// (gateway, control socket) after chain init completes anyway.
+    /// `None` keeps the constructor-provided `upload` /
+    /// `pushsync_swap` as the final word, exactly as before.
+    pub late_chain_rx: Option<mpsc::Receiver<LateChainInit>>,
+}
+
+/// Chain-derived swarm inputs delivered through
+/// [`RunConfig::late_chain_rx`] once the daemon's startup Gnosis RPC
+/// reads complete. Fields mirror [`RunConfig::upload`] and
+/// [`RunConfig::pushsync_swap`].
+pub struct LateChainInit {
+    /// Postage stamping + signing runtime; see [`RunConfig::upload`].
+    pub upload: Option<Arc<UploadRuntime>>,
+    /// Outbound SWAP settlement config; see
+    /// [`RunConfig::pushsync_swap`]. `peer_eth` is patched to the
+    /// loop's live registry on arrival, so the sender may leave it
+    /// defaulted.
+    pub pushsync_swap: Option<crate::PushsyncSwapConfig>,
 }
 
 /// Inputs needed to spin up the SWAP inbound listener.
@@ -1433,6 +1461,15 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
             "outbound SWAP settlement enabled (with pseudosettle hot-hint integration)",
         );
         state.pushsync_swap = Some(svc);
+    } else if cfg.late_chain_rx.is_some() {
+        // Chain init is still resolving concurrently with bootstrap;
+        // the DISABLED/enabled verdict is logged when the
+        // `LateChainInit` arrives so operators don't see a scary
+        // warning that flips to "enabled" two seconds later.
+        info!(
+            target: "ant_p2p::pushsync_swap",
+            "outbound SWAP settlement pending chain init (resolving concurrently with bootstrap)",
+        );
     } else {
         info!(
             target: "ant_p2p::pushsync_swap",
@@ -1511,6 +1548,15 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     let mut status_pulse = tokio::time::interval(Duration::from_millis(250));
     status_pulse.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     status_pulse.tick().await;
+    // Upload runtime slot: starts as the constructor-provided value and
+    // may be filled once by a `LateChainInit` (see the select arm
+    // below). Loop-local rather than read from `cfg` so the late init
+    // can replace it without `cfg` being mutable everywhere.
+    let mut upload_rt = cfg.upload.clone();
+    // Taken out of `cfg` so the select arm below can hold it `&mut`;
+    // dropped to `None` after the single delivery (or on a closed
+    // sender) so the arm goes inert instead of busy-polling.
+    let mut late_chain_rx = cfg.late_chain_rx.take();
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
     let mut last_pipeline_sync = Instant::now()
@@ -1619,7 +1665,15 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
                             ),
                         });
                     }
-                    other => handle_control_command(&mut state, &mut peerstore, &control, cfg.upload.clone(), cfg.network_id, other),
+                    other => handle_control_command(&mut state, &mut peerstore, &control, upload_rt.clone(), cfg.network_id, other),
+                }
+            }
+            init = recv_late_chain(late_chain_rx.as_mut()), if late_chain_rx.is_some() => {
+                // Single-shot: drop the receiver whether we got a value
+                // or the sender went away, so this arm never fires again.
+                late_chain_rx = None;
+                if let Some(init) = init {
+                    apply_late_chain_init(&mut state, &mut upload_rt, &control, init);
                 }
             }
             _ = &mut shutdown => {
@@ -1641,6 +1695,66 @@ async fn recv_command(
     match commands {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
+    }
+}
+
+/// [`recv_command`]'s twin for the late chain-init channel; the select
+/// arm additionally guards on `late_chain_rx.is_some()` and drops the
+/// receiver after the first resolution, so the `None` branch here only
+/// covers the same-poll race.
+async fn recv_late_chain(rx: Option<&mut mpsc::Receiver<LateChainInit>>) -> Option<LateChainInit> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Install the chain-derived inputs once `antd`'s startup Gnosis reads
+/// complete: fill the upload-runtime slot consulted by
+/// `handle_control_command` (`PushChunk`, postage commands) and build
+/// the outbound SWAP service. Mirrors the startup path at the top of
+/// [`run`] and the runtime [`ControlCommand::EnablePushsyncSwap`]
+/// handler — and defers to either if they got there first: the FFI
+/// first-buy flow can legitimately race this delivery.
+fn apply_late_chain_init(
+    state: &mut SwarmState,
+    upload_rt: &mut Option<Arc<UploadRuntime>>,
+    control: &Control,
+    init: LateChainInit,
+) {
+    if upload_rt.is_none() {
+        *upload_rt = init.upload;
+    }
+    if state.pushsync_swap.is_some() {
+        // A runtime `EnablePushsyncSwap` (FFI first-buy) raced this
+        // delivery and won; its service — and its ledger state — stay.
+        return;
+    }
+    match init.pushsync_swap {
+        Some(mut swap_cfg) => {
+            // The daemon-side config was built before the loop existed;
+            // patch in the live handshake-EOA registry the same way
+            // `run_node` does for the startup path.
+            swap_cfg.peer_eth = state.peer_eth.clone();
+            let mut svc = crate::PushsyncSwap::new(swap_cfg, control.clone());
+            if let Some(tx) = state.hot_hint.clone() {
+                svc = svc.with_hot_hint(tx);
+            }
+            info!(
+                target: "ant_p2p::pushsync_swap",
+                chequebook = %hex::encode(svc.chequebook()),
+                "outbound SWAP settlement enabled (with pseudosettle hot-hint integration)",
+            );
+            state.pushsync_swap = Some(Arc::new(svc));
+        }
+        None => {
+            info!(
+                target: "ant_p2p::pushsync_swap",
+                "outbound SWAP settlement DISABLED — uploads will stall \
+                 after ~20K chunks across the peer set; configure \
+                 --chequebook + --swap-key to enable",
+            );
+        }
     }
 }
 
