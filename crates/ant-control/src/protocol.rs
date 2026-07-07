@@ -313,6 +313,14 @@ pub struct UploadJobView {
     /// is a liveness hint, not a terminal status. Defaults to `false`.
     #[serde(default)]
     pub stalled: bool,
+    /// `true` when the job was paused by the *system* (an app
+    /// suspension / offline transition via `UploadSuspendAll`), not by
+    /// the user. Such jobs resume automatically on `UploadWakeAll` or
+    /// the next rehydrate, so a client should render them as "Paused —
+    /// resumes automatically" rather than offering a Resume button as
+    /// the only way forward. Defaults to `false` for older daemons.
+    #[serde(default)]
+    pub auto_paused: bool,
     /// `true` once the post-upload self-heal confirmed every chunk is
     /// *deep-reachable* (held by its true neighbourhood, not merely
     /// reachable via the uploader's privileged link to a shallow
@@ -923,6 +931,7 @@ mod tests {
             reference: None,
             chunks_requeued: 0,
             stalled: false,
+            auto_paused: false,
             heal_verified: false,
             heal_finished: false,
             heal_phase: None,

@@ -74,7 +74,9 @@ pub extern "system" fn Java_at_vibing_ant_downloadsmoke_AntNode_nativeInit<'call
                     return Ok(0);
                 }
             };
-            match init_inner(&PathBuf::from(path)) {
+            // No container-move rebase on Android (its app data dir is
+            // stable across updates), so no source root.
+            match init_inner(&PathBuf::from(path), None) {
                 Ok(handle) => Ok(Box::into_raw(Box::new(handle)) as jlong),
                 Err(e) => {
                     throw_ant_exception(env, &e.to_string());

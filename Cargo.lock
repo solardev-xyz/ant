@@ -218,6 +218,7 @@ dependencies = [
  "ant-crypto",
  "ant-p2p",
  "ant-retrieval",
+ "async-trait",
  "futures",
  "hex",
  "libp2p",

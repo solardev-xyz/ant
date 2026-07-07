@@ -724,7 +724,9 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
         | ControlCommand::UploadPause { ack, .. }
         | ControlCommand::UploadResume { ack, .. }
         | ControlCommand::UploadRepush { ack, .. }
-        | ControlCommand::UploadCancel { ack, .. } => {
+        | ControlCommand::UploadCancel { ack, .. }
+        | ControlCommand::UploadSuspendAll { ack }
+        | ControlCommand::UploadWakeAll { ack } => {
             let _ = ack.send(ControlAck::Error {
                 message: "Upload* not supported in gateway test fixtures".into(),
             });

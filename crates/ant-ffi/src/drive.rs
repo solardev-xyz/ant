@@ -269,6 +269,41 @@ pub(crate) fn resume(h: &AntHandle) -> Result<String, DriveError> {
     })
 }
 
+/// System suspend of the upload subsystem (app backgrounded / network
+/// gone): auto-pause every in-flight job and stop securing passes. The
+/// node acks only once the paused drivers have drained and checkpointed
+/// (bounded server-side), so this blocking call returning means upload
+/// state is durably on disk — exactly what the iOS background grace
+/// window should be spent on. Backs [`crate::ant_suspend`].
+pub(crate) fn suspend(h: &AntHandle) -> Result<String, DriveError> {
+    let cmd_tx = h.cmd_tx.clone();
+    h.runtime.block_on(async move {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        send(&cmd_tx, ControlCommand::UploadSuspendAll { ack: ack_tx }).await?;
+        match recv_oneshot(ack_rx).await? {
+            ControlAck::Ok { message } => Ok(message),
+            ControlAck::Error { message } => Err(DriveError::Op(message)),
+            other => Err(unexpected(&other)),
+        }
+    })
+}
+
+/// Undo [`suspend`]: restart the jobs it paused (a user pause stays
+/// paused) and re-queue securing for completed-but-unverified jobs.
+/// Backs [`crate::ant_wake`].
+pub(crate) fn wake(h: &AntHandle) -> Result<String, DriveError> {
+    let cmd_tx = h.cmd_tx.clone();
+    h.runtime.block_on(async move {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        send(&cmd_tx, ControlCommand::UploadWakeAll { ack: ack_tx }).await?;
+        match recv_oneshot(ack_rx).await? {
+            ControlAck::Ok { message } => Ok(message),
+            ControlAck::Error { message } => Err(DriveError::Op(message)),
+            other => Err(unexpected(&other)),
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Storage plan
 // ---------------------------------------------------------------------------

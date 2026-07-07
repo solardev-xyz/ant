@@ -34,6 +34,19 @@
         <key>NSAllowsArbitraryLoads</key>
         <true/>
     </dict>
+    <!--
+        Background securing: after the app leaves the foreground, a
+        BGProcessingTask (id antdrive.secure, see AntDriveApp) wakes the
+        embedded node to finish interrupted uploads/securing passes.
+    -->
+    <key>BGTaskSchedulerPermittedIdentifiers</key>
+    <array>
+        <string>antdrive.secure</string>
+    </array>
+    <key>UIBackgroundModes</key>
+    <array>
+        <string>processing</string>
+    </array>
     <key>UIApplicationSceneManifest</key>
     <dict>
         <key>UIApplicationSupportsMultipleScenes</key>

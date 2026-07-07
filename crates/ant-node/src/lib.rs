@@ -381,6 +381,25 @@ async fn intercept_commands(
                 let mgr = mgr.clone();
                 tokio::spawn(async move { uploads::run_follow(mgr, job_id, ack).await });
             }
+            ControlCommand::UploadSuspendAll { ack } => {
+                // Spawned so the (bounded) drain wait never blocks the
+                // interceptor; the ack fires only once the paused
+                // drivers have checkpointed, which is what lets a host
+                // with a short background grace window block on it.
+                let mgr = mgr.clone();
+                tokio::spawn(async move {
+                    let suspended = mgr.suspend_all().await;
+                    let _ = ack.send(ControlAck::Ok {
+                        message: format!("suspended {suspended} upload job(s)"),
+                    });
+                });
+            }
+            ControlCommand::UploadWakeAll { ack } => {
+                let woken = mgr.wake_all();
+                let _ = ack.send(ControlAck::Ok {
+                    message: format!("resumed {woken} auto-paused upload job(s)"),
+                });
+            }
             ControlCommand::UploadRepush {
                 job_id,
                 progress,

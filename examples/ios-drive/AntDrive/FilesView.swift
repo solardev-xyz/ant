@@ -74,7 +74,7 @@ struct FilesView: View {
                 Text("Files")
                     .font(.system(.largeTitle, design: .rounded).weight(.bold))
                     .foregroundStyle(.white)
-                Text(node.status.isReady ? "\(node.peerCount) connections" : node.status.label)
+                Text(headerStatus)
                     .font(.footnote)
                     .foregroundStyle(.white.opacity(0.65))
             }
@@ -82,6 +82,14 @@ struct FilesView: View {
             addButton
         }
         .padding(.horizontal, 6)
+    }
+
+    /// Connectivity line under the "Files" headline. Offline wins over
+    /// the peer count — uploads are auto-paused for the duration and
+    /// resume on their own once a path is back.
+    private var headerStatus: String {
+        if node.isOffline { return "Waiting for network…" }
+        return node.status.isReady ? "\(node.peerCount) connections" : node.status.label
     }
 
     private var getStartedCard: some View {
@@ -351,6 +359,12 @@ private struct FileRow: View {
     /// network"). A retrievable verdict — the expected outcome — stays
     /// silent, as does the transient in-progress probe.
     private var statusMessage: String? {
+        // Offline: an in-flight or auto-paused upload is waiting on the
+        // network, whatever its own label says (the node suspends it
+        // and resumes automatically).
+        if node.isOffline, job.isActive || job.isAutoPaused {
+            return "Waiting for network…"
+        }
         // While uploading / paused / failed, the job's own status line wins.
         if !job.isDone { return job.statusLabel.isEmpty ? nil : job.statusLabel }
         // Completed: a user-run deep verify (propagation) is the richest
@@ -384,10 +398,21 @@ private struct FileRow: View {
                 }
             }
         } else if job.isDone {
-            // Copy moved to the detail page; the row just hints it's tappable.
-            Image(systemName: "chevron.right")
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(.white.opacity(0.4))
+            if job.isSecuring {
+                // "Stop securing": cancelling a completed job cleanly
+                // stops its heal pass (the job stays completed; "Push
+                // again" still works later).
+                Button { onCancel(job) } label: {
+                    Image(systemName: "stop.circle")
+                        .font(.title2).foregroundStyle(.white.opacity(0.6))
+                }
+            } else {
+                // Copy moved to the detail page; the row just hints it's
+                // tappable.
+                Image(systemName: "chevron.right")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.4))
+            }
         } else if job.isFailed {
             Button { onResume(job) } label: {
                 Image(systemName: "arrow.clockwise.circle.fill")
@@ -901,6 +926,14 @@ struct FileDetailView: View {
                     Text("The original file isn't on this device anymore, so it can't be pushed again.")
                         .font(.caption).foregroundStyle(.white.opacity(0.6))
                         .multilineTextAlignment(.center)
+                }
+            }
+
+            // Stop the background securing pass. The file stays
+            // completed; the pass can be re-run later with "Push again".
+            if job.isSecuring {
+                secondaryButton("Stop securing", icon: "stop.fill") {
+                    Task { await node.cancelUpload(job.jobId) }
                 }
             }
 

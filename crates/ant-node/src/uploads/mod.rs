@@ -269,6 +269,15 @@ const HEAL_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_secs(3)
 /// so each ack's JSON stays bounded on a large file.
 const HEAL_VERIFY_BATCH: usize = 512;
 
+/// How long [`UploadManager::suspend_all`] waits for paused drivers to
+/// drain their in-flight pushes and write the final checkpoint before
+/// returning anyway. Sized to fit inside iOS's background grace window
+/// (the host wraps the call in a `beginBackgroundTask`, which gives
+/// roughly tens of seconds; we use a conservative slice of it). A
+/// driver that misses the window loses at most one checkpoint interval
+/// of progress — resume re-pushes those chunks; pushsync is idempotent.
+const SUSPEND_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Number of closest peers heal probes per chunk. Non-zero, so the
 /// read-back is the *deep* neighbourhood check (see
 /// [`ControlCommand::VerifyChunksPresent`]): each chunk's own closest
@@ -720,6 +729,12 @@ struct JobHandle {
     /// resume path uses it; the driver itself calls `notified()`
     /// inside its run loop after observing `pause_requested`.
     notify: Notify,
+    /// The live driver task, kept so [`UploadManager::suspend_all`] can
+    /// await (bounded) the drain-and-checkpoint that `pause` triggers —
+    /// the driver's final act before exiting is a state save, so a
+    /// completed join means the resume cursor is durably on disk.
+    /// Replaced by every `spawn_driver`; `None` when no driver runs.
+    driver: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl JobHandle {
@@ -769,6 +784,19 @@ struct UploadManagerInner {
     /// trigger for the same job (a fresh upload completing, a startup
     /// re-heal, a `resume`) doesn't enqueue a duplicate pass.
     heal_inflight: Mutex<HashSet<String>>,
+    /// Root under which app-managed sources live (the iOS
+    /// `Application Support/antdrive/imports` dir). Jobs whose source
+    /// is under it persist a relative path too, so a container move
+    /// (iOS reassigning the app-container UUID) can be healed by
+    /// re-anchoring `source_root/source_rel` — see
+    /// [`UploadManager::resolve_job_source`]. `None` (the `antd`
+    /// daemon) leaves absolute-path behaviour untouched.
+    source_root: Option<PathBuf>,
+    /// Flipped by [`UploadManager::suspend_all`] /
+    /// [`UploadManager::wake_all`]. While set, running securing passes
+    /// bail at their next check *without* marking the heal finished,
+    /// so wake re-queues them; queued passes park until wake.
+    suspended: AtomicBool,
 }
 
 impl UploadManager {
@@ -795,8 +823,24 @@ impl UploadManager {
                 status: None,
                 heal_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HEALS)),
                 heal_inflight: Mutex::new(HashSet::new()),
+                source_root: None,
+                suspended: AtomicBool::new(false),
             }),
         })
+    }
+
+    /// Set the root under which app-managed sources live, enabling the
+    /// container-move rebase (`source_rel` recording at `start`,
+    /// re-anchoring on rehydrate/heal). Must be configured *before*
+    /// `rehydrate_from_disk` so rehydrated jobs rebase immediately.
+    /// Same lifecycle / `Arc::get_mut` rationale as [`with_disk_cache`]:
+    /// called once, before the manager is cloned into the node loop.
+    #[must_use]
+    pub fn with_source_root(mut self, source_root: Option<PathBuf>) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.source_root = source_root;
+        }
+        self
     }
 
     /// Attach the daemon's persistent chunk store so heal can re-push
@@ -886,9 +930,19 @@ impl UploadManager {
 
         let job_id = self.mint_id();
         let now_s = unix_seconds();
+        // Record the root-relative path alongside the absolute one when
+        // the source lives under the configured root, so the job can be
+        // re-anchored after a container move (see `resolve_job_source`).
+        let source_rel = self
+            .inner
+            .source_root
+            .as_deref()
+            .and_then(|root| source_path.strip_prefix(root).ok())
+            .map(Path::to_path_buf);
         let info = UploadJobInfo {
             job_id: job_id.clone(),
             source_path: source_path.clone(),
+            source_rel,
             source_size,
             source_mtime_unix_ms,
             batch_id,
@@ -915,6 +969,7 @@ impl UploadManager {
             heal_total: None,
             chunks_requeued: 0,
             stalled: false,
+            auto_paused: false,
         };
         info.save(&UploadJobInfo::manifest_path(
             &self.inner.state_dir,
@@ -928,6 +983,7 @@ impl UploadManager {
             pause_requested: AtomicBool::new(false),
             cancel_requested: AtomicBool::new(false),
             notify: Notify::new(),
+            driver: Mutex::new(None),
         });
         self.inner
             .jobs
@@ -1002,10 +1058,18 @@ impl UploadManager {
                 UploadStatus::Running | UploadStatus::Pending => {
                     handle.pause_requested.store(true, Ordering::SeqCst);
                     info.status = UploadStatus::Paused;
+                    // A user pause is sticky: wake/rehydrate must not
+                    // auto-resume it.
+                    info.auto_paused = false;
                     info.last_update_unix = unix_seconds();
                     info.clone()
                 }
-                UploadStatus::Paused => info.clone(),
+                UploadStatus::Paused => {
+                    // Pausing an already-(auto-)paused job converts it
+                    // to a user pause, so wake leaves it alone.
+                    info.auto_paused = false;
+                    info.clone()
+                }
                 other => return Err(UploadError::BadState(other)),
             }
         };
@@ -1063,6 +1127,7 @@ impl UploadManager {
                     handle.pause_requested.store(false, Ordering::SeqCst);
                     handle.cancel_requested.store(false, Ordering::SeqCst);
                     info.status = UploadStatus::Running;
+                    info.auto_paused = false;
                     info.last_error = None;
                     info.last_update_unix = unix_seconds();
                     info.clone()
@@ -1118,7 +1183,7 @@ impl UploadManager {
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
             }
-            let info = match UploadJobInfo::load(&path) {
+            let mut info = match UploadJobInfo::load(&path) {
                 Ok(v) => v,
                 Err(e) => {
                     warn!(
@@ -1130,34 +1195,30 @@ impl UploadManager {
                 }
             };
             let job_id = info.job_id.clone();
+            // Re-anchor a source stranded by a container move (iOS
+            // reassigning the app-container UUID) before the job is
+            // registered, so the driver / heal opens a live path from
+            // the start. Guarded by a size+mtime match — see
+            // `rebase_candidate` — and persisted immediately: the
+            // rebase is a durable repair, not a per-run guess.
+            if let Some(rebased) = self.rebase_candidate(&info) {
+                info!(
+                    target: "ant_node::uploads",
+                    job_id,
+                    from = %info.source_path.display(),
+                    to = %rebased.display(),
+                    "re-anchored upload source after data-container move",
+                );
+                info.source_path = rebased;
+                info.last_update_unix = unix_seconds();
+                let _ = info.save(&path);
+            }
+            // Auto-resume also restarts jobs the *system* paused
+            // (`auto_paused` — the app was suspended mid-upload and
+            // never woke), but never a user pause.
             let needs_restart =
-                matches!(info.status, UploadStatus::Running | UploadStatus::Pending,);
-            // A completed job whose self-heal never finished (the daemon was
-            // killed / redeployed mid-heal, or before it ran) needs its
-            // securing pass re-queued on boot — captured here before `info`
-            // is moved into the handle. `None` ⇒ leave it untouched.
-            let secure_req = (matches!(info.status, UploadStatus::Completed)
-                && !info.heal_finished)
-                .then(|| HealRequest {
-                    job_id: job_id.clone(),
-                    // Conservative at boot: confirm reachability and re-push
-                    // genuinely-missing chunks, but don't auto-promote shallow
-                    // placements — a thin startup routing table makes that
-                    // probe unreliable (the historical reason the post-upload
-                    // heal stayed reachable-only). "Push again" still does the
-                    // shallow-aware repair on demand.
-                    mode: HealMode::ReachableOnly,
-                    addrs: None,
-                    batch_id: resolve_batch_id(
-                        info.batch_id.as_deref(),
-                        self.inner.default_batch_id,
-                    ),
-                    source_path: info.source_path.clone(),
-                    source_size: info.source_size,
-                    raw: info.raw,
-                    name: info.name.clone(),
-                    content_type: info.content_type.clone(),
-                });
+                matches!(info.status, UploadStatus::Running | UploadStatus::Pending)
+                    || (info.status == UploadStatus::Paused && info.auto_paused);
             let (progress_tx, _rx) = watch::channel(info.clone());
             let handle = Arc::new(JobHandle {
                 info: Mutex::new(info),
@@ -1165,6 +1226,7 @@ impl UploadManager {
                 pause_requested: AtomicBool::new(false),
                 cancel_requested: AtomicBool::new(false),
                 notify: Notify::new(),
+                driver: Mutex::new(None),
             });
             self.inner
                 .jobs
@@ -1182,15 +1244,7 @@ impl UploadManager {
                 // Park as Paused so the operator can inspect via
                 // `antctl upload list` and `resume` explicitly.
                 let snap = {
-                    let h = self
-                        .inner
-                        .jobs
-                        .lock()
-                        .expect("uploads jobs mutex poisoned")
-                        .get(&job_id)
-                        .cloned()
-                        .expect("just inserted");
-                    let mut info = h.info.lock().expect("upload mutex poisoned");
+                    let mut info = handle.info.lock().expect("upload mutex poisoned");
                     info.status = UploadStatus::Paused;
                     info.last_update_unix = unix_seconds();
                     info.clone()
@@ -1201,21 +1255,160 @@ impl UploadManager {
                     &job_id,
                 ));
             }
-            // Startup heal: finish securing any completed-but-unverified job
-            // whose heal was interrupted. Without this they sit "Securing…"
-            // forever — nothing else re-runs heal on boot. Bounded + queued
-            // by `enqueue_heal` so a backlog secures a few at a time instead
-            // of thundering the network, and reachable-only (see `mode`
-            // above) so a thin boot-time routing table doesn't churn postage.
-            if let Some(req) = secure_req {
-                info!(
-                    target: "ant_node::uploads",
-                    job_id, "queuing startup heal for unsecured completed upload",
-                );
-                self.enqueue_heal(req);
+        }
+        // Startup heal: finish securing any completed-but-unverified job
+        // whose heal was interrupted. Without this they sit "Securing…"
+        // forever — nothing else re-runs heal on boot. Shared with
+        // `wake_all`, which needs the same re-queue after a suspension.
+        self.requeue_unsecured_heals();
+        Ok(count)
+    }
+
+    /// Queue a securing pass for every `Completed` job whose heal hasn't
+    /// finished (interrupted by a shutdown / suspension, or never run).
+    /// Bounded + deduped by [`enqueue_heal`](Self::enqueue_heal) so a
+    /// backlog secures a few at a time instead of thundering the network,
+    /// and reachable-only: a thin boot/wake-time routing table makes the
+    /// shallow probe unreliable (the historical reason the post-upload
+    /// heal stayed reachable-only), and "Push again" still does the
+    /// shallow-aware repair on demand. Shared by `rehydrate_from_disk`
+    /// and [`wake_all`](Self::wake_all).
+    fn requeue_unsecured_heals(&self) {
+        let handles: Vec<Arc<JobHandle>> = self
+            .inner
+            .jobs
+            .lock()
+            .expect("uploads jobs mutex poisoned")
+            .values()
+            .cloned()
+            .collect();
+        for handle in handles {
+            let snap = handle.snapshot();
+            if snap.status != UploadStatus::Completed || snap.heal_finished {
+                continue;
+            }
+            info!(
+                target: "ant_node::uploads",
+                job_id = %snap.job_id,
+                "queuing heal for unsecured completed upload",
+            );
+            self.enqueue_heal(HealRequest {
+                job_id: snap.job_id.clone(),
+                mode: HealMode::ReachableOnly,
+                addrs: None,
+                batch_id: resolve_batch_id(snap.batch_id.as_deref(), self.inner.default_batch_id),
+                source_path: snap.source_path.clone(),
+                source_size: snap.source_size,
+                raw: snap.raw,
+                name: snap.name.clone(),
+                content_type: snap.content_type.clone(),
+            });
+        }
+    }
+
+    /// System-initiated pause of the whole upload subsystem — the app is
+    /// moving to the background or the network went away. Every
+    /// `Running`/`Pending` job is paused with the `auto_paused` marker
+    /// (so [`wake_all`](Self::wake_all) / the next rehydrate knows to
+    /// restart it; a job the *user* paused is left untouched), running
+    /// securing passes are asked to stop, and the call waits — bounded
+    /// by `SUSPEND_DRAIN_TIMEOUT` — for the paused drivers to drain
+    /// their in-flight pushes and write their final checkpoint, so a
+    /// host with a short background grace window (iOS gives ~a few
+    /// seconds) knows the resume cursors are durably on disk when this
+    /// returns. Idempotent. Returns the number of jobs it suspended.
+    pub async fn suspend_all(&self) -> usize {
+        // Flag first: securing passes observe it at their next round /
+        // batch boundary and bail without claiming heal_finished.
+        self.inner.suspended.store(true, Ordering::SeqCst);
+        let handles: Vec<Arc<JobHandle>> = self
+            .inner
+            .jobs
+            .lock()
+            .expect("uploads jobs mutex poisoned")
+            .values()
+            .cloned()
+            .collect();
+        let mut suspended = 0usize;
+        let mut drivers = Vec::new();
+        for handle in handles {
+            let snap = {
+                let mut info = handle.info.lock().expect("upload mutex poisoned");
+                match info.status {
+                    UploadStatus::Running | UploadStatus::Pending => {
+                        handle.pause_requested.store(true, Ordering::SeqCst);
+                        info.status = UploadStatus::Paused;
+                        info.auto_paused = true;
+                        info.last_update_unix = unix_seconds();
+                        info.clone()
+                    }
+                    _ => continue,
+                }
+            };
+            suspended += 1;
+            let _ = handle.progress.send(snap.clone());
+            let _ = snap.save(&UploadJobInfo::manifest_path(
+                &self.inner.state_dir,
+                &snap.job_id,
+            ));
+            if let Some(task) = handle.driver.lock().expect("driver mutex poisoned").take() {
+                drivers.push(task);
             }
         }
-        Ok(count)
+        // The driver's last act before exiting on pause is the
+        // drain-and-checkpoint (`drain_for_pause`), so joining it means
+        // the resume cursor is on disk. Bounded: a wedged push can hold
+        // a driver for up to PUSH_TIMEOUT, far past any OS grace window
+        // — losing at most one checkpoint interval of progress there is
+        // the accepted trade (resume re-pushes; pushsync is idempotent).
+        if !drivers.is_empty() {
+            let _ = tokio::time::timeout(SUSPEND_DRAIN_TIMEOUT, futures::future::join_all(drivers))
+                .await;
+        }
+        info!(
+            target: "ant_node::uploads",
+            suspended, "upload subsystem suspended",
+        );
+        suspended
+    }
+
+    /// Undo [`suspend_all`](Self::suspend_all): restart only the jobs it
+    /// paused (`auto_paused` — a user pause stays paused) and re-queue
+    /// securing passes for completed-but-unsecured jobs, exactly like a
+    /// daemon boot does. Idempotent and safe without a prior suspend.
+    /// Returns the number of jobs it resumed.
+    pub fn wake_all(&self) -> usize {
+        self.inner.suspended.store(false, Ordering::SeqCst);
+        let jobs: Vec<(String, bool)> = self
+            .inner
+            .jobs
+            .lock()
+            .expect("uploads jobs mutex poisoned")
+            .iter()
+            .map(|(id, h)| {
+                let info = h.info.lock().expect("upload mutex poisoned");
+                (
+                    id.clone(),
+                    info.status == UploadStatus::Paused && info.auto_paused,
+                )
+            })
+            .collect();
+        let mut woken = 0usize;
+        for (job_id, auto_paused) in jobs {
+            if !auto_paused {
+                continue;
+            }
+            // `resume` clears `auto_paused` and spawns a fresh driver.
+            if self.resume(&job_id).is_ok() {
+                woken += 1;
+            }
+        }
+        self.requeue_unsecured_heals();
+        info!(
+            target: "ant_node::uploads",
+            woken, "upload subsystem woken",
+        );
+        woken
     }
 
     /// Queue an automatic heal for a completed job, bounded by
@@ -1256,55 +1449,75 @@ impl UploadManager {
     }
 
     /// Run one queued automatic heal to completion. Derives the chunk
-    /// address list if the request didn't carry it (the source must still
-    /// be present and the same size); a missing/oversized source can't be
-    /// verified, so the job is marked heal-finished to stop the endless
-    /// "Securing…". No progress sink — the automatic bar is driven by the
-    /// job snapshot via [`set_heal_progress`], not a stream.
+    /// address list if the request didn't carry it: from the (possibly
+    /// re-anchored) source file when it's still present and unchanged,
+    /// else — for a job with a `reference` — by traversing the completed
+    /// chunk tree through the persistent chunk store (the same store the
+    /// re-push reads payloads from), so heal proceeds store-only instead
+    /// of failing when the app deleted or lost the source. A job whose
+    /// addresses can't be derived either way is marked heal-finished to
+    /// stop the endless "Securing…". No progress sink — the automatic
+    /// bar is driven by the job snapshot via [`set_heal_progress`], not
+    /// a stream.
     async fn run_heal(&self, req: HealRequest) {
+        if self.heal_aborted(&req.job_id) {
+            return;
+        }
         let addrs = if let Some(addrs) = req.addrs {
             addrs
         } else {
-            let resolved = self.resolve_source_path(&req.source_path);
-            match std::fs::metadata(&resolved) {
-                Ok(md) if md.len() == req.source_size => {}
-                _ => {
-                    info!(
-                        target: "ant_node::uploads",
-                        job_id = %req.job_id,
-                        "queued heal: source missing or changed — marking secured-as-is",
-                    );
-                    self.mark_heal_finished(&req.job_id);
-                    return;
+            // Prefer the live (rebased) source; the request's copy of
+            // the path may predate a container-move re-anchor.
+            let resolved = self
+                .job_handle(&req.job_id)
+                .map_or_else(|| req.source_path.clone(), |h| self.resolve_job_source(&h));
+            let source_ok =
+                std::fs::metadata(&resolved).is_ok_and(|md| md.len() == req.source_size);
+            let derived = if source_ok {
+                match collect_heal_addrs(
+                    &resolved,
+                    req.source_size,
+                    req.raw,
+                    req.name.as_deref(),
+                    req.content_type.as_deref(),
+                ) {
+                    Ok(Some(addrs)) => Some(addrs),
+                    Ok(None) => {
+                        info!(
+                            target: "ant_node::uploads",
+                            job_id = %req.job_id,
+                            "queued heal: file exceeds heal chunk cap — skipping",
+                        );
+                        self.mark_heal_finished(&req.job_id);
+                        return;
+                    }
+                    Err(e) => {
+                        warn!(
+                            target: "ant_node::uploads",
+                            job_id = %req.job_id,
+                            "queued heal: could not re-derive chunks: {e}",
+                        );
+                        None
+                    }
                 }
-            }
-            match collect_heal_addrs(
-                &resolved,
-                req.source_size,
-                req.raw,
-                req.name.as_deref(),
-                req.content_type.as_deref(),
-            ) {
-                Ok(Some(addrs)) => addrs,
-                Ok(None) => {
-                    info!(
-                        target: "ant_node::uploads",
-                        job_id = %req.job_id,
-                        "queued heal: file exceeds heal chunk cap — skipping",
-                    );
-                    self.mark_heal_finished(&req.job_id);
-                    return;
-                }
-                Err(e) => {
-                    warn!(
-                        target: "ant_node::uploads",
-                        job_id = %req.job_id,
-                        "queued heal: could not re-derive chunks: {e}",
-                    );
-                    self.mark_heal_finished(&req.job_id);
-                    return;
-                }
-            }
+            } else {
+                None
+            };
+            let derived = if derived.is_some() {
+                derived
+            } else {
+                self.collect_heal_addrs_from_store(&req.job_id).await
+            };
+            let Some(addrs) = derived else {
+                info!(
+                    target: "ant_node::uploads",
+                    job_id = %req.job_id,
+                    "queued heal: source unavailable and store traversal failed — marking secured-as-is",
+                );
+                self.mark_heal_finished(&req.job_id);
+                return;
+            };
+            addrs
         };
         self.verify_and_heal(
             &req.job_id,
@@ -1339,58 +1552,55 @@ impl UploadManager {
     ) {
         let snap = handle.snapshot();
         let job_id = snap.job_id.clone();
-        let source_path = self.resolve_source_path(&snap.source_path);
+        let source_path = self.resolve_job_source(&handle);
 
-        // Source must still be present and have the same content, or a
-        // re-derived chunk set wouldn't match what was uploaded. We gate
-        // on size only, not mtime: heal re-derives every chunk address
-        // straight from the bytes, and a re-anchored import (carried into
-        // a new data container) can legitimately carry a fresh mtime while
-        // its content is byte-identical.
-        match std::fs::metadata(&source_path) {
-            Ok(md) if md.len() == snap.source_size => {}
-            Ok(_) => {
-                info!(
-                    target: "ant_node::uploads",
-                    job_id = %job_id,
-                    "skipping heal: source file changed since upload (size mismatch)",
-                );
-                return;
+        // Prefer re-deriving the chunk set from the source file — it must
+        // still be present and have the same content, or the set wouldn't
+        // match what was uploaded. We gate on size only, not mtime: heal
+        // re-derives every chunk address straight from the bytes, and a
+        // re-anchored import (carried into a new data container) can
+        // legitimately carry a fresh mtime while its content is
+        // byte-identical. With the source gone/changed, fall back to
+        // traversing the completed chunk tree through the persistent
+        // chunk store, so "Push again" keeps working after the app
+        // deleted the original.
+        let source_ok =
+            std::fs::metadata(&source_path).is_ok_and(|md| md.len() == snap.source_size);
+        let all_addrs = if source_ok {
+            match collect_heal_addrs(
+                &source_path,
+                snap.source_size,
+                snap.raw,
+                snap.name.as_deref(),
+                snap.content_type.as_deref(),
+            ) {
+                Ok(Some(addrs)) => addrs,
+                Ok(None) => {
+                    info!(
+                        target: "ant_node::uploads",
+                        job_id = %job_id,
+                        "skipping heal: file exceeds heal chunk cap",
+                    );
+                    return;
+                }
+                Err(e) => {
+                    warn!(
+                        target: "ant_node::uploads",
+                        job_id = %job_id,
+                        "skipping heal: could not re-derive chunks: {e}",
+                    );
+                    return;
+                }
             }
-            Err(_) => {
-                info!(
-                    target: "ant_node::uploads",
-                    job_id = %job_id,
-                    "skipping heal: source file no longer present",
-                );
-                return;
-            }
-        }
-
-        let all_addrs = match collect_heal_addrs(
-            &source_path,
-            snap.source_size,
-            snap.raw,
-            snap.name.as_deref(),
-            snap.content_type.as_deref(),
-        ) {
-            Ok(Some(addrs)) => addrs,
-            Ok(None) => {
-                info!(
-                    target: "ant_node::uploads",
-                    job_id = %job_id,
-                    "skipping heal: file exceeds heal chunk cap",
-                );
-                return;
-            }
-            Err(e) => {
-                warn!(
-                    target: "ant_node::uploads",
-                    job_id = %job_id,
-                    "skipping heal: could not re-derive chunks: {e}",
-                );
-                return;
-            }
+        } else if let Some(addrs) = self.collect_heal_addrs_from_store(&job_id).await {
+            addrs
+        } else {
+            info!(
+                target: "ant_node::uploads",
+                job_id = %job_id,
+                "skipping heal: source unavailable and store traversal failed",
+            );
+            return;
         };
 
         let batch_id = resolve_batch_id(snap.batch_id.as_deref(), self.inner.default_batch_id);
@@ -1449,8 +1659,9 @@ impl UploadManager {
 
     fn spawn_driver(&self, handle: Arc<JobHandle>) {
         let mgr = self.clone();
-        tokio::spawn(async move {
-            if let Err(e) = mgr.run_job(handle.clone()).await {
+        let task_handle = handle.clone();
+        let task = tokio::spawn(async move {
+            if let Err(e) = mgr.run_job(task_handle.clone()).await {
                 warn!(
                     target: "ant_node::uploads",
                     "upload driver returned error: {e}",
@@ -1459,9 +1670,12 @@ impl UploadManager {
                 // already surfaced by `mark_failed`; this branch
                 // exists for the `?` propagation path before the
                 // driver's own error handling kicks in.
-                mgr.mark_failed(&handle, e.to_string());
+                mgr.mark_failed(&task_handle, e.to_string());
             }
         });
+        // Keep the task joinable so `suspend_all` can await the
+        // drain-and-checkpoint a pause triggers.
+        *handle.driver.lock().expect("driver mutex poisoned") = Some(task);
     }
 
     /// Move `info.status` to `Failed` and persist. Called on
@@ -1489,19 +1703,30 @@ impl UploadManager {
     /// `ControlCommand::PushChunk` pipeline with bounded
     /// concurrency.
     async fn run_job(&self, handle: Arc<JobHandle>) -> Result<(), UploadError> {
-        // Mark Running unconditionally — even Pending jobs flip
-        // here so the watch receiver sees the transition.
+        // Mark Running — even Pending jobs flip here so the watch
+        // receiver sees the transition. A running driver also means any
+        // prior system pause is over. Skipped when a pause/cancel beat
+        // the driver to its first turn (a suspend can land between
+        // `start` and here): the requester already persisted the
+        // Paused/Cancelled state and the loop below exits on the flag —
+        // overwriting it with `Running` would strand a parked job
+        // looking alive.
         {
             let mut info = handle.info.lock().expect("upload mutex poisoned");
-            info.status = UploadStatus::Running;
-            info.last_update_unix = unix_seconds();
-            let _ = handle.progress.send(info.clone());
+            if !handle.pause_requested.load(Ordering::SeqCst)
+                && !handle.cancel_requested.load(Ordering::SeqCst)
+            {
+                info.status = UploadStatus::Running;
+                info.auto_paused = false;
+                info.last_update_unix = unix_seconds();
+                let _ = handle.progress.send(info.clone());
+            }
         }
 
-        let snap = handle.snapshot();
         // Re-anchor the source if its stored absolute path went stale
-        // across a data-container move (see `resolve_source_path`).
-        let source_path = self.resolve_source_path(&snap.source_path);
+        // across a data-container move (see `resolve_job_source`).
+        let source_path = self.resolve_job_source(&handle);
+        let snap = handle.snapshot();
         // Resolve which postage batch stamps this job's chunks: the
         // job's own `batch_id` (hex) if set, else the manager's startup
         // default. A zeroed id means "none configured" — the node loop
@@ -2286,11 +2511,17 @@ impl UploadManager {
         // verdict; for `ReachableThenShallow` it just gates entry to phase 2,
         // since reachable-but-shallow chunks aren't counted here.
         for round in 0..mode.mopup_rounds() {
+            if self.heal_aborted(job_id) {
+                return;
+            }
             tokio::time::sleep(HEAL_SETTLE_DELAY).await;
             let Some(missing) = self
                 .query_missing(job_id, all_addrs, HEAL_PROBES, false, &progress)
                 .await
             else {
+                if self.heal_aborted(job_id) {
+                    return;
+                }
                 // Read-back couldn't run (peers not ready / transport
                 // error). Do NOT claim the upload is healthy — just try
                 // again next round after another settle delay.
@@ -2351,6 +2582,9 @@ impl UploadManager {
         // skips straight to the reachable-set verdict.
         let include_shallow = mode.promotes_shallow();
         if include_shallow {
+            if self.heal_aborted(job_id) {
+                return;
+            }
             tokio::time::sleep(HEAL_SETTLE_DELAY).await;
             if let Some(missing) = self
                 .query_missing(job_id, all_addrs, HEAL_PROBES, true, &progress)
@@ -2390,11 +2624,19 @@ impl UploadManager {
         // One final read-back after the last re-push decides the verdict. It
         // probes for the same depth the pass repaired: deep reachability when
         // shallow was promoted, plain reachability otherwise.
+        if self.heal_aborted(job_id) {
+            return;
+        }
         tokio::time::sleep(HEAL_SETTLE_DELAY).await;
-        match self
+        let final_missing = self
             .query_missing(job_id, all_addrs, HEAL_PROBES, include_shallow, &progress)
-            .await
-        {
+            .await;
+        // An abort mid-read-back surfaces as an inconclusive result;
+        // don't let it masquerade as "heal ran its course" below.
+        if self.heal_aborted(job_id) {
+            return;
+        }
+        match final_missing {
             Some(missing) if missing.is_empty() => {
                 info!(
                     target: "ant_node::uploads",
@@ -2435,30 +2677,77 @@ impl UploadManager {
         self.mark_heal_finished(job_id);
     }
 
-    /// Resolve a job's stored source path to a file that actually exists,
+    /// The `source_root/source_rel` re-anchor candidate for a job whose
+    /// absolute source path went stale across a data-container move,
+    /// guarded by a size **and mtime** match so a *different* file that
+    /// happens to share the relative path can never be silently
+    /// substituted (its chunk tree wouldn't match the persisted resume
+    /// cursor / reference). `None` when the stored path still exists,
+    /// no root/rel is configured, or the guard fails.
+    fn rebase_candidate(&self, info: &UploadJobInfo) -> Option<PathBuf> {
+        if info.source_path.exists() {
+            return None;
+        }
+        let root = self.inner.source_root.as_ref()?;
+        let rel = info.source_rel.as_ref()?;
+        let candidate = root.join(rel);
+        let md = std::fs::metadata(&candidate).ok()?;
+        (md.len() == info.source_size && mtime_unix_ms(&md) == info.source_mtime_unix_ms)
+            .then_some(candidate)
+    }
+
+    /// Resolve a job's source to a file that actually exists,
     /// re-anchoring app-managed imports across data-container moves.
     ///
-    /// The iOS app stages picked files under `<data_dir>/imports/<name>`
+    /// The iOS app stages picked files under the configured source root
     /// but the job manifest persists an *absolute* path that embeds the
-    /// OS data-container id. When the OS reassigns that id (app reinstall
-    /// or device migration) the absolute path goes stale even though the
-    /// bytes were carried into the new container — which is exactly what
-    /// left old uploads unable to self-heal. We recover by retrying the
-    /// same filename under the *current* data dir's `imports/` folder.
-    /// Sources outside the data dir (e.g. `antctl` uploads from an
-    /// arbitrary path) simply don't match the fallback, so their
-    /// behaviour is unchanged.
-    fn resolve_source_path(&self, stored: &Path) -> PathBuf {
-        if stored.exists() {
-            return stored.to_path_buf();
+    /// OS data-container id. When the OS reassigns that id (app update,
+    /// reinstall, or device migration) the absolute path goes stale even
+    /// though the bytes were carried into the new container — which is
+    /// exactly what left old uploads unable to resume or self-heal.
+    ///
+    /// Order: the stored absolute path if it still exists; else the
+    /// guarded `source_root/source_rel` candidate, which is **persisted**
+    /// back into the job (rewrite + checkpoint) so every later open is
+    /// direct; else the legacy `<data_dir>/imports/<basename>` fallback
+    /// kept for jobs persisted before `source_rel` existed (no rewrite —
+    /// its only guard is the size check every caller performs
+    /// downstream); else the stored path, letting the caller surface the
+    /// open error.
+    fn resolve_job_source(&self, handle: &Arc<JobHandle>) -> PathBuf {
+        let snap = handle.snapshot();
+        if snap.source_path.exists() {
+            return snap.source_path;
         }
-        if let (Some(name), Some(data_dir)) = (stored.file_name(), self.inner.state_dir.parent()) {
+        if let Some(candidate) = self.rebase_candidate(&snap) {
+            let rebased = {
+                let mut info = handle.info.lock().expect("upload mutex poisoned");
+                info.source_path.clone_from(&candidate);
+                info.last_update_unix = unix_seconds();
+                info.clone()
+            };
+            info!(
+                target: "ant_node::uploads",
+                job_id = %rebased.job_id,
+                to = %candidate.display(),
+                "re-anchored upload source after data-container move",
+            );
+            let _ = handle.progress.send(rebased.clone());
+            let _ = rebased.save(&UploadJobInfo::manifest_path(
+                &self.inner.state_dir,
+                &rebased.job_id,
+            ));
+            return candidate;
+        }
+        if let (Some(name), Some(data_dir)) =
+            (snap.source_path.file_name(), self.inner.state_dir.parent())
+        {
             let candidate = data_dir.join("imports").join(name);
             if candidate.exists() {
                 return candidate;
             }
         }
-        stored.to_path_buf()
+        snap.source_path
     }
 
     /// Look up a registered job handle by id, if the manager still holds
@@ -2470,6 +2759,112 @@ impl UploadManager {
             .expect("uploads jobs mutex poisoned")
             .get(job_id)
             .cloned()
+    }
+
+    /// Enumerate a completed job's full chunk address set (data leaves +
+    /// intermediates + manifest) **without the source file**, by
+    /// traversing its final `reference` through the persistent chunk
+    /// store — the same store [`repush_missing`](Self::repush_missing)
+    /// re-pushes payloads from, populated by the `PushChunk` handler on
+    /// the way up. Store-only: a chunk missing from the store fails the
+    /// traversal (`None`) rather than touching the network, and the
+    /// caller falls back to marking the heal finished. Also `None` when
+    /// no store is wired, the job has no reference, or the tree exceeds
+    /// [`HEAL_MAX_CHUNKS`].
+    async fn collect_heal_addrs_from_store(&self, job_id: &str) -> Option<Vec<[u8; 32]>> {
+        let cache = self.inner.disk_cache.clone()?;
+        let reference = self.job_handle(job_id)?.snapshot().reference?;
+        let hexstr = reference.strip_prefix("0x").unwrap_or(&reference);
+        let mut root = [0u8; 32];
+        hex::decode_to_slice(hexstr, &mut root).ok()?;
+        let fetcher = StoreFetcher(cache);
+        match ant_retrieval::traverse_chunk_addresses(&fetcher, root, HEAL_MAX_CHUNKS * CHUNK_SIZE)
+            .await
+        {
+            Ok(addrs) if addrs.len() <= HEAL_MAX_CHUNKS => {
+                info!(
+                    target: "ant_node::uploads",
+                    job_id, chunks = addrs.len(),
+                    "heal: enumerated chunk set from the local store (source file unavailable)",
+                );
+                Some(addrs)
+            }
+            Ok(_) => None,
+            Err(e) => {
+                warn!(
+                    target: "ant_node::uploads",
+                    job_id, "heal: store-only traversal failed: {e}",
+                );
+                None
+            }
+        }
+    }
+
+    /// Whether a securing pass for `job_id` should stop at its next
+    /// opportunity — the manager is suspended, or the user cancelled the
+    /// job. Pure check, no exit bookkeeping; dispatch loops use it to
+    /// stop issuing new work while [`heal_aborted`](Self::heal_aborted)
+    /// at the caller's next boundary performs the actual exit.
+    fn heal_abort_pending(&self, job_id: &str) -> bool {
+        self.inner.suspended.load(Ordering::SeqCst)
+            || self
+                .job_handle(job_id)
+                .is_some_and(|h| h.cancel_requested.load(Ordering::SeqCst))
+    }
+
+    /// Check for an abort request and, when one is pending, perform the
+    /// exit bookkeeping. Returns `true` when the securing pass must stop.
+    ///
+    /// * **Suspended** (system pause): stop quietly *without* marking
+    ///   the heal finished, so `wake_all` / the next rehydrate re-queues
+    ///   the pass; just clear the live progress so the UI doesn't show a
+    ///   frozen bar.
+    /// * **Cancelled** (user's "Stop securing"): clear the cancel flag —
+    ///   a later "Push again" on this still-`Completed` job must work —
+    ///   and mark the heal finished so the UI stops showing "Securing…".
+    ///   (The `heal_inflight` marker is cleared by the `enqueue_heal`
+    ///   wrapper as the pass exits, so a re-heal can be queued.)
+    fn heal_aborted(&self, job_id: &str) -> bool {
+        if self.inner.suspended.load(Ordering::SeqCst) {
+            info!(
+                target: "ant_node::uploads",
+                job_id, "securing pass stopping: upload subsystem suspended",
+            );
+            self.clear_heal_progress(job_id);
+            return true;
+        }
+        if let Some(handle) = self.job_handle(job_id) {
+            if handle.cancel_requested.swap(false, Ordering::SeqCst) {
+                info!(
+                    target: "ant_node::uploads",
+                    job_id, "securing pass stopping: cancelled by the user",
+                );
+                self.mark_heal_finished(job_id);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Clear the transient "Securing…" progress fields without touching
+    /// `heal_finished` — the suspended-abort path, where the pass will
+    /// be re-queued on wake and must still read as unsecured.
+    fn clear_heal_progress(&self, job_id: &str) {
+        let Some(handle) = self.job_handle(job_id) else {
+            return;
+        };
+        let snap = {
+            let mut info = handle.info.lock().expect("upload mutex poisoned");
+            if info.heal_phase.is_none() && info.heal_checked.is_none() && info.heal_total.is_none()
+            {
+                return;
+            }
+            info.heal_phase = None;
+            info.heal_checked = None;
+            info.heal_total = None;
+            info.clone()
+        };
+        let _ = handle.progress.send(snap);
     }
 
     /// Fold one live heal step into the job snapshot's transient
@@ -2684,6 +3079,12 @@ impl UploadManager {
         let mut checked = 0usize;
         self.report_heal(job_id, progress, "checking", Some(0), Some(total));
         for batch in all_addrs.chunks(HEAL_VERIFY_BATCH) {
+            // Abort (suspend / user cancel) surfaces as an inconclusive
+            // read-back; the caller's next boundary check does the exit
+            // bookkeeping.
+            if self.heal_abort_pending(job_id) {
+                return None;
+            }
             let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
             if self
                 .inner
@@ -2770,6 +3171,12 @@ impl UploadManager {
         if let Some(cache) = self.inner.disk_cache.clone() {
             let addrs: Vec<[u8; 32]> = remaining.iter().copied().collect();
             for addr in addrs {
+                // Stop dispatching on abort; in-flight pushes are simply
+                // dropped (pushsync is idempotent). The caller's next
+                // boundary check performs the exit bookkeeping.
+                if self.heal_abort_pending(job_id) {
+                    return Ok(());
+                }
                 match cache.get(addr).await {
                     Ok(Some(wire)) => {
                         if in_flight.len() >= MAX_PUSH_CONCURRENCY {
@@ -2822,6 +3229,9 @@ impl UploadManager {
                     macro_rules! maybe_push {
                         ($chunk:expr) => {{
                             let chunk = $chunk;
+                            if self.heal_abort_pending(job_id) {
+                                return Ok(());
+                            }
                             if remaining.contains(&chunk.address) {
                                 if in_flight.len() >= MAX_PUSH_CONCURRENCY {
                                     if let Some((_, res)) = in_flight.next().await {
@@ -2873,10 +3283,34 @@ impl UploadManager {
         }
 
         while let Some((_, res)) = in_flight.next().await {
+            if self.heal_abort_pending(job_id) {
+                return Ok(());
+            }
             res?;
             note_done!();
         }
         Ok(())
+    }
+}
+
+/// Store-only [`ant_retrieval::ChunkFetcher`] for enumerating a
+/// completed upload's chunk addresses when the source file is gone:
+/// reads exclusively from the persistent chunk store and errors on a
+/// miss, so the traversal never touches the network (heal's read-back
+/// is what talks to peers, not the enumeration).
+struct StoreFetcher(Arc<ant_retrieval::DiskChunkCache>);
+
+#[async_trait::async_trait]
+impl ant_retrieval::ChunkFetcher for StoreFetcher {
+    async fn fetch(
+        &self,
+        addr: [u8; 32],
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        match self.0.get(addr).await {
+            Ok(Some(wire)) => Ok(wire),
+            Ok(None) => Err(format!("chunk 0x{} not in local store", hex::encode(addr)).into()),
+            Err(e) => Err(e.to_string().into()),
+        }
     }
 }
 
@@ -3148,6 +3582,7 @@ pub fn to_view(info: UploadJobInfo) -> UploadJobView {
         reference: info.reference,
         chunks_requeued: info.chunks_requeued,
         stalled: info.stalled,
+        auto_paused: info.auto_paused,
         heal_verified: info.heal_verified,
         heal_finished: info.heal_finished,
         heal_phase: info.heal_phase,
@@ -4420,6 +4855,7 @@ mod tests {
         let info = UploadJobInfo {
             job_id: job_id.clone(),
             source_path: f.path().to_path_buf(),
+            source_rel: None,
             source_size: len as u64,
             // Older than the file's true mtime.
             source_mtime_unix_ms: 1,
@@ -4442,6 +4878,7 @@ mod tests {
             heal_total: None,
             chunks_requeued: 0,
             stalled: false,
+            auto_paused: false,
         };
         info.save(&UploadJobInfo::manifest_path(state_dir.path(), &job_id))
             .expect("save");
@@ -4464,5 +4901,373 @@ mod tests {
             }
             rx.changed().await.expect("watch");
         }
+    }
+
+    /// Fake node loop whose `PushChunk` acks are delayed, so a
+    /// several-dozen-chunk upload reliably stays `Running` long enough
+    /// for the suspend / container-move tests to interrupt it
+    /// mid-flight. Acks are processed serially (one command at a time),
+    /// which is exactly what stretches the run. Heal read-backs report
+    /// everything present so post-completion securing no-ops.
+    fn spawn_fake_pushsync_delayed(delay: Duration) -> mpsc::Sender<ControlCommand> {
+        let (tx, mut rx) = mpsc::channel::<ControlCommand>(64);
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                match cmd {
+                    ControlCommand::PushChunk { wire, ack, .. } => {
+                        tokio::time::sleep(delay).await;
+                        let mut span = [0u8; 8];
+                        span.copy_from_slice(&wire[..8]);
+                        let addr =
+                            ant_crypto::bmt::bmt_hash_with_span(&span, &wire[8..]).expect("BMT");
+                        let _ = ack.send(ControlAck::ChunkUploaded {
+                            reference: format!("0x{}", hex::encode(addr)),
+                        });
+                    }
+                    ControlCommand::VerifyChunksPresent { addresses, ack, .. } => {
+                        let body = serde_json::json!({
+                            "checked": addresses.len(),
+                            "missing": Vec::<String>::new(),
+                        });
+                        let _ = ack.send(ControlAck::Ok {
+                            message: body.to_string(),
+                        });
+                    }
+                    ControlCommand::PostageList { ack } => {
+                        let _ = ack.send(ControlAck::PostageList(Vec::new()));
+                    }
+                    other => panic!("unexpected control command in delayed-push test: {other:?}"),
+                }
+            }
+        });
+        tx
+    }
+
+    /// Poll a job until `pred` holds, panicking after ~20 s.
+    async fn wait_for(
+        mgr: &UploadManager,
+        id: &str,
+        what: &str,
+        pred: impl Fn(&UploadJobInfo) -> bool,
+    ) -> UploadJobInfo {
+        for _ in 0..80 {
+            let snap = mgr.status(id).expect("status");
+            if pred(&snap) {
+                return snap;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// `suspend_all` pauses running jobs with the `auto_paused` marker
+    /// and `wake_all` resumes exactly those — a job the *user* paused
+    /// stays paused across the suspend/wake cycle.
+    #[tokio::test]
+    async fn suspend_wake_resumes_auto_paused_but_not_user_paused() {
+        let len = 250_000usize;
+        let payload: Vec<u8> = (0..len).map(|i| ((i * 11) % 251) as u8).collect();
+        let f_user = write_temp_file(&payload);
+        let f_auto = write_temp_file(&payload);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let tx = spawn_fake_pushsync_delayed(Duration::from_millis(5));
+        let mgr = UploadManager::new(state_dir.path().to_path_buf(), tx, None).expect("manager");
+
+        let user_id = mgr
+            .start(f_user.path().to_path_buf(), None, None, None, true)
+            .expect("start user job");
+        wait_for(&mgr, &user_id, "user job running", |s| {
+            s.status == UploadStatus::Running
+        })
+        .await;
+        mgr.pause(&user_id).expect("user pause");
+
+        let auto_id = mgr
+            .start(f_auto.path().to_path_buf(), None, None, None, true)
+            .expect("start auto job");
+        wait_for(&mgr, &auto_id, "auto job running", |s| {
+            s.status == UploadStatus::Running
+        })
+        .await;
+
+        let suspended = mgr.suspend_all().await;
+        assert_eq!(suspended, 1, "only the running job is suspended");
+        let user_snap = mgr.status(&user_id).expect("status");
+        assert_eq!(user_snap.status, UploadStatus::Paused);
+        assert!(!user_snap.auto_paused, "user pause must stay a user pause");
+        let auto_snap = mgr.status(&auto_id).expect("status");
+        assert_eq!(auto_snap.status, UploadStatus::Paused);
+        assert!(auto_snap.auto_paused, "system pause carries the marker");
+        // The marker must be persisted — a relaunch decides restart vs
+        // stay-paused from the on-disk manifest.
+        let on_disk =
+            UploadJobInfo::load(&UploadJobInfo::manifest_path(state_dir.path(), &auto_id))
+                .expect("load");
+        assert!(on_disk.auto_paused && on_disk.status == UploadStatus::Paused);
+
+        let woken = mgr.wake_all();
+        assert_eq!(woken, 1, "only the auto-paused job wakes");
+        let done = wait_for(&mgr, &auto_id, "auto job completion", |s| {
+            s.status.is_terminal()
+        })
+        .await;
+        assert_eq!(done.status, UploadStatus::Completed);
+        assert!(!done.auto_paused, "resume clears the marker");
+        let user_snap = mgr.status(&user_id).expect("status");
+        assert_eq!(
+            user_snap.status,
+            UploadStatus::Paused,
+            "user-paused job must still be paused after wake",
+        );
+    }
+
+    /// The container-move simulation (the iOS quirk end-to-end): an
+    /// upload started under `source_root` is suspended mid-flight, the
+    /// whole container directory is renamed (what iOS does to the app
+    /// container on update), and a fresh manager rehydrates with the
+    /// *new* root. The job must rebase its source path, auto-resume from
+    /// the persisted cursor, and complete.
+    #[tokio::test]
+    async fn container_move_rebases_resumes_and_completes() {
+        let len = 250_000usize;
+        let payload: Vec<u8> = (0..len).map(|i| ((i * 37) % 251) as u8).collect();
+        let root = tempfile::tempdir().expect("tempdir");
+        let container_a = root.path().join("container-A");
+        let imports_a = container_a.join("imports");
+        std::fs::create_dir_all(&imports_a).expect("mkdir imports");
+        let source_a = imports_a.join("blob.bin");
+        std::fs::write(&source_a, &payload).expect("write source");
+        let state_dir = tempfile::tempdir().expect("state dir");
+
+        // Phase 1: upload under root A, suspend mid-flight.
+        let tx1 = spawn_fake_pushsync_delayed(Duration::from_millis(5));
+        let mgr1 = UploadManager::new(state_dir.path().to_path_buf(), tx1, None)
+            .expect("manager")
+            .with_source_root(Some(imports_a.clone()));
+        let id = mgr1
+            .start(source_a.clone(), None, None, None, false)
+            .expect("start");
+        wait_for(&mgr1, &id, "job running", |s| {
+            s.status == UploadStatus::Running
+        })
+        .await;
+        mgr1.suspend_all().await;
+        let snap = mgr1.status(&id).expect("status");
+        assert_eq!(snap.status, UploadStatus::Paused);
+        assert!(snap.auto_paused);
+        assert!(
+            snap.chunks_pushed < estimate_chunk_count(len as u64, false),
+            "suspend must land mid-upload for the resume leg to mean anything",
+        );
+        assert_eq!(snap.source_rel.as_deref(), Some(Path::new("blob.bin")));
+        drop(mgr1);
+
+        // Phase 2: the OS moves the container.
+        let container_b = root.path().join("container-B");
+        std::fs::rename(&container_a, &container_b).expect("rename container");
+        let imports_b = container_b.join("imports");
+
+        // Phase 3: relaunch against the new root; the job must rebase,
+        // resume from the cursor, and complete.
+        let (tx2, stats2) = spawn_fake_pushsync();
+        let mgr2 = UploadManager::new(state_dir.path().to_path_buf(), tx2, None)
+            .expect("manager")
+            .with_source_root(Some(imports_b.clone()));
+        mgr2.rehydrate_from_disk(true).expect("rehydrate");
+
+        let done = wait_for(&mgr2, &id, "completion after move", |s| {
+            s.status.is_terminal()
+        })
+        .await;
+        assert_eq!(
+            done.status,
+            UploadStatus::Completed,
+            "job must complete after the container move (last_error: {:?})",
+            done.last_error,
+        );
+        assert!(
+            done.source_path.starts_with(&imports_b),
+            "source path must be re-anchored under the new container, got {}",
+            done.source_path.display(),
+        );
+        assert!(done.reference.is_some());
+        // The second run resumed from the persisted cursor instead of
+        // re-pushing the whole file.
+        let resumed_pushes = stats2.lock().expect("stats").total_dispatches;
+        assert!(
+            resumed_pushes < estimate_chunk_count(len as u64, false),
+            "resume should skip already-pushed chunks (pushed {resumed_pushes})",
+        );
+    }
+
+    /// The rebase guard: a candidate at `source_root/source_rel` whose
+    /// mtime doesn't match the recorded one must NOT be substituted (it
+    /// could be a different file with the same name), so the job fails
+    /// on its stale absolute path instead of silently uploading the
+    /// wrong bytes.
+    #[tokio::test]
+    async fn rebase_refuses_on_mtime_mismatch() {
+        let len = 8_000usize;
+        let payload: Vec<u8> = vec![0x5A; len];
+        let root = tempfile::tempdir().expect("tempdir");
+        let imports = root.path().join("imports");
+        std::fs::create_dir_all(&imports).expect("mkdir");
+        std::fs::write(imports.join("blob.bin"), &payload).expect("write candidate");
+        let state_dir = tempfile::tempdir().expect("state dir");
+
+        let stale = root.path().join("gone-container").join("blob.bin");
+        let job_id = "feedfacefeedface".to_string();
+        let info = UploadJobInfo {
+            job_id: job_id.clone(),
+            source_path: stale.clone(),
+            source_rel: Some(PathBuf::from("blob.bin")),
+            source_size: len as u64,
+            // Deliberately different from the candidate's real mtime.
+            source_mtime_unix_ms: 1,
+            batch_id: None,
+            name: Some("blob.bin".into()),
+            content_type: None,
+            raw: true,
+            status: UploadStatus::Running,
+            bytes_pushed: 0,
+            chunks_pushed: 0,
+            chunks_total: Some(estimate_chunk_count(len as u64, true)),
+            created_at_unix: 0,
+            last_update_unix: 0,
+            last_error: None,
+            reference: None,
+            heal_verified: false,
+            heal_finished: false,
+            heal_phase: None,
+            heal_checked: None,
+            heal_total: None,
+            chunks_requeued: 0,
+            stalled: false,
+            auto_paused: false,
+        };
+        info.save(&UploadJobInfo::manifest_path(state_dir.path(), &job_id))
+            .expect("save");
+
+        let (tx, _stats) = spawn_fake_pushsync();
+        let mgr = UploadManager::new(state_dir.path().to_path_buf(), tx, None)
+            .expect("manager")
+            .with_source_root(Some(imports));
+        mgr.rehydrate_from_disk(true).expect("rehydrate");
+
+        let snap = wait_for(&mgr, &job_id, "terminal state", |s| s.status.is_terminal()).await;
+        assert_eq!(
+            snap.status,
+            UploadStatus::Failed,
+            "a guarded rebase miss must fail the job, not substitute the file",
+        );
+        assert_eq!(
+            snap.source_path, stale,
+            "the stale path must not be rewritten on a guard mismatch",
+        );
+    }
+
+    /// Cancelling a `Completed` job stops its securing pass cleanly: the
+    /// heal bails before re-pushing anything, `heal_finished` flips so
+    /// the UI stops showing "Securing…", the live progress fields clear,
+    /// and a subsequent "Push again" still works.
+    #[tokio::test]
+    async fn cancel_stops_securing_and_allows_repush() {
+        let len = 20_000usize;
+        let payload: Vec<u8> = (0..len).map(|i| ((i * 41) % 251) as u8).collect();
+        let f = write_temp_file(&payload);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let (tx, harness) = spawn_fake_pushsync_with_heal();
+        let mgr = UploadManager::new(state_dir.path().to_path_buf(), tx, None).expect("manager");
+
+        let id = mgr
+            .start(f.path().to_path_buf(), None, None, None, false)
+            .expect("start");
+        wait_for(&mgr, &id, "completion", |s| s.status.is_terminal()).await;
+
+        // Cancel while the enqueued heal is still in its settle window —
+        // it must bail before re-pushing the forced-missing chunk.
+        mgr.cancel(&id).expect("cancel");
+        let snap = wait_for(&mgr, &id, "heal_finished after cancel", |s| s.heal_finished).await;
+        assert_eq!(snap.status, UploadStatus::Completed);
+        assert!(snap.heal_phase.is_none(), "no frozen Securing… state");
+        if let Some(t) = harness.target() {
+            assert_eq!(
+                harness.dispatch_count(t),
+                1,
+                "cancelled securing pass must not have re-pushed",
+            );
+        }
+
+        // "Push again" after the cancel must still run a full pass.
+        let after = mgr
+            .repush_with_progress(&id, None)
+            .await
+            .expect("repush after cancelled securing");
+        assert_eq!(after.status, UploadStatus::Completed);
+        let snap = wait_for(&mgr, &id, "heal verdict after repush", |s| s.heal_finished).await;
+        assert!(
+            snap.heal_verified,
+            "push-again after a cancelled securing pass should verify",
+        );
+    }
+
+    /// Store-only heal (source gone): a completed-but-unsecured job whose
+    /// source file was deleted enumerates its chunk set by traversing the
+    /// reference through the persistent chunk store, re-pushes the
+    /// missing chunk from that same store, and ends verified.
+    #[tokio::test]
+    async fn startup_heal_traverses_store_when_source_deleted() {
+        let len = 20_000usize;
+        let payload: Vec<u8> = (0..len).map(|i| ((i * 43) % 251) as u8).collect();
+        let f = write_temp_file(&payload);
+        let source = f.path().to_path_buf();
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let cache_dir = tempfile::tempdir().expect("cachedir");
+        let cache = Arc::new(
+            ant_retrieval::DiskChunkCache::open(cache_dir.path().join("c.sqlite"), 1 << 30)
+                .expect("cache"),
+        );
+
+        // Run 1: upload with the store wired and let securing finish.
+        let (tx1, _h1) = spawn_fake_pushsync_with_cache(cache.clone());
+        let mgr1 = UploadManager::new(state_dir.path().to_path_buf(), tx1, None)
+            .expect("manager")
+            .with_disk_cache(Some(cache.clone()));
+        let id = mgr1
+            .start(source.clone(), None, None, None, false)
+            .expect("start");
+        wait_for(&mgr1, &id, "first-run securing", |s| s.heal_finished).await;
+        drop(mgr1);
+
+        // Simulate a relaunch that still owes this job a securing pass,
+        // with the source file gone.
+        let manifest_path = state_dir.path().join(format!("{id}.json"));
+        let mut info = UploadJobInfo::load(&manifest_path).expect("load");
+        info.heal_finished = false;
+        info.heal_verified = false;
+        info.save(&manifest_path).expect("save");
+        drop(f);
+        std::fs::remove_file(&source).ok();
+        assert!(!source.exists());
+
+        // Run 2: rehydrate; the startup heal must proceed store-only —
+        // enumerate from the reference, re-push the forced-missing chunk
+        // from the cache — and end verified.
+        let (tx2, h2) = spawn_fake_pushsync_with_cache(cache.clone());
+        let mgr2 = UploadManager::new(state_dir.path().to_path_buf(), tx2, None)
+            .expect("manager")
+            .with_disk_cache(Some(cache));
+        mgr2.rehydrate_from_disk(true).expect("rehydrate");
+
+        let snap = wait_for(&mgr2, &id, "store-only securing", |s| s.heal_finished).await;
+        assert!(
+            snap.heal_verified,
+            "store-only heal should verify without the source file",
+        );
+        let target = h2.target().expect("second run forced a missing chunk");
+        assert!(
+            h2.dispatch_count(target) >= 1,
+            "the forced-missing chunk must have been re-pushed from the store",
+        );
     }
 }

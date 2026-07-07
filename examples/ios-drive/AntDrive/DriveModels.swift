@@ -20,6 +20,15 @@ struct UploadJob: Codable, Identifiable, Equatable {
     let lastUpdateUnix: UInt64
     let lastError: String?
     let reference: String?
+    /// `true` while the driver keeps retrying but nothing has acked for a
+    /// sustained window — the network is effectively down for us. The job
+    /// isn't failed; the UI shows "Waiting for network…" instead of a
+    /// frozen progress bar.
+    let stalled: Bool
+    /// `true` when the pause was imposed by the system (app suspension /
+    /// offline) rather than the user. Such uploads resume on their own,
+    /// so the row says "Paused — resumes automatically".
+    let autoPaused: Bool
     /// `true` once the daemon's automatic post-upload self-heal confirmed
     /// every chunk is *deep-reachable* (held by its true neighbourhood, not
     /// merely reachable via our privileged link to a shallow storer). This is
@@ -58,6 +67,8 @@ struct UploadJob: Codable, Identifiable, Equatable {
         case lastUpdateUnix = "last_update_unix"
         case lastError = "last_error"
         case reference
+        case stalled
+        case autoPaused = "auto_paused"
         case healVerified = "heal_verified"
         case healFinished = "heal_finished"
         case healPhase = "heal_phase"
@@ -83,6 +94,8 @@ struct UploadJob: Codable, Identifiable, Equatable {
         lastUpdateUnix = try c.decode(UInt64.self, forKey: .lastUpdateUnix)
         lastError = try c.decodeIfPresent(String.self, forKey: .lastError)
         reference = try c.decodeIfPresent(String.self, forKey: .reference)
+        stalled = try c.decodeIfPresent(Bool.self, forKey: .stalled) ?? false
+        autoPaused = try c.decodeIfPresent(Bool.self, forKey: .autoPaused) ?? false
         healVerified = try c.decodeIfPresent(Bool.self, forKey: .healVerified) ?? false
         healFinished = try c.decodeIfPresent(Bool.self, forKey: .healFinished) ?? false
         healPhase = try c.decodeIfPresent(String.self, forKey: .healPhase)
@@ -129,6 +142,9 @@ struct UploadJob: Codable, Identifiable, Equatable {
 
     var isActive: Bool { status == "running" || status == "pending" }
     var isPaused: Bool { status == "paused" }
+    /// Paused by the system (suspension / offline), not the user — it
+    /// resumes on its own at the next wake.
+    var isAutoPaused: Bool { isPaused && autoPaused }
     /// Every chunk was pushed once. NOT the same as durable — the file may
     /// still be settling into its neighbourhoods (see `isDurable`).
     var isDone: Bool { status == "completed" }
@@ -163,9 +179,13 @@ struct UploadJob: Codable, Identifiable, Equatable {
             return ""
         // `pending` is the daemon's pre-dispatch state (before the driver
         // pushes its first chunk); from the user's view that's still part
-        // of uploading, so it shares the "Uploading…" label.
-        case "running", "pending": return fraction.map { "Uploading \(Int($0 * 100))%" } ?? "Uploading…"
-        case "paused": return "Paused"
+        // of uploading, so it shares the "Uploading…" label. A stalled
+        // driver (nothing acked for minutes; still retrying) reads as a
+        // network problem, not slow progress.
+        case "running", "pending":
+            if stalled { return "Waiting for network…" }
+            return fraction.map { "Uploading \(Int($0 * 100))%" } ?? "Uploading…"
+        case "paused": return autoPaused ? "Paused — resumes automatically" : "Paused"
         case "failed": return "Upload failed"
         case "cancelled": return "Cancelled"
         default: return status.capitalized

@@ -1637,6 +1637,25 @@ Not a capability milestone, but required before GA.
 
 **Exit:** App survives being killed mid-upload, relaunched, and finishes the upload. Cold-start to "ready to upload" under 30 s for a returning user.
 
+> **Status update (2026-07, issue #41):** the iOS suspend/resume +
+> flaky-network leg landed. `UploadManager` gained
+> `suspend_all`/`wake_all` (system pause with a persisted `auto_paused`
+> marker, bounded drain-and-checkpoint, securing passes stop cleanly and
+> re-queue on wake), a **container-move rebase** (`source_rel` recorded
+> against a configured `source_root`; stale absolute paths re-anchor
+> under the new app-container UUID guarded by size+mtime), and a
+> **store-only heal** fallback (chunk set enumerated by traversing the
+> completed reference through the disk chunk store when the source file
+> is gone). Wire: `ControlCommand::{UploadSuspendAll,UploadWakeAll}`,
+> `auto_paused` on `UploadJobView`. FFI: `ant_init_with_options`
+> (source-root), blocking `ant_suspend` + `ant_wake`. AntDrive now
+> observes `scenePhase` (background ⇒ `beginBackgroundTask` +
+> `ant_suspend`; active ⇒ `ant_wake`), schedules an `antdrive.secure`
+> `BGProcessingTask` to finish securing in the background, monitors the
+> network path (`NWPathMonitor` ⇒ suspend/wake + "Waiting for
+> network…"), and offers per-file "Stop securing". Android WorkManager
+> wiring is still open.
+
 #### Phase 11 — Interop, beta, polish
 
 - Continuous interop against latest `bee` mainnet release in CI.
