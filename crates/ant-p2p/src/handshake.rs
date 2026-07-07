@@ -275,29 +275,30 @@ where
     .await
 }
 
-/// Perf-lab Experiment 7, **DEFAULT ON** since 2026-07-06 (project
-/// owner's decision): every outbound BZZ handshake advertises
-/// `full_node = true`. `ANT_ADVERTISE_FULL_NODE=0` restores the
-/// honest light-node advertisement.
+/// Perf-lab Experiment 7, **DEFAULT OFF** since 2026-07-07: outbound
+/// BZZ handshakes advertise the honest `full_node = false`.
+/// `ANT_ADVERTISE_FULL_NODE=1` opts back into advertising
+/// `full_node = true`.
 ///
-/// **Be clear about what this is**: ant stores no chunks, keeps no
-/// reserve and serves no pullsync — by Swarm's own taxonomy it is a
-/// light client. Advertising full-node status is a deliberate
-/// misdeclaration whose sole purpose is bee's 10× wider per-peer
-/// accounting budget for full peers (4.5 M vs 450 K PLUR/s refresh,
-/// 13.5 M vs 1.35 M payment threshold) — measured on mainnet as 2.5×
-/// upload throughput with 12× fewer connection kills (PERF-LAB.md
-/// exp 7). The Swarm network may not welcome this posture: it works
-/// today because bee tolerates protocol-poor "full" peers (inbound
-/// reserve/pullsync requests get an honest `UnsupportedProtocol`,
-/// exactly like hoverfly, which ships the same trade-off), but a
-/// future bee release could gate full-node privileges on actually
-/// serving storage — at which point this default must be revisited.
-/// Read once per process.
+/// The misdeclaration was default-ON for one day (2026-07-06, project
+/// owner's decision) for bee's 10× wider per-peer accounting budget
+/// for full peers (4.5 M vs 450 K PLUR/s refresh, 13.5 M vs 1.35 M
+/// payment threshold) — measured on mainnet as 2.5× upload throughput
+/// with 12× fewer connection kills during sustained pushes
+/// (PERF-LAB.md exp 7). It was flipped back off because of what it
+/// does to bootstrap on a NAT-ed light client (measured 2026-07-07,
+/// interleaved cold starts): remote bees admit the "full" peer and
+/// then reset it within ~0.3 s (506 resets across 607 handshakes vs
+/// 38/148 honest — reachability checks and reserve/pullsync
+/// expectations we can't meet), and the bee bootnode handshake sits
+/// its full 10 s peerstore stall. Cold 0→100 peers: ~10 s honest vs
+/// ~30 s misdeclared. Set the env flag for upload-heavy sessions where
+/// the throughput trade wins; a future ramp-light-then-full hybrid
+/// could recover both. Read once per process.
 fn advertise_full_node_from_env() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var("ANT_ADVERTISE_FULL_NODE") {
-        Err(_) => true,
+        Err(_) => false,
         Ok(v) => {
             let v = v.trim();
             !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
