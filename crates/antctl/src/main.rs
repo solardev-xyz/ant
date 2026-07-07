@@ -3104,11 +3104,13 @@ fn wait_for_peers(socket: &Path, min_peers: u32, timeout: Duration) {
 }
 
 fn resolve_socket(opt: &Opt) -> PathBuf {
-    if let Some(p) = &opt.socket {
-        return expand_tilde(p);
-    }
-    let dir = expand_tilde(&opt.data_dir);
-    dir.join("antd.sock")
+    // Pointer-file aware: when the daemon had to bind its socket at a
+    // temp-dir fallback (data-dir path over `sun_path`'s limit, issue
+    // #39), `<data-dir>/antd.sock.path` names the real location.
+    ant_control::resolve_client_socket(
+        opt.socket.as_deref().map(expand_tilde),
+        &expand_tilde(&opt.data_dir),
+    )
 }
 
 fn expand_tilde(p: &Path) -> PathBuf {

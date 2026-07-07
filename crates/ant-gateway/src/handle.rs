@@ -69,12 +69,16 @@ pub struct GatewayHandle {
     /// so `antop` can render the Retrieval tab.
     pub activity: Arc<GatewayActivity>,
     /// Whether the node is running in **light** mode (uploads + SWAP
-    /// settlement configured) versus **ultra-light** (read-only). Set
-    /// by `antd` at startup from the postage/chequebook config. Drives
-    /// `GET /node.beeMode`, which Freedom's `checkSwarmPreFlight` gates
-    /// every publish/feed/SOC write on — an `ultra-light` answer makes
-    /// Freedom refuse to publish at all (PLAN.md J.4.1).
-    pub light_mode: bool,
+    /// settlement configured) versus **ultra-light** (read-only) — see
+    /// [`GatewayChainState::light_mode`]. Together with the chain
+    /// reader it is filled once by `antd` when the startup chain init
+    /// resolves, which happens *after* the HTTP listener binds so the
+    /// API answers from t≈0 instead of refusing connections for the
+    /// whole chain-init window (issue #38). Endpoints that need the
+    /// contents answer `503 chain init in progress` until it's set;
+    /// everything snapshot-driven (`/health`, `/peers`, `/topology`,
+    /// retrieval) works from the start.
+    pub chain_state: Arc<std::sync::OnceLock<GatewayChainState>>,
     /// In-process upload-tag registry backing `POST /tags` and
     /// `GET /tags/{uid}`. bee auto-creates a tag on every `POST /bzz`
     /// / `POST /bytes` and returns its uid in the `Swarm-Tag-Uid`
@@ -89,12 +93,6 @@ pub struct GatewayHandle {
     /// (`null`) origin. With the default (deny) config no CORS headers
     /// are emitted, matching a bee node started without the option.
     pub cors: Arc<CorsConfig>,
-    /// Optional live Gnosis chain reader + addresses backing
-    /// `/wallet`, `/chequebook/*`, `/status`, `/chainstate` (PLAN.md J.5
-    /// A2/A3/D1/D2). `None` on a node started without an RPC endpoint:
-    /// balances then report the bee zero-stub and the chain-state
-    /// endpoints fall to `501`, matching bee with no configured backend.
-    pub chain: Option<Arc<ChainContext>>,
     /// The node's secp256k1 signing secret, used as the ACT
     /// **publisher** identity — exactly bee, whose access-control
     /// session is `accesscontrol.NewDefaultSession(swarmPrivateKey)`
@@ -103,4 +101,55 @@ pub struct GatewayHandle {
     /// and `identity.public_key_hex` must be its public key so clients
     /// can read the publisher from `GET /addresses`.
     pub act_secret: Arc<[u8; 32]>,
+}
+
+/// The chain-derived slice of gateway wiring, resolved by `antd`'s
+/// startup Gnosis reads (postage batch validation/rediscovery,
+/// chequebook resolution) and installed into
+/// [`GatewayHandle::chain_state`] once available.
+#[derive(Clone)]
+pub struct GatewayChainState {
+    /// Whether the node is running in **light** mode (uploads + SWAP
+    /// settlement configured) versus **ultra-light** (read-only).
+    /// Drives `GET /node.beeMode`, which Freedom's
+    /// `checkSwarmPreFlight` gates every publish/feed/SOC write on —
+    /// an `ultra-light` answer makes Freedom refuse to publish at all
+    /// (PLAN.md J.4.1).
+    pub light_mode: bool,
+    /// Optional live Gnosis chain reader + addresses backing
+    /// `/wallet`, `/chequebook/*`, `/status`, `/chainstate` (PLAN.md J.5
+    /// A2/A3/D1/D2). `None` on a node started without an RPC endpoint:
+    /// balances then report the bee zero-stub and the chain-state
+    /// endpoints fall to `501`, matching bee with no configured backend.
+    pub chain: Option<Arc<ChainContext>>,
+}
+
+impl GatewayChainState {
+    /// Wrap into the pre-resolved slot shape [`GatewayHandle`] wants —
+    /// for embedders (ant-ffi) and tests whose chain wiring is known
+    /// at handle-construction time and never arrives late.
+    #[must_use]
+    pub fn preset(self) -> Arc<std::sync::OnceLock<GatewayChainState>> {
+        Arc::new(std::sync::OnceLock::from(self))
+    }
+}
+
+impl GatewayHandle {
+    /// The chain-derived wiring, or `None` while the daemon's startup
+    /// chain init is still resolving. Handlers that need it should
+    /// return [`crate::error::chain_initializing`] on `None` — a
+    /// retryable `503`, not a wrong-but-plausible stub answer.
+    #[must_use]
+    pub fn chain_state(&self) -> Option<&GatewayChainState> {
+        self.chain_state.get()
+    }
+
+    /// Convenience: the chain reader, when chain init has resolved AND
+    /// an RPC endpoint is configured. Callers that must distinguish
+    /// "still initializing" from "no RPC configured" use
+    /// [`Self::chain_state`] directly.
+    #[must_use]
+    pub fn chain(&self) -> Option<Arc<ChainContext>> {
+        self.chain_state().and_then(|s| s.chain.clone())
+    }
 }

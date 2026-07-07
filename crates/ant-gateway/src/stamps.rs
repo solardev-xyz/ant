@@ -203,7 +203,7 @@ const STAMPS_ENRICH_TIMEOUT: Duration = Duration::from_secs(8);
 /// `batchTTL = (remainingBalance / currentPrice) * blockTime`, matching
 /// bee.
 async fn enrich_with_chain(stamps: &mut [StampEntry], handle: &GatewayHandle) {
-    let Some(chain) = handle.chain.clone() else {
+    let Some(chain) = handle.chain() else {
         return;
     };
     if stamps.is_empty() {
@@ -300,7 +300,10 @@ pub async fn batch(State(handle): State<GatewayHandle>, Path(id): Path<String>) 
     let Some(batch_id) = crate::error::parse_hex_param::<32>("batch_id", &id, &mut reasons) else {
         return crate::error::params_error(crate::error::ParamKind::Path, reasons);
     };
-    let Some(chain) = handle.chain.clone() else {
+    let Some(chain) = handle.chain() else {
+        if handle.chain_state().is_none() {
+            return crate::error::chain_initializing();
+        }
         return json_error(StatusCode::NOT_FOUND, "batch not found");
     };
     let result = tokio::time::timeout(STAMPS_ENRICH_TIMEOUT, async {

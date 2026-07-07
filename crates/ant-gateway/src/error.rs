@@ -129,6 +129,19 @@ pub fn status_text_error(status: StatusCode) -> Response {
     json_error(status, status.canonical_reason().unwrap_or("error"))
 }
 
+/// `503` for endpoints that need the chain-derived wiring
+/// ([`crate::GatewayChainState`]) while the daemon's startup Gnosis
+/// reads are still resolving. Retryable within seconds; clients poll
+/// `/health.chainReady` for the flip. Distinct from the permanent
+/// no-RPC-configured behaviors (zero-stubs / `501`) so a transient
+/// window never produces a wrong-but-plausible answer (issue #38).
+pub fn chain_initializing() -> Response {
+    json_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "chain init in progress; retry shortly",
+    )
+}
+
 /// Bee's parameter-validation failure: `400` with
 /// `{"code":400,"message":"invalid <kind> params","reasons":[...]}`.
 pub fn params_error(kind: ParamKind, reasons: Vec<Reason>) -> Response {

@@ -64,6 +64,25 @@ pub async fn serve(
     status_rx: watch::Receiver<StatusSnapshot>,
     command_tx: Option<mpsc::Sender<ControlCommand>>,
 ) -> Result<(), ServerError> {
+    bind(socket_path)?.serve(agent, status_rx, command_tx).await
+}
+
+/// A control socket whose Unix listener is already bound. Split from
+/// [`serve`] so the daemon can surface bind failures immediately (a
+/// too-long socket path fails `bind(2)` with `SUN_LEN`, not the accept
+/// loop) and decide what to do about them — e.g. fall back to a shorter
+/// path or run without the socket — instead of discovering the error
+/// seconds later when the spawned serve task is first joined, and
+/// tearing down an otherwise healthy node over it (issue #39).
+pub struct BoundControlSocket {
+    listener: UnixListener,
+    socket_path: PathBuf,
+}
+
+/// Remove a stale socket, create the parent directory, bind, and
+/// restrict permissions. Must be called from within a tokio runtime
+/// (the listener registers with the reactor).
+pub fn bind(socket_path: PathBuf) -> Result<BoundControlSocket, ServerError> {
     if socket_path.exists() {
         std::fs::remove_file(&socket_path)?;
     }
@@ -72,23 +91,49 @@ pub async fn serve(
     }
     let listener = UnixListener::bind(&socket_path)?;
     restrict_socket_permissions(&socket_path)?;
+    Ok(BoundControlSocket {
+        listener,
+        socket_path,
+    })
+}
 
-    debug!(target: "ant_control", "control socket listening at {}", socket_path.display());
+impl BoundControlSocket {
+    /// The path the listener is actually bound to.
+    #[must_use]
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
 
-    loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                let rx = status_rx.clone();
-                let agent = agent.clone();
-                let cmd_tx = command_tx.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, agent, rx, cmd_tx).await {
-                        warn!(target: "ant_control", "control request failed: {e}");
-                    }
-                });
-            }
-            Err(e) => {
-                warn!(target: "ant_control", "accept failed: {e}");
+    /// Accept-and-dispatch loop; runs until the task is cancelled.
+    /// Accept errors are logged and survived, so this only returns if
+    /// the future is dropped.
+    pub async fn serve(
+        self,
+        agent: String,
+        status_rx: watch::Receiver<StatusSnapshot>,
+        command_tx: Option<mpsc::Sender<ControlCommand>>,
+    ) -> Result<(), ServerError> {
+        debug!(
+            target: "ant_control",
+            "control socket listening at {}",
+            self.socket_path.display(),
+        );
+
+        loop {
+            match self.listener.accept().await {
+                Ok((stream, _)) => {
+                    let rx = status_rx.clone();
+                    let agent = agent.clone();
+                    let cmd_tx = command_tx.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_connection(stream, agent, rx, cmd_tx).await {
+                            warn!(target: "ant_control", "control request failed: {e}");
+                        }
+                    });
+                }
+                Err(e) => {
+                    warn!(target: "ant_control", "accept failed: {e}");
+                }
             }
         }
     }

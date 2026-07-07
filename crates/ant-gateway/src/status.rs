@@ -27,16 +27,26 @@ struct HealthBody {
     version: String,
     #[serde(rename = "apiVersion")]
     api_version: String,
+    /// `false` while the daemon's startup chain init (postage /
+    /// chequebook Gnosis reads) is still resolving. The listener now
+    /// binds before that init (issue #38), so supervisors get their
+    /// `200` from t≈0 and can read the init progress here instead of
+    /// inferring it from connection-refused. Additive to bee's body —
+    /// bee-js ignores unknown fields.
+    #[serde(rename = "chainReady")]
+    chain_ready: bool,
 }
 
-/// `GET /health`. Constant after the gateway is bound; PLAN.md D.2.1
-/// requires this to answer within 50 ms of socket bind so external
-/// supervisors can poll aggressively, hence no I/O at all here.
+/// `GET /health`. Bound before chain init; PLAN.md D.2.1 requires this
+/// to answer within 50 ms of socket bind so external supervisors can
+/// poll aggressively, hence no I/O at all here.
 pub async fn health(State(handle): State<GatewayHandle>) -> Response {
+    let chain_ready = handle.chain_state().is_some();
     Json(HealthBody {
         status: "ok",
         version: handle.agent.as_str().to_string(),
         api_version: handle.api_version.as_str().to_string(),
+        chain_ready,
     })
     .into_response()
 }
@@ -58,6 +68,7 @@ pub async fn readiness(State(handle): State<GatewayHandle>) -> Response {
         status: if ready { "ready" } else { "unready" },
         version: handle.agent.as_str().to_string(),
         api_version: handle.api_version.as_str().to_string(),
+        chain_ready: handle.chain_state().is_some(),
     });
     if ready {
         body.into_response()
@@ -79,14 +90,20 @@ struct NodeBody {
 }
 
 /// `GET /node`. Reports `light` once `antd` has uploads + SWAP
-/// settlement configured (`handle.light_mode`), `ultra-light`
-/// otherwise. Freedom's `checkSwarmPreFlight` refuses to publish
-/// against an `ultra-light` node, so this flag is the gate that lets
-/// the whole publish/feed/SOC-write surface work (PLAN.md J.4.1).
-/// `chequebookEnabled` / `swapEnabled` track `beeMode` because, in
-/// `antd`, light mode *is* the SWAP-settlement mode.
+/// settlement configured, `ultra-light` otherwise. Freedom's
+/// `checkSwarmPreFlight` refuses to publish against an `ultra-light`
+/// node, so this flag is the gate that lets the whole
+/// publish/feed/SOC-write surface work (PLAN.md J.4.1). While chain
+/// init is still resolving we answer a retryable `503` rather than a
+/// premature `ultra-light` that would wrongly disable Freedom's
+/// publish surface. `chequebookEnabled` / `swapEnabled` track
+/// `beeMode` because, in `antd`, light mode *is* the SWAP-settlement
+/// mode.
 pub async fn node(State(handle): State<GatewayHandle>) -> Response {
-    let light = handle.light_mode;
+    let Some(state) = handle.chain_state() else {
+        return crate::error::chain_initializing();
+    };
+    let light = state.light_mode;
     Json(NodeBody {
         bee_mode: if light { "light" } else { "ultra-light" },
         gateway_mode: false,
