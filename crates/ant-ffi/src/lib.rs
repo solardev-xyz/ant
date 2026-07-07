@@ -264,11 +264,42 @@ pub unsafe extern "C" fn ant_init(
     data_dir: *const c_char,
     out_err: *mut *mut c_char,
 ) -> *mut AntHandle {
+    unsafe { ant_init_with_options(data_dir, std::ptr::null(), out_err) }
+}
+
+/// Like [`ant_init`], with embedder options. `source_root` (nullable)
+/// names the directory the host stages upload sources under (the iOS
+/// app's `Application Support/antdrive/imports`); the upload manager
+/// then records each job's source *relative* to it and re-anchors the
+/// absolute path when the OS relocates the app container (iOS assigns a
+/// new container UUID on updates/reinstalls), so persisted uploads keep
+/// resuming and self-healing across the move. The root is applied
+/// *before* the persisted jobs are rehydrated, which is why this is an
+/// init option rather than a post-init call. Pass NULL to disable the
+/// rebase (identical to `ant_init`).
+///
+/// # Safety
+///
+/// * `data_dir` must be a valid NUL-terminated UTF-8 string.
+/// * `source_root` must be a valid NUL-terminated UTF-8 string, or null.
+/// * `out_err` must point at a writable `*mut c_char` slot, or be null
+///   to opt out of error reporting.
+#[no_mangle]
+pub unsafe extern "C" fn ant_init_with_options(
+    data_dir: *const c_char,
+    source_root: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut AntHandle {
     unsafe {
         clear_out_err(out_err);
         let result = catch_unwind(AssertUnwindSafe(|| -> Result<AntHandle, FfiError> {
             let path = cstr_to_path(data_dir)?;
-            init_inner(&path)
+            let source_root = if source_root.is_null() {
+                None
+            } else {
+                Some(cstr_to_path(source_root)?)
+            };
+            init_inner(&path, source_root.as_deref())
         }));
         match result {
             Ok(Ok(handle)) => Box::into_raw(Box::new(handle)),
@@ -284,7 +315,7 @@ pub unsafe extern "C" fn ant_init(
     }
 }
 
-fn init_inner(data_dir: &Path) -> Result<AntHandle, FfiError> {
+fn init_inner(data_dir: &Path, source_root: Option<&Path>) -> Result<AntHandle, FfiError> {
     install_log_subscriber();
 
     std::fs::create_dir_all(data_dir)
@@ -391,7 +422,15 @@ fn init_inner(data_dir: &Path) -> Result<AntHandle, FfiError> {
         // Read the live status watch so the automatic post-upload heal can
         // also promote shallow placements once the node is well-connected
         // enough for its closest-peer probe to be trustworthy (Sketch B).
-        .with_status_watch(Some(status_rx.clone()));
+        .with_status_watch(Some(status_rx.clone()))
+        // Container-move rebase root (see `ant_init_with_options`). Set
+        // before `rehydrate_from_disk` so stranded sources re-anchor as
+        // the persisted jobs load.
+        .with_source_root(source_root.map(Path::to_path_buf))
+        // Attach the persistent chunk store so heal can re-push — and,
+        // with the source file gone, enumerate a completed upload's
+        // chunk set by store-only traversal from its reference.
+        .with_disk_cache(disk_cache.clone());
     {
         // `rehydrate_from_disk` may `tokio::spawn` (auto-resuming an
         // interrupted upload, or kicking off a startup self-heal for a
@@ -869,6 +908,89 @@ pub unsafe extern "C" fn ant_resume(handle: *const AntHandle, out_err: *mut *mut
             }
             Err(_) => {
                 write_out_err(out_err, "panic in ant_resume");
+                -2
+            }
+        }
+    }
+}
+
+/// System-suspend the upload subsystem — call when the app is moving to
+/// the background or the device just went offline. Every in-flight
+/// upload is paused with the "resumes automatically" marker (a job the
+/// user paused is left alone) and running securing passes stop at their
+/// next opportunity. **Blocks** until the paused upload drivers have
+/// drained their in-flight pushes and written their resume checkpoint
+/// (bounded node-side at ~5 s), so wrap the call in a
+/// `beginBackgroundTask` and treat its return as "state is safely on
+/// disk". Idempotent — safe to call repeatedly, in any order with
+/// [`ant_wake`], and with nothing uploading.
+///
+/// Returns `0` on success, `-1` on a null handle, `-2` if the node loop
+/// didn't ack (already shut down); in the `-2` case an allocated error
+/// string is written into `*out_err` (free with [`ant_free_string`]).
+///
+/// # Safety
+///
+/// * `handle` must come from [`ant_init`] and must not have been passed
+///   to [`ant_shutdown`].
+/// * `out_err` must point at a writable `*mut c_char` slot, or be null.
+#[no_mangle]
+pub unsafe extern "C" fn ant_suspend(handle: *const AntHandle, out_err: *mut *mut c_char) -> i32 {
+    unsafe {
+        clear_out_err(out_err);
+        let Some(handle) = handle.as_ref() else {
+            write_out_err(out_err, "ant_suspend: null handle");
+            return -1;
+        };
+        match catch_unwind(AssertUnwindSafe(|| drive::suspend(handle))) {
+            Ok(Ok(msg)) => {
+                tracing::info!(target: "ant-ffi", "{msg}");
+                0
+            }
+            Ok(Err(e)) => {
+                write_out_err(out_err, &e.to_string());
+                -2
+            }
+            Err(_) => {
+                write_out_err(out_err, "panic in ant_suspend");
+                -2
+            }
+        }
+    }
+}
+
+/// Undo [`ant_suspend`] — call on foreground / network-restored
+/// transitions. Restarts only the uploads the suspend paused (a user
+/// pause stays paused) and re-queues the securing pass for any
+/// completed-but-unverified upload, exactly like a fresh launch does.
+/// Cheap and idempotent; safe without a prior suspend. Pair with
+/// [`ant_resume`], which re-warms the *peer connections* after the same
+/// suspension — the two recover different halves of the node.
+///
+/// Return values and safety: same contract as [`ant_suspend`].
+///
+/// # Safety
+///
+/// See [`ant_suspend`].
+#[no_mangle]
+pub unsafe extern "C" fn ant_wake(handle: *const AntHandle, out_err: *mut *mut c_char) -> i32 {
+    unsafe {
+        clear_out_err(out_err);
+        let Some(handle) = handle.as_ref() else {
+            write_out_err(out_err, "ant_wake: null handle");
+            return -1;
+        };
+        match catch_unwind(AssertUnwindSafe(|| drive::wake(handle))) {
+            Ok(Ok(msg)) => {
+                tracing::info!(target: "ant-ffi", "{msg}");
+                0
+            }
+            Ok(Err(e)) => {
+                write_out_err(out_err, &e.to_string());
+                -2
+            }
+            Err(_) => {
+                write_out_err(out_err, "panic in ant_wake");
                 -2
             }
         }

@@ -76,6 +76,17 @@ pub struct UploadJobInfo {
     /// for the upload's life. Resume refuses if the size or mtime
     /// changed.
     pub source_path: PathBuf,
+    /// Path of the source relative to the manager's configured
+    /// `source_root`, recorded at job creation when the source lives
+    /// under that root. iOS relocates the whole app container (new
+    /// UUID) on updates/reinstalls, which strands the absolute
+    /// `source_path`; on rehydrate the manager re-anchors it as
+    /// `source_root/source_rel` (guarded by a size+mtime match) so the
+    /// job survives the move. `None` for sources outside the root and
+    /// for daemons without a root (`antd`) — their behaviour is
+    /// unchanged.
+    #[serde(default)]
+    pub source_rel: Option<PathBuf>,
     /// File body size in bytes at job creation. Cross-checked
     /// against the live `metadata().len()` on resume.
     pub source_size: u64,
@@ -161,6 +172,15 @@ pub struct UploadJobInfo {
     /// Never persisted as a terminal state; defaults to `false`.
     #[serde(default)]
     pub stalled: bool,
+    /// `true` when the current `Paused` state was imposed by the
+    /// *system* ([`UploadManager::suspend_all`] — app backgrounded /
+    /// network gone), not by the user. Wake (`wake_all`) and rehydrate
+    /// auto-resume only these; a user-paused job stays paused until the
+    /// user says otherwise. Cleared on any resume and on a user pause.
+    /// Persisted so the distinction survives a relaunch. Defaults to
+    /// `false` for jobs persisted by older daemons.
+    #[serde(default)]
+    pub auto_paused: bool,
     /// Set once the post-upload self-heal has run its rounds for this
     /// job (whether or not it could confirm `heal_verified`). Lets a
     /// durability-waiting client distinguish "heal still in progress"

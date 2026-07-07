@@ -351,6 +351,20 @@ pub enum ControlCommand {
         job_id: String,
         ack: mpsc::Sender<ControlAck>,
     },
+    /// System-initiated suspend of the whole upload subsystem (an app
+    /// moving to the background / the network going away). Pauses every
+    /// non-terminal job with the `auto_paused` marker (distinguishing
+    /// it from a user pause), asks running securing passes to stop, and
+    /// acks only after the drivers have drained their in-flight pushes
+    /// and checkpointed (bounded wait), so a host with a short
+    /// background grace window knows state is safely on disk. Safe to
+    /// call repeatedly.
+    UploadSuspendAll { ack: oneshot::Sender<ControlAck> },
+    /// Undo [`ControlCommand::UploadSuspendAll`]: restart only the jobs
+    /// it paused (`auto_paused` — a user-paused job stays paused) and
+    /// re-queue securing passes for completed-but-unverified jobs. Safe
+    /// to call repeatedly and without a prior suspend.
+    UploadWakeAll { ack: oneshot::Sender<ControlAck> },
     /// Snapshot of the local postage stamp issuer (capacity, fill,
     /// per-bucket extremes). Pure local read — no chain RPC, no
     /// network round-trip. With multiple registered batches this returns

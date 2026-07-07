@@ -2690,7 +2690,9 @@ fn handle_control_command(
         | ControlCommand::UploadPause { ack, .. }
         | ControlCommand::UploadResume { ack, .. }
         | ControlCommand::UploadRepush { ack, .. }
-        | ControlCommand::UploadCancel { ack, .. } => {
+        | ControlCommand::UploadCancel { ack, .. }
+        | ControlCommand::UploadSuspendAll { ack }
+        | ControlCommand::UploadWakeAll { ack } => {
             let _ = ack.send(ControlAck::Error {
                 message: "upload manager not wired into the swarm loop".into(),
             });

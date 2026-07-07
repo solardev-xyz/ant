@@ -14,6 +14,7 @@ ant-crypto = { path = "../ant-crypto" }
 # for them.
 ant-p2p = { path = "../ant-p2p", default-features = false }
 ant-retrieval = { path = "../ant-retrieval" }
+async-trait.workspace = true
 futures = "0.3.31"
 hex.workspace = true
 libp2p.workspace = true

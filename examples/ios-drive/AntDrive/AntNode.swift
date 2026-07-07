@@ -1,4 +1,5 @@
 import Foundation
+import Network
 import SwiftUI
 
 /// Swift wrapper around the hand-written C API in `crates/ant-ffi/`.
@@ -48,6 +49,11 @@ final class AntNode: ObservableObject {
     /// while `verifying` contains the id and cleared when it finishes;
     /// drives the determinate progress bar on the file detail page.
     @Published private(set) var verifyProgress: [String: VerifyProgress] = [:]
+    /// `true` while the device has no usable network path
+    /// (`NWPathMonitor`). The node is suspended for the duration —
+    /// uploads auto-pause and resume on their own — so the UI shows
+    /// "Waiting for network…" instead of stuck progress bars.
+    @Published private(set) var isOffline: Bool = false
     /// Job ids with an in-flight "Push again" re-push/heal, so the detail
     /// page can show a re-pushing indicator until the follow-up re-verify.
     @Published private(set) var repushing: Set<String> = []
@@ -59,6 +65,7 @@ final class AntNode: ObservableObject {
     private var handle: OpaquePointer?
     private var peerPollTask: Task<Void, Never>?
     private var refreshTask: Task<Void, Never>?
+    private var pathMonitor: NWPathMonitor?
 
     // MARK: - Lifecycle
 
@@ -69,10 +76,20 @@ final class AntNode: ObservableObject {
         let dataDir = Self.resolveDataDir()
         Self.seedPeerstoreIfNeeded(in: dataDir)
         let path = dataDir.path
+        // Register the imports dir as the upload source root so the node
+        // can re-anchor persisted uploads when iOS relocates the app
+        // container (new UUID on update/reinstall) — without it, old
+        // jobs' absolute source paths dangle and they can't resume or
+        // self-heal from the source.
+        let importsPath = (try? antdriveImportsDir())?.path
 
         let raw: OpaquePointer? = await Task.detached(priority: .userInitiated) {
             var errPtr: UnsafeMutablePointer<CChar>? = nil
-            let h = path.withCString { ant_init($0, &errPtr) }
+            let h = path.withCString { cpath in
+                Self.withOptCString(importsPath) { croot in
+                    ant_init_with_options(cpath, croot, &errPtr)
+                }
+            }
             if h == nil, let errPtr { ant_free_string(errPtr) }
             return h
         }.value
@@ -84,6 +101,7 @@ final class AntNode: ObservableObject {
         handle = raw
         status = .ready
         startPollingPeers()
+        startNetworkMonitor()
         await refreshAll()
         startAutoRefresh()
     }
@@ -93,9 +111,71 @@ final class AntNode: ObservableObject {
         handle = nil
         peerPollTask?.cancel()
         refreshTask?.cancel()
+        pathMonitor?.cancel()
+        pathMonitor = nil
         peerCount = 0
         await Task.detached(priority: .userInitiated) { ant_shutdown(h) }.value
         status = .idle
+    }
+
+    /// System-suspend the upload subsystem before the app loses execution
+    /// (backgrounding) or the network disappears. In-flight uploads pause
+    /// with the "resumes automatically" marker; the call returns once
+    /// upload state is checkpointed on disk (bounded node-side at ~5 s),
+    /// so run it inside a `beginBackgroundTask` window.
+    func suspend() async {
+        guard let h = handle else { return }
+        await Task.detached(priority: .userInitiated) {
+            var errPtr: UnsafeMutablePointer<CChar>? = nil
+            if ant_suspend(h, &errPtr) != 0, let errPtr { ant_free_string(errPtr) }
+        }.value
+    }
+
+    /// Undo `suspend()` on foreground / network-restored transitions:
+    /// restarts the uploads it paused (a user pause stays paused) and
+    /// re-queues securing for completed-but-unverified files. Also
+    /// re-warms the peer connections (`ant_resume`) — a suspension long
+    /// enough to pause uploads has usually also reaped the sockets.
+    func wake() async {
+        guard let h = handle else { return }
+        await Task.detached(priority: .userInitiated) {
+            var errPtr: UnsafeMutablePointer<CChar>? = nil
+            if ant_resume(h, &errPtr) != 0, let errPtr { ant_free_string(errPtr) }
+            var wakeErr: UnsafeMutablePointer<CChar>? = nil
+            if ant_wake(h, &wakeErr) != 0, let wakeErr { ant_free_string(wakeErr) }
+        }.value
+        await refreshJobs()
+    }
+
+    /// Any upload that still needs network work to become durable — an
+    /// in-flight or auto-paused transfer, or a completed file whose
+    /// securing pass hasn't finished. Drives whether backgrounding
+    /// schedules the `antdrive.secure` background task.
+    var hasUnsettledUploads: Bool {
+        jobs.contains { $0.isActive || $0.isAutoPaused || $0.isSecuring }
+    }
+
+    /// Watch the device's network path. Offline ⇒ suspend the node's
+    /// uploads (they'd only burn retries against a dead network) and
+    /// surface "Waiting for network…"; back online ⇒ wake them. The
+    /// node-side `stalled` flag still covers degraded-but-connected.
+    private func startNetworkMonitor() {
+        guard pathMonitor == nil else { return }
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] netPath in
+            let offline = netPath.status != .satisfied
+            Task { @MainActor [weak self] in
+                guard let self, self.isOffline != offline else { return }
+                self.isOffline = offline
+                if offline {
+                    await self.suspend()
+                } else {
+                    await self.wake()
+                }
+            }
+        }
+        monitor.start(queue: DispatchQueue(label: "antdrive.netpath"))
+        pathMonitor = monitor
     }
 
     // MARK: - Uploads
@@ -510,7 +590,9 @@ final class AntNode: ObservableObject {
         }.value
     }
 
-    private static func withOptCString<R>(_ s: String?, _ body: (UnsafePointer<CChar>?) -> R) -> R {
+    // `nonisolated`: a pure pointer helper, also used inside detached
+    // tasks (the init call passes the optional source root from one).
+    nonisolated private static func withOptCString<R>(_ s: String?, _ body: (UnsafePointer<CChar>?) -> R) -> R {
         if let s { return s.withCString { body($0) } }
         return body(nil)
     }

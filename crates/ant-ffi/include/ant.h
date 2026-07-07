@@ -72,6 +72,23 @@ typedef struct AntProgress {
 AntHandle *ant_init(const char *data_dir, char **out_err);
 
 /*
+ * Like ant_init, with embedder options. `source_root` (nullable) names
+ * the directory the host stages upload sources under (e.g. the iOS
+ * app's Application Support/antdrive/imports). The upload manager then
+ * records each job's source path *relative* to that root and, when the
+ * OS relocates the app container (iOS assigns a new container UUID on
+ * updates/reinstalls), re-anchors the stale absolute path as
+ * `source_root/relative` — guarded by a size+mtime match — so persisted
+ * uploads keep resuming and self-healing across the move. Applied
+ * before persisted jobs are rehydrated, which is why it is an init
+ * option rather than a post-init call. Pass NULL for source_root to
+ * behave exactly like ant_init.
+ */
+AntHandle *ant_init_with_options(const char *data_dir,
+                                 const char *source_root,
+                                 char **out_err);
+
+/*
  * Download a Swarm reference. Accepted forms:
  *
  *   64-hex          single-chunk or multi-chunk /bytes tree
@@ -119,6 +136,37 @@ int ant_peer_count(const AntHandle *handle);
  * NULL to opt out of error reporting.
  */
 int ant_resume(const AntHandle *handle, char **out_err);
+
+/*
+ * System-suspend the upload subsystem — call when the app is moving to
+ * the background or the device just went offline. Every in-flight
+ * upload is paused with the "resumes automatically" marker (a job the
+ * user paused is left alone) and running securing passes stop at their
+ * next opportunity. BLOCKS until the paused upload drivers have drained
+ * their in-flight pushes and written their resume checkpoint (bounded
+ * node-side at ~5 s) — wrap the call in a beginBackgroundTask and treat
+ * its return as "upload state is safely on disk". Idempotent: safe to
+ * call repeatedly, in any order with ant_wake, and with nothing
+ * uploading.
+ *
+ * Returns 0 on success, -1 if `handle` is NULL, and -2 if the node loop
+ * didn't ack (already shut down) — in which case an allocated error
+ * string is written into *out_err (free with ant_free_string).
+ */
+int ant_suspend(const AntHandle *handle, char **out_err);
+
+/*
+ * Undo ant_suspend — call on foreground / network-restored transitions.
+ * Restarts only the uploads the suspend paused (a user pause stays
+ * paused) and re-queues the securing pass for any completed-but-
+ * unverified upload, exactly like a fresh launch does. Cheap and
+ * idempotent; safe without a prior suspend. Pair with ant_resume, which
+ * re-warms the peer connections after the same suspension — the two
+ * recover different halves of the node.
+ *
+ * Return values match ant_suspend.
+ */
+int ant_wake(const AntHandle *handle, char **out_err);
 
 /*
  * Snapshot the running node's `agent` string from the live status
