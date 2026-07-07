@@ -75,6 +75,11 @@ final class AntNode: ObservableObject {
 
         let dataDir = Self.resolveDataDir()
         Self.seedPeerstoreIfNeeded(in: dataDir)
+        // Restore persisted verify verdicts before anything renders: a
+        // user-run check is the richest durability signal a row has, and
+        // without this a re-checked (green) file fell back to the
+        // daemon's stale degraded heal flag on every relaunch.
+        loadPersistedVerdicts()
         let path = dataDir.path
         // Register the imports dir as the upload source root so the node
         // can re-anchor persisted uploads when iOS relocates the app
@@ -220,7 +225,7 @@ final class AntNode: ObservableObject {
         repushing.insert(job.id)
         // Drop the stale "not verified" verdict so the card shows the
         // re-pushing state, not the old failure, while the heal runs.
-        propagation[job.id] = nil
+        setPropagation(nil, for: job.id)
         repushProgress[job.id] = VerifyProgress(phase: "checking", checked: nil, total: nil)
         defer { repushing.remove(job.id); repushProgress[job.id] = nil }
 
@@ -411,7 +416,7 @@ final class AntNode: ObservableObject {
         // A user-cancelled check returns a cancelled body — leave the file
         // unchecked (no verdict) rather than recording a bogus "missing".
         if info.error == "cancelled" { return nil }
-        propagation[jobId] = info
+        setPropagation(info, for: jobId)
         return info
     }
 
@@ -431,8 +436,40 @@ final class AntNode: ObservableObject {
     /// real redundancy, not just "at least one copy exists".
     func reverify(_ job: UploadJob, probes: UInt8 = 2) async {
         guard job.reference?.isEmpty == false else { return }
-        propagation[job.id] = nil
+        setPropagation(nil, for: job.id)
         await verifyPropagationStreaming(job, samples: 0, probes: probes)
+    }
+
+    // MARK: - Verdict persistence
+
+    /// Single mutation point for `propagation` so every change lands on
+    /// disk: verdicts must survive an app restart, or a re-checked
+    /// (green) file flip-flops back to the daemon's degraded heal label
+    /// on relaunch. Stored as one JSON dictionary in the app data dir.
+    private func setPropagation(_ info: PropagationInfo?, for jobId: String) {
+        if let info {
+            propagation[jobId] = info
+        } else {
+            propagation.removeValue(forKey: jobId)
+        }
+        let snapshot = propagation
+        let url = Self.verdictsFileURL()
+        Task.detached(priority: .utility) {
+            if let data = try? JSONEncoder().encode(snapshot) {
+                try? data.write(to: url, options: .atomic)
+            }
+        }
+    }
+
+    private func loadPersistedVerdicts() {
+        guard let data = try? Data(contentsOf: Self.verdictsFileURL()),
+              let decoded = try? JSONDecoder().decode([String: PropagationInfo].self, from: data)
+        else { return }
+        propagation = decoded
+    }
+
+    private static func verdictsFileURL() -> URL {
+        resolveDataDir().appendingPathComponent("propagation.json")
     }
 
     /// Probe depth for a thorough, user-requested "Deep verify": fetch
