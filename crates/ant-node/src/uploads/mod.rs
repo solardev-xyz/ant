@@ -269,6 +269,15 @@ const HEAL_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_secs(3)
 /// so each ack's JSON stays bounded on a large file.
 const HEAL_VERIFY_BATCH: usize = 512;
 
+/// Ceiling on one read-back batch's ack. The verify probes up to
+/// [`HEAL_VERIFY_BATCH`] chunks against the live network, so minutes are
+/// legitimate — but an *unbounded* await meant a wedged node loop hung
+/// the securing pass forever, leaking its in-flight marker and silently
+/// killing every future automatic retry for that job. On expiry the
+/// read-back is inconclusive; the pass gives up its round and the retry
+/// schedule stays alive.
+const HEAL_VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(10);
+
 /// Minimum spacing between *automatic* re-heals of a **degraded** job —
 /// one whose securing pass ran to the end but couldn't confirm every
 /// chunk deep-reachable. Historically such jobs were only repaired by a
@@ -279,6 +288,16 @@ const HEAL_VERIFY_BATCH: usize = 512;
 /// fresh process always retries once immediately, which is exactly the
 /// "on every launch" cadence we want. Tunable.
 const DEGRADED_HEAL_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_mins(15);
+
+/// How often the manager's retry ticker re-evaluates the heal queue
+/// (cheap: a snapshot walk gated by the backoff map and the in-flight
+/// set). The ticker is what turns [`DEGRADED_HEAL_RETRY_INTERVAL`] from
+/// a *minimum spacing* (retries only ever fired at launch/wake) into an
+/// actual schedule — required for the user-visible "next check in
+/// ~M min" countdown (`heal_retry_unix`) to be honest, and it lets a
+/// long-running daemon re-check degraded uploads without waiting for a
+/// restart.
+const DEGRADED_RETRY_TICK: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// How long [`UploadManager::suspend_all`] waits for paused drivers to
 /// drain their in-flight pushes and write the final checkpoint before
@@ -839,6 +858,10 @@ struct UploadManagerInner {
     /// "Stop securing" so the very next wake doesn't immediately undo
     /// the stop. In-memory: resets on relaunch by design.
     degraded_retry_after: Mutex<HashMap<String, Instant>>,
+    /// One retry ticker per manager process (see
+    /// [`DEGRADED_RETRY_TICK`]); spawned by the first
+    /// `rehydrate_from_disk`.
+    retry_ticker_started: AtomicBool,
 }
 
 impl UploadManager {
@@ -868,6 +891,7 @@ impl UploadManager {
                 source_root: None,
                 suspended: AtomicBool::new(false),
                 degraded_retry_after: Mutex::new(HashMap::new()),
+                retry_ticker_started: AtomicBool::new(false),
             }),
         })
     }
@@ -1007,6 +1031,10 @@ impl UploadManager {
             reference: None,
             heal_verified: false,
             heal_finished: false,
+            heal_missing: None,
+            heal_retry_unix: None,
+            heal_attempts: 0,
+            heal_last_check_unix: None,
             heal_phase: None,
             heal_checked: None,
             heal_total: None,
@@ -1304,6 +1332,24 @@ impl UploadManager {
         // forever — nothing else re-runs heal on boot. Shared with
         // `wake_all`, which needs the same re-queue after a suspension.
         self.requeue_unsecured_heals();
+        // Keep degraded uploads retrying on a schedule (not only at
+        // launch/wake): the ticker re-runs the same re-queue, with the
+        // backoff map and in-flight set bounding the actual work. Started
+        // once per process; skipped entirely while suspended.
+        if !self.inner.retry_ticker_started.swap(true, Ordering::SeqCst) {
+            let mgr = self.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(DEGRADED_RETRY_TICK);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    if mgr.inner.suspended.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    mgr.requeue_unsecured_heals();
+                }
+            });
+        }
         Ok(count)
     }
 
@@ -1343,18 +1389,32 @@ impl UploadManager {
             if snap.status != UploadStatus::Completed || snap.heal_verified {
                 continue;
             }
+            // A pass already queued or running needs no re-queue (and
+            // the retry ticker must not re-log it every tick).
+            if self
+                .inner
+                .heal_inflight
+                .lock()
+                .expect("heal inflight mutex poisoned")
+                .contains(&snap.job_id)
+            {
+                continue;
+            }
             if snap.heal_finished {
-                // Degraded: retry, but with the long backoff.
-                let mut retry = self
+                // Degraded: retry, but with the long backoff. The window
+                // is stamped when a pass *ends* degraded (note_degraded),
+                // so spacing runs from the last attempt.
+                let retry = self
                     .inner
                     .degraded_retry_after
                     .lock()
                     .expect("degraded retry mutex poisoned");
-                let now = Instant::now();
-                if retry.get(&snap.job_id).is_some_and(|&next| now < next) {
+                if retry
+                    .get(&snap.job_id)
+                    .is_some_and(|&next| Instant::now() < next)
+                {
                     continue;
                 }
-                retry.insert(snap.job_id.clone(), now + DEGRADED_HEAL_RETRY_INTERVAL);
             }
             info!(
                 target: "ant_node::uploads",
@@ -1626,6 +1686,44 @@ impl UploadManager {
         .await;
     }
 
+    /// Record a degraded / inconclusive securing outcome: stamp the
+    /// long-backoff window that gates the next automatic retry (both in
+    /// the manager map the requeue consults and as the user-visible
+    /// `heal_retry_unix`), and — when the pass measured one — the
+    /// residual chunk count (`heal_missing`), so a client can show
+    /// "N parts still settling · next check in ~M min" instead of a
+    /// bare warning. `missing = None` (inconclusive read-back, user
+    /// cancel) keeps the previous residual figure.
+    fn note_degraded(&self, job_id: &str, missing: Option<u64>) {
+        self.inner
+            .degraded_retry_after
+            .lock()
+            .expect("degraded retry mutex poisoned")
+            .insert(
+                job_id.to_string(),
+                Instant::now() + DEGRADED_HEAL_RETRY_INTERVAL,
+            );
+        let Some(handle) = self.job_handle(job_id) else {
+            return;
+        };
+        let snap = {
+            let mut info = handle.info.lock().expect("upload mutex poisoned");
+            if let Some(n) = missing {
+                info.heal_missing = Some(n);
+            }
+            info.heal_attempts = info.heal_attempts.saturating_add(1);
+            info.heal_last_check_unix = Some(unix_seconds());
+            info.heal_retry_unix = Some(unix_seconds() + DEGRADED_HEAL_RETRY_INTERVAL.as_secs());
+            info.last_update_unix = unix_seconds();
+            info.clone()
+        };
+        let _ = handle.progress.send(snap.clone());
+        let _ = snap.save(&UploadJobInfo::manifest_path(
+            &self.inner.state_dir,
+            &snap.job_id,
+        ));
+    }
+
     /// Re-open a job's securing state as a queued heal pass actually
     /// starts running: clear `heal_finished` (persisted) so watchers see
     /// the pass as live progress rather than a stale terminal verdict,
@@ -1642,6 +1740,8 @@ impl UploadManager {
                 return;
             }
             info.heal_finished = false;
+            // The pass is live again — the countdown no longer applies.
+            info.heal_retry_unix = None;
             info.last_update_unix = unix_seconds();
             info.clone()
         };
@@ -2778,15 +2878,19 @@ impl UploadManager {
                 warn!(
                     target: "ant_node::uploads",
                     job_id, missing = n, total, mode = mode.label(),
-                    "post-upload heal: {n}/{total} chunks not deep-reachable after {} — leaving job completed (degraded); tap Push again to retry",
+                    "post-upload heal: {n}/{total} chunks not deep-reachable after {} — leaving job completed (degraded); auto-retry scheduled",
                     mode.label(),
                 );
+                self.note_degraded(job_id, Some(n as u64));
             }
-            None => warn!(
-                target: "ant_node::uploads",
-                job_id, total = all_addrs.len(), mode = mode.label(),
-                "post-upload heal: final read-back inconclusive (peers not ready?) — leaving job completed; tap Push again to retry",
-            ),
+            None => {
+                warn!(
+                    target: "ant_node::uploads",
+                    job_id, total = all_addrs.len(), mode = mode.label(),
+                    "post-upload heal: final read-back inconclusive (peers not ready?) — leaving job completed; auto-retry scheduled",
+                );
+                self.note_degraded(job_id, None);
+            }
         }
         // Heal has run its full course for this job. `mark_heal_verified`
         // already set this on the verified arms; this idempotent call
@@ -2961,14 +3065,7 @@ impl UploadManager {
                 // auto-retry must not re-queue the job on the very next
                 // wake. (One backoff interval, not forever — durability
                 // is still pursued on later launches.)
-                self.inner
-                    .degraded_retry_after
-                    .lock()
-                    .expect("degraded retry mutex poisoned")
-                    .insert(
-                        job_id.to_string(),
-                        Instant::now() + DEGRADED_HEAL_RETRY_INTERVAL,
-                    );
+                self.note_degraded(job_id, None);
                 self.mark_heal_finished(job_id);
                 return true;
             }
@@ -3062,6 +3159,8 @@ impl UploadManager {
             info.heal_verified = true;
             // Verified implies the heal has run its course.
             info.heal_finished = true;
+            info.heal_missing = None;
+            info.heal_retry_unix = None;
             info.heal_phase = None;
             info.heal_checked = None;
             info.heal_total = None;
@@ -3230,17 +3329,28 @@ impl UploadManager {
             {
                 return None;
             }
-            match ack_rx.await {
-                Ok(ControlAck::Ok { message }) => match parse_missing(&message) {
-                    Some(batch_missing) => missing.extend(batch_missing),
-                    // A malformed body means we can't trust this batch —
-                    // treat the whole read-back as inconclusive rather
-                    // than assuming the batch was fully present.
-                    None => return None,
+            match tokio::time::timeout(HEAL_VERIFY_TIMEOUT, ack_rx).await {
+                Err(_) => {
+                    warn!(
+                        target: "ant_node::uploads",
+                        job_id,
+                        "heal read-back batch timed out after {}s — treating as inconclusive",
+                        HEAL_VERIFY_TIMEOUT.as_secs(),
+                    );
+                    return None;
+                }
+                Ok(ack) => match ack {
+                    Ok(ControlAck::Ok { message }) => match parse_missing(&message) {
+                        Some(batch_missing) => missing.extend(batch_missing),
+                        // A malformed body means we can't trust this batch —
+                        // treat the whole read-back as inconclusive rather
+                        // than assuming the batch was fully present.
+                        None => return None,
+                    },
+                    // No peers yet, an error, or an unexpected ack — can't
+                    // verify now, so the read-back is inconclusive.
+                    _ => return None,
                 },
-                // No peers yet, an error, or an unexpected ack — can't
-                // verify now, so the read-back is inconclusive.
-                _ => return None,
             }
             checked += batch.len();
             self.report_heal(job_id, progress, "checking", Some(checked), Some(total));
@@ -3715,6 +3825,10 @@ pub fn to_view(info: UploadJobInfo) -> UploadJobView {
         auto_paused: info.auto_paused,
         heal_verified: info.heal_verified,
         heal_finished: info.heal_finished,
+        heal_missing: info.heal_missing,
+        heal_retry_unix: info.heal_retry_unix,
+        heal_attempts: info.heal_attempts,
+        heal_last_check_unix: info.heal_last_check_unix,
         heal_phase: info.heal_phase,
         heal_checked: info.heal_checked,
         heal_total: info.heal_total,
@@ -5003,6 +5117,10 @@ mod tests {
             reference: None,
             heal_verified: false,
             heal_finished: false,
+            heal_missing: None,
+            heal_retry_unix: None,
+            heal_attempts: 0,
+            heal_last_check_unix: None,
             heal_phase: None,
             heal_checked: None,
             heal_total: None,
@@ -5268,6 +5386,10 @@ mod tests {
             reference: None,
             heal_verified: false,
             heal_finished: false,
+            heal_missing: None,
+            heal_retry_unix: None,
+            heal_attempts: 0,
+            heal_last_check_unix: None,
             heal_phase: None,
             heal_checked: None,
             heal_total: None,
@@ -5403,6 +5525,10 @@ mod tests {
             heal_verified: false,
             // Degraded: the pass ran to the end without verifying.
             heal_finished: true,
+            heal_missing: None,
+            heal_retry_unix: None,
+            heal_attempts: 0,
+            heal_last_check_unix: None,
             heal_phase: None,
             heal_checked: None,
             heal_total: None,
@@ -5458,6 +5584,10 @@ mod tests {
             reference: Some(format!("0x{}", "22".repeat(32))),
             heal_verified: false,
             heal_finished: true,
+            heal_missing: None,
+            heal_retry_unix: None,
+            heal_attempts: 0,
+            heal_last_check_unix: None,
             heal_phase: None,
             heal_checked: None,
             heal_total: None,
@@ -5521,6 +5651,27 @@ mod tests {
         })
         .await;
         assert!(!snap.heal_verified, "harness keeps one chunk missing");
+
+        // The degraded verdict surfaces its honest residual and the
+        // retry schedule, so the UI can say
+        // "N parts still settling · next check in ~M min".
+        assert_eq!(
+            snap.heal_missing,
+            Some(1),
+            "the pass measured exactly one unconfirmed chunk",
+        );
+        assert!(
+            snap.heal_retry_unix.is_some_and(|at| at > unix_seconds()),
+            "next automatic retry must be scheduled in the future",
+        );
+        assert!(
+            snap.heal_attempts >= 1,
+            "the completed unsuccessful pass must count as a check",
+        );
+        assert!(
+            snap.heal_last_check_unix.is_some(),
+            "the pass must stamp its completion time",
+        );
 
         // An immediate wake must be suppressed by the backoff: enqueue
         // would synchronously stamp heal_phase = "queued".

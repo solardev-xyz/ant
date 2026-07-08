@@ -40,6 +40,20 @@ struct UploadJob: Codable, Identifiable, Equatable {
     /// whether or not it could confirm `healVerified`. Lets the UI stop
     /// showing "Securing…" once heal is done even on the degraded path.
     let healFinished: Bool
+    /// Parts the last completed securing pass could not confirm — the
+    /// honest residual behind "Propagating…", shrinking across the
+    /// node's automatic retries. `nil` when never measured.
+    let healMissing: UInt64?
+    /// When the node's next automatic securing retry becomes eligible
+    /// (unix seconds), for a "next check in ~M min" label. `nil` while a
+    /// pass runs, once verified, or on an older daemon.
+    let healRetryUnix: UInt64?
+    /// Completed securing passes that ended without verifying —
+    /// "Checked N times" evidence that the retry loop is active.
+    let healAttempts: UInt64
+    /// Unix seconds of the most recent completed-but-unverified pass
+    /// ("last checked 3 min ago").
+    let healLastCheckUnix: UInt64?
     /// Live "Securing…" progress emitted by the daemon's automatic heal.
     /// `healPhase` is the current step (`"checking"` while reading chunks
     /// back, `"repushing"` while re-storing the ones that didn't land);
@@ -71,6 +85,10 @@ struct UploadJob: Codable, Identifiable, Equatable {
         case autoPaused = "auto_paused"
         case healVerified = "heal_verified"
         case healFinished = "heal_finished"
+        case healMissing = "heal_missing"
+        case healRetryUnix = "heal_retry_unix"
+        case healAttempts = "heal_attempts"
+        case healLastCheckUnix = "heal_last_check_unix"
         case healPhase = "heal_phase"
         case healChecked = "heal_checked"
         case healTotal = "heal_total"
@@ -98,6 +116,10 @@ struct UploadJob: Codable, Identifiable, Equatable {
         autoPaused = try c.decodeIfPresent(Bool.self, forKey: .autoPaused) ?? false
         healVerified = try c.decodeIfPresent(Bool.self, forKey: .healVerified) ?? false
         healFinished = try c.decodeIfPresent(Bool.self, forKey: .healFinished) ?? false
+        healMissing = try c.decodeIfPresent(UInt64.self, forKey: .healMissing)
+        healRetryUnix = try c.decodeIfPresent(UInt64.self, forKey: .healRetryUnix)
+        healAttempts = try c.decodeIfPresent(UInt64.self, forKey: .healAttempts) ?? 0
+        healLastCheckUnix = try c.decodeIfPresent(UInt64.self, forKey: .healLastCheckUnix)
         healPhase = try c.decodeIfPresent(String.self, forKey: .healPhase)
         healChecked = try c.decodeIfPresent(UInt64.self, forKey: .healChecked)
         healTotal = try c.decodeIfPresent(UInt64.self, forKey: .healTotal)
@@ -138,6 +160,44 @@ struct UploadJob: Codable, Identifiable, Equatable {
         case "repushing": return "Re-storing missing parts…"
         default: return "Securing…"
         }
+    }
+
+    /// Row label for a degraded (still-propagating) file: lead with the
+    /// honest residual when the node measured one, so the user sees the
+    /// number shrink across automatic retries.
+    var propagatingLabel: String {
+        if let n = healMissing, n > 0 {
+            return "Propagating — \(n) \(n == 1 ? "part" : "parts") left"
+        }
+        return "Propagating…"
+    }
+
+    /// "Checked 4x — last 2 min ago" for the degraded card: proof the
+    /// automatic retry loop is working the file between visible passes.
+    var checkHistoryLabel: String? {
+        guard healAttempts > 0 else { return nil }
+        var label = "Checked \(healAttempts)\u{00D7}"
+        if let at = healLastCheckUnix {
+            let secs = max(0, Int64(Date().timeIntervalSince1970) - Int64(at))
+            if secs < 90 {
+                label += " — just now"
+            } else if secs < 3600 {
+                label += " — last \(secs / 60) min ago"
+            } else {
+                label += " — last \(secs / 3600) h ago"
+            }
+        }
+        return label
+    }
+
+    /// "Next check in ~M min" for the degraded card, from the node's
+    /// retry schedule. `nil` when unknown or already due.
+    var nextCheckLabel: String? {
+        guard let at = healRetryUnix else { return nil }
+        let secs = Int64(at) - Int64(Date().timeIntervalSince1970)
+        if secs <= 30 { return "Next check: any moment now" }
+        let mins = (secs + 59) / 60
+        return "Next check in ~\(mins) min"
     }
 
     var isActive: Bool { status == "running" || status == "pending" }
@@ -181,7 +241,7 @@ struct UploadJob: Codable, Identifiable, Equatable {
                 if isQueuedToSecure { return "Queued" }
                 return securingFraction.map { "Securing \(Int($0 * 100))%" } ?? "Securing…"
             }
-            if isDegraded { return "Propagating…" }
+            if isDegraded { return propagatingLabel }
             return ""
         // `pending` is the daemon's pre-dispatch state (before the driver
         // pushes its first chunk); from the user's view that's still part

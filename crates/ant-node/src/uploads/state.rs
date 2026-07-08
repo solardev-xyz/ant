@@ -189,6 +189,35 @@ pub struct UploadJobInfo {
     /// daemons; a manual "Push again" refreshes it.
     #[serde(default)]
     pub heal_finished: bool,
+    /// Chunks the most recent *completed* securing pass could not
+    /// confirm deep-reachable — the honest residual behind a degraded
+    /// verdict, so a client can show "N parts still settling" (and
+    /// watch it shrink across automatic retries) instead of a bare
+    /// warning. Persisted so the figure survives a relaunch; cleared
+    /// when a pass finally verifies. `None` = never measured (older
+    /// jobs, or heal skipped).
+    #[serde(default)]
+    pub heal_missing: Option<u64>,
+    /// Completed securing passes that ended *without* verifying —
+    /// "Checked N times" evidence for the UI that the automatic retry
+    /// loop really is working the file between visible passes.
+    /// Persisted; stops mattering (and stops being shown) once the job
+    /// verifies.
+    #[serde(default)]
+    pub heal_attempts: u64,
+    /// Unix seconds of the most recent completed-but-unverified
+    /// securing pass ("last checked 3 min ago"). Persisted alongside
+    /// `heal_attempts`.
+    #[serde(default)]
+    pub heal_last_check_unix: Option<u64>,
+    /// When the next *automatic* securing retry for a degraded job
+    /// becomes eligible (unix seconds) — the manager's retry ticker
+    /// re-queues the pass at roughly this time, so a client can render
+    /// "next check in ~M min". Runtime-only (`skip_serializing`): a
+    /// relaunch retries immediately, making a persisted value stale by
+    /// construction.
+    #[serde(default, skip_serializing)]
+    pub heal_retry_unix: Option<u64>,
     /// Live "Securing…" (post-upload self-heal) progress, surfaced to
     /// watchers while the automatic heal runs so the app can draw a
     /// determinate bar. `heal_phase` is the current step (`"checking"` /

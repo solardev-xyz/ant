@@ -656,17 +656,39 @@ struct FileDetailView: View {
                     fraction: job.securingFraction,
                     tint: .blue)
             }
-        } else if job.isDegraded {
+        } else if job.isDegraded, node.propagation[job.id]?.isStoredSafely != true {
+            // A user-run verify that confirmed the file retrievable is
+            // the richest verdict (same precedence as the row and the
+            // status badge): don't contradict it with a warning-toned
+            // "Propagating" card. The node still optimises placement in
+            // the background; the verification card carries a one-line
+            // note instead.
             GlassCard {
                 progressBlock(
                     icon: "arrow.triangle.2.circlepath",
-                    title: "Propagating…",
-                    detail: nil,
-                    explanation: "Some parts haven't confirmed their place on the network yet. The app re-secures this file automatically until it verifies — Push again below does it right now.",
+                    title: job.propagatingLabel,
+                    detail: job.healMissing.flatMap { m in
+                        job.chunksTotal.map { "\(m) / \($0) parts unconfirmed" }
+                    },
+                    explanation: degradedExplanation(job),
                     fraction: nil,
                     tint: .orange)
             }
         }
+    }
+
+    /// Explanation under the "Propagating…" card: what's left, that the
+    /// node retries on its own, the check history (proof the loop is
+    /// alive), and when the next check is due.
+    private func degradedExplanation(_ job: UploadJob) -> String {
+        var text = "Some parts haven't confirmed their place on the network yet. The app re-checks and re-stores them automatically until the file verifies."
+        var facts: [String] = []
+        if let history = job.checkHistoryLabel { facts.append(history) }
+        if let next = job.nextCheckLabel { facts.append(next) }
+        if !facts.isEmpty {
+            text += " \(facts.joined(separator: " \u{00B7} "))."
+        }
+        return text
     }
 
     /// "12 / 480 parts" for a securing step that carries determinate counts.
@@ -783,6 +805,10 @@ struct FileDetailView: View {
                             .font(.headline).foregroundStyle(.green)
                         Text("Every part of this file is on the network and can be opened by anyone.")
                             .font(.subheadline).foregroundStyle(.white.opacity(0.75))
+                        if job.isDegraded {
+                            Text("Placement is still being optimised in the background.")
+                                .font(.caption).foregroundStyle(.white.opacity(0.55))
+                        }
                     } else {
                         Label("Not fully stored", systemImage: "exclamationmark.triangle.fill")
                             .font(.headline).foregroundStyle(.orange)
