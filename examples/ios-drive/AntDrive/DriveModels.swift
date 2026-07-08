@@ -156,8 +156,11 @@ struct UploadJob: Codable, Identifiable, Equatable {
     /// Completed but the background heal hasn't finished its rounds yet — the
     /// file is still being secured. Drive a spinner / "Securing…" off this.
     var isSecuring: Bool { isDone && !healFinished }
-    /// Completed, heal ran to the end, but couldn't confirm deep reachability:
-    /// some chunks landed shallow and didn't propagate. "Push again" repairs it.
+    /// Completed, the last securing pass ran to the end, but couldn't
+    /// confirm deep reachability yet: some chunks are still settling into
+    /// place. The node re-queues the pass automatically on every
+    /// launch/wake until the file verifies; "Push again" is the manual
+    /// accelerator.
     var isDegraded: Bool { isDone && healFinished && !healVerified }
 
     /// A friendly, non-Swarm status line for the row. Completed uploads
@@ -169,13 +172,16 @@ struct UploadJob: Codable, Identifiable, Equatable {
         case "completed":
             // Heal still running ⇒ tell the user it's being secured rather
             // than implying it's already safe. Heal finished but couldn't
-            // confirm deep reachability ⇒ flag it. Verified ⇒ stay silent
-            // (the "Verified" badge is the completion signal).
+            // confirm deep reachability ⇒ "Propagating…": the node keeps
+            // re-queuing the securing pass on every launch/wake until the
+            // file verifies, so this is an in-progress state, not a dead
+            // end. Verified ⇒ stay silent (the "Verified" badge is the
+            // completion signal).
             if isSecuring {
                 if isQueuedToSecure { return "Queued" }
                 return securingFraction.map { "Securing \(Int($0 * 100))%" } ?? "Securing…"
             }
-            if isDegraded { return "Not fully backed up" }
+            if isDegraded { return "Propagating…" }
             return ""
         // `pending` is the daemon's pre-dispatch state (before the driver
         // pushes its first chunk); from the user's view that's still part

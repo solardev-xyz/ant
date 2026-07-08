@@ -1655,6 +1655,22 @@ Not a capability milestone, but required before GA.
 > network path (`NWPathMonitor` ⇒ suspend/wake + "Waiting for
 > network…"), and offers per-file "Stop securing". Android WorkManager
 > wiring is still open.
+>
+> **Follow-up (2026-07, shallow-placement loss):** a real iOS upload
+> (4 MB, "completed") was 404 network-wide a day later — its chunks had
+> been accepted on *shallow* receipts and the storers GC'd them. Two
+> fixes: (1) **strict receipts** — the upload-job path now passes
+> `require_deep` through `PushChunk`, and `RoutingFetcher::
+> push_stamped_chunk` returns `ShallowReceipt` instead of accepting
+> after the deeper-storer hunt, so the chunk parks in the retry-forever
+> queue until a storer inside its neighbourhood signs
+> (`ANT_UPLOAD_ACCEPT_SHALLOW=1` opts out; gateway parity endpoints
+> unchanged); (2) **degraded auto-retry** — `requeue_unsecured_heals`
+> re-queues *degraded* jobs (not just unfinished ones) on every
+> launch/wake with a 15-min backoff until `heal_verified`, upgrading to
+> the shallow-aware mode at execution time when well-connected; the app
+> shows these as "Propagating…" instead of the dead-end "Not fully
+> backed up".
 
 #### Phase 11 — Interop, beta, polish
 

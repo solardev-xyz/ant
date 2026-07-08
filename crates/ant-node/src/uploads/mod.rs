@@ -269,6 +269,17 @@ const HEAL_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_secs(3)
 /// so each ack's JSON stays bounded on a large file.
 const HEAL_VERIFY_BATCH: usize = 512;
 
+/// Minimum spacing between *automatic* re-heals of a **degraded** job —
+/// one whose securing pass ran to the end but couldn't confirm every
+/// chunk deep-reachable. Historically such jobs were only repaired by a
+/// manual "Push again"; now every launch and every wake re-queues them
+/// (a file must not silently stay uploader-only), but with this long
+/// backoff so an app that flips foreground/background every few seconds
+/// doesn't burn a read-back + re-push pass each time. In-memory only: a
+/// fresh process always retries once immediately, which is exactly the
+/// "on every launch" cadence we want. Tunable.
+const DEGRADED_HEAL_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_mins(15);
+
 /// How long [`UploadManager::suspend_all`] waits for paused drivers to
 /// drain their in-flight pushes and write the final checkpoint before
 /// returning anyway. Sized to fit inside iOS's background grace window
@@ -497,6 +508,31 @@ enum AttemptResult {
     Fatal(UploadError),
 }
 
+/// Strict receipts for the upload-job path: a chunk only counts as
+/// pushed once a storer *inside its own neighbourhood* signs the
+/// receipt. A merely-shallow receipt comes back as a transient error,
+/// parks in the retry queue, and every re-dispatch re-runs the
+/// gossip-deepening dial cycle — so `Completed` means the data is
+/// genuinely placed where the network routes to, not merely
+/// acked-somewhere. Bee accepts shallow because a full node's
+/// pull-sync repairs placement afterwards; a light node has no
+/// pull-sync, and a shallow-accepted chunk is readable only through
+/// the uploader's own links and ages out of the network (observed: a
+/// 4 MB iOS upload 404 network-wide a day later — issue #41
+/// follow-up). `ANT_UPLOAD_ACCEPT_SHALLOW=1` opts back into the old
+/// bee-aligned accept; the gateway's parity endpoints are unaffected
+/// either way. Read once per process.
+fn require_deep_receipts() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("ANT_UPLOAD_ACCEPT_SHALLOW") {
+        Err(_) => true,
+        Ok(v) => {
+            let v = v.trim();
+            v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false")
+        }
+    })
+}
+
 /// One `PushChunk` command → ack round-trip, classified. No retries.
 async fn push_attempt(
     cmd_tx: &mpsc::Sender<ControlCommand>,
@@ -509,6 +545,7 @@ async fn push_attempt(
             wire,
             batch_id,
             stamp: None,
+            require_deep: require_deep_receipts(),
             ack: ack_tx,
         })
         .await
@@ -797,6 +834,11 @@ struct UploadManagerInner {
     /// bail at their next check *without* marking the heal finished,
     /// so wake re-queues them; queued passes park until wake.
     suspended: AtomicBool,
+    /// Earliest next automatic re-heal per *degraded* job (see
+    /// [`DEGRADED_HEAL_RETRY_INTERVAL`]). Also stamped by a user's
+    /// "Stop securing" so the very next wake doesn't immediately undo
+    /// the stop. In-memory: resets on relaunch by design.
+    degraded_retry_after: Mutex<HashMap<String, Instant>>,
 }
 
 impl UploadManager {
@@ -825,6 +867,7 @@ impl UploadManager {
                 heal_inflight: Mutex::new(HashSet::new()),
                 source_root: None,
                 suspended: AtomicBool::new(false),
+                degraded_retry_after: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -1264,15 +1307,28 @@ impl UploadManager {
         Ok(count)
     }
 
-    /// Queue a securing pass for every `Completed` job whose heal hasn't
-    /// finished (interrupted by a shutdown / suspension, or never run).
+    /// Queue a securing pass for every `Completed` job that isn't
+    /// `heal_verified` yet. Two flavours:
+    ///
+    /// * **Unfinished** — the pass was interrupted (shutdown /
+    ///   suspension) or never ran: re-queued unconditionally.
+    /// * **Degraded** — the pass ran to the end but couldn't confirm
+    ///   deep reachability: re-queued too, but no more than once per
+    ///   [`DEGRADED_HEAL_RETRY_INTERVAL`]. Repair used to be left to a
+    ///   manual "Push again"; that let shallow-placed uploads silently
+    ///   age out of the network while the row read "completed", so the
+    ///   node now keeps trying at every launch/wake until the file
+    ///   verifies. The postage/battery worry that made this manual is
+    ///   bounded by the long backoff, the [`MAX_CONCURRENT_HEALS`]
+    ///   queue, and the connectivity gate on shallow re-pushes (see
+    ///   [`run_heal`](Self::run_heal)).
+    ///
     /// Bounded + deduped by [`enqueue_heal`](Self::enqueue_heal) so a
-    /// backlog secures a few at a time instead of thundering the network,
-    /// and reachable-only: a thin boot/wake-time routing table makes the
-    /// shallow probe unreliable (the historical reason the post-upload
-    /// heal stayed reachable-only), and "Push again" still does the
-    /// shallow-aware repair on demand. Shared by `rehydrate_from_disk`
-    /// and [`wake_all`](Self::wake_all).
+    /// backlog secures a few at a time instead of thundering the
+    /// network. Requests are enqueued reachable-only; `run_heal`
+    /// upgrades to the shallow-aware mode at execution time when the
+    /// node is well-connected. Shared by `rehydrate_from_disk` and
+    /// [`wake_all`](Self::wake_all).
     fn requeue_unsecured_heals(&self) {
         let handles: Vec<Arc<JobHandle>> = self
             .inner
@@ -1284,12 +1340,26 @@ impl UploadManager {
             .collect();
         for handle in handles {
             let snap = handle.snapshot();
-            if snap.status != UploadStatus::Completed || snap.heal_finished {
+            if snap.status != UploadStatus::Completed || snap.heal_verified {
                 continue;
+            }
+            if snap.heal_finished {
+                // Degraded: retry, but with the long backoff.
+                let mut retry = self
+                    .inner
+                    .degraded_retry_after
+                    .lock()
+                    .expect("degraded retry mutex poisoned");
+                let now = Instant::now();
+                if retry.get(&snap.job_id).is_some_and(|&next| now < next) {
+                    continue;
+                }
+                retry.insert(snap.job_id.clone(), now + DEGRADED_HEAL_RETRY_INTERVAL);
             }
             info!(
                 target: "ant_node::uploads",
                 job_id = %snap.job_id,
+                degraded = snap.heal_finished,
                 "queuing heal for unsecured completed upload",
             );
             self.enqueue_heal(HealRequest {
@@ -1463,6 +1533,28 @@ impl UploadManager {
         if self.heal_aborted(&req.job_id) {
             return;
         }
+        // A pass that actually runs re-opens the job's securing state:
+        // watchers see live "Securing…" progress again, and a retry
+        // interrupted mid-pass re-queues unconditionally on the next
+        // launch (the degraded backoff only applies to *finished*
+        // passes).
+        self.mark_heal_running(&req.job_id);
+        // Requests are enqueued conservative (reachable-only); upgrade
+        // to the shallow-aware mode at *execution* time when the node
+        // is well-connected — the queue wait often spans the window in
+        // which the routing table fills, and degraded jobs are almost
+        // always shallow-placement victims that a reachable-only pass
+        // cannot repair (Sketch B's gate, applied when it matters).
+        let mode = if req.mode == HealMode::ReachableOnly && self.neighbourhood_ready() {
+            info!(
+                target: "ant_node::uploads",
+                job_id = %req.job_id,
+                "node well-connected — queued heal will also re-push shallow placements",
+            );
+            HealMode::ReachableThenShallow
+        } else {
+            req.mode
+        };
         let addrs = if let Some(addrs) = req.addrs {
             addrs
         } else {
@@ -1528,10 +1620,36 @@ impl UploadManager {
             req.raw,
             req.name.as_deref(),
             req.content_type.as_deref(),
-            req.mode,
+            mode,
             None,
         )
         .await;
+    }
+
+    /// Re-open a job's securing state as a queued heal pass actually
+    /// starts running: clear `heal_finished` (persisted) so watchers see
+    /// the pass as live progress rather than a stale terminal verdict,
+    /// and so an interruption mid-pass re-queues unconditionally on the
+    /// next launch. No-op when the flag is already clear (the fresh
+    /// post-upload pass).
+    fn mark_heal_running(&self, job_id: &str) {
+        let Some(handle) = self.job_handle(job_id) else {
+            return;
+        };
+        let snap = {
+            let mut info = handle.info.lock().expect("upload mutex poisoned");
+            if !info.heal_finished {
+                return;
+            }
+            info.heal_finished = false;
+            info.last_update_unix = unix_seconds();
+            info.clone()
+        };
+        let _ = handle.progress.send(snap.clone());
+        let _ = snap.save(&UploadJobInfo::manifest_path(
+            &self.inner.state_dir,
+            &snap.job_id,
+        ));
     }
 
     /// Deep-heal one `Completed` job. Re-validates the source file
@@ -2839,6 +2957,18 @@ impl UploadManager {
                     target: "ant_node::uploads",
                     job_id, "securing pass stopping: cancelled by the user",
                 );
+                // Honour the stop beyond this pass: the degraded
+                // auto-retry must not re-queue the job on the very next
+                // wake. (One backoff interval, not forever — durability
+                // is still pursued on later launches.)
+                self.inner
+                    .degraded_retry_after
+                    .lock()
+                    .expect("degraded retry mutex poisoned")
+                    .insert(
+                        job_id.to_string(),
+                        Instant::now() + DEGRADED_HEAL_RETRY_INTERVAL,
+                    );
                 self.mark_heal_finished(job_id);
                 return true;
             }
@@ -5198,6 +5328,17 @@ mod tests {
             );
         }
 
+        // The stop is honoured across the next wake: the cancel stamped
+        // the degraded-retry backoff, so wake must not immediately
+        // re-queue the pass (enqueue would synchronously set
+        // heal_phase = "queued").
+        mgr.wake_all();
+        let snap = mgr.status(&id).expect("status");
+        assert!(
+            snap.heal_phase.is_none(),
+            "Stop securing must not be undone by the very next wake",
+        );
+
         // "Push again" after the cancel must still run a full pass.
         let after = mgr
             .repush_with_progress(&id, None)
@@ -5209,6 +5350,187 @@ mod tests {
             snap.heal_verified,
             "push-again after a cancelled securing pass should verify",
         );
+    }
+
+    /// Strict receipts: the shallow-placement error the push path returns
+    /// under `require_deep` must be classified *transient* by the upload
+    /// driver — the chunk parks in the retry queue and keeps hunting for
+    /// a deep storer — and must not take the long no-peer back-off (the
+    /// neighbourhood answered; it just answered shallow).
+    #[test]
+    fn shallow_receipt_error_is_transient_for_uploads() {
+        let msg = "pushsync: shallow receipt: storer proximity 3 < storage radius 9";
+        assert!(
+            !is_fatal_push_error(msg),
+            "a shallow placement must be retried, not fail the job",
+        );
+        assert!(
+            !is_no_peer_error(msg),
+            "shallow means the neighbourhood answered — use the normal back-off",
+        );
+    }
+
+    /// A degraded persisted job (securing pass ran but couldn't verify)
+    /// is re-queued on launch and, once the network cooperates, ends
+    /// `heal_verified` — repair no longer waits for a manual Push again.
+    #[tokio::test]
+    async fn launch_retries_degraded_heal_until_verified() {
+        let len = 20_000usize;
+        let payload: Vec<u8> = (0..len).map(|i| ((i * 47) % 251) as u8).collect();
+        let f = write_temp_file(&payload);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+
+        let md = std::fs::metadata(f.path()).expect("metadata");
+        let job_id = "deadbeefdeadbeef".to_string();
+        let info = UploadJobInfo {
+            job_id: job_id.clone(),
+            source_path: f.path().to_path_buf(),
+            source_rel: None,
+            source_size: len as u64,
+            source_mtime_unix_ms: mtime_unix_ms(&md),
+            batch_id: None,
+            name: Some("blob.bin".into()),
+            content_type: None,
+            raw: false,
+            status: UploadStatus::Completed,
+            bytes_pushed: len as u64,
+            chunks_pushed: estimate_chunk_count(len as u64, false),
+            chunks_total: Some(estimate_chunk_count(len as u64, false)),
+            created_at_unix: 0,
+            last_update_unix: 0,
+            last_error: None,
+            reference: Some(format!("0x{}", "11".repeat(32))),
+            heal_verified: false,
+            // Degraded: the pass ran to the end without verifying.
+            heal_finished: true,
+            heal_phase: None,
+            heal_checked: None,
+            heal_total: None,
+            chunks_requeued: 0,
+            stalled: false,
+            auto_paused: false,
+        };
+        info.save(&UploadJobInfo::manifest_path(state_dir.path(), &job_id))
+            .expect("save");
+
+        // The fake network now confirms everything present, so the retry
+        // pass verifies.
+        let (tx, _stats) = spawn_fake_pushsync();
+        let mgr = UploadManager::new(state_dir.path().to_path_buf(), tx, None).expect("manager");
+        mgr.rehydrate_from_disk(true).expect("rehydrate");
+
+        let snap = wait_for(&mgr, &job_id, "degraded retry to verify", |s| {
+            s.heal_verified
+        })
+        .await;
+        assert!(snap.heal_finished, "the retry pass ran to completion");
+    }
+
+    /// The degraded auto-retry is spaced by a long backoff: after a retry
+    /// pass ends degraded again, an immediate wake must NOT re-queue the
+    /// heal (the backoff window hasn't lapsed).
+    #[tokio::test]
+    async fn degraded_retry_backs_off_between_wakes() {
+        let len = 20_000usize;
+        let payload: Vec<u8> = (0..len).map(|i| ((i * 53) % 251) as u8).collect();
+        let f = write_temp_file(&payload);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+
+        let md = std::fs::metadata(f.path()).expect("metadata");
+        let job_id = "cafebabecafebabe".to_string();
+        let info = UploadJobInfo {
+            job_id: job_id.clone(),
+            source_path: f.path().to_path_buf(),
+            source_rel: None,
+            source_size: len as u64,
+            source_mtime_unix_ms: mtime_unix_ms(&md),
+            batch_id: None,
+            name: Some("blob.bin".into()),
+            content_type: None,
+            raw: false,
+            status: UploadStatus::Completed,
+            bytes_pushed: len as u64,
+            chunks_pushed: estimate_chunk_count(len as u64, false),
+            chunks_total: Some(estimate_chunk_count(len as u64, false)),
+            created_at_unix: 0,
+            last_update_unix: 0,
+            last_error: None,
+            reference: Some(format!("0x{}", "22".repeat(32))),
+            heal_verified: false,
+            heal_finished: true,
+            heal_phase: None,
+            heal_checked: None,
+            heal_total: None,
+            chunks_requeued: 0,
+            stalled: false,
+            auto_paused: false,
+        };
+        info.save(&UploadJobInfo::manifest_path(state_dir.path(), &job_id))
+            .expect("save");
+
+        // Fake loop that keeps one chunk permanently missing, so every
+        // retry pass ends degraded again.
+        let (tx, mut rx) = mpsc::channel::<ControlCommand>(64);
+        tokio::spawn(async move {
+            let mut target: Option<[u8; 32]> = None;
+            while let Some(cmd) = rx.recv().await {
+                match cmd {
+                    ControlCommand::PushChunk { wire, ack, .. } => {
+                        let mut span = [0u8; 8];
+                        span.copy_from_slice(&wire[..8]);
+                        let addr =
+                            ant_crypto::bmt::bmt_hash_with_span(&span, &wire[8..]).expect("BMT");
+                        let _ = ack.send(ControlAck::ChunkUploaded {
+                            reference: format!("0x{}", hex::encode(addr)),
+                        });
+                    }
+                    ControlCommand::VerifyChunksPresent { addresses, ack, .. } => {
+                        let t = *target.get_or_insert_with(|| addresses[0]);
+                        let missing: Vec<String> = addresses
+                            .iter()
+                            .filter(|a| **a == t)
+                            .map(|a| format!("0x{}", hex::encode(a)))
+                            .collect();
+                        let body = serde_json::json!({
+                            "checked": addresses.len(),
+                            "missing": missing,
+                        });
+                        let _ = ack.send(ControlAck::Ok {
+                            message: body.to_string(),
+                        });
+                    }
+                    ControlCommand::PostageList { ack } => {
+                        let _ = ack.send(ControlAck::PostageList(Vec::new()));
+                    }
+                    other => panic!("unexpected command in backoff test: {other:?}"),
+                }
+            }
+        });
+        let mgr = UploadManager::new(state_dir.path().to_path_buf(), tx, None).expect("manager");
+        mgr.rehydrate_from_disk(true).expect("rehydrate");
+
+        // First retry pass runs (rehydrate re-queued it) and ends
+        // degraded again: heal_finished flips false while running, then
+        // back to true, still unverified.
+        wait_for(&mgr, &job_id, "first retry pass to start", |s| {
+            !s.heal_finished || s.heal_phase.is_some()
+        })
+        .await;
+        let snap = wait_for(&mgr, &job_id, "first retry pass to finish", |s| {
+            s.heal_finished && s.heal_phase.is_none()
+        })
+        .await;
+        assert!(!snap.heal_verified, "harness keeps one chunk missing");
+
+        // An immediate wake must be suppressed by the backoff: enqueue
+        // would synchronously stamp heal_phase = "queued".
+        mgr.wake_all();
+        let snap = mgr.status(&job_id).expect("status");
+        assert!(
+            snap.heal_phase.is_none(),
+            "degraded retry must back off, not re-queue on every wake",
+        );
+        assert!(snap.heal_finished && !snap.heal_verified);
     }
 
     /// Store-only heal (source gone): a completed-but-unsecured job whose

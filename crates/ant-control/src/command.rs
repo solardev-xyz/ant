@@ -198,6 +198,16 @@ pub enum ControlCommand {
         batch_id: [u8; 32],
         /// Pre-signed 113-byte stamp; `None` = stamp locally.
         stamp: Option<Vec<u8>>,
+        /// Require a receipt from a storer inside the chunk's own
+        /// neighbourhood: a merely-shallow receipt then errors (so the
+        /// caller's retry machinery keeps working the chunk) instead of
+        /// being accepted after the deeper-storer hunt. The upload-job
+        /// manager passes `true` — a light node has no pull-sync to
+        /// repair a shallow placement later, so accepting one strands
+        /// the chunk with the uploader as its only route. The gateway's
+        /// bee-parity endpoints pass `false` (bee's own accept-shallow
+        /// semantics).
+        require_deep: bool,
         ack: oneshot::Sender<ControlAck>,
     },
     /// Gateway `POST /soc/{owner}/{id}`: stamp the SOC at `address` and

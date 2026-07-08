@@ -1957,6 +1957,7 @@ fn handle_control_command(
             wire,
             batch_id,
             stamp,
+            require_deep,
             ack,
         } => {
             // Validate wire bytes locally before paying for a stamp,
@@ -1992,7 +1993,16 @@ fn handle_control_command(
                         return;
                     }
                 };
-                push_with_stamp(state, control, network_id, addr, wire, stamp, ack);
+                push_with_stamp(
+                    state,
+                    control,
+                    network_id,
+                    addr,
+                    wire,
+                    stamp,
+                    require_deep,
+                    ack,
+                );
                 return;
             }
 
@@ -2079,7 +2089,16 @@ fn handle_control_command(
                 }
             };
 
-            push_with_stamp(state, control, network_id, addr, wire, stamp, ack);
+            push_with_stamp(
+                state,
+                control,
+                network_id,
+                addr,
+                wire,
+                stamp,
+                require_deep,
+                ack,
+            );
         }
         ControlCommand::PushSoc {
             address,
@@ -3323,6 +3342,7 @@ fn validate_presigned_stamp(
 /// Shared `PushChunk` tail: cache the chunk locally (store-then-push),
 /// then pushsync it with `stamp` and ack. Used by both the local-issuer
 /// and the presigned-stamp paths.
+#[allow(clippy::too_many_arguments)]
 fn push_with_stamp(
     state: &SwarmState,
     control: &Control,
@@ -3330,6 +3350,7 @@ fn push_with_stamp(
     addr: [u8; 32],
     wire: Vec<u8>,
     stamp: [u8; ant_postage::STAMP_SIZE],
+    require_deep: bool,
     ack: oneshot::Sender<ControlAck>,
 ) {
     let peers_rx = state.peers_watch.subscribe();
@@ -3372,7 +3393,8 @@ fn push_with_stamp(
         }
         let mut fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx)
             .with_push_skip(push_skip)
-            .with_network_id(network_id);
+            .with_network_id(network_id)
+            .with_require_deep(require_deep);
         if let Some(load) = push_load {
             fetcher = fetcher.with_push_load(load);
         }
