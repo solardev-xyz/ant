@@ -656,6 +656,16 @@ struct FileDetailView: View {
                     fraction: job.securingFraction,
                     tint: .blue)
             }
+        } else if job.isDegraded {
+            GlassCard {
+                progressBlock(
+                    icon: "arrow.triangle.2.circlepath",
+                    title: "Propagating…",
+                    detail: nil,
+                    explanation: "Some parts haven't confirmed their place on the network yet. The app re-secures this file automatically until it verifies — Push again below does it right now.",
+                    fraction: nil,
+                    tint: .orange)
+            }
         }
     }
 
@@ -1048,7 +1058,9 @@ struct FileDetailView: View {
             // file reports its real durability without the user tapping verify.
             if job.isSecuring { return ("Securing…", .blue, "arrow.triangle.2.circlepath") }
             if job.isDurable  { return ("Stored safely", .green, "checkmark.seal.fill") }
-            if job.isDegraded { return ("Not fully stored", .orange, "exclamationmark.triangle.fill") }
+            // The node keeps re-queuing the securing pass until the file
+            // verifies, so degraded reads as in-progress, not terminal.
+            if job.isDegraded { return ("Propagating…", .orange, "arrow.triangle.2.circlepath") }
             return ("Uploaded", .white.opacity(0.8), "checkmark.circle")
         }
         return (job.status.capitalized, .gray, "minus.circle")

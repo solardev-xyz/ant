@@ -766,6 +766,10 @@ pub async fn upload_chunk(
         wire: body.to_vec(),
         batch_id,
         stamp: stamp.map(|s| s.to_vec()),
+        // Bee-parity: accept a shallow receipt after the deeper-storer
+        // hunt, exactly like bee's own pusher (strict receipts are the
+        // upload-job manager's policy, not the HTTP API's).
+        require_deep: false,
         ack: ack_tx,
     };
     if handle.commands.send(cmd).await.is_err() {
@@ -1867,6 +1871,8 @@ pub(crate) async fn push_chunks(
                 wire: chunk.wire.clone(),
                 batch_id,
                 stamp: None,
+                // Bee-parity accept-shallow (see POST /chunks above).
+                require_deep: false,
                 ack: ack_tx,
             };
             if handle.commands.send(cmd).await.is_err() {

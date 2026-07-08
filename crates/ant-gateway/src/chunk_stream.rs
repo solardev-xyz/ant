@@ -215,6 +215,8 @@ async fn handle_upload_stream(
             wire: wire.to_vec(),
             batch_id: chunk_batch,
             stamp,
+            // Bee-parity accept-shallow (see POST /chunks).
+            require_deep: false,
             ack: ack_tx,
         };
         if handle.commands.send(cmd).await.is_err() {

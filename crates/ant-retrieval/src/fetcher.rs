@@ -212,6 +212,16 @@ pub struct RoutingFetcher {
     /// Best-effort: a full channel drops the request rather than blocking
     /// the push. `None` for retrieval-only fetchers and tests.
     neighborhood_dial: Option<mpsc::Sender<[u8; 32]>>,
+    /// Strict receipts (the upload-job path). When `true`,
+    /// [`Self::push_stamped_chunk`] never *accepts* a merely-shallow
+    /// receipt: after the deeper-storer hunt is exhausted it returns
+    /// [`crate::pushsync::PushSyncError::ShallowReceipt`] instead, so the
+    /// caller's retry machinery re-queues the chunk and each fresh walk
+    /// (with its neighbourhood re-dial cycle) gets another chance to
+    /// land a deep receipt. `false` (the default) keeps the bee-aligned
+    /// accept-after-budget behaviour for the gateway's parity endpoints.
+    /// See [`Self::with_require_deep`] for why the upload path opts in.
+    require_deep: bool,
 }
 
 impl RoutingFetcher {
@@ -250,7 +260,32 @@ impl RoutingFetcher {
             push_load: None,
             push_network_id: None,
             neighborhood_dial: None,
+            require_deep: false,
         }
+    }
+
+    /// Require a *deep* receipt for [`Self::push_stamped_chunk`] to
+    /// report success: a chunk whose every receipt is shallow errors
+    /// with [`crate::pushsync::PushSyncError::ShallowReceipt`] instead
+    /// of being accepted after the retry budget.
+    ///
+    /// Why the upload-job path opts in: bee accepts a shallow receipt
+    /// because a full node's pull-sync migrates the chunk into its true
+    /// neighbourhood afterwards. A light node has no pull-sync — a
+    /// shallow-accepted chunk stays readable only through the
+    /// uploader's own link to the shallow storer, is invisible to the
+    /// network's routed lookups, and gets GC'd from the storer's
+    /// reserve within hours (observed: a 4 MB upload whose shallow-heavy
+    /// chunk set was 404 network-wide a day later). Erroring instead
+    /// hands the chunk back to the upload driver's retry-forever queue,
+    /// whose every re-dispatch re-runs the gossip-deepening dial cycle
+    /// — so the upload only completes when the data is genuinely
+    /// placed. The gateway's bee-parity `POST` endpoints keep the
+    /// accept-shallow default.
+    #[must_use]
+    pub const fn with_require_deep(mut self, require_deep: bool) -> Self {
+        self.require_deep = require_deep;
+        self
     }
 
     /// Attach the on-demand neighbourhood-dial request channel. When set,
@@ -678,7 +713,11 @@ impl RoutingFetcher {
     ///   retry for a deeper storer up to [`MAX_SHALLOW_ATTEMPTS`] (bee
     ///   `DefaultRetryCount`) and then **accept** it — bee reports the
     ///   chunk `ChunkSynced` rather than ever failing the upload on a
-    ///   shallow receipt.
+    ///   shallow receipt. Under [`Self::with_require_deep`] (the upload-
+    ///   job path) the exhausted hunt returns
+    ///   [`PushSyncError::ShallowReceipt`] instead of accepting, so the
+    ///   caller's retry queue keeps working the chunk until it lands
+    ///   deep.
     /// * **Hard failures** (stream open / io / remote rejection) consume a
     ///   bounded budget ([`MAX_PUSH_ERRORS`], bee `maxPushErrors`); a
     ///   single mid-exchange `Io` gets one same-peer retry first.
@@ -712,6 +751,9 @@ impl RoutingFetcher {
         let mut errors_left: i32 = Self::MAX_PUSH_ERRORS as i32;
         let mut shallow_attempts: u32 = 0;
         let mut shallow_seen = false;
+        // Most recent shallow receipt's (po, storage_radius), so the
+        // strict-receipts error can report what the network answered.
+        let mut last_shallow = (0u8, 0u32);
         let mut last_err: Option<PushSyncError> = None;
 
         // In-flight pushsync attempts. Each yields
@@ -834,6 +876,7 @@ impl RoutingFetcher {
                             // neighbourhood.
                             shallow_attempts += 1;
                             shallow_seen = true;
+                            last_shallow = (po, storage_radius);
                             warn!(
                                 target: "ant_retrieval::fetcher",
                                 %peer,
@@ -843,8 +886,22 @@ impl RoutingFetcher {
                                 "pushsync got a shallow receipt; chunk stored but shallow — trying for a deeper storer",
                             );
                             if accept_shallow_after(shallow_attempts) {
+                                // Strict receipts: hand the chunk back to
+                                // the caller's retry queue instead of
+                                // accepting a placement the routed network
+                                // can't see (see `with_require_deep`). The
+                                // storer did settle-worthy work either way.
                                 if let Some(s) = self.pushsync_settlement.as_ref() {
                                     s.note_pushsync(peer, price).await;
+                                }
+                                if self.require_deep {
+                                    warn!(
+                                        target: "ant_retrieval::fetcher",
+                                        addr = %hex::encode(chunk_addr),
+                                        shallow_attempts,
+                                        "deep receipt required: reporting shallow placement so the upload re-queues the chunk",
+                                    );
+                                    return Err(PushSyncError::ShallowReceipt { po, storage_radius });
                                 }
                                 warn!(
                                     target: "ant_retrieval::fetcher",
@@ -909,8 +966,20 @@ impl RoutingFetcher {
         // Candidate set / error budget exhausted. Bee never fails an
         // upload on a shallow receipt — its pusher reports the chunk
         // `ChunkSynced` after the retry budget — so if any storer accepted
-        // the chunk (even shallow), treat the push as done.
+        // the chunk (even shallow), treat the push as done. Under strict
+        // receipts (`with_require_deep`) the shallow outcome is instead
+        // surfaced as an error so the upload driver re-queues the chunk
+        // and keeps hunting on the next dispatch.
         if shallow_seen {
+            if self.require_deep {
+                let (po, storage_radius) = last_shallow;
+                warn!(
+                    target: "ant_retrieval::fetcher",
+                    addr = %hex::encode(chunk_addr),
+                    "deep receipt required: exhausted candidates with only shallow receipts — reporting shallow so the upload re-queues",
+                );
+                return Err(PushSyncError::ShallowReceipt { po, storage_radius });
+            }
             warn!(
                 target: "ant_retrieval::fetcher",
                 addr = %hex::encode(chunk_addr),
