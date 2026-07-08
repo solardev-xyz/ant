@@ -289,6 +289,26 @@ const HEAL_VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(
 /// "on every launch" cadence we want. Tunable.
 const DEGRADED_HEAL_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_mins(15);
 
+/// Escalating wait before the next automatic securing retry, keyed by
+/// how many completed-but-unverified passes the job has had. A fresh
+/// upload usually finishes settling within minutes (neighbourhood
+/// pull-sync moves the last shallow chunks on its own), so the first
+/// re-checks come quickly and the badge flips green without the user
+/// tapping anything; a long-degraded file backs off to the
+/// [`DEGRADED_HEAL_RETRY_INTERVAL`] cap so it can't burn postage and
+/// battery on a file the network refuses to settle. Keyed off the
+/// *persisted* `heal_attempts`, so the schedule continues across
+/// relaunches instead of restarting.
+fn degraded_retry_interval(attempts: u64) -> std::time::Duration {
+    match attempts {
+        0 | 1 => std::time::Duration::from_mins(1),
+        2 => std::time::Duration::from_mins(2),
+        3 => std::time::Duration::from_mins(5),
+        4 => std::time::Duration::from_mins(10),
+        _ => DEGRADED_HEAL_RETRY_INTERVAL,
+    }
+}
+
 /// How often the manager's retry ticker re-evaluates the heal queue
 /// (cheap: a snapshot walk gated by the backoff map and the in-flight
 /// set). The ticker is what turns [`DEGRADED_HEAL_RETRY_INTERVAL`] from
@@ -1695,25 +1715,54 @@ impl UploadManager {
     /// bare warning. `missing = None` (inconclusive read-back, user
     /// cancel) keeps the previous residual figure.
     fn note_degraded(&self, job_id: &str, missing: Option<u64>) {
-        self.inner
-            .degraded_retry_after
-            .lock()
-            .expect("degraded retry mutex poisoned")
-            .insert(
-                job_id.to_string(),
-                Instant::now() + DEGRADED_HEAL_RETRY_INTERVAL,
-            );
         let Some(handle) = self.job_handle(job_id) else {
+            // Unknown job: still park a conservative window so it can't
+            // spin the requeue.
+            self.defer_degraded_retry(job_id, DEGRADED_HEAL_RETRY_INTERVAL);
             return;
         };
-        let snap = {
+        let (snap, interval) = {
             let mut info = handle.info.lock().expect("upload mutex poisoned");
             if let Some(n) = missing {
                 info.heal_missing = Some(n);
             }
             info.heal_attempts = info.heal_attempts.saturating_add(1);
+            // Escalate from quick early re-checks to the cap (see
+            // `degraded_retry_interval`).
+            let interval = degraded_retry_interval(info.heal_attempts);
             info.heal_last_check_unix = Some(unix_seconds());
-            info.heal_retry_unix = Some(unix_seconds() + DEGRADED_HEAL_RETRY_INTERVAL.as_secs());
+            info.heal_retry_unix = Some(unix_seconds() + interval.as_secs());
+            info.last_update_unix = unix_seconds();
+            (info.clone(), interval)
+        };
+        self.inner
+            .degraded_retry_after
+            .lock()
+            .expect("degraded retry mutex poisoned")
+            .insert(job_id.to_string(), Instant::now() + interval);
+        let _ = handle.progress.send(snap.clone());
+        let _ = snap.save(&UploadJobInfo::manifest_path(
+            &self.inner.state_dir,
+            &snap.job_id,
+        ));
+    }
+
+    /// Park the next automatic retry of `job_id` for `interval` without
+    /// counting a check (the user-cancel path: a stop is not a pass,
+    /// but it must hold for the full window regardless of how young the
+    /// escalation schedule is). Also updates the user-visible countdown.
+    fn defer_degraded_retry(&self, job_id: &str, interval: std::time::Duration) {
+        self.inner
+            .degraded_retry_after
+            .lock()
+            .expect("degraded retry mutex poisoned")
+            .insert(job_id.to_string(), Instant::now() + interval);
+        let Some(handle) = self.job_handle(job_id) else {
+            return;
+        };
+        let snap = {
+            let mut info = handle.info.lock().expect("upload mutex poisoned");
+            info.heal_retry_unix = Some(unix_seconds() + interval.as_secs());
             info.last_update_unix = unix_seconds();
             info.clone()
         };
@@ -3065,7 +3114,7 @@ impl UploadManager {
                 // auto-retry must not re-queue the job on the very next
                 // wake. (One backoff interval, not forever — durability
                 // is still pursued on later launches.)
-                self.note_degraded(job_id, None);
+                self.defer_degraded_retry(job_id, DEGRADED_HEAL_RETRY_INTERVAL);
                 self.mark_heal_finished(job_id);
                 return true;
             }
@@ -5490,6 +5539,16 @@ mod tests {
             !is_no_peer_error(msg),
             "shallow means the neighbourhood answered — use the normal back-off",
         );
+    }
+
+    /// Pin the escalation schedule: quick early re-checks (a fresh
+    /// upload usually settles within minutes), backing off to the cap.
+    #[test]
+    fn degraded_retry_schedule_escalates_to_cap() {
+        let mins: Vec<u64> = (0..7)
+            .map(|a| degraded_retry_interval(a).as_secs() / 60)
+            .collect();
+        assert_eq!(mins, vec![1, 1, 2, 5, 10, 15, 15]);
     }
 
     /// A degraded persisted job (securing pass ran but couldn't verify)

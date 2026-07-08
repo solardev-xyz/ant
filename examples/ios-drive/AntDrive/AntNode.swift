@@ -436,7 +436,12 @@ final class AntNode: ObservableObject {
     /// real redundancy, not just "at least one copy exists".
     func reverify(_ job: UploadJob, probes: UInt8 = 2) async {
         guard job.reference?.isEmpty == false else { return }
-        setPropagation(nil, for: job.id)
+        // Keep the previous verdict on screen until the new one replaces
+        // it: clearing it here made a previously-green file fall back to
+        // the warning-toned "Propagating" state for the whole duration
+        // of the re-check. The `verifying` set already communicates the
+        // in-flight check; a cancelled/failed check keeps the old
+        // verdict.
         await verifyPropagationStreaming(job, samples: 0, probes: probes)
     }
 
