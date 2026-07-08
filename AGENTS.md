@@ -1,6 +1,11 @@
 # Agent Notes
 
 - The implementation plan lives in `PLAN.md` at the repo root.
+- **Never commit, push, or create a PR unless the user specifically asks
+ for it.** Finished work stays in the working tree until the user has
+ tested it by hand and says to commit — only human-tested code gets
+ committed. "Implement X" is not permission to commit X; wait for an
+ explicit "commit" / "push" / "open a PR".
 - **Keep CI green — it is a hard requirement, not a nicety.** Before you
  push or merge anything, the full CI gate must pass locally. CI
  (`.github/workflows/ci.yml`) runs these steps in order and stops at the
@@ -48,10 +53,10 @@
  number across all crates; we ship them as one unit. Bump minor or
  major only when the user asks for it explicitly.
 - **Always put version bumps in their own commit**, separate from any
- fix/feature work, so the diff for a change stays clean and easy to
- review/revert. Never fold the `Cargo.toml` patch-version bumps into a
- commit that also contains code changes — commit the bump on its own
- (e.g. `chore: bump workspace crates to x.y.Z`).
+ fix/feature work — mixed in, they pollute the diffs and make the real
+ change hard to review/revert. Never fold the `Cargo.toml` patch-version
+ bumps into a commit that also contains code changes — commit the bump
+ on its own (e.g. `chore: bump workspace crates to x.y.Z`).
 
 ## Driving the iOS Drive app on the simulator (idb + log capture)
 
