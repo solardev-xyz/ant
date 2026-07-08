@@ -600,20 +600,37 @@ final class AntNode: ObservableObject {
         }
     }
 
-    /// While any upload is in flight — or a completed one is still being
-    /// secured by the daemon's background heal — refresh the job list ~once a
-    /// second so the Files tab shows live progress and flips to "Verified" on
-    /// its own when `heal_verified` lands (no user tap).
+    /// Keep the job list current. Two cadences:
+    ///
+    /// * **Fast (1.5 s)** while a transfer or securing pass is visibly
+    ///   live, so bars move.
+    /// * **Slow (10 s)** while any completed file is still unverified —
+    ///   the node's retry ticker starts securing passes on its *own*
+    ///   schedule, so a state change can happen while the app believes
+    ///   everything is idle. Gating all polling on the *last known*
+    ///   state deadlocked here: the UI could never notice the pass that
+    ///   would have made it look busy again (a degraded file sat frozen
+    ///   on "next check: any moment now" while the node re-checked
+    ///   underneath).
+    ///
+    /// No polling at all when nothing is watchable (all files verified
+    /// or terminal — nothing changes node-side on its own), and the
+    /// publish dedup means a no-change poll never re-renders.
     private func startAutoRefresh() {
         refreshTask?.cancel()
         refreshTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 1_500_000_000)
                 guard let self else { return }
-                let busy = await MainActor.run {
-                    self.jobs.contains { $0.isActive || $0.isSecuring }
+                let (busy, watchable) = await MainActor.run {
+                    (
+                        self.jobs.contains {
+                            $0.isActive || $0.isSecuring || $0.healPhase != nil
+                        },
+                        self.jobs.contains { $0.isDone && !$0.healVerified }
+                    )
                 }
-                if busy { await self.refreshJobs() }
+                try? await Task.sleep(nanoseconds: busy ? 1_500_000_000 : 10_000_000_000)
+                if busy || watchable { await self.refreshJobs() }
             }
         }
     }

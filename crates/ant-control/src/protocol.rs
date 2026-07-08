@@ -339,6 +339,27 @@ pub struct UploadJobView {
     /// of blocking forever. Defaults to `false`.
     #[serde(default)]
     pub heal_finished: bool,
+    /// Chunks the most recent completed securing pass could not confirm
+    /// deep-reachable — the residual behind a degraded verdict, so a
+    /// client can render "N parts still settling" and watch it shrink
+    /// across the automatic retries. Absent on older daemons or when
+    /// never measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heal_missing: Option<u64>,
+    /// When the next automatic securing retry becomes eligible (unix
+    /// seconds), for a "next check in ~M min" label. Absent while a
+    /// pass runs, once verified, and on older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heal_retry_unix: Option<u64>,
+    /// Completed securing passes that ended without verifying —
+    /// "Checked N times" evidence that the retry loop is active.
+    /// Defaults to `0` on older daemons.
+    #[serde(default)]
+    pub heal_attempts: u64,
+    /// Unix seconds of the most recent completed-but-unverified pass
+    /// ("last checked 3 min ago"). Absent on older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heal_last_check_unix: Option<u64>,
     /// Live post-upload self-heal ("Securing…") progress, surfaced while
     /// the automatic heal runs so a client can draw a *determinate* bar
     /// instead of an indeterminate spinner. `heal_phase` names the current
@@ -934,6 +955,10 @@ mod tests {
             auto_paused: false,
             heal_verified: false,
             heal_finished: false,
+            heal_missing: None,
+            heal_retry_unix: None,
+            heal_attempts: 0,
+            heal_last_check_unix: None,
             heal_phase: None,
             heal_checked: None,
             heal_total: None,
