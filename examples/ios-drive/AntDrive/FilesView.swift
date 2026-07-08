@@ -367,6 +367,9 @@ private struct FileRow: View {
         }
         // While uploading / paused / failed, the job's own status line wins.
         if !job.isDone { return job.statusLabel.isEmpty ? nil : job.statusLabel }
+        // A user-run check in flight beats the heal-derived labels — the
+        // row should say what's happening right now.
+        if node.verifying.contains(job.id) { return "Checking…" }
         // Completed: a user-run deep verify (propagation) is the richest
         // verdict and *overrides* the daemon's heal flags, which can lag a
         // successful "Push again" — heal may leave the job `degraded` while
@@ -656,7 +659,9 @@ struct FileDetailView: View {
                     fraction: job.securingFraction,
                     tint: .blue)
             }
-        } else if job.isDegraded, node.propagation[job.id]?.isStoredSafely != true {
+        } else if job.isDegraded,
+                  node.propagation[job.id]?.isStoredSafely != true,
+                  !node.verifying.contains(job.id) {
             // A user-run verify that confirmed the file retrievable is
             // the richest verdict (same precedence as the row and the
             // status badge): don't contradict it with a warning-toned
