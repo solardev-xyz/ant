@@ -78,7 +78,6 @@ const FORK_PRE_REF_SIZE: usize = 32; // type(1) + prefixLen(1) + prefix(30)
 const FORK_METADATA_SIZE_BYTES: usize = 2;
 const NODE_TYPE_VALUE: u8 = 2;
 const NODE_TYPE_EDGE: u8 = 4;
-const NODE_TYPE_PATH_SEPARATOR: u8 = 8;
 const NODE_TYPE_WITH_METADATA: u8 = 16;
 const MANIFEST_LIST_MAX_DEPTH: usize = 6;
 const MANIFEST_LIST_MAX_ENTRIES: usize = 512;
@@ -681,11 +680,18 @@ fn collect_entries<'a>(
 
             match load_node_ref(fetcher, &fork.child_ref).await {
                 Ok(mut child_node) => {
-                    let child_path = child_listing_path(&fork_path, fork.node_type);
                     for (k, v) in fork.metadata {
                         child_node.metadata.entry(k).or_insert(v);
                     }
-                    collect_entries(fetcher, child_node, child_path, entries, visited, depth + 1)
+                    // The listing path is the plain concatenation of fork
+                    // prefixes — real `/` separators are already inside the
+                    // prefix bytes, exactly as `walk` matches them. Bee's
+                    // path-separator type bit means "this prefix *contains*
+                    // a separator" (see `bee_path_separator` in
+                    // manifest_writer.rs), never "append one": deriving a
+                    // `/` from it can split a name mid-byte when a fork
+                    // boundary falls inside a segment (issue #13).
+                    collect_entries(fetcher, child_node, fork_path, entries, visited, depth + 1)
                         .await?;
                 }
                 Err(_) => {
@@ -706,13 +712,6 @@ fn collect_entries<'a>(
     })
 }
 
-fn child_listing_path(path: &str, node_type: u8) -> String {
-    if !path.is_empty() && !path.ends_with('/') && (node_type & NODE_TYPE_PATH_SEPARATOR) != 0 {
-        format!("{path}/")
-    } else {
-        path.to_string()
-    }
-}
 /// Fetch a manifest node by a 32-byte (plain) or 64-byte (encrypted)
 /// reference and unmarshal it. Encrypted nodes go through the
 /// decrypting joiner; plain nodes fetch the root chunk and join.
@@ -770,6 +769,10 @@ pub(crate) struct Node {
 
 #[derive(Debug, Clone)]
 pub(crate) struct Fork {
+    /// Bee-side bitfield. Parsed for wire fidelity and `Debug` output
+    /// only — never for path reconstruction: deriving a `/` from the
+    /// path-separator bit is exactly the bug behind issue #13.
+    #[allow(dead_code)]
     node_type: u8,
     pub(crate) prefix: Vec<u8>,
     /// 32 bytes, or 64 (`address ‖ key`) in an encrypted manifest.
@@ -1345,6 +1348,55 @@ mod tests {
             matches!(err, ManifestError::NotAManifest),
             "expected NotAManifest, got {err:?}",
         );
+    }
+
+    /// Regression for issue #13: `collect_entries` used to append a `/`
+    /// to the listing path whenever a fork carried bee's path-separator
+    /// type bit. That bit means "this prefix *contains* a separator",
+    /// never "append one" — so whenever a fork boundary fell inside a
+    /// name segment the listing emitted a path with a spurious `/`
+    /// (`assets/…` as `a/ssets/…`, `…payment.png` as `…payment.pn/g`)
+    /// that retrieval 404s on. Invariant locked here: every value path
+    /// returned by `list_manifest_paths` must round-trip through
+    /// `lookup_path` on the same manifest to the same data ref.
+    #[tokio::test]
+    async fn listed_paths_round_trip_through_lookup() {
+        // Paths chosen so the trie forks mid-segment:
+        //  - `admin/…` vs `assets/…` share only `a`, so the split-off
+        //    prefixes carry a later `/` inside them (directory variant —
+        //    unrecoverable from metadata);
+        //  - the two `fonts/iAWriterMonoS-…` names split inside the
+        //    basename (the originally reported variant).
+        let paths = [
+            "admin/.gitignore",
+            "assets/hero/build.png",
+            "fonts/iAWriterMonoS-Bold.woff",
+            "fonts/iAWriterMonoS-Regular.woff",
+            "index.html",
+        ];
+        let (fetcher, root, data_refs) = website_fetcher(&paths);
+
+        let entries = list_manifest_paths(&fetcher, &root).await.unwrap();
+        let listed: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.reference.is_some())
+            .map(|e| e.path.as_str())
+            .collect();
+        let mut want = paths;
+        want.sort_unstable();
+        assert_eq!(listed, want, "listing must emit exactly the stored paths");
+
+        for entry in entries.iter().filter(|e| e.reference.is_some()) {
+            let looked_up = lookup_path(&fetcher, &root, &entry.path)
+                .await
+                .unwrap_or_else(|e| panic!("listed path {:?} does not resolve: {e:?}", entry.path));
+            assert_eq!(
+                looked_up.data_ref.as_slice(),
+                data_refs[entry.path.as_str()].as_slice(),
+                "listed path {:?} resolved to a different data ref than it was stored under",
+                entry.path,
+            );
+        }
     }
 
     /// JSON escape parser: covers every escape mantaray emits.
