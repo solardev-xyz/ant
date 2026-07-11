@@ -640,6 +640,12 @@ impl RoutingFetcher {
     /// Best-effort request to the swarm loop to dial peers toward `target`'s
     /// neighbourhood. Dropped silently if no dialer is wired or the request
     /// channel is full (the loop is already busy dialing).
+    /// Public alias of [`Self::request_neighborhood_dial`] for the
+    /// gateway read-retry path (`ant-p2p`, bug-hunt Fix C).
+    pub fn request_neighborhood_dial_pub(&self, target: &[u8; 32]) {
+        self.request_neighborhood_dial(target);
+    }
+
     fn request_neighborhood_dial(&self, target: &[u8; 32]) {
         if let Some(tx) = self.neighborhood_dial.as_ref() {
             let _ = tx.try_send(*target);

@@ -1811,8 +1811,10 @@ fn handle_control_command(
             // still be returned. The fetcher subscribes to the live peer
             // snapshot so network fallback tracks the current BZZ set.
             let peers_rx = state.peers_watch.subscribe();
+            let retry_peers = state.peers_watch.subscribe();
             let cache = state.cache_for_request(false);
             let disk_cache = state.disk_cache_for_request(false);
+            let neighborhood_dial = state.neighborhood_dial_tx.clone();
             let control = control.clone();
             tokio::spawn(async move {
                 let mut builder =
@@ -1820,8 +1822,11 @@ fn handle_control_command(
                 if let Some(disk) = disk_cache {
                     builder = builder.with_disk_cache(disk);
                 }
+                if let Some(tx) = neighborhood_dial {
+                    builder = builder.with_neighborhood_dialer(tx);
+                }
                 let fetcher = builder;
-                let reply = match fetcher.fetch(reference).await {
+                let reply = match fetch_with_retry(&fetcher, retry_peers, reference).await {
                     Ok(wire) if wire.len() >= ant_crypto::SPAN_SIZE => {
                         // `fetch` returns the chunk's wire bytes
                         // (`span || payload`); `GetChunk` acks the payload.
@@ -3337,6 +3342,55 @@ fn validate_presigned_stamp(
     ant_crypto::recover_public_key(sig, digest.as_ref())
         .map_err(|e| format!("presigned stamp signature invalid: {e}"))?;
     Ok(stamp)
+}
+
+/// Bug-hunt Fix C: one bounded retry of a failed network read after
+/// the peer set changes. Retrieval failures on a light node cluster in
+/// churn troughs — the walk exhausts against a momentarily-thin/flappy
+/// pool and the SAME read succeeds seconds later (the field report's
+/// self-healing read 502s). Instead of surfacing the first exhaustion,
+/// nudge the swarm to dial toward the target's neighbourhood, wait
+/// (≤ `ANT_READ_RETRY_WAIT_MS`, default 2500, 0 disables) for the peer
+/// set to actually change, and re-run the fetch once. The local-cache
+/// fast path is unaffected — this only runs after a full network walk
+/// already failed.
+async fn fetch_with_retry(
+    fetcher: &ant_retrieval::RoutingFetcher,
+    mut peers_rx: watch::Receiver<Vec<(PeerId, [u8; 32])>>,
+    reference: [u8; 32],
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let first = fetcher.fetch(reference).await;
+    let wait = read_retry_wait();
+    if wait.is_zero() {
+        return first;
+    }
+    match first {
+        Ok(wire) => Ok(wire),
+        Err(e) => {
+            debug!(
+                target: "ant_p2p",
+                addr = %hex::encode(reference),
+                err = %e,
+                "read walk exhausted; dialing toward the neighbourhood and retrying once",
+            );
+            fetcher.request_neighborhood_dial_pub(&reference);
+            let _ = tokio::time::timeout(wait, peers_rx.changed()).await;
+            fetcher.fetch(reference).await
+        }
+    }
+}
+
+/// `ANT_READ_RETRY_WAIT_MS` — bounded wait for a peer-set change before
+/// the single read re-walk. Default 2500 ms; `0` disables (pre-fix
+/// behaviour, the A/B control arm).
+fn read_retry_wait() -> Duration {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    Duration::from_millis(*MS.get_or_init(|| {
+        std::env::var("ANT_READ_RETRY_WAIT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(2500)
+    }))
 }
 
 /// Perf-lab bug-hunt Fix A: outer patience for the gateway's ONE-SHOT
