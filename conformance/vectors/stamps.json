@@ -1,0 +1,29 @@
+{
+  "cases": [
+    {
+      "name": "chunk-0",
+      "secretHex": "b81dcb6350c980d80602e37c8d42ca7cf1ca93e85240bac7879cf7cecaeca9c6",
+      "ownerHex": "ff6316419def87e4ea768e09a04dd56ebb40cb4e",
+      "chunkAddrHex": "2ffafb919bceaf3391380de98c01f42630d0a9d7bd51234004f59a332603278f",
+      "batchIdHex": "8de674cb4e16158c83ae031841772c3f9ec44224e0bcfdb48b257e3a00f933cc",
+      "indexHex": "00002ffa00000003",
+      "timestampHex": "17deaae315ac0000",
+      "digestHex": "9030d4dceb310150e9bee76aca689544276f152ae5bd4a82e8ca552c2ff18271",
+      "signatureHex": "1bfa0916ea6be390c0cc359ab867dfd53e5391d27989a44cf72ebdff2574925f162beb8a12c7185f240e3851666bfa1546b9d7f1227457e58f8703ec23df84f11c",
+      "stampHex": "8de674cb4e16158c83ae031841772c3f9ec44224e0bcfdb48b257e3a00f933cc00002ffa0000000317deaae315ac00001bfa0916ea6be390c0cc359ab867dfd53e5391d27989a44cf72ebdff2574925f162beb8a12c7185f240e3851666bfa1546b9d7f1227457e58f8703ec23df84f11c"
+    },
+    {
+      "name": "chunk-1",
+      "secretHex": "b81dcb6350c980d80602e37c8d42ca7cf1ca93e85240bac7879cf7cecaeca9c6",
+      "ownerHex": "ff6316419def87e4ea768e09a04dd56ebb40cb4e",
+      "chunkAddrHex": "3c36cf54dcc765eb5d487f3505e73fa03f76d6bdd1a0d30de8121d1b2c82ad17",
+      "batchIdHex": "8de674cb4e16158c83ae031841772c3f9ec44224e0bcfdb48b257e3a00f933cc",
+      "indexHex": "00003c3600000004",
+      "timestampHex": "17deaae315ac0001",
+      "digestHex": "a5b5abd9323bf2d708058ebf9c8305907bf41d010142f072a36ab5be33abb646",
+      "signatureHex": "56e45bbe768aa784e92abcba997558507ca9928fbb535572d00e338afdfa95806a9cbe0be1b0316a01979d283ad396ed81b5ea91d65acbf934b6a54c81945b631b",
+      "stampHex": "8de674cb4e16158c83ae031841772c3f9ec44224e0bcfdb48b257e3a00f933cc00003c360000000417deaae315ac000156e45bbe768aa784e92abcba997558507ca9928fbb535572d00e338afdfa95806a9cbe0be1b0316a01979d283ad396ed81b5ea91d65acbf934b6a54c81945b631b"
+    }
+  ],
+  "description": "postage stamps: digest = keccak256(chunkAddr || batchID || index || ts) via bee postage.ToSignDigest, signed with Ethereum message prefix; stamp wire = batchID || index || ts || sig (113 bytes)"
+}

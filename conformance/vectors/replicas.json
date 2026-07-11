@@ -1,0 +1,174 @@
+{
+  "baseAddressHex": "72c604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+  "cases": [
+    {
+      "entropy": 0,
+      "idHex": "00c604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "c096a4fd9a7ca8b765b4ee2b5f00857e2ae1a5c9c2dad5f1d2ba91343bc6568d"
+    },
+    {
+      "entropy": 1,
+      "idHex": "01c604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "73c3ff3150df6c7e26563a3760efb7afbcbe5ad15af3abdbf35618e3186f082a"
+    },
+    {
+      "entropy": 2,
+      "idHex": "02c604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "0eecf618bfe2e3c84178268dda31c8f5fd6938d9443925e04f063a4aa3ed6d20"
+    },
+    {
+      "entropy": 3,
+      "idHex": "03c604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "2b72109eb8999e8e159561683d80702142cb1568c57dfd273e3a40377ba4f12b"
+    },
+    {
+      "entropy": 4,
+      "idHex": "04c604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "7b2dc55ee4a57c5e9ed4efc173c4def3ef7db79b7e8062ab62ed8b86cc30c75d"
+    },
+    {
+      "entropy": 5,
+      "idHex": "05c604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "b556fdc3b5617ad33907ef3e85ba9e4577d288fcbbcc0bbb10b31bf3b7f32608"
+    },
+    {
+      "entropy": 6,
+      "idHex": "06c604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "9db34b05ff4b505e98529cfc54a145ac19956e4e64684645b571145ebf74a858"
+    },
+    {
+      "entropy": 7,
+      "idHex": "07c604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "be6fa7041dd9701991af423b29e32acc231fee99e9407553de26fa6b68f9bd76"
+    },
+    {
+      "entropy": 8,
+      "idHex": "08c604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "68b4962c6114a3dfb932c913591cea92228d1b1e0f94657034029f4c109e6056"
+    },
+    {
+      "entropy": 9,
+      "idHex": "09c604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "c3a52c4601a1495c9846c26bb6e60236c9725074b1707a9951b9318f5072d2be"
+    },
+    {
+      "entropy": 10,
+      "idHex": "0ac604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "55066e3df4a582922949bd4c19de6dcb79f7f0ea623e2f316435e9110ea79c08"
+    },
+    {
+      "entropy": 11,
+      "idHex": "0bc604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "99027b7f13b365e19937bb96587ec6229949d9e324beaa1873de921e6ed590a0"
+    },
+    {
+      "entropy": 12,
+      "idHex": "0cc604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "0bde8468b39dc864f97464ffc83145e0988b6a6fa2786d7b9af202531763bceb"
+    },
+    {
+      "entropy": 13,
+      "idHex": "0dc604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "261715c92feb40e3ec6c4029f9970e33c59d44f88d6cff04736c07b34d7bc1bf"
+    },
+    {
+      "entropy": 14,
+      "idHex": "0ec604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "02b0929cf1f5fe6e42e81863297dd0906210b8fd9931afc2c814fe7a9c217d4d"
+    },
+    {
+      "entropy": 15,
+      "idHex": "0fc604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "34144d297277b9d917b2bd23e6b31b3211c2deeee716e8526e50934dcfa7b58d"
+    },
+    {
+      "entropy": 16,
+      "idHex": "10c604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "1c7c33dc735b945e9b005b635cd5ddcb76c5c474f73c1cb0c5d373f0df38ff0d"
+    },
+    {
+      "entropy": 17,
+      "idHex": "11c604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "4e1072add08bc6968799afc6d4cdda8ae0556b668aefbc1cb08dd8cdaede6403"
+    },
+    {
+      "entropy": 18,
+      "idHex": "12c604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "9aa3ca18b7db56e19d5499a8e7c256683ccecb53cd982f02c7b20586dba12dd6"
+    },
+    {
+      "entropy": 19,
+      "idHex": "13c604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "0e9a4ba20396f4d2e75e8bcd1ebb25002dbf67eb3a7ba57b23ed8b647a1d830e"
+    },
+    {
+      "entropy": 20,
+      "idHex": "14c604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "066e90762464a59fbf3822940d375f4e9ea76140047673df507cc727694356ad"
+    },
+    {
+      "entropy": 21,
+      "idHex": "15c604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "1d8483f20fc88d9e2c77ef3c33f0a1b216a1a6f62976f9ff68fe3f66f343e30c"
+    },
+    {
+      "entropy": 22,
+      "idHex": "16c604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "a3965558f6d629e66f3e80898b19d85fe8b83fd830ef85dfc41c8c7f13c91955"
+    },
+    {
+      "entropy": 23,
+      "idHex": "17c604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "64a40767ad90cc8533309378b344d8c2eb1568466e18e19c7ea5a13ff4ecac45"
+    },
+    {
+      "entropy": 24,
+      "idHex": "18c604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "13a97c50aeb48ce92b978d7db22939f180e04fe40855c9909ffefd3ed4608555"
+    },
+    {
+      "entropy": 25,
+      "idHex": "19c604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "48ddeacf07d91d798cc6fd58f88662f833ef013b16008a80d88b31ad5df0fd24"
+    },
+    {
+      "entropy": 26,
+      "idHex": "1ac604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "4ce7a78f71d73be0e249870830891d9d5fe6c04b5428d4b5166694caab4b4ee0"
+    },
+    {
+      "entropy": 27,
+      "idHex": "1bc604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "12ab5eb1fc7b47fd371363d3299c2b6b05e4cf5139abfbff097b74c762f8c84c"
+    },
+    {
+      "entropy": 28,
+      "idHex": "1cc604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "0005553cb37a659abc65d984afb8021d6094574c3cffc46e3ece50849bf85b87"
+    },
+    {
+      "entropy": 29,
+      "idHex": "1dc604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "5403ad72d0d093bf46001e73e5f5c70e0c8daebb74879f8628448e698edc01af"
+    },
+    {
+      "entropy": 30,
+      "idHex": "1ec604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "b0ac05b7d3abf169ba68e115d48c9c96e96a2d98728a8ddb06d0f3dfe1051c53"
+    },
+    {
+      "entropy": 31,
+      "idHex": "1fc604a12ad8f5c791d98f92f6ea171ece602580e1a33a567a98c0c1b5d0b872",
+      "socAddressHex": "79d1b0a187a5eccac544cb72a3381fbef169a99ba849913562e053e35f55f14a"
+    }
+  ],
+  "description": "dispersed replica addresses: id = chunk address with id[0] = entropy, soc address = keccak256(id || ReplicasOwner)",
+  "replicaCounts": [
+    0,
+    2,
+    4,
+    8,
+    16
+  ],
+  "replicasOwnerHex": "dc5b20847f43d67928f49cd4f85d696b5a7617b5"
+}

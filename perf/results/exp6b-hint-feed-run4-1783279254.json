@@ -1,0 +1,102 @@
+{
+  "antd_bin": "/home/florian/claude/ant/crates/ant-conformance/../../target/release/antd",
+  "git_commit": "d6b5732",
+  "label": "exp6b-hint",
+  "peer_warmup_secs": 0.504280998,
+  "peers_at_start": 97,
+  "resolutions": [
+    {
+      "head_index": 0,
+      "timings": [
+        {
+          "attempt": 0,
+          "cold": true,
+          "ok": true,
+          "resolved_index": "0000000000000000",
+          "secs": 1.6108256920000001,
+          "status": 200
+        },
+        {
+          "attempt": 1,
+          "cold": false,
+          "ok": true,
+          "resolved_index": "0000000000000000",
+          "secs": 1.604669682,
+          "status": 200
+        },
+        {
+          "attempt": 2,
+          "cold": false,
+          "ok": true,
+          "resolved_index": "0000000000000000",
+          "secs": 1.602755221,
+          "status": 200
+        }
+      ],
+      "topic": "4ce252011e759cdc4c420b57aa4812b7c57cc7c6a83c8db0523a86afa019b4ba"
+    },
+    {
+      "head_index": 10,
+      "timings": [
+        {
+          "attempt": 0,
+          "cold": true,
+          "ok": true,
+          "resolved_index": "000000000000000a",
+          "secs": 2.781501245,
+          "status": 200
+        },
+        {
+          "attempt": 1,
+          "cold": false,
+          "ok": true,
+          "resolved_index": "000000000000000a",
+          "secs": 1.604172471,
+          "status": 200
+        },
+        {
+          "attempt": 2,
+          "cold": false,
+          "ok": true,
+          "resolved_index": "000000000000000a",
+          "secs": 1.604409253,
+          "status": 200
+        }
+      ],
+      "topic": "fd7b4635adf647bbf06b303461ce07028b0848739feef7bca6b66da0a3e0e3e8"
+    },
+    {
+      "head_index": 100,
+      "timings": [
+        {
+          "attempt": 0,
+          "cold": true,
+          "ok": true,
+          "resolved_index": "0000000000000064",
+          "secs": 4.381476708,
+          "status": 200
+        },
+        {
+          "attempt": 1,
+          "cold": false,
+          "ok": true,
+          "resolved_index": "0000000000000064",
+          "secs": 1.6043826110000001,
+          "status": 200
+        },
+        {
+          "attempt": 2,
+          "cold": false,
+          "ok": true,
+          "resolved_index": "0000000000000064",
+          "secs": 1.605052711,
+          "status": 200
+        }
+      ],
+      "topic": "a3cd2bc4bb9b076a1bb3e83820fcd2ac59d4ba8d5835845e74d9df8b8768271a"
+    }
+  ],
+  "run": 4,
+  "started_utc": "2026-07-05T19:20:54Z",
+  "suite": "feed"
+}

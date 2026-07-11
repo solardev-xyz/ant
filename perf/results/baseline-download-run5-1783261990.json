@@ -1,0 +1,89 @@
+{
+  "antd_bin": "/home/florian/claude/ant/crates/ant-conformance/../../target/release/antd",
+  "fetches": [
+    {
+      "cold": {
+        "bytes": 1048576,
+        "ok": true,
+        "secs": 0.53856572,
+        "status": 200,
+        "throughput_kib_s": 1901.3464132102577,
+        "ttfb_secs": 0.135857993
+      },
+      "reference": "3a9281699610b9ef74befa54b9336e8b6387bb4c590cb66fc95d9514f5bb1e47/payload-1mib.bin",
+      "warm": {
+        "bytes": 1048576,
+        "ok": true,
+        "secs": 0.00660369,
+        "status": 200,
+        "throughput_kib_s": 155064.81982043374,
+        "ttfb_secs": 0.00424909
+      }
+    },
+    {
+      "cold": {
+        "bytes": 1048576,
+        "ok": true,
+        "secs": 1.377527847,
+        "status": 200,
+        "throughput_kib_s": 743.3606530932075,
+        "ttfb_secs": 0.129379202
+      },
+      "reference": "3bdddf9937cc804605ecc48862ae0375e5083116882558486e531b8f26c4f8da/payload-1mib.bin",
+      "warm": {
+        "bytes": 1048576,
+        "ok": true,
+        "secs": 0.006069171,
+        "status": 200,
+        "throughput_kib_s": 168721.56016035797,
+        "ttfb_secs": 0.003716331
+      }
+    },
+    {
+      "cold": {
+        "bytes": 1048576,
+        "ok": true,
+        "secs": 1.186467451,
+        "status": 200,
+        "throughput_kib_s": 863.0662384686017,
+        "ttfb_secs": 0.082548168
+      },
+      "reference": "50c1c8302e906849566028e352601294cbdb5743b2906bf8be03279e6287fa16/payload-1mib.bin",
+      "warm": {
+        "bytes": 1048576,
+        "ok": true,
+        "secs": 0.004461679,
+        "status": 200,
+        "throughput_kib_s": 229510.0118139382,
+        "ttfb_secs": 0.00253765
+      }
+    },
+    {
+      "cold": {
+        "bytes": 54958120,
+        "ok": true,
+        "secs": 78.343162417,
+        "status": 200,
+        "throughput_kib_s": 685.063474676048,
+        "ttfb_secs": 0.181829136
+      },
+      "reference": "c4f8a45301b57d0e36f0f5348ed371aee42ea0b9fe9b3caaf26015d652eedc40/tracks/01%20arrival.wav",
+      "warm": {
+        "bytes": 54958120,
+        "ok": true,
+        "secs": 0.150870213,
+        "status": 200,
+        "throughput_kib_s": 355736.4836655994,
+        "ttfb_secs": 0.016276691
+      }
+    }
+  ],
+  "git_commit": "6b7b96a",
+  "kind": "bzz",
+  "label": "baseline",
+  "peer_warmup_secs": 0.252590272,
+  "peers_at_start": 98,
+  "run": 5,
+  "started_utc": "2026-07-05T14:33:10Z",
+  "suite": "download"
+}

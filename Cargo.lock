@@ -133,6 +133,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "ant-conformance"
+version = "0.5.39"
+dependencies = [
+ "ant-control",
+ "ant-crypto",
+ "ant-gateway",
+ "ant-postage",
+ "ant-retrieval",
+ "async-trait",
+ "axum",
+ "futures",
+ "hex",
+ "k256",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+]
+
+[[package]]
 name = "ant-control"
 version = "0.5.39"
 dependencies = [

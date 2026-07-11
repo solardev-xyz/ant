@@ -1,0 +1,380 @@
+[
+  {
+    "scenario": "tags",
+    "step": "list",
+    "aspect": "body",
+    "note": "beemock's mockstorer lists sessions from a Go map (random order) with all-zero counters; ant lists creation-ordered tags with real synced counters \u2014 mock artifact, not an API divergence"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "latest-after-1",
+    "aspect": "status",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "latest-after-1",
+    "aspect": "header:content-type",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "latest-after-1",
+    "aspect": "header:etag",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "latest-after-1",
+    "aspect": "header:swarm-feed-index",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "latest-after-1",
+    "aspect": "header:swarm-feed-index-next",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "latest-after-1",
+    "aspect": "header:swarm-feed-resolved-version",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "latest-after-1",
+    "aspect": "header:swarm-soc-signature",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "latest-after-1",
+    "aspect": "body",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "epoch-type",
+    "aspect": "status",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "epoch-type",
+    "aspect": "header:content-type",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "epoch-type",
+    "aspect": "header:etag",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "epoch-type",
+    "aspect": "header:swarm-feed-index",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "epoch-type",
+    "aspect": "header:swarm-feed-index-next",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "epoch-type",
+    "aspect": "header:swarm-feed-resolved-version",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "epoch-type",
+    "aspect": "header:swarm-soc-signature",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "epoch-type",
+    "aspect": "body",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "deref-via-bzz",
+    "aspect": "status",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path \u2014 bzz feed-dereference surface of the same race"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "deref-via-bzz",
+    "aspect": "header:content-type",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path \u2014 bzz feed-dereference surface of the same race"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "deref-via-bzz",
+    "aspect": "body",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path \u2014 bzz feed-dereference surface of the same race"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "deref-via-bzz",
+    "aspect": "header:swarm-feed-index",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path \u2014 bzz feed-dereference surface of the same race"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "deref-via-bzz",
+    "aspect": "header:swarm-feed-resolved-version",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path \u2014 bzz feed-dereference surface of the same race"
+  },
+  {
+    "scenario": "encryption",
+    "step": "feed-latest",
+    "aspect": "status",
+    "note": "encrypted-feed serving: bee's feedGetHandler resolves the 80-byte v1 payload to the 64-byte encrypted reference but then serves it via downloadHandler with the pre-fetched root chunk (joiner.NewJoiner(..., rootCh)), which skips the decrypting store: the still-encrypted span becomes the Content-Length (garbage petabytes) and the response either 500s with net/http's 'seeker can't seek' or 200s and aborts the body mid-stream. ant decrypts (GetBytesEncrypted via join_encrypted) and serves the plaintext with 200 + correct length \u2014 ant is deliberately correct where bee is broken; the smoke + bee-js cover encrypted content via /bytes and /bzz, which bee serves fine"
+  },
+  {
+    "scenario": "encryption",
+    "step": "feed-latest",
+    "aspect": "body",
+    "note": "encrypted-feed serving: bee's feedGetHandler resolves the 80-byte v1 payload to the 64-byte encrypted reference but then serves it via downloadHandler with the pre-fetched root chunk (joiner.NewJoiner(..., rootCh)), which skips the decrypting store: the still-encrypted span becomes the Content-Length (garbage petabytes) and the response either 500s with net/http's 'seeker can't seek' or 200s and aborts the body mid-stream. ant decrypts (GetBytesEncrypted via join_encrypted) and serves the plaintext with 200 + correct length \u2014 ant is deliberately correct where bee is broken; the smoke + bee-js cover encrypted content via /bytes and /bzz, which bee serves fine"
+  },
+  {
+    "scenario": "encryption",
+    "step": "feed-latest",
+    "aspect": "header:content-type",
+    "note": "encrypted-feed serving: bee's feedGetHandler resolves the 80-byte v1 payload to the 64-byte encrypted reference but then serves it via downloadHandler with the pre-fetched root chunk (joiner.NewJoiner(..., rootCh)), which skips the decrypting store: the still-encrypted span becomes the Content-Length (garbage petabytes) and the response either 500s with net/http's 'seeker can't seek' or 200s and aborts the body mid-stream. ant decrypts (GetBytesEncrypted via join_encrypted) and serves the plaintext with 200 + correct length \u2014 ant is deliberately correct where bee is broken; the smoke + bee-js cover encrypted content via /bytes and /bzz, which bee serves fine"
+  },
+  {
+    "scenario": "encryption",
+    "step": "feed-latest",
+    "aspect": "header:etag",
+    "note": "encrypted-feed serving: bee's feedGetHandler resolves the 80-byte v1 payload to the 64-byte encrypted reference but then serves it via downloadHandler with the pre-fetched root chunk (joiner.NewJoiner(..., rootCh)), which skips the decrypting store: the still-encrypted span becomes the Content-Length (garbage petabytes) and the response either 500s with net/http's 'seeker can't seek' or 200s and aborts the body mid-stream. ant decrypts (GetBytesEncrypted via join_encrypted) and serves the plaintext with 200 + correct length \u2014 ant is deliberately correct where bee is broken; the smoke + bee-js cover encrypted content via /bytes and /bzz, which bee serves fine"
+  },
+  {
+    "scenario": "encryption",
+    "step": "feed-latest",
+    "aspect": "header:content-disposition",
+    "note": "encrypted-feed serving: bee's feedGetHandler resolves the 80-byte v1 payload to the 64-byte encrypted reference but then serves it via downloadHandler with the pre-fetched root chunk (joiner.NewJoiner(..., rootCh)), which skips the decrypting store: the still-encrypted span becomes the Content-Length (garbage petabytes) and the response either 500s with net/http's 'seeker can't seek' or 200s and aborts the body mid-stream. ant decrypts (GetBytesEncrypted via join_encrypted) and serves the plaintext with 200 + correct length \u2014 ant is deliberately correct where bee is broken; the smoke + bee-js cover encrypted content via /bytes and /bzz, which bee serves fine"
+  },
+  {
+    "scenario": "feeds-matrix",
+    "step": "gap-0-3",
+    "aspect": "status",
+    "note": "bee's sequence asyncFinder is racy on gapped histories: for {0,3} the base-0 window probes indices 1 (absent) and 3 (present) concurrently, and depending on goroutine arrival order either returns index 0 (the not-found-at-1 result fires the found.level==notFound==0 early return) or deadlocks in the retry interval (base=3 probes 3+2^l-1 for l=3..8, all absent, leaving notFound=2 != found.level=0 with the result channel drained \u2014 the request hangs until the client disconnects). ant's finder is deterministic and answers index 0, matching bee's non-hang outcome; these aspects only fire when bee takes the hang branch (observed as a client timeout)"
+  },
+  {
+    "scenario": "feeds-matrix",
+    "step": "gap-0-3",
+    "aspect": "body",
+    "note": "bee's sequence asyncFinder is racy on gapped histories: for {0,3} the base-0 window probes indices 1 (absent) and 3 (present) concurrently, and depending on goroutine arrival order either returns index 0 (the not-found-at-1 result fires the found.level==notFound==0 early return) or deadlocks in the retry interval (base=3 probes 3+2^l-1 for l=3..8, all absent, leaving notFound=2 != found.level=0 with the result channel drained \u2014 the request hangs until the client disconnects). ant's finder is deterministic and answers index 0, matching bee's non-hang outcome; these aspects only fire when bee takes the hang branch (observed as a client timeout)"
+  },
+  {
+    "scenario": "feeds-matrix",
+    "step": "gap-0-3",
+    "aspect": "header:content-type",
+    "note": "bee's sequence asyncFinder is racy on gapped histories: for {0,3} the base-0 window probes indices 1 (absent) and 3 (present) concurrently, and depending on goroutine arrival order either returns index 0 (the not-found-at-1 result fires the found.level==notFound==0 early return) or deadlocks in the retry interval (base=3 probes 3+2^l-1 for l=3..8, all absent, leaving notFound=2 != found.level=0 with the result channel drained \u2014 the request hangs until the client disconnects). ant's finder is deterministic and answers index 0, matching bee's non-hang outcome; these aspects only fire when bee takes the hang branch (observed as a client timeout)"
+  },
+  {
+    "scenario": "feeds-matrix",
+    "step": "gap-0-3",
+    "aspect": "header:etag",
+    "note": "bee's sequence asyncFinder is racy on gapped histories: for {0,3} the base-0 window probes indices 1 (absent) and 3 (present) concurrently, and depending on goroutine arrival order either returns index 0 (the not-found-at-1 result fires the found.level==notFound==0 early return) or deadlocks in the retry interval (base=3 probes 3+2^l-1 for l=3..8, all absent, leaving notFound=2 != found.level=0 with the result channel drained \u2014 the request hangs until the client disconnects). ant's finder is deterministic and answers index 0, matching bee's non-hang outcome; these aspects only fire when bee takes the hang branch (observed as a client timeout)"
+  },
+  {
+    "scenario": "feeds-matrix",
+    "step": "gap-0-3",
+    "aspect": "header:swarm-feed-index",
+    "note": "bee's sequence asyncFinder is racy on gapped histories: for {0,3} the base-0 window probes indices 1 (absent) and 3 (present) concurrently, and depending on goroutine arrival order either returns index 0 (the not-found-at-1 result fires the found.level==notFound==0 early return) or deadlocks in the retry interval (base=3 probes 3+2^l-1 for l=3..8, all absent, leaving notFound=2 != found.level=0 with the result channel drained \u2014 the request hangs until the client disconnects). ant's finder is deterministic and answers index 0, matching bee's non-hang outcome; these aspects only fire when bee takes the hang branch (observed as a client timeout)"
+  },
+  {
+    "scenario": "feeds-matrix",
+    "step": "gap-0-3",
+    "aspect": "header:swarm-feed-index-next",
+    "note": "bee's sequence asyncFinder is racy on gapped histories: for {0,3} the base-0 window probes indices 1 (absent) and 3 (present) concurrently, and depending on goroutine arrival order either returns index 0 (the not-found-at-1 result fires the found.level==notFound==0 early return) or deadlocks in the retry interval (base=3 probes 3+2^l-1 for l=3..8, all absent, leaving notFound=2 != found.level=0 with the result channel drained \u2014 the request hangs until the client disconnects). ant's finder is deterministic and answers index 0, matching bee's non-hang outcome; these aspects only fire when bee takes the hang branch (observed as a client timeout)"
+  },
+  {
+    "scenario": "feeds-matrix",
+    "step": "gap-0-3",
+    "aspect": "header:swarm-soc-signature",
+    "note": "bee's sequence asyncFinder is racy on gapped histories: for {0,3} the base-0 window probes indices 1 (absent) and 3 (present) concurrently, and depending on goroutine arrival order either returns index 0 (the not-found-at-1 result fires the found.level==notFound==0 early return) or deadlocks in the retry interval (base=3 probes 3+2^l-1 for l=3..8, all absent, leaving notFound=2 != found.level=0 with the result channel drained \u2014 the request hangs until the client disconnects). ant's finder is deterministic and answers index 0, matching bee's non-hang outcome; these aspects only fire when bee takes the hang branch (observed as a client timeout)"
+  },
+  {
+    "scenario": "feeds-matrix",
+    "step": "gap-0-3",
+    "aspect": "header:swarm-feed-resolved-version",
+    "note": "bee's sequence asyncFinder is racy on gapped histories: for {0,3} the base-0 window probes indices 1 (absent) and 3 (present) concurrently, and depending on goroutine arrival order either returns index 0 (the not-found-at-1 result fires the found.level==notFound==0 early return) or deadlocks in the retry interval (base=3 probes 3+2^l-1 for l=3..8, all absent, leaving notFound=2 != found.level=0 with the result channel drained \u2014 the request hangs until the client disconnects). ant's finder is deterministic and answers index 0, matching bee's non-hang outcome; these aspects only fire when bee takes the hang branch (observed as a client timeout)"
+  },
+  {
+    "scenario": "feeds-matrix",
+    "step": "gap-0-3?after=3",
+    "aspect": "status",
+    "note": "bee's asyncFinder seeds its initial interval with base=0 and result index 0 even when ?after anchors at a later index (sequence.go At: `i.found = &result{ch, nil, 0, 0}`), so ?after=3 on {0,3} either serves index 3's content mislabeled swarm-feed-index=0/next=1, or hangs in the same gapped-feed retry race as the plain lookup. ant anchors at `after` and reports the true index 3/next 4 for the same body"
+  },
+  {
+    "scenario": "feeds-matrix",
+    "step": "gap-0-3?after=3",
+    "aspect": "body",
+    "note": "bee's asyncFinder seeds its initial interval with base=0 and result index 0 even when ?after anchors at a later index (sequence.go At: `i.found = &result{ch, nil, 0, 0}`), so ?after=3 on {0,3} either serves index 3's content mislabeled swarm-feed-index=0/next=1, or hangs in the same gapped-feed retry race as the plain lookup. ant anchors at `after` and reports the true index 3/next 4 for the same body"
+  },
+  {
+    "scenario": "feeds-matrix",
+    "step": "gap-0-3?after=3",
+    "aspect": "header:content-type",
+    "note": "bee's asyncFinder seeds its initial interval with base=0 and result index 0 even when ?after anchors at a later index (sequence.go At: `i.found = &result{ch, nil, 0, 0}`), so ?after=3 on {0,3} either serves index 3's content mislabeled swarm-feed-index=0/next=1, or hangs in the same gapped-feed retry race as the plain lookup. ant anchors at `after` and reports the true index 3/next 4 for the same body"
+  },
+  {
+    "scenario": "feeds-matrix",
+    "step": "gap-0-3?after=3",
+    "aspect": "header:etag",
+    "note": "bee's asyncFinder seeds its initial interval with base=0 and result index 0 even when ?after anchors at a later index (sequence.go At: `i.found = &result{ch, nil, 0, 0}`), so ?after=3 on {0,3} either serves index 3's content mislabeled swarm-feed-index=0/next=1, or hangs in the same gapped-feed retry race as the plain lookup. ant anchors at `after` and reports the true index 3/next 4 for the same body"
+  },
+  {
+    "scenario": "feeds-matrix",
+    "step": "gap-0-3?after=3",
+    "aspect": "header:swarm-feed-index",
+    "note": "bee's asyncFinder seeds its initial interval with base=0 and result index 0 even when ?after anchors at a later index (sequence.go At: `i.found = &result{ch, nil, 0, 0}`), so ?after=3 on {0,3} either serves index 3's content mislabeled swarm-feed-index=0/next=1, or hangs in the same gapped-feed retry race as the plain lookup. ant anchors at `after` and reports the true index 3/next 4 for the same body"
+  },
+  {
+    "scenario": "feeds-matrix",
+    "step": "gap-0-3?after=3",
+    "aspect": "header:swarm-feed-index-next",
+    "note": "bee's asyncFinder seeds its initial interval with base=0 and result index 0 even when ?after anchors at a later index (sequence.go At: `i.found = &result{ch, nil, 0, 0}`), so ?after=3 on {0,3} either serves index 3's content mislabeled swarm-feed-index=0/next=1, or hangs in the same gapped-feed retry race as the plain lookup. ant anchors at `after` and reports the true index 3/next 4 for the same body"
+  },
+  {
+    "scenario": "feeds-matrix",
+    "step": "gap-0-3?after=3",
+    "aspect": "header:swarm-soc-signature",
+    "note": "bee's asyncFinder seeds its initial interval with base=0 and result index 0 even when ?after anchors at a later index (sequence.go At: `i.found = &result{ch, nil, 0, 0}`), so ?after=3 on {0,3} either serves index 3's content mislabeled swarm-feed-index=0/next=1, or hangs in the same gapped-feed retry race as the plain lookup. ant anchors at `after` and reports the true index 3/next 4 for the same body"
+  },
+  {
+    "scenario": "feeds-matrix",
+    "step": "gap-0-3?after=3",
+    "aspect": "header:swarm-feed-resolved-version",
+    "note": "bee's asyncFinder seeds its initial interval with base=0 and result index 0 even when ?after anchors at a later index (sequence.go At: `i.found = &result{ch, nil, 0, 0}`), so ?after=3 on {0,3} either serves index 3's content mislabeled swarm-feed-index=0/next=1, or hangs in the same gapped-feed retry race as the plain lookup. ant anchors at `after` and reports the true index 3/next 4 for the same body"
+  },
+  {
+    "scenario": "feeds-matrix",
+    "step": "only-5?after=5",
+    "aspect": "header:swarm-feed-index",
+    "note": "bee's asyncFinder seeds its initial interval with result index 0 even when ?after anchors at a later index, and {5}'s base-0 window (probes 1,3,7,...,255) finds nothing, so bee deterministically serves index 5's chunk labeled swarm-feed-index=0000000000000000 / next=0000000000000001 \u2014 factually wrong metadata (a writer following index-next would collide with nothing and orphan the feed). ant reports the true index 5/next 6; body, etag and signature agree"
+  },
+  {
+    "scenario": "feeds-matrix",
+    "step": "only-5?after=5",
+    "aspect": "header:swarm-feed-index-next",
+    "note": "bee's asyncFinder seeds its initial interval with result index 0 even when ?after anchors at a later index, and {5}'s base-0 window (probes 1,3,7,...,255) finds nothing, so bee deterministically serves index 5's chunk labeled swarm-feed-index=0000000000000000 / next=0000000000000001 \u2014 factually wrong metadata (a writer following index-next would collide with nothing and orphan the feed). ant reports the true index 5/next 6; body, etag and signature agree"
+  },
+  {
+    "scenario": "feeds-matrix",
+    "step": "lattice-0-1-2-3-5",
+    "aspect": "body",
+    "note": "gapped-history probe-lattice artifact: on {0,1,2,3,5} bee's second window (base=3, level=2) probes only 3+1=4 and 3+3=6 \u2014 never 5 \u2014 and deterministically answers index 3, while ant's binary search over the bracket (3,7) lands exactly on 5, the true latest. The mirror-image history {0,1,2,3,6} would flip bee to 6-or-hang (6 IS on its lattice, racing the not-found at 4), so bee's gap behavior is not a coherent spec to match; sequence writers (bee's own updater.next++) never skip indices, so contiguous histories \u2014 where both finders provably agree \u2014 are the real surface"
+  },
+  {
+    "scenario": "feeds-matrix",
+    "step": "lattice-0-1-2-3-5",
+    "aspect": "header:etag",
+    "note": "gapped-history probe-lattice artifact: on {0,1,2,3,5} bee's second window (base=3, level=2) probes only 3+1=4 and 3+3=6 \u2014 never 5 \u2014 and deterministically answers index 3, while ant's binary search over the bracket (3,7) lands exactly on 5, the true latest. The mirror-image history {0,1,2,3,6} would flip bee to 6-or-hang (6 IS on its lattice, racing the not-found at 4), so bee's gap behavior is not a coherent spec to match; sequence writers (bee's own updater.next++) never skip indices, so contiguous histories \u2014 where both finders provably agree \u2014 are the real surface"
+  },
+  {
+    "scenario": "feeds-matrix",
+    "step": "lattice-0-1-2-3-5",
+    "aspect": "header:swarm-feed-index",
+    "note": "gapped-history probe-lattice artifact: on {0,1,2,3,5} bee's second window (base=3, level=2) probes only 3+1=4 and 3+3=6 \u2014 never 5 \u2014 and deterministically answers index 3, while ant's binary search over the bracket (3,7) lands exactly on 5, the true latest. The mirror-image history {0,1,2,3,6} would flip bee to 6-or-hang (6 IS on its lattice, racing the not-found at 4), so bee's gap behavior is not a coherent spec to match; sequence writers (bee's own updater.next++) never skip indices, so contiguous histories \u2014 where both finders provably agree \u2014 are the real surface"
+  },
+  {
+    "scenario": "feeds-matrix",
+    "step": "lattice-0-1-2-3-5",
+    "aspect": "header:swarm-feed-index-next",
+    "note": "gapped-history probe-lattice artifact: on {0,1,2,3,5} bee's second window (base=3, level=2) probes only 3+1=4 and 3+3=6 \u2014 never 5 \u2014 and deterministically answers index 3, while ant's binary search over the bracket (3,7) lands exactly on 5, the true latest. The mirror-image history {0,1,2,3,6} would flip bee to 6-or-hang (6 IS on its lattice, racing the not-found at 4), so bee's gap behavior is not a coherent spec to match; sequence writers (bee's own updater.next++) never skip indices, so contiguous histories \u2014 where both finders provably agree \u2014 are the real surface"
+  },
+  {
+    "scenario": "feeds-matrix",
+    "step": "lattice-0-1-2-3-5",
+    "aspect": "header:swarm-soc-signature",
+    "note": "gapped-history probe-lattice artifact: on {0,1,2,3,5} bee's second window (base=3, level=2) probes only 3+1=4 and 3+3=6 \u2014 never 5 \u2014 and deterministically answers index 3, while ant's binary search over the bracket (3,7) lands exactly on 5, the true latest. The mirror-image history {0,1,2,3,6} would flip bee to 6-or-hang (6 IS on its lattice, racing the not-found at 4), so bee's gap behavior is not a coherent spec to match; sequence writers (bee's own updater.next++) never skip indices, so contiguous histories \u2014 where both finders provably agree \u2014 are the real surface"
+  },
+  {
+    "scenario": "pins",
+    "step": "get-chunk-pin",
+    "aspect": "status",
+    "note": "deliberate ant extension: ant honors swarm-pin on POST /chunks (pin-light makes every upload pinnable), while bee's chunkUploadHandler does not parse Swarm-Pin at all and silently ignores it \u2014 so after a pinned chunk upload ant reports the pin (200) and bee has none (404)"
+  },
+  {
+    "scenario": "pins",
+    "step": "get-chunk-pin",
+    "aspect": "body",
+    "note": "deliberate ant extension: ant honors swarm-pin on POST /chunks (pin-light makes every upload pinnable), while bee's chunkUploadHandler does not parse Swarm-Pin at all and silently ignores it \u2014 so after a pinned chunk upload ant reports the pin (200) and bee has none (404)"
+  },
+  {
+    "scenario": "batches",
+    "step": "list",
+    "aspect": "body",
+    "note": "by design: bee lists ALL network batches from its chain-event-synced batchstore; ant deliberately has no postage event sync (direct RPC reads only), so GET /batches is honestly empty instead of fabricating entries \u2014 beemock's mock batchstore carries one synthetic WithBatch entry"
+  },
+  {
+    "scenario": "batches",
+    "step": "get-known",
+    "aspect": "status",
+    "note": "by design: GET /batches/{id} on ant answers from direct PostageStamp contract reads and requires a configured RPC endpoint; the differential MemNode rig has no chain, so a chain-less ant 404s (bee's 'batch not found' shape) while beemock serves its synthetic batchstore entry. With an RPC configured ant serves the single-batch lookup for real (start=0: the creation block is not a contract view)"
+  },
+  {
+    "scenario": "batches",
+    "step": "get-known",
+    "aspect": "body",
+    "note": "by design: GET /batches/{id} on ant answers from direct PostageStamp contract reads and requires a configured RPC endpoint; the differential MemNode rig has no chain, so a chain-less ant 404s (bee's 'batch not found' shape) while beemock serves its synthetic batchstore entry. With an RPC configured ant serves the single-batch lookup for real (start=0: the creation block is not a contract view)"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "epoch-type",
+    "aspect": "header:accept-ranges",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path \u2014 when bee's race lands on 200 its ServeContent adds Accept-Ranges, ant's 404 has none"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "latest-after-1",
+    "aspect": "header:accept-ranges",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path \u2014 when bee's race lands on 200 its ServeContent adds Accept-Ranges, ant's 404 has none"
+  },
+  {
+    "scenario": "feeds-timeline",
+    "step": "deref-via-bzz",
+    "aspect": "header:accept-ranges",
+    "note": "v1-dead-ref scenario semantics: bee's resolveFeed (bee/pkg/api/bzz.go) races the v1/v2 interpretations of the ambiguous 48-byte payload and nondeterministically either 404s (wrapped chunk cannot be retrieved) or serves the raw ts||ref payload as v2; ant deterministically 404s like bee's documented error path \u2014 when bee's race lands on 200 its ServeContent adds Accept-Ranges, ant's 404 has none"
+  },
+  {
+    "scenario": "encryption",
+    "step": "feed-latest",
+    "aspect": "header:accept-ranges",
+    "note": "encrypted-feed serving: bee's feedGetHandler resolves the 80-byte v1 payload to the 64-byte encrypted reference but serves it via downloadHandler with the pre-fetched root chunk, skipping the decrypting store: the still-encrypted span becomes the Content-Length (garbage petabytes) and bee nondeterministically 500s, aborts the body mid-stream, or wedges without ever sending headers (observed as the harness's status-0 request-error marker). ant decrypts (GetBytesEncrypted via join_encrypted) and serves the plaintext 200 with correct length \u2014 deliberately correct where bee is broken"
+  },
+  {
+    "scenario": "encryption",
+    "step": "feed-latest",
+    "aspect": "header:swarm-soc-signature",
+    "note": "encrypted-feed serving: bee's feedGetHandler resolves the 80-byte v1 payload to the 64-byte encrypted reference but serves it via downloadHandler with the pre-fetched root chunk, skipping the decrypting store: the still-encrypted span becomes the Content-Length (garbage petabytes) and bee nondeterministically 500s, aborts the body mid-stream, or wedges without ever sending headers (observed as the harness's status-0 request-error marker). ant decrypts (GetBytesEncrypted via join_encrypted) and serves the plaintext 200 with correct length \u2014 deliberately correct where bee is broken"
+  },
+  {
+    "scenario": "encryption",
+    "step": "feed-latest",
+    "aspect": "header:swarm-feed-index",
+    "note": "encrypted-feed serving: bee's feedGetHandler resolves the 80-byte v1 payload to the 64-byte encrypted reference but serves it via downloadHandler with the pre-fetched root chunk, skipping the decrypting store: the still-encrypted span becomes the Content-Length (garbage petabytes) and bee nondeterministically 500s, aborts the body mid-stream, or wedges without ever sending headers (observed as the harness's status-0 request-error marker). ant decrypts (GetBytesEncrypted via join_encrypted) and serves the plaintext 200 with correct length \u2014 deliberately correct where bee is broken"
+  },
+  {
+    "scenario": "encryption",
+    "step": "feed-latest",
+    "aspect": "header:swarm-feed-index-next",
+    "note": "encrypted-feed serving: bee's feedGetHandler resolves the 80-byte v1 payload to the 64-byte encrypted reference but serves it via downloadHandler with the pre-fetched root chunk, skipping the decrypting store: the still-encrypted span becomes the Content-Length (garbage petabytes) and bee nondeterministically 500s, aborts the body mid-stream, or wedges without ever sending headers (observed as the harness's status-0 request-error marker). ant decrypts (GetBytesEncrypted via join_encrypted) and serves the plaintext 200 with correct length \u2014 deliberately correct where bee is broken"
+  },
+  {
+    "scenario": "encryption",
+    "step": "feed-latest",
+    "aspect": "header:swarm-feed-resolved-version",
+    "note": "encrypted-feed serving: bee's feedGetHandler resolves the 80-byte v1 payload to the 64-byte encrypted reference but serves it via downloadHandler with the pre-fetched root chunk, skipping the decrypting store: the still-encrypted span becomes the Content-Length (garbage petabytes) and bee nondeterministically 500s, aborts the body mid-stream, or wedges without ever sending headers (observed as the harness's status-0 request-error marker). ant decrypts (GetBytesEncrypted via join_encrypted) and serves the plaintext 200 with correct length \u2014 deliberately correct where bee is broken"
+  }
+]

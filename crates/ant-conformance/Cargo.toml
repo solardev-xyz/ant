@@ -1,0 +1,35 @@
+[package]
+name = "ant-conformance"
+version = "0.5.39"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+ant-control = { path = "../ant-control" }
+ant-crypto = { path = "../ant-crypto" }
+ant-gateway = { path = "../ant-gateway" }
+ant-postage = { path = "../ant-postage" }
+ant-retrieval = { path = "../ant-retrieval" }
+async-trait.workspace = true
+axum.workspace = true
+hex.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true }
+k256.workspace = true
+# Plain-HTTP client for the gateway integration tests and the mainnet
+# smoke binary (bins can't see dev-deps); no TLS stack needed — every
+# target is loopback. Version matches the `reqwest` already in the
+# workspace lockfile via `ant-chain`.
+reqwest = { version = "0.12.23", default-features = false }
+tokio.workspace = true
+
+[dev-dependencies]
+# WebSocket client for the /chunks/stream conformance test (the
+# differential Step model is plain HTTP; the WS flow gets its own
+# integration test driving both backends). Loopback only — no TLS.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake"] }
+futures = "0.3.31"
+
+[lints]
+workspace = true
