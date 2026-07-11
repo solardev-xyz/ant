@@ -357,6 +357,119 @@ enum ProbeOutcome {
     Transient(Box<dyn StdError + Send + Sync>),
 }
 
+/// Clonable snapshot of one probe outcome, held in the per-resolution
+/// prefetch cache ([`ProbeOutcome`] itself can't be stored: `Transient`
+/// carries a `Box<dyn Error>`).
+enum CachedOutcome {
+    Present(DecodedUpdate),
+    Absent,
+    Transient(String),
+}
+
+/// Per-resolution prefetch cache: outcomes for the offsets one
+/// concurrent window speculated ahead of the sequential walk.
+type ProbeCache = std::collections::HashMap<u64, CachedOutcome>;
+
+/// The offsets (relative to `anchor`) that one iteration of the
+/// sequential finder can visit in its common cases, all probed
+/// CONCURRENTLY in one wall-clock round of ~[`FEED_PROBE_TIMEOUT`]:
+///
+/// - the exponential bracket's moving-`lo` lattice `anchor + 2^k − 1`
+///   (1, 3, 7, …) — the walk re-anchors on every present probe, so its
+///   deterministic all-present prefix IS this lattice (a stop just
+///   leaves later speculative offsets unused);
+/// - the binary-search midpoint `anchor + 2` of the smallest bracket;
+/// - the phase-3 confirmation lattices `head + 2^k` for the two
+///   overwhelmingly common resolved heads, `head = anchor` (steady
+///   poll) and `head = anchor + 1` (poll right after a fresh write).
+///
+/// The sequential walk then consumes these cached outcomes instead of
+/// paying one absent-probe deadline per step — the old behaviour cost
+/// a flat ~2.4 s per `latest` resolution even with the head SOC in
+/// local cache (soak `base-normal` 2026-07-11: median = p99 =
+/// 2405 ms), because each absent probe burns the full deadline while
+/// the multi-peer walk fails to prove non-existence any faster.
+/// Rarely-visited offsets (head advanced ≥ 2 within one poll) simply
+/// miss the cache and probe live, exactly as before. Decision logic is
+/// untouched — same lattice, same rules, same results (pinned by the
+/// `feeds_matrix` differential, incl. the gap cases {0,2}→0 and
+/// {0,1,3}→3 that encode bee's walk shape).
+async fn prefetch_window(
+    fetcher: &dyn ChunkFetcher,
+    feed: &Feed,
+    anchor: u64,
+    probed: &mut u64,
+) -> ProbeCache {
+    let mut offsets: Vec<u64> = Vec::new();
+    for k in 0..=LOOKAHEAD_LEVELS {
+        // Bracket lattice: anchor + 2^k − 1 (skip k=0's +0).
+        if let Some(o) = 1u64.checked_shl(k).map(|s| s - 1).filter(|&o| o > 0) {
+            offsets.push(o);
+        }
+        // Phase-3 lattice from `anchor`: + 2^k.
+        if let Some(o) = 1u64.checked_shl(k) {
+            offsets.push(o);
+        }
+        // Phase-3 lattice from `anchor + 1`: + 1 + 2^k.
+        if let Some(o) = 1u64.checked_shl(k).and_then(|s| s.checked_add(1)) {
+            offsets.push(o);
+        }
+    }
+    offsets.push(2); // binary mid of the smallest bracket (a+1, a+3)
+    offsets.sort_unstable();
+    offsets.dedup();
+    let indices: Vec<u64> = offsets
+        .into_iter()
+        .filter_map(|o| anchor.checked_add(o))
+        .collect();
+    *probed += indices.len() as u64;
+    let outcomes = futures::future::join_all(indices.iter().map(|&i| async move {
+        (
+            i,
+            probe_once(fetcher, feed, i, Some(FEED_PROBE_TIMEOUT)).await,
+        )
+    }))
+    .await;
+    let mut cache = ProbeCache::new();
+    for (i, outcome) in outcomes {
+        let cached = match outcome {
+            Ok(ProbeOutcome::Present(u)) => CachedOutcome::Present(u),
+            Ok(ProbeOutcome::Absent) => CachedOutcome::Absent,
+            Ok(ProbeOutcome::Transient(e)) => CachedOutcome::Transient(e.to_string()),
+            // Protocol violations (owner mismatch, bad SOC framing)
+            // must surface exactly where the sequential walk would
+            // have raised them: leave the offset uncached so the live
+            // re-probe re-encounters the error.
+            Err(_) => continue,
+        };
+        cache.insert(i, cached);
+    }
+    cache
+}
+
+/// [`probe`] with prefetch-cache consultation: a hit re-materialises
+/// the cached outcome (no network, no deadline); a miss probes live.
+/// Non-consuming — several walk steps can ask about the same offset
+/// (the binary midpoint is often also a phase-3 candidate), and within
+/// one loop iteration the window's snapshot is the consistent answer.
+async fn probe_cached(
+    fetcher: &dyn ChunkFetcher,
+    feed: &Feed,
+    index: u64,
+    probed: &mut u64,
+    deadline: Option<Duration>,
+    cache: &ProbeCache,
+) -> Result<ProbeOutcome, FeedError> {
+    if let Some(hit) = cache.get(&index) {
+        return Ok(match hit {
+            CachedOutcome::Present(u) => ProbeOutcome::Present(*u),
+            CachedOutcome::Absent => ProbeOutcome::Absent,
+            CachedOutcome::Transient(msg) => ProbeOutcome::Transient(msg.clone().into()),
+        });
+    }
+    probe(fetcher, feed, index, probed, deadline).await
+}
+
 /// Probe a single sequence index, retrying transient fetch failures.
 ///
 /// `*probed` is incremented once per call so the caller can report how
@@ -542,6 +655,13 @@ pub async fn resolve_sequence_feed_after(
         };
 
     loop {
+        // Speculative concurrent window: probe every offset the walk
+        // below is likely to visit in ONE deadline round, then let the
+        // (unchanged) sequential logic consume the cached outcomes.
+        // See `prefetch_window` for the lattice + the measured cost of
+        // the sequential original.
+        let cache = prefetch_window(fetcher, feed, latest_index, &mut probed).await;
+
         // Phase 1 — exponential bracket. `lo` is known present, `hi` is
         // known absent (a transient that survived retries counts as
         // absent here; phase 3 re-checks the boundary).
@@ -556,12 +676,13 @@ pub async fn resolve_sequence_feed_after(
                 hi = u64::MAX;
                 break;
             }
-            if let ProbeOutcome::Present(u) = probe(
+            if let ProbeOutcome::Present(u) = probe_cached(
                 fetcher,
                 feed,
                 candidate,
                 &mut probed,
                 Some(FEED_PROBE_TIMEOUT),
+                &cache,
             )
             .await?
             {
@@ -579,8 +700,15 @@ pub async fn resolve_sequence_feed_after(
         // Phase 2 — binary search the boundary in (lo, hi).
         while hi - lo > 1 {
             let mid = lo + (hi - lo) / 2;
-            if let ProbeOutcome::Present(u) =
-                probe(fetcher, feed, mid, &mut probed, Some(FEED_PROBE_TIMEOUT)).await?
+            if let ProbeOutcome::Present(u) = probe_cached(
+                fetcher,
+                feed,
+                mid,
+                &mut probed,
+                Some(FEED_PROBE_TIMEOUT),
+                &cache,
+            )
+            .await?
             {
                 lo = mid;
                 lo_update = u;
@@ -606,14 +734,36 @@ pub async fn resolve_sequence_feed_after(
         let candidates: Vec<u64> = (0..=LOOKAHEAD_LEVELS)
             .map_while(|k| latest_index.checked_add(1u64 << k))
             .collect();
-        probed += candidates.len() as u64;
-        let outcomes = futures::future::join_all(candidates.iter().map(|&i| async move {
+        // Serve confirmation probes from the prefetch window where it
+        // covered them (heads `anchor` / `anchor+1`); only offsets the
+        // window didn't speculate go to the network.
+        let mut cached_hits: Vec<(u64, Result<ProbeOutcome, FeedError>)> = Vec::new();
+        let mut live: Vec<u64> = Vec::new();
+        for &i in &candidates {
+            if let Some(hit) = cache.get(&i) {
+                cached_hits.push((
+                    i,
+                    Ok(match hit {
+                        CachedOutcome::Present(u) => ProbeOutcome::Present(*u),
+                        CachedOutcome::Absent => ProbeOutcome::Absent,
+                        CachedOutcome::Transient(msg) => {
+                            ProbeOutcome::Transient(msg.clone().into())
+                        }
+                    }),
+                ));
+            } else {
+                live.push(i);
+            }
+        }
+        probed += live.len() as u64;
+        let mut outcomes = futures::future::join_all(live.iter().map(|&i| async move {
             (
                 i,
                 probe_once(fetcher, feed, i, Some(FEED_PROBE_TIMEOUT)).await,
             )
         }))
         .await;
+        outcomes.extend(cached_hits);
         let mut higher: Option<(u64, DecodedUpdate)> = None;
         let mut lowest_transient: Option<u64> = None;
         for (i, outcome) in outcomes {
