@@ -7,27 +7,42 @@ Every experiment: Hypothesis → Change → Method → Results → Decision
 
 ## STATUS
 
-- **Branch**: `bug-hunt` (created 2026-07-11 from origin/main
-  v0.5.39, harness grafted from `perf-lab`). Purpose: node bug
-  hunting — details TBD from the user.
-- **Provenance**: main absorbed all perf-lab production fixes as
-  re-landed commits (228d3d2 stall fix, 7853b85 feeds, 1d49ae4
-  full-node advert) — but note **bb55134 REVERTED the full-node
-  advert default** ("bootstrap cost was 3-6x"): the flag remains,
-  honest-light is default again upstream, and main also landed its
-  own wins (e08e929 swarm-before-chain-init: TTFP 3.1 s → 0.2 s).
-  The harness (conformance/ + ant-conformance + perf/ + this
-  notebook) never merged; this branch re-adds it on top of main.
-- **Graft verification (2026-07-11)**: memnode updated for main's
-  API drift (GatewayChainState OnceLock, chain_ready,
-  UploadSuspendAll/WakeAll). Conformance 15/15 suites incl.
-  differential (zero unregistered divergences vs 0.5.39), bee-js
-  32/32, fmt+clippy+workspace-lib all green.
-- **Batches**: 1 = 0.69, 2 = 0.844 (stopped), 3 (d22) untouched,
-  4 (d23) ~25 % used. Issuer .bins PRECIOUS in perf/state/postage/.
-- **Round 1+2 history**: see Final summary + experiment sections
-  below (all verdicts remain valid; they describe the code that is
-  now main).
+- **Branch**: `bug-hunt` (main v0.5.39 + grafted harness). Campaign:
+  the 2026-07 reliability report's intermittent 502s (SOC feed
+  workload via freedom browser). All three mechanism fixes LANDED +
+  measured; final gate running.
+- **Root causes found (each measured)**:
+  1. **502-writes**: gateway one-shot pushes had no outer retry — the
+     walk exhausts before gossip-deepening connects the fresh
+     neighbourhood; client retries succeed because deepening kept
+     working. → Fix A `push_with_patience` (12 s budget, re-walk on
+     peer-set change; `ANT_GATEWAY_PUSH_PATIENCE_SECS=0` = control).
+  2. **Invisible writes** (worst read-502 class): SOC path kept
+     unconditional shallow-accept after v0.5.37 made the upload path
+     strict. Measured: **0.35 % of 201'd SOCs never cross-node
+     retrievable (n=1152, 16 workers)**. → Fix B strict-during-
+     patience (deep placement hunted for 12 s, shallow accepted only
+     at ceiling). After: **100.00 % ≤1 s, zero never**.
+  3. **Slow/flaky feed reads**: every `latest` resolution burned a
+     flat 2405 ms (sequential absent-probe deadline windows), 5–8 s on
+     cold pools. → speculative concurrent probe window (identical
+     walk lattice — feeds_matrix-pinned; an earlier lattice-changing
+     design was CAUGHT by the bridge case {0,1,3}→3). After: **802 ms
+     median / 812 ms p99** read-your-own-write (sub-second criterion
+     met). Fix C adds one read re-walk after peer-set change
+     (`ANT_READ_RETRY_WAIT_MS=0` = control) for churn-trough reads.
+- **Soak harness**: `soak` bin + `perf/soak_summary.py` — parallel
+  fresh-identity SOC feed writers, client-style retries, immediate
+  read-back, cross-node probes at 1/10/60/300 s, restart-reread
+  (browser reload), per-event JSONL with peers/PO/error bodies.
+  Committed baselines + fix verifications under `perf/results/soak-*`.
+- **Not reproduced on this host**: actual write-502s (healthy server
+  pool reaches 100–230 peers; `--target-peers` is a target, not a
+  cap). The fixes address the report's mechanisms directly; field
+  validation in freedom browser is the remaining confirmation.
+- **Wallet**: `ANT_LAB_WALLET_PRIVATE_KEY` in `.env` (0.66 xDAI +
+  10.9 BZZ) for on-demand batch purchases via `antctl postage create`.
+  Batches: 3 (d22) in use for soaks, 4 (d23) ~29 %.
 
 ### ⚠ Batch budget vs. the full matrix (2026-07-05 arithmetic)
 
