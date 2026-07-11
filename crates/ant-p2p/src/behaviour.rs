@@ -1811,8 +1811,10 @@ fn handle_control_command(
             // still be returned. The fetcher subscribes to the live peer
             // snapshot so network fallback tracks the current BZZ set.
             let peers_rx = state.peers_watch.subscribe();
+            let retry_peers = state.peers_watch.subscribe();
             let cache = state.cache_for_request(false);
             let disk_cache = state.disk_cache_for_request(false);
+            let neighborhood_dial = state.neighborhood_dial_tx.clone();
             let control = control.clone();
             tokio::spawn(async move {
                 let mut builder =
@@ -1820,8 +1822,11 @@ fn handle_control_command(
                 if let Some(disk) = disk_cache {
                     builder = builder.with_disk_cache(disk);
                 }
+                if let Some(tx) = neighborhood_dial {
+                    builder = builder.with_neighborhood_dialer(tx);
+                }
                 let fetcher = builder;
-                let reply = match fetcher.fetch(reference).await {
+                let reply = match fetch_with_retry(&fetcher, retry_peers, reference).await {
                     Ok(wire) if wire.len() >= ant_crypto::SPAN_SIZE => {
                         // `fetch` returns the chunk's wire bytes
                         // (`span || payload`); `GetChunk` acks the payload.
@@ -3339,6 +3344,164 @@ fn validate_presigned_stamp(
     Ok(stamp)
 }
 
+/// Bug-hunt Fix C: one bounded retry of a failed network read after
+/// the peer set changes. Retrieval failures on a light node cluster in
+/// churn troughs — the walk exhausts against a momentarily-thin/flappy
+/// pool and the SAME read succeeds seconds later (the field report's
+/// self-healing read 502s). Instead of surfacing the first exhaustion,
+/// nudge the swarm to dial toward the target's neighbourhood, wait
+/// (≤ `ANT_READ_RETRY_WAIT_MS`, default 2500, 0 disables) for the peer
+/// set to actually change, and re-run the fetch once. The local-cache
+/// fast path is unaffected — this only runs after a full network walk
+/// already failed.
+async fn fetch_with_retry(
+    fetcher: &ant_retrieval::RoutingFetcher,
+    mut peers_rx: watch::Receiver<Vec<(PeerId, [u8; 32])>>,
+    reference: [u8; 32],
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let first = fetcher.fetch(reference).await;
+    let wait = read_retry_wait();
+    if wait.is_zero() {
+        return first;
+    }
+    match first {
+        Ok(wire) => Ok(wire),
+        Err(e) => {
+            debug!(
+                target: "ant_p2p",
+                addr = %hex::encode(reference),
+                err = %e,
+                "read walk exhausted; dialing toward the neighbourhood and retrying once",
+            );
+            fetcher.request_neighborhood_dial_pub(&reference);
+            let _ = tokio::time::timeout(wait, peers_rx.changed()).await;
+            fetcher.fetch(reference).await
+        }
+    }
+}
+
+/// `ANT_READ_RETRY_WAIT_MS` — bounded wait for a peer-set change before
+/// the single read re-walk. Default 2500 ms; `0` disables (pre-fix
+/// behaviour, the A/B control arm).
+fn read_retry_wait() -> Duration {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    Duration::from_millis(*MS.get_or_init(|| {
+        std::env::var("ANT_READ_RETRY_WAIT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(2500)
+    }))
+}
+
+/// Perf-lab bug-hunt Fix A: outer patience for the gateway's ONE-SHOT
+/// push paths (`POST /soc`, `POST /chunks`, `/bytes`, `/bzz`).
+///
+/// Unlike the `antctl upload` job manager — which re-queues failed
+/// chunks forever with escalating backoff — the gateway endpoints get
+/// a single `push_stamped_chunk` walk over the currently-connected
+/// peers, and its exhaustion surfaces as a client-visible 502. The
+/// field signature (2026-07 reliability report): a fresh SOC address
+/// lands in a never-dialed neighbourhood, the walk exhausts before the
+/// gossip-deepening cycle connects deeper peers, and the CLIENT's
+/// retry succeeds a second later because deepening kept working in the
+/// background. This loop is that retry, server-side: re-walk on
+/// transient exhaustion until `ANT_GATEWAY_PUSH_PATIENCE_SECS`
+/// (default 12 s, `0` disables) elapses, waiting ≤1.5 s for the peer
+/// set to CHANGE between walks so a re-walk only runs against a
+/// genuinely different candidate pool.
+///
+/// Fix B rides the same loop for SOCs: the walk runs strict-receipt
+/// (`require_deep`) during patience — a shallow receipt re-walks after
+/// deepening instead of being accepted immediately — and only at the
+/// patience ceiling falls back to one final shallow-accepting walk, so
+/// a hostile neighbourhood degrades to today's behaviour instead of a
+/// new failure mode. (The upload job manager got strict receipts in
+/// v0.5.37; the SOC path had kept unconditional shallow-accept, which
+/// the 16-worker soak measured as 0.35 % of SOCs never becoming
+/// retrievable from an independent node — a 201'd write the network
+/// cannot see.)
+async fn push_with_patience(
+    fetcher: &ant_retrieval::RoutingFetcher,
+    mut peers_rx: watch::Receiver<Vec<(PeerId, [u8; 32])>>,
+    addr: [u8; 32],
+    wire: Vec<u8>,
+    stamp: [u8; ant_postage::STAMP_SIZE],
+    strict_first: bool,
+) -> Result<(), ant_retrieval::pushsync::PushSyncError> {
+    let budget = gateway_push_patience();
+    let started = std::time::Instant::now();
+    let mut last_err = None;
+    let mut walk = 0u32;
+    loop {
+        walk += 1;
+        let strict = strict_first && started.elapsed() < budget;
+        let res = fetcher
+            .push_stamped_chunk_with_policy(addr, wire.clone(), stamp, strict)
+            .await;
+        match res {
+            Ok(()) => {
+                if walk > 1 {
+                    debug!(
+                        target: "ant_p2p",
+                        addr = %hex::encode(addr),
+                        walk,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "gateway push landed after outer re-walk",
+                    );
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                if started.elapsed() >= budget {
+                    // Strict SOCs get one final bee-aligned
+                    // shallow-accepting walk before we give up: stored
+                    // shallow beats a 502 with nothing stored.
+                    if strict {
+                        if let Ok(()) = fetcher
+                            .push_stamped_chunk_with_policy(addr, wire.clone(), stamp, false)
+                            .await
+                        {
+                            warn!(
+                                target: "ant_p2p",
+                                addr = %hex::encode(addr),
+                                "gateway push: deep placement not achieved within patience; accepted shallow",
+                            );
+                            return Ok(());
+                        }
+                    }
+                    return Err(last_err.unwrap_or(e));
+                }
+                warn!(
+                    target: "ant_p2p",
+                    addr = %hex::encode(addr),
+                    walk,
+                    err = %e,
+                    "gateway push walk failed; waiting for peer-set change before re-walk",
+                );
+                last_err = Some(e);
+                // Ride the deepening cycle: re-walk when the peer set
+                // actually changes (a dial landed / gossip arrived),
+                // with a nap floor so a hot flapping set can't spin us.
+                let _ = tokio::time::timeout(Duration::from_millis(1500), peers_rx.changed()).await;
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+}
+
+/// `ANT_GATEWAY_PUSH_PATIENCE_SECS` — outer re-walk budget for gateway
+/// one-shot pushes. Default 12 s; `0` disables (single-walk, the
+/// pre-fix behaviour, kept as the A/B control arm).
+fn gateway_push_patience() -> Duration {
+    static SECS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    Duration::from_secs(*SECS.get_or_init(|| {
+        std::env::var("ANT_GATEWAY_PUSH_PATIENCE_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(12)
+    }))
+}
+
 /// Shared `PushChunk` tail: cache the chunk locally (store-then-push),
 /// then pushsync it with `stamp` and ack. Used by both the local-issuer
 /// and the presigned-stamp paths.
@@ -3354,6 +3517,7 @@ fn push_with_stamp(
     ack: oneshot::Sender<ControlAck>,
 ) {
     let peers_rx = state.peers_watch.subscribe();
+    let patience_peers = state.peers_watch.subscribe();
     if peers_rx.borrow().is_empty() {
         let _ = ack.send(ControlAck::Error {
             message: "no peers available; wait for handshakes to complete".into(),
@@ -3414,14 +3578,15 @@ fn push_with_stamp(
                 Arc::new(crate::push_pseudosettle::PushPseudosettle::new(acc));
             fetcher = fetcher.with_pushsync_settlement(s);
         }
-        let reply = match fetcher.push_stamped_chunk(addr, wire, stamp).await {
-            Ok(()) => ControlAck::ChunkUploaded {
-                reference: format!("0x{}", hex::encode(addr)),
-            },
-            Err(e) => ControlAck::Error {
-                message: format!("pushsync: {e}"),
-            },
-        };
+        let reply =
+            match push_with_patience(&fetcher, patience_peers, addr, wire, stamp, false).await {
+                Ok(()) => ControlAck::ChunkUploaded {
+                    reference: format!("0x{}", hex::encode(addr)),
+                },
+                Err(e) => ControlAck::Error {
+                    message: format!("pushsync: {e}"),
+                },
+            };
         let _ = ack.send(reply);
     });
 }
@@ -3440,6 +3605,7 @@ fn push_soc_with_stamp(
 ) {
     const SOC_HEADER: usize = 32 + 65;
     let peers_rx = state.peers_watch.subscribe();
+    let patience_peers = state.peers_watch.subscribe();
     if peers_rx.borrow().is_empty() {
         let _ = ack.send(ControlAck::NotReady {
             message: "no peers available; wait for handshakes to complete".into(),
@@ -3523,14 +3689,18 @@ fn push_soc_with_stamp(
                 Arc::new(crate::push_pseudosettle::PushPseudosettle::new(acc));
             fetcher = fetcher.with_pushsync_settlement(s);
         }
-        let reply = match fetcher.push_stamped_chunk(address, wire, stamp).await {
-            Ok(()) => ControlAck::ChunkUploaded {
-                reference: format!("0x{}", hex::encode(address)),
-            },
-            Err(e) => ControlAck::Error {
-                message: format!("pushsync: {e}"),
-            },
-        };
+        // Fix B: SOCs run strict-receipt during the patience budget —
+        // the walk hunts a DEEP placement (re-walking after deepening)
+        // and only degrades to shallow-accept at the ceiling.
+        let reply =
+            match push_with_patience(&fetcher, patience_peers, address, wire, stamp, true).await {
+                Ok(()) => ControlAck::ChunkUploaded {
+                    reference: format!("0x{}", hex::encode(address)),
+                },
+                Err(e) => ControlAck::Error {
+                    message: format!("pushsync: {e}"),
+                },
+            };
         let _ = ack.send(reply);
     });
 }
