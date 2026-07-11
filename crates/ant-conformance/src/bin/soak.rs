@@ -415,6 +415,7 @@ async fn main() {
     let env = load_env();
     let (bvar, kvar) = match batch_n {
         "4" => ("SWARM_BATCH_ID_4", "SWARM_OWNER_PRIVATE_KEY_4"),
+        "5" => ("SWARM_BATCH_ID_5", "ANT_LAB_WALLET_PRIVATE_KEY"),
         _ => ("SWARM_BATCH_ID_3", "SWARM_OWNER_PRIVATE_KEY_3"),
     };
     let batch_hex = env

@@ -715,6 +715,10 @@ async fn upload(args: &Args) {
         "2" => ("SWARM_BATCH_ID_2", "SWARM_OWNER_PRIVATE_KEY_2"),
         "3" => ("SWARM_BATCH_ID_3", "SWARM_OWNER_PRIVATE_KEY_3"),
         "4" => ("SWARM_BATCH_ID_4", "SWARM_OWNER_PRIVATE_KEY_4"),
+        // Batch 5: bought at runtime 2026-07-11 with the lab wallet
+        // (ANT_LAB_WALLET_PRIVATE_KEY) after batch 4's TTL expired
+        // on-chain mid-session. d22 mutable, ~2-week TTL.
+        "5" => ("SWARM_BATCH_ID_5", "ANT_LAB_WALLET_PRIVATE_KEY"),
         _ => ("SWARM_BATCH_ID", "SWARM_OWNER_PRIVATE_KEY"),
     };
     let batch_hex = env

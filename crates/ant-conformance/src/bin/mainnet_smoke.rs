@@ -227,6 +227,37 @@ async fn main() {
     }
     h.record("antd peers warmed", peers >= 30, format!("{peers} peers"));
 
+    // Since v0.5.35 the HTTP API binds BEFORE chain init resolves, so
+    // /health answers while the startup batch registration is still in
+    // flight and an immediate upload 503s with "uploads not
+    // configured". Wait until GET /stamps lists the configured batch
+    // as usable before pushing anything.
+    let batch_ready = {
+        let want = batch.trim_start_matches("0x").to_lowercase();
+        let start = Instant::now();
+        let mut ready = false;
+        while start.elapsed() < Duration::from_mins(3) {
+            if let Ok(r) = h.client.get(format!("{ant}/stamps")).send().await {
+                if let Ok(body) = r.bytes().await {
+                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) {
+                        ready = v["stamps"].as_array().is_some_and(|a| {
+                            a.iter().any(|s| {
+                                s["batchID"].as_str().is_some_and(|b| b == want)
+                                    && s["usable"].as_bool().unwrap_or(false)
+                            })
+                        });
+                        if ready {
+                            break;
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        ready
+    };
+    h.record("postage batch registered (chain init)", batch_ready, "");
+
     // ---- phase 2: upload + read-your-own-writes -----------------------------
     println!("phase 2: upload via ant + immediate self-reads");
     let file_body =
