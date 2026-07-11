@@ -392,7 +392,7 @@ type ProbeCache = std::collections::HashMap<u64, CachedOutcome>;
 /// Rarely-visited offsets (head advanced ≥ 2 within one poll) simply
 /// miss the cache and probe live, exactly as before. Decision logic is
 /// untouched — same lattice, same rules, same results (pinned by the
-/// feeds_matrix differential, incl. the gap cases {0,2}→0 and
+/// `feeds_matrix` differential, incl. the gap cases {0,2}→0 and
 /// {0,1,3}→3 that encode bee's walk shape).
 async fn prefetch_window(
     fetcher: &dyn ChunkFetcher,
