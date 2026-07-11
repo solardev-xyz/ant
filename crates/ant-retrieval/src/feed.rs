@@ -447,21 +447,24 @@ async fn prefetch_window(
     cache
 }
 
-/// [`probe`] with prefetch-cache consultation: a hit consumes the
-/// cached outcome (no network, no deadline); a miss probes live.
+/// [`probe`] with prefetch-cache consultation: a hit re-materialises
+/// the cached outcome (no network, no deadline); a miss probes live.
+/// Non-consuming — several walk steps can ask about the same offset
+/// (the binary midpoint is often also a phase-3 candidate), and within
+/// one loop iteration the window's snapshot is the consistent answer.
 async fn probe_cached(
     fetcher: &dyn ChunkFetcher,
     feed: &Feed,
     index: u64,
     probed: &mut u64,
     deadline: Option<Duration>,
-    cache: &mut ProbeCache,
+    cache: &ProbeCache,
 ) -> Result<ProbeOutcome, FeedError> {
-    if let Some(hit) = cache.remove(&index) {
+    if let Some(hit) = cache.get(&index) {
         return Ok(match hit {
-            CachedOutcome::Present(u) => ProbeOutcome::Present(u),
+            CachedOutcome::Present(u) => ProbeOutcome::Present(*u),
             CachedOutcome::Absent => ProbeOutcome::Absent,
-            CachedOutcome::Transient(msg) => ProbeOutcome::Transient(msg.into()),
+            CachedOutcome::Transient(msg) => ProbeOutcome::Transient(msg.clone().into()),
         });
     }
     probe(fetcher, feed, index, probed, deadline).await
@@ -657,7 +660,7 @@ pub async fn resolve_sequence_feed_after(
         // (unchanged) sequential logic consume the cached outcomes.
         // See `prefetch_window` for the lattice + the measured cost of
         // the sequential original.
-        let mut cache = prefetch_window(fetcher, feed, latest_index, &mut probed).await;
+        let cache = prefetch_window(fetcher, feed, latest_index, &mut probed).await;
 
         // Phase 1 — exponential bracket. `lo` is known present, `hi` is
         // known absent (a transient that survived retries counts as
@@ -679,7 +682,7 @@ pub async fn resolve_sequence_feed_after(
                 candidate,
                 &mut probed,
                 Some(FEED_PROBE_TIMEOUT),
-                &mut cache,
+                &cache,
             )
             .await?
             {
@@ -703,7 +706,7 @@ pub async fn resolve_sequence_feed_after(
                 mid,
                 &mut probed,
                 Some(FEED_PROBE_TIMEOUT),
-                &mut cache,
+                &cache,
             )
             .await?
             {
@@ -737,13 +740,15 @@ pub async fn resolve_sequence_feed_after(
         let mut cached_hits: Vec<(u64, Result<ProbeOutcome, FeedError>)> = Vec::new();
         let mut live: Vec<u64> = Vec::new();
         for &i in &candidates {
-            if let Some(hit) = cache.remove(&i) {
+            if let Some(hit) = cache.get(&i) {
                 cached_hits.push((
                     i,
                     Ok(match hit {
-                        CachedOutcome::Present(u) => ProbeOutcome::Present(u),
+                        CachedOutcome::Present(u) => ProbeOutcome::Present(*u),
                         CachedOutcome::Absent => ProbeOutcome::Absent,
-                        CachedOutcome::Transient(msg) => ProbeOutcome::Transient(msg.into()),
+                        CachedOutcome::Transient(msg) => {
+                            ProbeOutcome::Transient(msg.clone().into())
+                        }
                     }),
                 ));
             } else {

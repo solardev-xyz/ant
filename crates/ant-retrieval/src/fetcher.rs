@@ -731,6 +731,22 @@ impl RoutingFetcher {
         wire: Vec<u8>,
         stamp: [u8; ant_postage::STAMP_SIZE],
     ) -> Result<(), crate::pushsync::PushSyncError> {
+        self.push_stamped_chunk_with_policy(chunk_addr, wire, stamp, self.require_deep)
+            .await
+    }
+
+    /// [`Self::push_stamped_chunk`] with a per-call receipt policy
+    /// override. The gateway's patience loop (`ant-p2p`, bug-hunt Fix
+    /// A/B) runs SOC walks strict while its outer budget lasts and
+    /// downgrades to shallow-accept for one final walk at the ceiling —
+    /// a per-call knob, not a per-fetcher one.
+    pub async fn push_stamped_chunk_with_policy(
+        &self,
+        chunk_addr: [u8; 32],
+        wire: Vec<u8>,
+        stamp: [u8; ant_postage::STAMP_SIZE],
+        require_deep: bool,
+    ) -> Result<(), crate::pushsync::PushSyncError> {
         use crate::pushsync::{
             push_chunk_to_peer_with_timeout, PushSyncError, DEFAULT_PUSHSYNC_TIMEOUT,
         };
@@ -894,7 +910,7 @@ impl RoutingFetcher {
                                 if let Some(s) = self.pushsync_settlement.as_ref() {
                                     s.note_pushsync(peer, price).await;
                                 }
-                                if self.require_deep {
+                                if require_deep {
                                     warn!(
                                         target: "ant_retrieval::fetcher",
                                         addr = %hex::encode(chunk_addr),
@@ -971,7 +987,7 @@ impl RoutingFetcher {
         // surfaced as an error so the upload driver re-queues the chunk
         // and keeps hunting on the next dispatch.
         if shallow_seen {
-            if self.require_deep {
+            if require_deep {
                 let (po, storage_radius) = last_shallow;
                 warn!(
                     target: "ant_retrieval::fetcher",
