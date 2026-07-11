@@ -36,7 +36,7 @@ use ant_crypto::{keccak256, sign_handshake_data};
 use ant_retrieval::feed::sequence_update_id;
 use std::collections::HashMap;
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -321,7 +321,7 @@ async fn soc_write(
 }
 
 /// Poll `url` until 200 (cap [`READBACK_CAP`]); returns
-/// (ok, first_status, attempts, ms_to_ok).
+/// `(ok, first_status, attempts, ms_to_ok)`.
 async fn read_until_ok(client: &reqwest::Client, url: &str) -> (bool, u16, u32, u64) {
     let start = Instant::now();
     let mut first_status = 0u16;
@@ -509,8 +509,10 @@ async fn main() {
         });
     }
 
-    // Everything written, for the restart cold re-read.
-    let written: Arc<Mutex<Vec<(String, String, String, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+    // Everything written, for the restart cold re-read:
+    // `(soc_path, owner_hex, topic_hex, index)`.
+    type WrittenRefs = Arc<Mutex<Vec<(String, String, String, u64)>>>;
+    let written: WrittenRefs = Arc::new(Mutex::new(Vec::new()));
 
     // Cross-node probe queue + prober.
     let (xtx, mut xrx) = tokio::sync::mpsc::unbounded_channel::<XnodeProbe>();
@@ -571,7 +573,7 @@ async fn main() {
             let mut prng = Prng(
                 (unix_now() ^ 0x5eed_5eed_0000_0000)
                     .wrapping_mul(w as u64 * 2 + 1)
-                    .wrapping_add(std::process::id() as u64)
+                    .wrapping_add(u64::from(std::process::id()))
                     | 1,
             );
             for feed_i in 0..feeds_per_worker {
