@@ -361,10 +361,7 @@ fn split_file(
 fn join_workers(workers: Vec<JoinHandle<Result<u64>>>) -> Result<u64> {
     let mut total = 0u64;
     for w in workers {
-        match w.join().map_err(|_| anyhow!("worker panicked"))? {
-            Ok(n) => total += n,
-            Err(e) => return Err(e),
-        }
+        total += w.join().map_err(|_| anyhow!("worker panicked"))??;
     }
     Ok(total)
 }
