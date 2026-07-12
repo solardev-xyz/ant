@@ -18,9 +18,10 @@
 
 use ant_control::{ControlAck, ControlCommand};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
+use serde::Deserialize;
 use tokio::sync::mpsc;
 use tracing::debug;
 
@@ -29,6 +30,18 @@ use crate::handle::GatewayHandle;
 
 /// Depth of the node→gateway message buffer for one subscription.
 const SUB_CHANNEL_CAP: usize = 64;
+
+/// Optional query for `/pss/subscribe`.
+#[derive(Debug, Deserialize)]
+pub struct PssSubscribeQuery {
+    /// Rendezvous-neighborhood override (64-hex overlay). When set, the
+    /// node lurks *this* neighborhood instead of its own overlay — the
+    /// basis for many-to-many rooms that no participant owns: every client
+    /// lurks the same topic-derived neighborhood and senders address
+    /// messages there. Absent ⇒ the node's own neighborhood (directed PSS
+    /// to this node).
+    neighborhood: Option<String>,
+}
 
 /// `GET /gsoc/subscribe/{address}` upgrade handler.
 pub async fn gsoc_subscribe(
@@ -50,14 +63,20 @@ pub async fn gsoc_subscribe(
 pub async fn pss_subscribe(
     State(handle): State<GatewayHandle>,
     Path(topic_str): Path<String>,
+    Query(query): Query<PssSubscribeQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
     let topic = ant_crypto::pss::topic_from_string(&topic_str);
-    // Target all-zeros → the node's own neighborhood (where PSS messages
-    // addressed to us land).
-    ws.on_upgrade(move |socket| {
-        run_subscription(handle, socket, [0u8; 32], Vec::new(), vec![topic])
-    })
+    // With `?neighborhood=`, lurk that rendezvous neighborhood; otherwise
+    // all-zeros → the node's own neighborhood (directed PSS to this node).
+    let target = match &query.neighborhood {
+        Some(hex) => match parse_hex32(hex) {
+            Some(t) => t,
+            None => return json_error(StatusCode::BAD_REQUEST, "invalid neighborhood overlay"),
+        },
+        None => [0u8; 32],
+    };
+    ws.on_upgrade(move |socket| run_subscription(handle, socket, target, Vec::new(), vec![topic]))
 }
 
 /// Drive one subscription: open the lurker on the node, forward each
