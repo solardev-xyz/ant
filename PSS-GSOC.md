@@ -45,19 +45,23 @@ Interop is bidirectional and pinned by golden vectors on both sides — see
 **A light ant node can, today, send a PSS message to any bee full node
 and a GSOC update to any GSOC listener.**
 
-### Receive primitives — DONE
+### Receive — DONE (GSOC proven live)
 
 | Piece | Where | Verified |
 |---|---|---|
-| pullsync 1.4.0 **client** | `ant-p2p/src/pullsync.rs` | codec pinned to bee's `cmd/pullvec` golden protobuf bytes (Get/Ack/Offer/Want, LSB-first bitvector, framing) — 7 tests |
-| message dispatch (lurker brain) | `ant-p2p/src/messaging.rs` | `classify()` decodes real GSOC + PSS chunks end-to-end and rejects spoofed addresses — 4 tests |
+| pullsync 1.4.0 **client** | `ant-p2p/src/pullsync.rs` | codec pinned to bee's `cmd/pullvec` golden protobuf bytes; **live on mainnet** (Exp-1) |
+| message dispatch (lurker brain) | `ant-p2p/src/messaging.rs` | `classify()` decodes real GSOC + PSS chunks and rejects spoofs |
+| lurker driver (residency + live loop) | `ant-p2p/src/lurker.rs` | **GSOC e2e PASS on mainnet** (bee-js → ant → pull → WS → bee-js) |
+| `LurkerSubscribe` control cmd | `ant-control`, `behaviour.rs` | streaming ack → WS fan-out |
+| WS `/gsoc/subscribe`, `/pss/subscribe` | `ant-gateway/src/subscribe.rs` | bee-js `gsocSubscribe`/`pssSubscribe` compatible |
+| `antctl pullsync` probe | `antctl`, `ControlCommand::PullsyncProbe` | Exp-1 tool |
 
 `pullsync::sync_once(bin, start, want)` runs one page (Get → Offer →
 Want → Delivery), with a `want` closure so a lurker requests only the
 addresses it watches (Delivery bandwidth ≈ 0 when nothing matches).
-`messaging::classify()` turns a delivered chunk + `WatchState` (watched
-GSOC addresses, registered PSS topics + secret) into a `DecodedMessage`,
-trusting content not the delivering peer.
+`messaging::classify()` turns a delivered chunk + `WatchState` into a
+`DecodedMessage`, trusting content not the delivering peer.
+`lurker::run` ties them together with neighborhood residency.
 
 ---
 
@@ -84,47 +88,52 @@ a covering peer actually stores**, which is exactly the case that worked.
 **The single biggest risk (would mainnet bees serve a NAT'd light peer?)
 is retired.**
 
-## What remains — the live receive wiring
+## GSOC receive e2e — PASS on mainnet (2026-07-12)
 
-The receive primitives + the pullsync probe are done; what's left is the
-persistent driver and the HTTP surface. None of it changes the crypto or
-the wire codec.
+The full receive path is wired and proven live. `ControlCommand::
+LurkerSubscribe` spawns `ant_p2p::lurker::run`, which resides in the
+target neighborhood (dials toward it, waits for the deepest covering peer
+via the existing neighborhood-dial primitive), pulls its bin live
+(`sync_once(bin, start=cursor+1)`, bounded 20 s per round so it re-dials
+and re-picks deeper peers), classifies each delivered chunk, and streams
+decoded payloads over `GET /gsoc/subscribe/{address}` /
+`GET /pss/subscribe/{topic}` WebSockets as binary frames.
 
-1. ~~**Exp 1 — mainnet pullsync viability probe**~~ **DONE** (above).
-   `ControlCommand::PullsyncProbe` + `antctl pullsync` also serve as the
-   lurker's underlying single-round operation. Confirms a light peer can
-   hold a pullsync stream and measures offer latency. **Open question the
-   probe answers:** do mainnet bees serve pullsync to a NAT'd light peer
-   in practice (the code says yes; the network sometimes disagrees).
+**End-to-end, driven entirely by bee-js against a live ant node:**
+`bee.gsocMine` + `bee.gsocSend` → ant `POST /soc` → pushed into the
+neighborhood → ant lurker pulls it back from a real full node via
+pullsync → `classify()` decodes → WS → `bee.gsocSubscribe` received the
+**exact payload**. The residency step was load-bearing: the lurker
+deepened from bin 5 (a shallow *forwarder*) to bin 13 (an actual
+*storer*) before the message came through.
 
-2. **Lurker driver** (`behaviour.rs`). A task that, given a `WatchState`:
-   - keeps 2–3 peers resident in the target neighborhood (extend the
-     existing `dial_toward_target`/`dial_and_await_deeper` from a
-     transient upload burst into a "stay resident near X" mode);
-   - per covering peer, runs the live loop `sync_once(bin, start=cursor+1)`
-     forever, advancing `start = topmost+1` (the server long-blocks, so it
-     parks rather than busy-spins);
-   - feeds each `DeliveredChunk` to `messaging::classify()` and pushes
-     `DecodedMessage`s onto a broadcast channel, deduping by address.
+**PSS send** verified live too: `POST /pss/send/{topic}/{targets}` → HTTP
+`201` (mine + push) in ~6 s; combined with the offline proof that bee's
+Go `pss.Unwrap` accepts ant-produced trojan chunks, ant→bee PSS is fully
+validated.
 
-3. **WS subscribe endpoints** (`ant-gateway`). `GET /pss/subscribe/{topic}`
-   and `GET /gsoc/subscribe/{address}` — clone the working
-   `chunk_stream.rs` WebSocket handler; registering a subscription updates
-   the node's `WatchState` (and sets/mines the neighborhood to reside in),
-   and the handler streams matching `DecodedMessage` payloads as binary
-   frames. bee-compatible, so bee-js `pssSubscribe`/`gsocSubscribe` work
-   unmodified.
+## What remains
 
-4. **`GET /addresses.pssPublicKey`**. Expose the node's PSS key once
-   receive works (deferred deliberately — advertising a receive key that
-   can't yet decrypt would mislead senders). Needs a persisted `pss.key`
-   like bee's dedicated key.
-
-5. **e2e on mainnet**: ant→bee PSS (bee full node as oracle), bee-js→ant
-   GSOC, and the **rendezvous-neighborhood** many-to-many test (all app
-   clients lurk a topic-derived neighborhood; real full nodes there store
-   and serve — no designated full node anywhere). Per-message unique SOC
-   ids sidestep GSOC's same-address reserve-overwrite caveat.
+1. **PSS *receive* depth alignment.** GSOC receive is exact because the
+   watch target *is* the chunk's address. PSS reception targets the
+   node's overlay, but `makeMaxTarget` mines a 2-byte (16-bit) prefix —
+   deeper than the lurker's typical bin-12/13 reach — and the chunk's
+   closest storer isn't necessarily the peer we pull from (replication to
+   it lags). So a mainnet PSS-receive loopback didn't land in the pulled
+   bin within the test window. Options to close it: reside deeper / pull a
+   small bin-window around the target, pull from several covering peers,
+   or accept PSS-receive only when the node sits deep in its own
+   neighborhood. The mechanism is proven (GSOC); this is a targeting
+   refinement, not a new capability.
+2. **`GET /addresses.pssPublicKey`** + a persisted `pss.key` for
+   *directed* PSS to the node's own key (topic-broadcast already works
+   without one). Deferred so we don't advertise a key before directed
+   receive is exercised.
+3. **Rendezvous-neighborhood many-to-many** demo (all app clients lurk a
+   topic-derived neighborhood; real full nodes there store and serve — no
+   designated full node anywhere). Per-message unique SOC ids sidestep
+   GSOC's same-address reserve-overwrite caveat. The primitives are all in
+   place; this is an app-level composition + demo.
 
 ---
 
