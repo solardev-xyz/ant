@@ -865,6 +865,147 @@ pub async fn upload_chunk(
     }
 }
 
+/// Query params for `POST /pss/send/{topic}/{targets}`.
+#[derive(serde::Deserialize)]
+pub struct PssSendQuery {
+    /// Optional recipient PSS public key (hex, SEC1 compressed or
+    /// uncompressed). Absent ⇒ bee's topic-derived broadcast key.
+    recipient: Option<String>,
+}
+
+/// `POST /pss/send/{topic}/{targets}` — wrap `body` as a PSS trojan
+/// chunk addressed to one of `targets` (comma-separated overlay-address
+/// hex prefixes, ≤3 bytes each), stamp it, and pushsync it. `topic` is a
+/// string hashed with keccak256 (bee's `NewTopic`). With `?recipient=`
+/// the payload is ECIES-encrypted to that key; without it, to the
+/// topic-derived key so any node registered on the topic can read it.
+///
+/// Bee exposes the same route (`bee/pkg/api/pss.go`); ant can send from a
+/// light node (only the ephemeral wrap + a usable postage batch are
+/// needed). Returns 201 on success. Mining is CPU-bound and runs on a
+/// blocking thread.
+pub async fn upload_pss(
+    State(handle): State<GatewayHandle>,
+    Path((topic_str, targets_str)): Path<(String, String)>,
+    Query(query): Query<PssSendQuery>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    use ant_crypto::pss::{topic_from_string, wrap, Recipient, MAX_PAYLOAD_SIZE, MAX_TARGET_LEN};
+
+    if body.len() > MAX_PAYLOAD_SIZE {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            format!("pss message exceeds {MAX_PAYLOAD_SIZE} bytes"),
+        );
+    }
+
+    // Parse targets: comma-separated hex prefixes, all the same length,
+    // 1..=3 bytes each (bee's API cap).
+    let mut targets: Vec<Vec<u8>> = Vec::new();
+    for t in targets_str.split(',') {
+        let t = t.trim();
+        match hex::decode(t) {
+            Ok(bytes) if !bytes.is_empty() && bytes.len() <= MAX_TARGET_LEN => targets.push(bytes),
+            _ => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "each target must be 1..=3 bytes of hex",
+                );
+            }
+        }
+    }
+    if targets.is_empty() || targets.iter().any(|t| t.len() != targets[0].len()) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "targets must be non-empty and all the same length",
+        );
+    }
+
+    // Recipient: explicit key, or the topic-derived broadcast key.
+    let recipient = match &query.recipient {
+        Some(hex_pk) => match hex::decode(hex_pk.trim())
+            .ok()
+            .and_then(|b| Recipient::from_sec1(&b).ok())
+        {
+            Some(r) => r,
+            None => {
+                return json_error(StatusCode::BAD_REQUEST, "invalid recipient public key");
+            }
+        },
+        None => Recipient::TopicDerived,
+    };
+
+    let (_stamp, batch_id) = match parse_stamp_or_batch(&headers) {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+
+    let topic = topic_from_string(&topic_str);
+    let msg = body.to_vec();
+
+    // Mining is CPU-heavy; keep it off the async runtime.
+    let wrapped =
+        tokio::task::spawn_blocking(move || wrap(&topic, &msg, &recipient, &targets)).await;
+    let (_addr, wire) = match wrapped {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => return json_error(StatusCode::BAD_REQUEST, e.to_string()),
+        Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "pss wrap task failed"),
+    };
+
+    let timeout = request_timeout(&headers, CHUNK_REQUEST_TIMEOUT);
+    let guard = handle
+        .activity
+        .begin(GatewayRequestKind::Chunk, "pss-send".to_string());
+
+    let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
+    let cmd = ControlCommand::PushChunk {
+        wire,
+        batch_id,
+        stamp: None,
+        require_deep: false,
+        ack: ack_tx,
+    };
+    if handle.commands.send(cmd).await.is_err() {
+        return node_unavailable();
+    }
+    guard.update(0, 1, 1, 0);
+
+    let ack = match tokio::time::timeout(timeout, ack_rx).await {
+        Ok(Ok(ack)) => ack,
+        Ok(Err(_)) => return node_unavailable(),
+        Err(_) => {
+            return json_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("pss send timed out after {}s", timeout.as_secs()),
+            );
+        }
+    };
+
+    match ack {
+        ControlAck::ChunkUploaded { .. } => {
+            guard.update(1, 1, 0, body.len() as u64);
+            StatusCode::CREATED.into_response()
+        }
+        ControlAck::Error { message } => {
+            let status = if message.starts_with("uploads not configured") {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else if message.contains("not usable") {
+                StatusCode::BAD_REQUEST
+            } else if message.contains("rejected by") && message.contains("not found on-chain") {
+                StatusCode::UNPROCESSABLE_ENTITY
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            json_error(status, message)
+        }
+        other => {
+            warn!(target: "ant_gateway", ?other, "unexpected ack from pss PushChunk");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "unexpected node ack")
+        }
+    }
+}
+
 /// `POST /soc/{owner}/{id}` — accept a single-owner-chunk's inner CAC
 /// payload, validate the signature, then stamp + pushsync the SOC. The
 /// path carries the 32-byte `id` and the 20-byte `owner` Ethereum

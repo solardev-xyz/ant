@@ -120,6 +120,9 @@ pub fn build(handle: GatewayHandle) -> Router {
             get(stewardship::stewardship_get).put(stewardship::stewardship_put),
         )
         .route("/soc/{owner}/{id}", post(retrieval::upload_soc))
+        // PSS: wrap+mine+stamp+push a trojan chunk to a target
+        // neighborhood (bee `pss.go`). Light-node send.
+        .route("/pss/send/{topic}/{targets}", post(retrieval::upload_pss))
         // Raw byte upload (PLAN.md J.2.5 / C1): bee-js feed payloads and
         // direct data uploads. Returns a `/bytes/<ref>` reference.
         .route("/bytes", post(retrieval::upload_bytes))
