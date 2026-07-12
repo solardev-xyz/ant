@@ -418,7 +418,7 @@ mod tests {
         let bytes = hex::decode("0a040005fa011087ad4b").unwrap();
         let ack = Ack::decode(bytes.as_slice()).unwrap();
         assert_eq!(ack.cursors, vec![0, 5, 250]);
-        assert_eq!(ack.epoch, 1234567);
+        assert_eq!(ack.epoch, 1_234_567);
     }
 
     #[test]
