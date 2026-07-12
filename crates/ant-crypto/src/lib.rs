@@ -8,6 +8,8 @@ pub mod act;
 pub mod bmt;
 pub mod encryption;
 mod error;
+pub mod gsoc;
+pub mod pss;
 pub mod soc;
 
 pub use bmt::{bmt_hash_with_span, bmt_root, cac_new, cac_valid, CHUNK_SIZE, SPAN_SIZE};
