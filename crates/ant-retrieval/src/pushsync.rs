@@ -53,6 +53,24 @@ pub enum PushSyncError {
     Timeout(Duration),
     #[error("{0}")]
     Remote(String),
+    /// Storer peers rejected the postage stamp itself — the batch is
+    /// not in their chain-synced batchstore (never created on this
+    /// chain, expired and evicted, or not yet synced). Unlike every
+    /// other variant this is NOT retryable against more peers: every
+    /// honest storer validates stamps against the same chain state.
+    /// Surfaced distinctly so the gateway can answer with an
+    /// actionable, non-retryable error instead of a generic 502, and
+    /// so the patience loop doesn't burn its budget re-walking
+    /// (phantom-batch report, 2026-07-12).
+    #[error(
+        "postage batch 0x{} rejected by {rejections} peer(s) as not found on-chain (peer said: {sample})",
+        hex::encode(batch_id)
+    )]
+    StampRejected {
+        batch_id: [u8; 32],
+        rejections: u32,
+        sample: String,
+    },
     #[error("receipt mismatch")]
     ReceiptMismatch,
     /// The receipt's storer signature could not be recovered, or the

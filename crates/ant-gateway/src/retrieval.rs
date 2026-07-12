@@ -849,6 +849,10 @@ pub async fn upload_chunk(
                 StatusCode::SERVICE_UNAVAILABLE
             } else if message.starts_with("chunk wire size") || message.contains("not usable") {
                 StatusCode::BAD_REQUEST
+            } else if message.contains("rejected by") && message.contains("not found on-chain") {
+                // Peer-attested phantom batch — deterministic, not
+                // retryable (see the PushSoc arm below).
+                StatusCode::UNPROCESSABLE_ENTITY
             } else {
                 StatusCode::BAD_GATEWAY
             };
@@ -1057,6 +1061,14 @@ pub async fn upload_soc(
         ControlAck::Error { message } => {
             let status = if message.contains("not usable") {
                 StatusCode::BAD_REQUEST
+            } else if message.contains("rejected by") && message.contains("not found on-chain") {
+                // Storer peers rejected the stamp: the batch is not in
+                // their chain-synced batchstore (phantom batch —
+                // never created on this chain, expired, or unsynced).
+                // Deterministic and NOT retryable, so it must be
+                // distinguishable from transient pushsync exhaustion
+                // (502): 422 with the batch id + a peer's own words.
+                StatusCode::UNPROCESSABLE_ENTITY
             } else {
                 StatusCode::BAD_GATEWAY
             };
@@ -1904,6 +1916,14 @@ pub(crate) async fn push_chunks(
                         StatusCode::SERVICE_UNAVAILABLE
                     } else if message.contains("not usable") {
                         StatusCode::BAD_REQUEST
+                    } else if message.contains("rejected by")
+                        && message.contains("not found on-chain")
+                    {
+                        // Peer-attested phantom batch: deterministic,
+                        // NOT retryable — distinct from transient
+                        // pushsync exhaustion (502) so clients stop
+                        // treating a dead batch as a flaky network.
+                        StatusCode::UNPROCESSABLE_ENTITY
                     } else {
                         StatusCode::BAD_GATEWAY
                     };

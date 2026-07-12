@@ -101,9 +101,12 @@ impl StampEntry {
             batch_id,
             // bee's `utilization` is the fill of the fullest bucket.
             utilization: view.bucket_fill_max,
-            // The batch was validated on-chain at daemon startup and is
-            // actively stamping, so it is usable.
-            usable: true,
+            // Peer-attested: flips false once storer peers reject the
+            // batch's stamps as not-on-chain (phantom batch) — the
+            // node-side registry can't vouch for chain presence by
+            // itself (ant has no batchstore), so a batch is reported
+            // usable only while the network isn't refuting it.
+            usable: view.usable,
             label: String::new(),
             depth: view.batch_depth,
             amount: "0".to_string(),

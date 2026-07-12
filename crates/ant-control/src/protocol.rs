@@ -401,6 +401,13 @@ pub struct UploadJobView {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PostageStatusView {
     pub enabled: bool,
+    /// `false` once storer peers have rejected this batch's stamps as
+    /// not-on-chain (peer-attested phantom batch: never created on
+    /// this chain, expired and evicted, or not yet synced) — the
+    /// gateway's `/stamps` must then stop reporting the batch green.
+    /// Defaults `true` so old daemons keep deserializing.
+    #[serde(default = "default_true")]
+    pub usable: bool,
     /// `0x`-prefixed hex of the configured batch id. Empty when
     /// `enabled = false`.
     #[serde(default)]
@@ -431,6 +438,11 @@ pub struct PostageStatusView {
     /// type-level doc). 0 when the batch is empty.
     #[serde(default)]
     pub worst_case_remaining_chunks: u64,
+}
+
+/// Missing-field default for [`PostageStatusView::usable`].
+fn default_true() -> bool {
+    true
 }
 
 /// Point-in-time snapshot of the node's settlement/balance mirror,
