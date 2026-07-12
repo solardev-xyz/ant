@@ -44,6 +44,20 @@ pub enum Request {
     /// dedup set without disconnecting current peers. The next restart will
     /// bootstrap fresh from bootnodes.
     PeersReset,
+    /// Run a pullsync viability probe against the closest connected peer
+    /// to `target` (64-hex overlay). Fetches the peer's cursors and pulls
+    /// one page of the neighborhood bin. Answers with
+    /// [`Response::PullsyncProbe`]. Ops/validation tool for the GSOC/PSS
+    /// lurker (Exp-1: does a mainnet full node serve pullsync to us?).
+    PullsyncProbe {
+        target: String,
+        #[serde(default)]
+        bin: Option<u8>,
+        #[serde(default)]
+        start: Option<u64>,
+        #[serde(default)]
+        max_deliver: Option<usize>,
+    },
     /// Retrieve the chunk at `reference` from the network. The 32-byte
     /// reference is a `0x`-prefixed hex string. The daemon answers with
     /// [`Response::Bytes`] carrying the verified chunk payload (without
@@ -256,6 +270,9 @@ pub enum Response {
     /// Local postage stamp issuer snapshot. Returned by
     /// [`Request::PostageStatus`].
     PostageStatus(PostageStatusView),
+    /// Result of a pullsync viability probe. Returned by
+    /// [`Request::PullsyncProbe`].
+    PullsyncProbe(PullsyncProbeView),
 }
 
 /// Wire shape of one upload job (status snapshot). Mirrors
@@ -459,6 +476,43 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AccountingSnapshotView {
     pub peers: Vec<PeerAccountingView>,
+}
+
+/// Result of a `PullsyncProbe` — the GSOC/PSS lurker's underlying
+/// operation, and the Exp-1 viability check. Confirms whether a light
+/// ant node can drive Swarm's pullsync protocol against a real full-node
+/// peer and pull chunks out of a neighborhood bin.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PullsyncProbeView {
+    /// The peer that was probed (overlay, 64 lowercase hex, no `0x`).
+    /// Empty when no connected peer was available.
+    pub peer_overlay: String,
+    /// The peer's libp2p peer id (base58), for logs.
+    pub peer_id: String,
+    /// Bin that was pulled.
+    pub bin: u8,
+    /// Start binID the page was requested from.
+    pub start: u64,
+    /// Whether the cursor exchange succeeded.
+    pub cursors_ok: bool,
+    /// The peer's cursor (highest binID) for `bin`, if cursors succeeded.
+    pub bin_cursor: u64,
+    /// The peer's reserve epoch, if cursors succeeded.
+    pub epoch: u64,
+    /// Whether the sync page (Get→Offer→Want→Delivery) completed.
+    pub sync_ok: bool,
+    /// `Offer.Topmost` returned for the page.
+    pub topmost: u64,
+    /// Number of chunk references the peer offered in the page.
+    pub offered: usize,
+    /// Number of chunks actually delivered (wanted and received).
+    pub delivered: usize,
+    /// Wall-clock milliseconds for the cursor exchange.
+    pub cursors_ms: u64,
+    /// Wall-clock milliseconds for the sync page.
+    pub sync_ms: u64,
+    /// Non-empty on failure: what went wrong.
+    pub error: String,
 }
 
 /// Per-peer settlement/balance row. All amounts are non-negative

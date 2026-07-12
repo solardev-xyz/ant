@@ -27,8 +27,8 @@ pub use protocol::{
     AccountingSnapshotView, CacheInfo, DiskCacheInfo, ExternalAddressInfo, GatewayRequestInfo,
     GatewayRequestKind, GetProgress, HandshakeReport, IdentityInfo, LastChequeView,
     PeerAccountingView, PeerConnectionInfo, PeerConnectionState, PeerInfo, PeerPipelineEntry,
-    PostageStatusView, ProtocolError, Request, Response, RetrievalInfo, RoutingInfo,
-    StatusSnapshot, UploadJobView, VersionInfo, PROTOCOL_VERSION,
+    PostageStatusView, ProtocolError, PullsyncProbeView, Request, Response, RetrievalInfo,
+    RoutingInfo, StatusSnapshot, UploadJobView, VersionInfo, PROTOCOL_VERSION,
 };
 
 #[cfg(unix)]
