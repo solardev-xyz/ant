@@ -20,7 +20,8 @@ use crate::fallback::not_implemented;
 use crate::handle::GatewayHandle;
 use crate::retrieval::GATEWAY_MAX_UPLOAD_BYTES;
 use crate::{
-    act, chain, chunk_stream, pins, retrieval, settlements, stamps, status, stewardship, tags,
+    act, chain, chunk_stream, pins, retrieval, settlements, stamps, status, stewardship, subscribe,
+    tags,
 };
 
 const SERVER_HEADER: &str = concat!("ant-gateway/", env!("CARGO_PKG_VERSION"));
@@ -123,6 +124,11 @@ pub fn build(handle: GatewayHandle) -> Router {
         // PSS: wrap+mine+stamp+push a trojan chunk to a target
         // neighborhood (bee `pss.go`). Light-node send.
         .route("/pss/send/{topic}/{targets}", post(retrieval::upload_pss))
+        // GSOC/PSS receive: pull-based lurker subscriptions streamed over
+        // WebSocket (bee `gsoc.go` / `pss.go` subscribe). Light-node
+        // receive without a reserve.
+        .route("/gsoc/subscribe/{address}", get(subscribe::gsoc_subscribe))
+        .route("/pss/subscribe/{topic}", get(subscribe::pss_subscribe))
         // Raw byte upload (PLAN.md J.2.5 / C1): bee-js feed payloads and
         // direct data uploads. Returns a `/bytes/<ref>` reference.
         .route("/bytes", post(retrieval::upload_bytes))

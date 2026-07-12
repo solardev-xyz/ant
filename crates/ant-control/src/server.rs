@@ -552,6 +552,12 @@ fn ack_to_response(ack: ControlAck) -> Response {
         ControlAck::UploadProgress(view) => Response::UploadProgress(view),
         ControlAck::PostageStatus(view) => Response::PostageStatus(view),
         ControlAck::PullsyncProbe(view) => Response::PullsyncProbe(view),
+        // Lurker message frames are a gateway WebSocket surface
+        // (`/gsoc/subscribe`, `/pss/subscribe`); the Unix-socket protocol
+        // doesn't expose the subscription command.
+        ControlAck::LurkerMessage { .. } => Response::Error {
+            message: "lurker subscriptions are only supported by ant-gateway".to_string(),
+        },
         // The Unix-socket protocol returns a single batch via
         // `PostageStatus`; the multi-batch list is an HTTP-gateway-only
         // surface (`GET /stamps`).

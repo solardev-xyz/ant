@@ -2452,6 +2452,69 @@ fn handle_control_command(
                 let _ = ack.send(ControlAck::PullsyncProbe(view));
             });
         }
+        ControlCommand::LurkerSubscribe {
+            target,
+            gsoc_addresses,
+            pss_topics,
+            ack,
+        } => {
+            use crate::lurker::{self, LurkerConfig};
+            use crate::messaging::{DecodedMessage, WatchState};
+
+            let watch = WatchState {
+                gsoc_addresses: gsoc_addresses.into_iter().collect(),
+                pss_topics,
+                // No persisted node PSS key yet: topic-broadcast reception
+                // only (the topic-derived key handles it). Directed PSS to
+                // the node's key lands when a pss.key is persisted.
+                pss_secret: None,
+            };
+            if watch.is_empty() {
+                // Nothing to watch — close the stream immediately.
+                return;
+            }
+            // All-zeros target → the node's own neighborhood (where PSS
+            // messages addressed to us land).
+            let target = if target == [0u8; 32] {
+                *state.routing.base()
+            } else {
+                target
+            };
+
+            let control = control.clone();
+            let peers = state.peers_watch.subscribe();
+            let neighborhood_dial = state.neighborhood_dial_tx.clone();
+            let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<DecodedMessage>(64);
+
+            // Forward decoded messages to the caller's ack stream; a send
+            // error (WS gone) drops `out_rx`, which stops the lurker.
+            tokio::spawn(async move {
+                while let Some(msg) = out_rx.recv().await {
+                    let frame = match msg {
+                        DecodedMessage::Gsoc { address, payload } => ControlAck::LurkerMessage {
+                            kind: "gsoc",
+                            key: hex::encode(address),
+                            payload,
+                        },
+                        DecodedMessage::Pss { topic, message } => ControlAck::LurkerMessage {
+                            kind: "pss",
+                            key: hex::encode(topic),
+                            payload: message,
+                        },
+                    };
+                    if ack.send(frame).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            tokio::spawn(lurker::run(
+                control,
+                peers,
+                neighborhood_dial,
+                LurkerConfig { target, watch },
+                out_tx,
+            ));
+        }
         ControlCommand::GetBytes {
             reference,
             bypass_cache,

@@ -566,6 +566,12 @@ async fn handle_command(store: &MemChunkStore, postage: &MemPostage, cmd: Contro
             };
             let _ = ack.send(reply);
         }
+        // Pullsync / lurker are live-network P2P surfaces the in-memory
+        // conformance node doesn't model; ack empty / drop the stream.
+        ControlCommand::PullsyncProbe { ack, .. } => {
+            let _ = ack.send(ControlAck::PullsyncProbe(Default::default()));
+        }
+        ControlCommand::LurkerSubscribe { .. } => {}
         ControlCommand::GetChunk { reference, ack } => {
             let reply = match store.fetch(reference).await {
                 Ok(data) => {
