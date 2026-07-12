@@ -101,6 +101,22 @@ pub enum ControlCommand {
         max_deliver: usize,
         ack: oneshot::Sender<ControlAck>,
     },
+    /// Start a GSOC/PSS lurker subscription: reside in the `target`
+    /// neighborhood, pull its bin live, and stream every decoded message
+    /// matching the watch set back as [`ControlAck::LurkerMessage`]
+    /// frames until the receiver is dropped. Backs the gateway's
+    /// `GET /gsoc/subscribe/{address}` and `GET /pss/subscribe/{topic}`
+    /// WebSocket endpoints. `target` all-zeros means "the node's own
+    /// overlay" (the neighborhood PSS messages to this node land in).
+    LurkerSubscribe {
+        target: [u8; 32],
+        /// Exact GSOC SOC addresses to watch (precise, offer-time filter).
+        gsoc_addresses: Vec<[u8; 32]>,
+        /// PSS topics to watch (`keccak256(topic_string)`); reception uses
+        /// the node's PSS key if present, else topic-broadcast.
+        pss_topics: Vec<[u8; 32]>,
+        ack: mpsc::Sender<ControlAck>,
+    },
     /// Walk the manifest at `reference`, resolve `path`, then join the
     /// resulting chunk tree into a single `Vec<u8>`. Acks with
     /// [`ControlAck::BzzBytes`] including any `Content-Type` metadata
@@ -664,6 +680,15 @@ pub enum ControlAck {
     },
     /// Terminal ack on `PullsyncProbe`.
     PullsyncProbe(PullsyncProbeView),
+    /// Non-terminal streaming frame on `LurkerSubscribe`: one decoded
+    /// GSOC/PSS message. `kind` is `"gsoc"` or `"pss"`; `key` is the SOC
+    /// address (gsoc) or topic (pss) as lowercase hex; `payload` is the
+    /// application bytes.
+    LurkerMessage {
+        kind: &'static str,
+        key: String,
+        payload: Vec<u8>,
+    },
     /// Successful `UploadStart`.
     UploadStarted {
         job_id: String,

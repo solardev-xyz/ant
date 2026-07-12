@@ -4,6 +4,7 @@ mod behaviour;
 mod dial;
 pub mod dnsaddr;
 mod handshake;
+pub mod lurker;
 pub mod messaging;
 mod peerstore;
 pub mod pseudosettle;

@@ -33,16 +33,19 @@ pub struct WatchState {
     pub gsoc_addresses: HashSet<[u8; 32]>,
     /// Registered PSS topics (`keccak256(topic_string)`).
     pub pss_topics: Vec<[u8; 32]>,
-    /// This node's PSS secret, if PSS receive is enabled.
+    /// This node's PSS secret, for messages encrypted directly to the
+    /// node's key. `None` still receives **topic-broadcast** PSS (messages
+    /// with no explicit recipient, decryptable via the topic-derived key).
     pub pss_secret: Option<[u8; 32]>,
 }
 
 impl WatchState {
     /// Whether anything is being watched — lets the driver skip the pull
-    /// loop entirely when idle.
+    /// loop entirely when idle. Registered topics count even without a
+    /// node secret (topic-broadcast reception needs none).
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.gsoc_addresses.is_empty() && (self.pss_topics.is_empty() || self.pss_secret.is_none())
+        self.gsoc_addresses.is_empty() && self.pss_topics.is_empty()
     }
 }
 
@@ -94,11 +97,14 @@ fn classify_gsoc(address: &[u8; 32], data: &[u8], watch: &WatchState) -> Option<
 }
 
 fn classify_pss(data: &[u8], watch: &WatchState) -> Option<DecodedMessage> {
-    let secret = watch.pss_secret.as_ref()?;
     if watch.pss_topics.is_empty() || data.len() != pss::TROJAN_DATA_SIZE {
         return None;
     }
-    let (topic, message) = pss::unwrap(secret, data, &watch.pss_topics)?;
+    // With no node secret, `unwrap` still tries the topic-derived key, so
+    // topic-broadcast messages are received; a zero secret is rejected by
+    // the direct ECDH path and falls through to that fallback.
+    let secret = watch.pss_secret.unwrap_or([0u8; 32]);
+    let (topic, message) = pss::unwrap(&secret, data, &watch.pss_topics)?;
     Some(DecodedMessage::Pss { topic, message })
 }
 
@@ -207,14 +213,39 @@ mod tests {
     #[test]
     fn empty_watch_short_circuits() {
         assert!(WatchState::default().is_empty());
+        // Registered topics count as active even without a node secret —
+        // topic-broadcast reception needs none.
         let only_topic = WatchState {
             pss_topics: vec![[0u8; 32]],
             pss_secret: None,
             ..Default::default()
         };
-        assert!(
-            only_topic.is_empty(),
-            "topics without a secret can't receive"
+        assert!(!only_topic.is_empty());
+    }
+
+    #[test]
+    fn decodes_topic_broadcast_pss_without_node_secret() {
+        // A sender broadcasts to a topic (no recipient); a lurker with the
+        // topic registered but NO node secret still decodes it.
+        let topic = topic_from_string("broadcast-room");
+        let (address, data) = wrap(
+            &topic,
+            b"hello room",
+            &Recipient::TopicDerived,
+            &[vec![0x00]],
+        )
+        .unwrap();
+        let watch = WatchState {
+            pss_topics: vec![topic],
+            pss_secret: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            classify(&address, &data, &watch),
+            Some(DecodedMessage::Pss {
+                topic,
+                message: b"hello room".to_vec(),
+            })
         );
     }
 }
