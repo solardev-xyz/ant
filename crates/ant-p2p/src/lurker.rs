@@ -28,9 +28,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
-/// How long to wait for peers/cursors before retrying when the
-/// neighborhood is momentarily uncovered.
-const RETRY_BACKOFF: Duration = Duration::from_millis(1500);
 /// Cap on the dedup set before it's cleared (bounds memory on a busy
 /// bin; a cleared entry can at worst re-deliver one message).
 const SEEN_CAP: usize = 8192;
@@ -299,19 +296,6 @@ fn closest_connected(
             proximity(b, target).cmp(&proximity(a, target))
         })
         .copied()
-}
-
-/// Wait for the peer set to change or the subscriber to drop. Returns
-/// `true` if the lurker should stop (channel closed).
-async fn wait_or_closed(
-    peers: &mut watch::Receiver<Vec<(PeerId, Overlay)>>,
-    out: &mpsc::Sender<DecodedMessage>,
-) -> bool {
-    tokio::select! {
-        () = out.closed() => true,
-        r = peers.changed() => r.is_err(),
-        () = tokio::time::sleep(RETRY_BACKOFF) => false,
-    }
 }
 
 #[cfg(test)]
