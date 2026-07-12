@@ -100,35 +100,40 @@ pub async fn run(
         PSS_BIN_WINDOW
     };
 
+    // One long-lived puller per (peer, bin). Pullers run **continuously** —
+    // we top up coverage for newly-connected peers on each tick but never
+    // abort a live puller, so a message is never dropped in a gap while the
+    // driver re-dials (an earlier design aborted-and-restarted every tick
+    // and lost messages that arrived during the re-reside window).
+    let mut active: std::collections::HashMap<(PeerId, u8), tokio::task::JoinHandle<()>> =
+        std::collections::HashMap::new();
+
+    // Dial deep into the neighborhood once up front so the first pullers
+    // hit real storers (a light node isn't resident by default).
+    reside(&mut peers, neighborhood_dial.as_ref(), &out, &target).await;
+
     loop {
         if out.is_closed() {
-            return;
+            break;
         }
-        // Dial into the target neighborhood and wait for the deepest
-        // covering peers we can get — a light node isn't resident in an
-        // arbitrary neighborhood by default, and a shallow peer that
-        // merely *forwards* the chunk deeper never sees the message.
-        reside(&mut peers, neighborhood_dial.as_ref(), &out, &target).await;
+        // Drop handles for pullers that ended (peer dropped / stream died).
+        active.retain(|_, h| !h.is_finished());
 
-        let covering = closest_n(&peers, &target, COVERING_PEERS);
-        if covering.is_empty() {
-            if wait_or_closed(&mut peers, &out).await {
-                return;
+        // Ensure a puller for each covering (peer, bin); add only the
+        // missing ones so existing pullers keep running uninterrupted.
+        for (peer_id, peer_overlay) in closest_n(&peers, &target, COVERING_PEERS) {
+            let base_bin = proximity(&peer_overlay, &target);
+            let top_bin = base_bin.saturating_add(window).min(MAX_BIN);
+            if (base_bin..=top_bin).all(|b| active.contains_key(&(peer_id, b))) {
+                continue; // already fully covered
             }
-            continue;
-        }
-
-        // Spawn a live puller per (peer, bin), all feeding the shared
-        // dedup + output. They keep running until we abort them at the
-        // next re-reside tick (or the subscriber leaves).
-        let mut tasks = Vec::new();
-        for (peer_id, peer_overlay) in &covering {
-            let base_bin = proximity(peer_overlay, &target);
-            let Ok(cursors) = pullsync::get_cursors(&mut control.clone(), *peer_id).await else {
+            let Ok(cursors) = pullsync::get_cursors(&mut control.clone(), peer_id).await else {
                 continue;
             };
-            let top_bin = base_bin.saturating_add(window).min(MAX_BIN);
             for bin in base_bin..=top_bin {
+                if active.contains_key(&(peer_id, bin)) {
+                    continue;
+                }
                 let start = cursors
                     .cursors
                     .get(bin as usize)
@@ -139,31 +144,39 @@ pub async fn run(
                     target: "ant_p2p::lurker",
                     peer = %peer_id, bin, start, "lurker pulling neighborhood bin",
                 );
-                tasks.push(tokio::spawn(pull_bin(
+                let handle = tokio::spawn(pull_bin(
                     control.clone(),
-                    *peer_id,
+                    peer_id,
                     bin,
                     start,
                     Arc::clone(&watch),
                     Arc::clone(&seen),
                     out.clone(),
-                )));
+                ));
+                active.insert((peer_id, bin), handle);
             }
         }
 
-        // Run the pullers until it's time to re-dial / re-pick, or the
-        // subscriber goes away.
+        // Hold residency and wait before the next top-up. The pullers keep
+        // running throughout — no gap.
         tokio::select! {
-            () = out.closed() => { abort_all(&tasks); return; }
+            () = out.closed() => break,
             () = tokio::time::sleep(RE_RESIDE_INTERVAL) => {}
         }
-        abort_all(&tasks);
+        if let Some(dial) = &neighborhood_dial {
+            let _ = dial.try_send(target);
+        }
+    }
+    for (_, h) in active {
+        h.abort();
     }
 }
 
-/// Live-pull one bin from one peer, forwarding decoded messages. Returns
-/// on stream error or round timeout (the parent re-spawns on its next
-/// re-reside tick) or when the subscriber leaves.
+/// Live-pull one bin from one peer, forwarding decoded messages. Runs
+/// until the peer's stream errors (peer likely gone → the driver drops
+/// this puller) or the subscriber leaves. A round timeout is *not* fatal:
+/// the server long-blocks on a quiet bin, so a timeout just means "no new
+/// chunk yet" and we re-open at the same `start`.
 async fn pull_bin(
     mut control: Control,
     peer_id: PeerId,
@@ -180,8 +193,10 @@ async fn pull_bin(
         let round = pullsync::sync_once(&mut control, peer_id, bin, start, |o: &OfferedChunk| {
             want(o, &watch)
         });
-        let Ok(Ok(page)) = tokio::time::timeout(SYNC_ROUND_TIMEOUT, round).await else {
-            return;
+        let page = match tokio::time::timeout(SYNC_ROUND_TIMEOUT, round).await {
+            Ok(Ok(page)) => page,
+            Ok(Err(_)) => return, // stream/peer error → drop this puller
+            Err(_) => continue,   // long-block timeout → re-open at same start
         };
         for chunk in &page.chunks {
             {
@@ -207,12 +222,6 @@ async fn pull_bin(
             }
         }
         start = page.topmost.saturating_add(1);
-    }
-}
-
-fn abort_all(tasks: &[tokio::task::JoinHandle<()>]) {
-    for t in tasks {
-        t.abort();
     }
 }
 
