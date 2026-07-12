@@ -4,6 +4,7 @@ mod behaviour;
 mod dial;
 pub mod dnsaddr;
 mod handshake;
+pub mod messaging;
 mod peerstore;
 pub mod pseudosettle;
 pub mod pullsync;
