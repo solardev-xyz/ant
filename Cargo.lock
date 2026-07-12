@@ -151,6 +151,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "k256",
+ "serde_json",
  "sha3 0.10.9",
  "thiserror 2.0.18",
 ]
