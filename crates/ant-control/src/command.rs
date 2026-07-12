@@ -8,7 +8,9 @@
 //! module, which is `#[cfg(unix)]`-gated; Windows builds get the types
 //! without the socket I/O.
 
-use crate::protocol::{AccountingSnapshotView, GetProgress, PostageStatusView, UploadJobView};
+use crate::protocol::{
+    AccountingSnapshotView, GetProgress, PostageStatusView, PullsyncProbeView, UploadJobView,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -75,6 +77,28 @@ pub enum ControlCommand {
     /// loop puts in `ControlAck::Bytes::data`.
     GetChunkRaw {
         reference: [u8; 32],
+        ack: oneshot::Sender<ControlAck>,
+    },
+    /// Run a bounded pullsync probe against the closest connected peer to
+    /// `target`: fetch its per-bin reserve cursors, then pull one page of
+    /// bin `bin` starting at binID `start`, requesting the delivery of
+    /// every offered chunk (bounded by `max_deliver`). This is the
+    /// GSOC/PSS lurker's underlying operation and the Exp-1 viability
+    /// probe (does a mainnet full node serve pullsync to our light peer?).
+    /// The node selects the peer via its routing table's proximity order.
+    /// The ack is [`ControlAck::PullsyncProbe`].
+    PullsyncProbe {
+        /// Overlay to select the closest connected peer to (and, by
+        /// default, the bin is that peer's proximity order to it).
+        target: [u8; 32],
+        /// Bin to pull. `None` = the closest peer's proximity-order bin
+        /// to `target` (the neighborhood bin a lurker cares about).
+        bin: Option<u8>,
+        /// Start binID (inclusive). `None` = the peer's cursor for the
+        /// bin (only newer chunks).
+        start: Option<u64>,
+        /// Cap on chunks whose delivery to actually request this page.
+        max_deliver: usize,
         ack: oneshot::Sender<ControlAck>,
     },
     /// Walk the manifest at `reference`, resolve `path`, then join the
@@ -638,6 +662,8 @@ pub enum ControlAck {
     Retrievable {
         retrievable: bool,
     },
+    /// Terminal ack on `PullsyncProbe`.
+    PullsyncProbe(PullsyncProbeView),
     /// Successful `UploadStart`.
     UploadStarted {
         job_id: String,

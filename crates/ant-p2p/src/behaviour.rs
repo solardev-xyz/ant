@@ -2369,6 +2369,89 @@ fn handle_control_command(
                 let _ = ack.send(reply);
             });
         }
+        ControlCommand::PullsyncProbe {
+            target,
+            bin,
+            start,
+            max_deliver,
+            ack,
+        } => {
+            use crate::pullsync;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            // Pick the connected peer closest to the target overlay — the
+            // one whose reserve most likely holds the neighborhood's
+            // chunks. Fall back to any peer if routing is empty but the
+            // peer snapshot isn't.
+            let peer = state
+                .routing
+                .closest_peer(&target, &[])
+                .or_else(|| state.peers_watch.subscribe().borrow().first().copied());
+            let Some((peer_id, peer_overlay)) = peer else {
+                let _ = ack.send(ControlAck::PullsyncProbe(ant_control::PullsyncProbeView {
+                    error: "no connected peer to probe (wait for handshakes)".into(),
+                    ..Default::default()
+                }));
+                return;
+            };
+            // The chunks near `target` sit in the server's proximity-order
+            // bin to that address, unless the caller pinned a bin.
+            let probe_bin =
+                bin.unwrap_or_else(|| crate::routing::proximity(&peer_overlay, &target));
+            let control = control.clone();
+            tokio::spawn(async move {
+                let mut view = ant_control::PullsyncProbeView {
+                    peer_overlay: hex::encode(peer_overlay),
+                    peer_id: peer_id.to_string(),
+                    bin: probe_bin,
+                    ..Default::default()
+                };
+
+                let t0 = std::time::Instant::now();
+                let cursors = pullsync::get_cursors(&mut control.clone(), peer_id).await;
+                view.cursors_ms = t0.elapsed().as_millis() as u64;
+                let cursor_for_bin = match cursors {
+                    Ok(c) => {
+                        view.cursors_ok = true;
+                        view.epoch = c.epoch;
+                        let cur = c.cursors.get(probe_bin as usize).copied().unwrap_or(0);
+                        view.bin_cursor = cur;
+                        cur
+                    }
+                    Err(e) => {
+                        view.error = format!("cursors: {e}");
+                        let _ = ack.send(ControlAck::PullsyncProbe(view));
+                        return;
+                    }
+                };
+
+                let sync_start = start.unwrap_or(cursor_for_bin.saturating_add(1));
+                view.start = sync_start;
+                let wanted = AtomicUsize::new(0);
+                let t1 = std::time::Instant::now();
+                let page = pullsync::sync_once(
+                    &mut control.clone(),
+                    peer_id,
+                    probe_bin,
+                    sync_start,
+                    |_offered| wanted.fetch_add(1, Ordering::Relaxed) < max_deliver,
+                )
+                .await;
+                view.sync_ms = t1.elapsed().as_millis() as u64;
+                match page {
+                    Ok(p) => {
+                        view.sync_ok = true;
+                        view.topmost = p.topmost;
+                        view.offered = wanted.load(Ordering::Relaxed);
+                        view.delivered = p.chunks.len();
+                    }
+                    Err(e) => {
+                        view.error = format!("sync: {e}");
+                    }
+                }
+                let _ = ack.send(ControlAck::PullsyncProbe(view));
+            });
+        }
         ControlCommand::GetBytes {
             reference,
             bypass_cache,

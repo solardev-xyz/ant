@@ -31,9 +31,11 @@ const TREE_TIMEOUT: Duration = Duration::from_secs(75);
 
 const fn timeout_for(request: &Request) -> Duration {
     match request {
-        Request::GetBytes { .. } | Request::GetBzz { .. } | Request::UploadFollow { .. } => {
-            TREE_TIMEOUT
-        }
+        Request::GetBytes { .. }
+        | Request::GetBzz { .. }
+        | Request::UploadFollow { .. }
+        // A pullsync page can long-block server-side on an empty live bin.
+        | Request::PullsyncProbe { .. } => TREE_TIMEOUT,
         _ => DEFAULT_TIMEOUT,
     }
 }

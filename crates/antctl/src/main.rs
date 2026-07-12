@@ -51,6 +51,24 @@ enum Command {
         #[command(subcommand)]
         command: PeersCommand,
     },
+    /// Probe the daemon's pullsync-client path against a live peer: pick
+    /// the connected peer closest to `target`, fetch its reserve cursors,
+    /// and pull one page of the neighborhood bin. Validates the GSOC/PSS
+    /// lurker receive path (Exp-1). Requires a running, connected `antd`.
+    Pullsync {
+        /// Target overlay (64 hex chars, optional `0x`). Chunks near this
+        /// address are what a lurker would pull.
+        target: String,
+        /// Force a specific bin instead of the peer's proximity to target.
+        #[arg(long)]
+        bin: Option<u8>,
+        /// Start binID (default: the peer's cursor for the bin → new only).
+        #[arg(long)]
+        start: Option<u64>,
+        /// Max chunk deliveries to request this page.
+        #[arg(long, default_value_t = 16)]
+        max_deliver: usize,
+    },
     /// Postage batch lifecycle on Gnosis: createBatch, topUp,
     /// increaseDepth, list (read-only). All variants talk directly to
     /// the chain — `antd` does not need to be running.
@@ -692,6 +710,47 @@ fn main() -> Result<()> {
                         println!("{}", serde_json::json!({ "ok": true, "message": message }));
                     } else {
                         println!("{message}");
+                    }
+                }
+                Response::Error { message } => bail!("antd: {message}"),
+                other => bail!("unexpected response: {other:?}"),
+            }
+        }
+        Command::Pullsync {
+            target,
+            bin,
+            start,
+            max_deliver,
+        } => {
+            let resp = request_sync(
+                &socket,
+                &Request::PullsyncProbe {
+                    target: target.clone(),
+                    bin,
+                    start,
+                    max_deliver: Some(max_deliver),
+                },
+            )
+            .with_context(|| format!("talk to antd at {}", socket.display()))?;
+            match resp {
+                Response::PullsyncProbe(v) => {
+                    if opt.json {
+                        println!("{}", serde_json::to_string_pretty(&v)?);
+                    } else if v.error.is_empty() {
+                        println!(
+                            "peer {} (…{})\n  bin {}  cursor {}  epoch {}  ({} ms)\n  page start {}  topmost {}  offered {}  delivered {}  ({} ms)",
+                            v.peer_overlay.get(..12).unwrap_or(&v.peer_overlay),
+                            v.peer_id.get(v.peer_id.len().saturating_sub(6)..).unwrap_or(""),
+                            v.bin, v.bin_cursor, v.epoch, v.cursors_ms,
+                            v.start, v.topmost, v.offered, v.delivered, v.sync_ms,
+                        );
+                        println!("cursors_ok={}  sync_ok={}", v.cursors_ok, v.sync_ok);
+                    } else {
+                        println!(
+                            "peer {} — probe error: {}",
+                            v.peer_overlay.get(..12).unwrap_or("(none)"),
+                            v.error
+                        );
                     }
                 }
                 Response::Error { message } => bail!("antd: {message}"),

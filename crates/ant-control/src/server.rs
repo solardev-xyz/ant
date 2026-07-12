@@ -331,6 +331,38 @@ async fn handle_connection(
             .await;
             write_response(&mut write_half, &response).await?;
         }
+        Ok(Request::PullsyncProbe {
+            target,
+            bin,
+            start,
+            max_deliver,
+        }) => match parse_reference(&target) {
+            Ok(target) => {
+                // The probe can long-block server-side on an empty live
+                // bin; give it the network timeout, not the fast one.
+                let response =
+                    dispatch_oneshot(command_tx.as_ref(), NETWORK_COMMAND_TIMEOUT, |ack| {
+                        ControlCommand::PullsyncProbe {
+                            target,
+                            bin,
+                            start,
+                            max_deliver: max_deliver.unwrap_or(16),
+                            ack,
+                        }
+                    })
+                    .await;
+                write_response(&mut write_half, &response).await?;
+            }
+            Err(e) => {
+                write_response(
+                    &mut write_half,
+                    &Response::Error {
+                        message: format!("bad request: {e}"),
+                    },
+                )
+                .await?;
+            }
+        },
         Ok(Request::PutChunkLocal { wire_hex }) => match parse_chunk_wire(&wire_hex) {
             Ok(wire) => {
                 let response = dispatch_oneshot(command_tx.as_ref(), FAST_COMMAND_TIMEOUT, |ack| {
@@ -519,6 +551,7 @@ fn ack_to_response(ack: ControlAck) -> Response {
         ControlAck::UploadList(views) => Response::UploadList { jobs: views },
         ControlAck::UploadProgress(view) => Response::UploadProgress(view),
         ControlAck::PostageStatus(view) => Response::PostageStatus(view),
+        ControlAck::PullsyncProbe(view) => Response::PullsyncProbe(view),
         // The Unix-socket protocol returns a single batch via
         // `PostageStatus`; the multi-batch list is an HTTP-gateway-only
         // surface (`GET /stamps`).
