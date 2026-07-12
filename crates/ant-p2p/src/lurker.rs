@@ -24,6 +24,7 @@ use crate::routing::{proximity, Overlay};
 use libp2p::PeerId;
 use libp2p_stream::Control;
 use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
@@ -38,10 +39,30 @@ const SEEN_CAP: usize = 8192;
 /// neighborhood and re-pick a deeper covering peer.
 const SYNC_ROUND_TIMEOUT: Duration = Duration::from_secs(20);
 /// Time budget spent dialing toward the target neighborhood and waiting
-/// for a deeper covering peer to connect before each pull.
-const RESIDE_BUDGET: Duration = Duration::from_secs(8);
+/// for deeper covering peers to connect before each pull. A light node
+/// isn't resident in an arbitrary neighborhood, so — like the retrieval
+/// path's dial-and-await-deeper — we spend real time pulling the actual
+/// storers (which sit at the network storage radius, ~bin 11–14) into our
+/// connection set before pulling.
+const RESIDE_BUDGET: Duration = Duration::from_secs(15);
 /// One reside wait step.
-const RESIDE_STEP: Duration = Duration::from_millis(800);
+const RESIDE_STEP: Duration = Duration::from_millis(700);
+/// How often the driver re-dials, re-picks covering peers, and restarts
+/// its pull tasks so it tracks peer churn.
+const RE_RESIDE_INTERVAL: Duration = Duration::from_secs(30);
+/// Number of closest connected peers to pull from concurrently. A
+/// freshly-pushed chunk lands on the storer(s) nearest its address and
+/// replicates outward; pulling several covering peers catches it
+/// regardless of which one got (or replicated) it first — the difference
+/// between reliable and flaky reception on a light node.
+const COVERING_PEERS: usize = 5;
+/// Extra deeper bins to pull past the base neighborhood bin. GSOC's watch
+/// target *is* the chunk address, so its base bin is exact; PSS mines a
+/// short overlay prefix, so the chunk can sit a few bins deeper on a given
+/// peer — this window covers that without pulling the whole reserve.
+const PSS_BIN_WINDOW: u8 = 3;
+/// Highest proximity-order bin.
+const MAX_BIN: u8 = 31;
 
 /// A live lurker subscription: the target neighborhood and what to watch.
 pub struct LurkerConfig {
@@ -59,7 +80,7 @@ pub struct LurkerConfig {
 /// dial primitive from the retrieval path). `peers` is the live
 /// connected-peer snapshot the swarm publishes.
 pub async fn run(
-    mut control: Control,
+    control: Control,
     mut peers: watch::Receiver<Vec<(PeerId, Overlay)>>,
     neighborhood_dial: Option<mpsc::Sender<[u8; 32]>>,
     config: LurkerConfig,
@@ -69,85 +90,144 @@ pub async fn run(
     if watch.is_empty() {
         return;
     }
-    let mut seen: HashSet<[u8; 32]> = HashSet::new();
+    let watch = Arc::new(watch);
+    let seen: Arc<Mutex<HashSet<[u8; 32]>>> = Arc::new(Mutex::new(HashSet::new()));
+    // Deeper bins only matter for PSS (unknown address); GSOC's base bin
+    // is exact.
+    let window = if watch.pss_topics.is_empty() {
+        0
+    } else {
+        PSS_BIN_WINDOW
+    };
 
     loop {
         if out.is_closed() {
             return;
         }
         // Dial into the target neighborhood and wait for the deepest
-        // covering peer we can get — a light node isn't resident in an
-        // arbitrary neighborhood by default, and pulling from a shallow
-        // peer that merely *forwards* the chunk deeper (rather than
-        // storing it) never sees the message.
+        // covering peers we can get — a light node isn't resident in an
+        // arbitrary neighborhood by default, and a shallow peer that
+        // merely *forwards* the chunk deeper never sees the message.
         reside(&mut peers, neighborhood_dial.as_ref(), &out, &target).await;
 
-        let Some((peer_id, peer_overlay)) = closest_connected(&peers, &target) else {
-            // No covering peer yet; wait for the peer set to change.
+        let covering = closest_n(&peers, &target, COVERING_PEERS);
+        if covering.is_empty() {
             if wait_or_closed(&mut peers, &out).await {
                 return;
             }
             continue;
-        };
-        let bin = proximity(&peer_overlay, &target);
+        }
 
-        // Cursor for this bin → start live from the next binID.
-        let mut start = if let Ok(c) = pullsync::get_cursors(&mut control, peer_id).await {
-            let cur = c.cursors.get(bin as usize).copied().unwrap_or(0);
-            tracing::info!(
-                target: "ant_p2p::lurker",
-                peer = %peer_id, bin, cursor = cur,
-                "lurker pulling neighborhood bin",
-            );
-            cur.saturating_add(1)
-        } else {
-            tokio::time::sleep(RETRY_BACKOFF).await;
-            continue;
-        };
-
-        // Pull this peer's bin until it drops or errors, then re-pick.
-        loop {
-            if out.is_closed() {
-                return;
-            }
-            // A peer/stream error, or the round timeout (so we periodically
-            // re-dial and re-pick a deeper peer), breaks out to re-reside.
-            let round =
-                pullsync::sync_once(&mut control, peer_id, bin, start, |o: &OfferedChunk| {
-                    want(o, &watch)
-                });
-            let Ok(Ok(page)) = tokio::time::timeout(SYNC_ROUND_TIMEOUT, round).await else {
-                break;
+        // Spawn a live puller per (peer, bin), all feeding the shared
+        // dedup + output. They keep running until we abort them at the
+        // next re-reside tick (or the subscriber leaves).
+        let mut tasks = Vec::new();
+        for (peer_id, peer_overlay) in &covering {
+            let base_bin = proximity(peer_overlay, &target);
+            let Ok(cursors) = pullsync::get_cursors(&mut control.clone(), *peer_id).await else {
+                continue;
             };
-            if !page.chunks.is_empty() {
+            let top_bin = base_bin.saturating_add(window).min(MAX_BIN);
+            for bin in base_bin..=top_bin {
+                let start = cursors
+                    .cursors
+                    .get(bin as usize)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(1);
                 tracing::info!(
                     target: "ant_p2p::lurker",
-                    delivered = page.chunks.len(), topmost = page.topmost,
-                    "lurker page delivered chunks",
+                    peer = %peer_id, bin, start, "lurker pulling neighborhood bin",
                 );
-            }
-            for chunk in &page.chunks {
-                if !seen.insert(chunk.address) {
-                    continue;
-                }
-                if seen.len() > SEEN_CAP {
-                    seen.clear();
-                    seen.insert(chunk.address);
-                }
-                if let Some(msg) = classify(&chunk.address, &chunk.data, &watch) {
-                    if out.send(msg).await.is_err() {
-                        return; // subscriber gone
-                    }
-                }
-            }
-            // Advance. If the peer is still the closest, keep pulling;
-            // otherwise fall back out to re-pick.
-            start = page.topmost.saturating_add(1);
-            if !still_closest(&peers, &target, &peer_id) {
-                break;
+                tasks.push(tokio::spawn(pull_bin(
+                    control.clone(),
+                    *peer_id,
+                    bin,
+                    start,
+                    Arc::clone(&watch),
+                    Arc::clone(&seen),
+                    out.clone(),
+                )));
             }
         }
+
+        // Run the pullers until it's time to re-dial / re-pick, or the
+        // subscriber goes away.
+        tokio::select! {
+            () = out.closed() => { abort_all(&tasks); return; }
+            () = tokio::time::sleep(RE_RESIDE_INTERVAL) => {}
+        }
+        abort_all(&tasks);
     }
+}
+
+/// Live-pull one bin from one peer, forwarding decoded messages. Returns
+/// on stream error or round timeout (the parent re-spawns on its next
+/// re-reside tick) or when the subscriber leaves.
+async fn pull_bin(
+    mut control: Control,
+    peer_id: PeerId,
+    bin: u8,
+    mut start: u64,
+    watch: Arc<WatchState>,
+    seen: Arc<Mutex<HashSet<[u8; 32]>>>,
+    out: mpsc::Sender<DecodedMessage>,
+) {
+    loop {
+        if out.is_closed() {
+            return;
+        }
+        let round = pullsync::sync_once(&mut control, peer_id, bin, start, |o: &OfferedChunk| {
+            want(o, &watch)
+        });
+        let Ok(Ok(page)) = tokio::time::timeout(SYNC_ROUND_TIMEOUT, round).await else {
+            return;
+        };
+        for chunk in &page.chunks {
+            {
+                let mut s = seen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !s.insert(chunk.address) {
+                    continue;
+                }
+                if s.len() > SEEN_CAP {
+                    s.clear();
+                    s.insert(chunk.address);
+                }
+            }
+            if let Some(msg) = classify(&chunk.address, &chunk.data, &watch) {
+                tracing::info!(
+                    target: "ant_p2p::lurker",
+                    peer = %peer_id, bin, "lurker decoded a message",
+                );
+                if out.send(msg).await.is_err() {
+                    return;
+                }
+            }
+        }
+        start = page.topmost.saturating_add(1);
+    }
+}
+
+fn abort_all(tasks: &[tokio::task::JoinHandle<()>]) {
+    for t in tasks {
+        t.abort();
+    }
+}
+
+/// The `n` connected peers whose overlays are closest to `target`,
+/// deepest first.
+fn closest_n(
+    peers: &watch::Receiver<Vec<(PeerId, Overlay)>>,
+    target: &[u8; 32],
+    n: usize,
+) -> Vec<(PeerId, Overlay)> {
+    let mut v: Vec<(PeerId, Overlay)> = peers.borrow().clone();
+    // Deepest proximity first (descending).
+    v.sort_by_key(|(_, ov)| std::cmp::Reverse(proximity(ov, target)));
+    v.truncate(n);
+    v
 }
 
 /// Decide whether to request a chunk's delivery. GSOC is precise (exact
@@ -162,11 +242,14 @@ fn want(offered: &OfferedChunk, watch: &WatchState) -> bool {
     !watch.pss_topics.is_empty()
 }
 
-/// Dial toward `target` and wait (up to [`RESIDE_BUDGET`]) for the
-/// deepest covering peer to connect, so we pull from an actual storer of
-/// the neighborhood rather than a shallow forwarder. Repeatedly pings the
-/// neighborhood dialer and re-checks the closest peer's proximity,
-/// returning early once it stops improving.
+/// Dial toward `target` for the full [`RESIDE_BUDGET`], pulling the
+/// neighborhood's actual storers into our connection set before we pull.
+/// A light node isn't resident in an arbitrary neighborhood, and the
+/// storers sit at the network storage radius — so, like the retrieval
+/// path, we keep re-issuing the neighborhood dial the whole time rather
+/// than stopping at the first plateau (deep peers can take several
+/// seconds and multiple dial rounds to connect). Returns early only if
+/// we hit the deepest possible bin or the subscriber leaves.
 async fn reside(
     peers: &mut watch::Receiver<Vec<(PeerId, Overlay)>>,
     neighborhood_dial: Option<&mpsc::Sender<[u8; 32]>>,
@@ -174,28 +257,17 @@ async fn reside(
     target: &[u8; 32],
 ) {
     let start = tokio::time::Instant::now();
-    let mut best = current_proximity(peers, target);
-    let mut stable_rounds = 0u8;
     while start.elapsed() < RESIDE_BUDGET && !out.is_closed() {
         if let Some(dial) = neighborhood_dial {
             let _ = dial.try_send(*target);
         }
-        // Wait for the peer set to change, or a step to elapse.
+        if current_proximity(peers, target) >= MAX_BIN {
+            return; // can't get any deeper
+        }
         tokio::select! {
             () = out.closed() => return,
             r = peers.changed() => if r.is_err() { return; },
             () = tokio::time::sleep(RESIDE_STEP) => {}
-        }
-        let now = current_proximity(peers, target);
-        if now > best {
-            best = now;
-            stable_rounds = 0;
-        } else {
-            stable_rounds += 1;
-            // Two quiet rounds with no improvement → deep enough / stuck.
-            if stable_rounds >= 2 {
-                break;
-            }
         }
     }
 }
@@ -218,15 +290,6 @@ fn closest_connected(
             proximity(b, target).cmp(&proximity(a, target))
         })
         .copied()
-}
-
-/// Is `peer` still the closest connected peer to `target`?
-fn still_closest(
-    peers: &watch::Receiver<Vec<(PeerId, Overlay)>>,
-    target: &[u8; 32],
-    peer: &PeerId,
-) -> bool {
-    closest_connected(peers, target).is_some_and(|(p, _)| &p == peer)
 }
 
 /// Wait for the peer set to change or the subscriber to drop. Returns
