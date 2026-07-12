@@ -738,6 +738,7 @@ impl Liveness {
 fn is_fatal_push_error(message: &str) -> bool {
     const FATAL_MARKERS: &[&str] = &[
         "not usable",         // batch id not registered
+        "not found on-chain", // peers reject the stamp: phantom batch (deterministic)
         "saturated",          // immutable batch collision bucket full
         "stamp issue failed", // postage signing dead-end
         "wire size out of range",

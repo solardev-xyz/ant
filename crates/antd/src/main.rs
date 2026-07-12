@@ -1370,6 +1370,58 @@ async fn build_upload_runtime(
                     match ant_postage::StampIssuer::open_existing(path.clone()) {
                         Ok(iss) => {
                             let id = *iss.batch_id();
+                            // Phantom-batch guard (2026-07-12): a
+                            // persisted issuer proves only that WE once
+                            // held the batch — not that the chain still
+                            // does (expiry evicts it; a failed/foreign-
+                            // chain buy never registered it). Storer
+                            // peers validate every stamp against their
+                            // chain-synced batchstore, so an
+                            // unconfirmable batch means every push is
+                            // rejected while /stamps reads green.
+                            // When an RPC is configured, confirm each
+                            // reloaded batch on-chain and SKIP the ones
+                            // the chain disowns (the .bin stays on disk
+                            // — a later re-buy or re-sync recovers).
+                            // RPC read errors keep the batch
+                            // (unconfirmed ≠ dead); no RPC keeps the
+                            // historical trust-the-disk behaviour.
+                            if let Some(rpc) = rpc_url.clone() {
+                                let chain = ant_chain::ChainClient::new(rpc);
+                                match ant_chain::fetch_postage_batch_meta(
+                                    &chain,
+                                    &postage_contract,
+                                    &id,
+                                )
+                                .await
+                                {
+                                    Ok(meta) if meta.batch_owner_eth == [0u8; 20] => {
+                                        tracing::warn!(
+                                            target: "antd",
+                                            batch = %format!("0x{}", hex::encode(id)),
+                                            store = %path.display(),
+                                            "persisted batch NOT FOUND on-chain (expired or never created) — not registering it; uploads with it would be rejected by every storer",
+                                        );
+                                        continue;
+                                    }
+                                    Ok(meta) if meta.batch_owner_eth != batch_owner => {
+                                        tracing::warn!(
+                                            target: "antd",
+                                            batch = %format!("0x{}", hex::encode(id)),
+                                            on_chain_owner = %format!("0x{}", hex::encode(meta.batch_owner_eth)),
+                                            our_owner = %format!("0x{}", hex::encode(batch_owner)),
+                                            "persisted batch is owned by a different key on-chain — not registering it (stamps we sign would be rejected)",
+                                        );
+                                        continue;
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => tracing::warn!(
+                                        target: "antd",
+                                        batch = %format!("0x{}", hex::encode(id)),
+                                        "could not confirm persisted batch on-chain ({e}); registering it unverified",
+                                    ),
+                                }
+                            }
                             tracing::info!(
                                 target: "antd",
                                 batch = %format!("0x{}", hex::encode(id)),

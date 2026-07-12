@@ -771,6 +771,12 @@ impl RoutingFetcher {
 
         // Hard-failure budget (bee `sentErrorsLeft = maxPushErrors`).
         let mut errors_left: i32 = Self::MAX_PUSH_ERRORS as i32;
+        // Distinct peers that rejected the STAMP (phantom-batch
+        // signature). Two independent storers agreeing the batch isn't
+        // on chain is decisive — abort the walk instead of hedging
+        // through the whole candidate set.
+        let mut stamp_rejecters: Vec<PeerId> = Vec::new();
+        let mut stamp_reject_sample = String::new();
         let mut shallow_attempts: u32 = 0;
         let mut shallow_seen = false;
         // Most recent shallow receipt's (po, storage_radius), so the
@@ -957,6 +963,28 @@ impl RoutingFetcher {
                             dispatch!(peer, overlay, price, 150u64);
                         }
                         Err(e) => {
+                            if is_stamp_rejection(&e) {
+                                if !stamp_rejecters.contains(&peer) {
+                                    stamp_rejecters.push(peer);
+                                }
+                                stamp_reject_sample = e.to_string();
+                                if stamp_rejecters.len() >= 2 {
+                                    let mut batch_id = [0u8; 32];
+                                    batch_id.copy_from_slice(&stamp[..32]);
+                                    warn!(
+                                        target: "ant_retrieval::fetcher",
+                                        addr = %hex::encode(chunk_addr),
+                                        batch = %hex::encode(batch_id),
+                                        rejecters = stamp_rejecters.len(),
+                                        "peers reject the postage stamp as an unknown batch — aborting the walk (not retryable)",
+                                    );
+                                    return Err(PushSyncError::StampRejected {
+                                        batch_id,
+                                        rejections: stamp_rejecters.len() as u32,
+                                        sample: stamp_reject_sample,
+                                    });
+                                }
+                            }
                             warn!(
                                 target: "ant_retrieval::fetcher",
                                 %peer,
@@ -1021,6 +1049,19 @@ impl RoutingFetcher {
             let target = self.best_connected_po(&chunk_addr).saturating_add(1);
             self.dial_and_await_deeper(&chunk_addr, target).await;
         }
+        // A walk that ended with nobody accepting AND at least one
+        // stamp rejection is classified as a stamp problem: any peer
+        // that considered the batch valid would have receipted.
+        if let Some(first) = stamp_rejecters.first() {
+            let _ = first;
+            let mut batch_id = [0u8; 32];
+            batch_id.copy_from_slice(&stamp[..32]);
+            return Err(PushSyncError::StampRejected {
+                batch_id,
+                rejections: stamp_rejecters.len() as u32,
+                sample: stamp_reject_sample,
+            });
+        }
         Err(PushSyncError::Remote(format!(
             "exhausted pushsync peers (last: {})",
             last_err.map_or_else(|| "unknown".to_string(), |e| e.to_string()),
@@ -1040,6 +1081,22 @@ fn straggler_patience() -> bool {
             !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
         }
     })
+}
+
+/// `true` when a peer's pushsync error means it REJECTED THE STAMP —
+/// bee's stamp validation failing against its chain-synced batchstore
+/// (`invalid stamp: batchstore get: … not found`, `batch not found`,
+/// `invalid batch id`…). Message-based because the rejection arrives
+/// as bee's free-text `Receipt.err`. Deliberately narrow: only
+/// batch-existence/validity phrasings count, not signature/bucket
+/// errors (those are OUR bug, not a phantom batch).
+fn is_stamp_rejection(err: &crate::pushsync::PushSyncError) -> bool {
+    let crate::pushsync::PushSyncError::Remote(m) = err else {
+        return false;
+    };
+    let m = m.to_ascii_lowercase();
+    m.contains("invalid stamp")
+        && (m.contains("not found") || m.contains("batchstore") || m.contains("unknown batch"))
 }
 
 /// `true` for the one `PushSyncError` worth a single fast retry on a
@@ -2091,5 +2148,29 @@ mod tests {
             1,
             "bypass must not read or delete the planted disk row",
         );
+    }
+
+    #[test]
+    fn stamp_rejection_classifier_matches_bee_phrasings() {
+        use crate::pushsync::PushSyncError as E;
+        // The live bee 2.8 rejection observed in the field report.
+        assert!(is_stamp_rejection(&E::Remote(
+            "invalid stamp: batchstore get: get batch de33180c: storage: not found, not found"
+                .into()
+        )));
+        assert!(is_stamp_rejection(&E::Remote(
+            "invalid stamp: unknown batch".into()
+        )));
+        // Signature/bucket stamp problems are OUR bug, not a phantom
+        // batch — must not trip the classifier.
+        assert!(!is_stamp_rejection(&E::Remote(
+            "invalid stamp: signature recovery failed".into()
+        )));
+        assert!(!is_stamp_rejection(&E::Remote(
+            "could not push chunk".into()
+        )));
+        assert!(!is_stamp_rejection(&E::Timeout(
+            std::time::Duration::from_secs(1)
+        )));
     }
 }

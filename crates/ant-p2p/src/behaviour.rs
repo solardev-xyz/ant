@@ -84,8 +84,12 @@ type FeedHints = Arc<std::sync::Mutex<HashMap<([u8; 20], [u8; 32]), u64>>>;
 /// Map a [`ant_postage::BucketStats`] snapshot to the control-plane
 /// [`ant_control::PostageStatusView`] reported over `PostageStatus` /
 /// `PostageList`.
-fn postage_status_view(stats: &ant_postage::BucketStats) -> ant_control::PostageStatusView {
+fn postage_status_view(
+    stats: &ant_postage::BucketStats,
+    usable: bool,
+) -> ant_control::PostageStatusView {
     ant_control::PostageStatusView {
+        usable,
         enabled: true,
         batch_id: format!("0x{}", hex::encode(stats.batch_id)),
         batch_depth: stats.batch_depth,
@@ -878,6 +882,14 @@ struct SwarmState {
     /// only when `ANT_PUSH_INFLIGHT_CAP` is set — one build serves
     /// both A/B benchmark arms.
     push_load: Option<Arc<ant_retrieval::PushLoadTracker>>,
+    /// Batches storer peers have rejected as not-on-chain (peer-
+    /// attested phantom batches). Fed by the push paths on
+    /// `StampRejected`; consulted by `PostageStatus`/`PostageList` so
+    /// `/stamps` stops reporting a dead batch as usable after the
+    /// first failed push. Process-lifetime only — a batch that later
+    /// syncs on-chain recovers on restart (or next successful push
+    /// clears it).
+    rejected_batches: Arc<std::sync::Mutex<HashSet<[u8; 32]>>>,
     /// Last successfully-resolved sequence-feed index per
     /// `(owner, topic)` (perf-lab Experiment 6b). Sequence feeds are
     /// append-only, so a previously-resolved index is always a valid
@@ -962,6 +974,7 @@ impl SwarmState {
             credit_ledger: None,
             push_skip: ant_retrieval::PushSkipCache::new(),
             push_load: ant_retrieval::PushLoadTracker::from_env().map(Arc::new),
+            rejected_batches: Arc::new(std::sync::Mutex::new(HashSet::new())),
             feed_hints: Arc::new(std::sync::Mutex::new(HashMap::new())),
             hot_hint: None,
             known_dialable: HashMap::new(),
@@ -2755,7 +2768,11 @@ fn handle_control_command(
                         .values()
                         .next()
                         .map_or_else(postage_status_disabled, |iss| {
-                            postage_status_view(&iss.stats())
+                            let rejected = state
+                                .rejected_batches
+                                .lock()
+                                .is_ok_and(|s| s.contains(iss.batch_id()));
+                            postage_status_view(&iss.stats(), !rejected)
                         })
                 }
                 None => postage_status_disabled(),
@@ -2773,7 +2790,13 @@ fn handle_control_command(
                     };
                     issuers
                         .values()
-                        .map(|iss| postage_status_view(&iss.stats()))
+                        .map(|iss| {
+                            let rejected = state
+                                .rejected_batches
+                                .lock()
+                                .is_ok_and(|s| s.contains(iss.batch_id()));
+                            postage_status_view(&iss.stats(), !rejected)
+                        })
                         .collect()
                 }
                 None => Vec::new(),
@@ -3452,6 +3475,17 @@ async fn push_with_patience(
                 return Ok(());
             }
             Err(e) => {
+                // A stamp rejection is deterministic across honest
+                // storers — re-walking or falling back to shallow can
+                // never help, and burning the patience budget turns an
+                // instant clear failure into a slow opaque one
+                // (phantom-batch report).
+                if matches!(
+                    e,
+                    ant_retrieval::pushsync::PushSyncError::StampRejected { .. }
+                ) {
+                    return Err(e);
+                }
                 if started.elapsed() >= budget {
                     // Strict SOCs get one final bee-aligned
                     // shallow-accepting walk before we give up: stored
@@ -3502,6 +3536,37 @@ fn gateway_push_patience() -> Duration {
     }))
 }
 
+/// Maintain the peer-attested phantom-batch set: a `StampRejected`
+/// outcome marks the stamp's batch rejected (so `/stamps` turns
+/// `usable:false` after the first failed push); any successful push
+/// with the batch clears it (a batch that synced late recovers).
+fn note_stamp_outcome(
+    rejected: &Arc<std::sync::Mutex<HashSet<[u8; 32]>>>,
+    stamp: &[u8; ant_postage::STAMP_SIZE],
+    err: Option<&ant_retrieval::pushsync::PushSyncError>,
+) {
+    let mut batch_id = [0u8; 32];
+    batch_id.copy_from_slice(&stamp[..32]);
+    let Ok(mut set) = rejected.lock() else {
+        return;
+    };
+    match err {
+        Some(ant_retrieval::pushsync::PushSyncError::StampRejected { .. }) => {
+            if set.insert(batch_id) {
+                warn!(
+                    target: "ant_p2p",
+                    batch = %hex::encode(batch_id),
+                    "batch marked peer-rejected — /stamps will report it unusable until a push succeeds",
+                );
+            }
+        }
+        Some(_) => {}
+        None => {
+            set.remove(&batch_id);
+        }
+    }
+}
+
 /// Shared `PushChunk` tail: cache the chunk locally (store-then-push),
 /// then pushsync it with `stamp` and ack. Used by both the local-issuer
 /// and the presigned-stamp paths.
@@ -3517,6 +3582,7 @@ fn push_with_stamp(
     ack: oneshot::Sender<ControlAck>,
 ) {
     let peers_rx = state.peers_watch.subscribe();
+    let rejected_batches = state.rejected_batches.clone();
     let patience_peers = state.peers_watch.subscribe();
     if peers_rx.borrow().is_empty() {
         let _ = ack.send(ControlAck::Error {
@@ -3580,12 +3646,18 @@ fn push_with_stamp(
         }
         let reply =
             match push_with_patience(&fetcher, patience_peers, addr, wire, stamp, false).await {
-                Ok(()) => ControlAck::ChunkUploaded {
-                    reference: format!("0x{}", hex::encode(addr)),
-                },
-                Err(e) => ControlAck::Error {
-                    message: format!("pushsync: {e}"),
-                },
+                Ok(()) => {
+                    note_stamp_outcome(&rejected_batches, &stamp, None);
+                    ControlAck::ChunkUploaded {
+                        reference: format!("0x{}", hex::encode(addr)),
+                    }
+                }
+                Err(e) => {
+                    note_stamp_outcome(&rejected_batches, &stamp, Some(&e));
+                    ControlAck::Error {
+                        message: format!("pushsync: {e}"),
+                    }
+                }
             };
         let _ = ack.send(reply);
     });
@@ -3605,6 +3677,7 @@ fn push_soc_with_stamp(
 ) {
     const SOC_HEADER: usize = 32 + 65;
     let peers_rx = state.peers_watch.subscribe();
+    let rejected_batches = state.rejected_batches.clone();
     let patience_peers = state.peers_watch.subscribe();
     if peers_rx.borrow().is_empty() {
         let _ = ack.send(ControlAck::NotReady {
@@ -3694,12 +3767,18 @@ fn push_soc_with_stamp(
         // and only degrades to shallow-accept at the ceiling.
         let reply =
             match push_with_patience(&fetcher, patience_peers, address, wire, stamp, true).await {
-                Ok(()) => ControlAck::ChunkUploaded {
-                    reference: format!("0x{}", hex::encode(address)),
-                },
-                Err(e) => ControlAck::Error {
-                    message: format!("pushsync: {e}"),
-                },
+                Ok(()) => {
+                    note_stamp_outcome(&rejected_batches, &stamp, None);
+                    ControlAck::ChunkUploaded {
+                        reference: format!("0x{}", hex::encode(address)),
+                    }
+                }
+                Err(e) => {
+                    note_stamp_outcome(&rejected_batches, &stamp, Some(&e));
+                    ControlAck::Error {
+                        message: format!("pushsync: {e}"),
+                    }
+                }
             };
         let _ = ack.send(reply);
     });
