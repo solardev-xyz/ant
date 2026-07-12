@@ -61,18 +61,38 @@ trusting content not the delivering peer.
 
 ---
 
+## Exp 1 — mainnet pullsync viability: CONFIRMED (2026-07-12)
+
+**A light ant node drove full pullsync against a live mainnet full node.**
+Wired `ControlCommand::PullsyncProbe` (peer picked via
+`routing.closest_peer(target)`, bin = the peer's proximity order to the
+target) + `antctl pullsync <target>`. Ran against a fresh mainnet daemon
+(overlay `d7a2…`, 100 peers):
+
+- **cursors**: `cursors_ok=true` in **84 ms** — peer returned its 32 bin
+  cursors + reserve epoch.
+- **sync page** (bin 7, historical `start=1`): `sync_ok=true`, **5/5**
+  then **50/62** chunks delivered (Get→Offer→Want→Delivery) in ~1.0–1.1 s.
+- Reproducible across peers (`d63cea…`, `d62ba4…`).
+
+Nuance that shapes the lurker: a full node's reserve only holds its
+**deep** neighborhood, so pulling a *shallow* bin (a target far from any
+connected peer) correctly long-blocks on an empty interval — which is
+also why a live `start=cursor+1` pull parks until a new chunk arrives.
+The lurker must therefore reside in / target the **deep neighborhood bin
+a covering peer actually stores**, which is exactly the case that worked.
+**The single biggest risk (would mainnet bees serve a NAT'd light peer?)
+is retired.**
+
 ## What remains — the live receive wiring
 
-The two receive primitives are complete and unit-tested; what's left is
-integrating them into the running node and exposing them over HTTP. None
-of it changes the crypto or the wire codec.
+The receive primitives + the pullsync probe are done; what's left is the
+persistent driver and the HTTP surface. None of it changes the crypto or
+the wire codec.
 
-1. **Exp 1 — mainnet pullsync viability probe** *(de-risks everything
-   below)*. Add a `ControlCommand::Pullsync{Cursors,Sync}` handled in the
-   `behaviour.rs` command loop (it already holds a cloneable `Control`;
-   pick a peer via `state.routing.closest_peer(target)`), then a small
-   conformance probe that boots the stack, connects to mainnet, and calls
-   `get_cursors` + one `sync_once`. Confirms a light-advertised peer can
+1. ~~**Exp 1 — mainnet pullsync viability probe**~~ **DONE** (above).
+   `ControlCommand::PullsyncProbe` + `antctl pullsync` also serve as the
+   lurker's underlying single-round operation. Confirms a light peer can
    hold a pullsync stream and measures offer latency. **Open question the
    probe answers:** do mainnet bees serve pullsync to a NAT'd light peer
    in practice (the code says yes; the network sometimes disagrees).
