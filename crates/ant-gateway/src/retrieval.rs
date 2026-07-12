@@ -947,11 +947,12 @@ pub async fn upload_pss(
     // Mining is CPU-heavy; keep it off the async runtime.
     let wrapped =
         tokio::task::spawn_blocking(move || wrap(&topic, &msg, &recipient, &targets)).await;
-    let (_addr, wire) = match wrapped {
+    let (addr, wire) = match wrapped {
         Ok(Ok(pair)) => pair,
         Ok(Err(e)) => return json_error(StatusCode::BAD_REQUEST, e.to_string()),
         Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "pss wrap task failed"),
     };
+    tracing::debug!(target: "ant_gateway", pss_chunk = %hex::encode(addr), "pss send: mined trojan chunk");
 
     let timeout = request_timeout(&headers, CHUNK_REQUEST_TIMEOUT);
     let guard = handle
