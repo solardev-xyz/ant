@@ -108,32 +108,75 @@ deepened from bin 5 (a shallow *forwarder*) to bin 13 (an actual
 *storer*) before the message came through.
 
 **PSS send** verified live too: `POST /pss/send/{topic}/{targets}` → HTTP
-`201` (mine + push) in ~6 s; combined with the offline proof that bee's
-Go `pss.Unwrap` accepts ant-produced trojan chunks, ant→bee PSS is fully
-validated.
+`201`; combined with the offline proof that bee's Go `pss.Unwrap` accepts
+ant-produced trojan chunks, ant→bee PSS is fully validated.
 
-## What remains
+## PSS receive e2e — PASS on mainnet (2026-07-12)
 
-1. **PSS *receive* depth alignment.** GSOC receive is exact because the
-   watch target *is* the chunk's address. PSS reception targets the
-   node's overlay, but `makeMaxTarget` mines a 2-byte (16-bit) prefix —
-   deeper than the lurker's typical bin-12/13 reach — and the chunk's
-   closest storer isn't necessarily the peer we pull from (replication to
-   it lags). So a mainnet PSS-receive loopback didn't land in the pulled
-   bin within the test window. Options to close it: reside deeper / pull a
-   small bin-window around the target, pull from several covering peers,
-   or accept PSS-receive only when the node sits deep in its own
-   neighborhood. The mechanism is proven (GSOC); this is a targeting
-   refinement, not a new capability.
+The first PSS-receive loopback missed: `makeMaxTarget` mines a 16-bit
+prefix, so the chunk's storers sit at bin ~14–16 — deeper than a light
+node's steady covering peers (bin ~13). The chunk was network-retrievable
+(retrieval dials to the storer) but our single steady peer wasn't a
+storer, so pullsync missed it. Three changes in `lurker.rs` closed it:
+
+- **Multi-peer**: pull concurrently from the N=5 closest covering peers
+  (a fresh chunk lands on the nearest storer and replicates outward —
+  several peers catch it whoever got it first).
+- **Bin window**: for PSS (address not exact, unlike GSOC) pull a few
+  deeper bins past the base bin.
+- **Deep residency**: `reside()` dials toward the target for its full 15 s
+  budget instead of stopping at the first plateau, pulling the actual
+  storers into our connection set — like the retrieval path's
+  dial-and-await-deeper.
+
+**Verified e2e**: bee-js `pssSubscribe` + `pssSend` (topic-broadcast, no
+recipient) → ant `/pss/send` → ant lurker (now reaching **bin 14–15**)
+pulls the trojan chunk → topic-derived unwrap → WS → bee-js received the
+exact payload.
+
+## Rendezvous many-to-many — PASS on mainnet (2026-07-12)
+
+The payoff: a **group channel with no central server**. A "room" is a
+shared PSS topic broadcast into a neighborhood; every participant lurks it
+and every participant can send. **Demo (`perf/pss-gsoc-demos/
+rendezvous_demo.mjs`): three independent senders (Alice/Bob/Carol) each
+broadcast to a shared room; the lurking participant received all 3/3
+exact messages.** Scale by running more ant nodes on the same room — the
+per-node reception mechanism is exactly what's proven here.
+
+Two fixes made multi-message reception reliable: **continuous pullers**
+(the driver no longer aborts its pull tasks to re-dial, which had left a
+gap that dropped messages) and spacing sends so each lands cleanly.
+
+A room in a *foreign* neighborhood (owned by nobody, e.g.
+`keccak("room:"+name)`) additionally needs each participant to reside
+*there* — `GET /pss/subscribe/{topic}?neighborhood=<overlay>` targets it,
+but a light node far from an arbitrary neighborhood only reaches ~bin 12
+and reception is unreliable at that depth; a room in (or near) a
+participant's own neighborhood is reliably reachable. Mining participant
+overlays into a shared room neighborhood is the path to arbitrary rooms.
+
+## What remains (optional)
+
+1. **Arbitrary-neighborhood rooms**: reliable only when participants are
+   resident near the room (mine overlays into it, or pick rooms in
+   well-connected regions). The `?neighborhood=` override is in place; the
+   residency depth a light node can reach far from home is the limit.
 2. **`GET /addresses.pssPublicKey`** + a persisted `pss.key` for
    *directed* PSS to the node's own key (topic-broadcast already works
-   without one). Deferred so we don't advertise a key before directed
-   receive is exercised.
-3. **Rendezvous-neighborhood many-to-many** demo (all app clients lurk a
-   topic-derived neighborhood; real full nodes there store and serve — no
-   designated full node anywhere). Per-message unique SOC ids sidestep
-   GSOC's same-address reserve-overwrite caveat. The primitives are all in
-   place; this is an app-level composition + demo.
+   without one).
+3. **GSOC same-address rooms**: a pull-based reader sees only the latest
+   write (the reserve keeps one SOC per address); per-message unique ids
+   avoid this. PSS topic-broadcast is the cleaner many-to-many vehicle.
+4. **Tuning**: residency budget / covering-peer count / bin window are
+   conservative defaults; expose as env knobs for busy rooms.
+
+## Demo scripts
+
+`perf/pss-gsoc-demos/` (run against a live `antd` with a usable batch;
+bee-js 12.2.2): `gsoc_e2e.mjs` (bee-js gsocSend → ant lurker →
+gsocSubscribe), `pss_e2e.mjs` (bee-js pssSend/pssSubscribe topic-
+broadcast), `rendezvous_demo.mjs` (multi-sender group room).
 
 ---
 
