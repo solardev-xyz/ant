@@ -159,7 +159,7 @@ rendezvous_demo.mjs`): one bee-js client against one ant node sent three
 serially-spaced messages into a shared room; the lurking subscription
 received all 3/3 — multi-*message* reception through one node.
 
-## TRUE multi-node rendezvous — PASS on mainnet (2026-07-13)
+## Multi-node multi-sender rendezvous — PASS on mainnet (2026-07-13)
 
 `perf/pss-gsoc-demos/multi_node_rendezvous.mjs`: **two independent ant
 nodes** (fresh overlays `1b63…` and `cb8c…`), one shared room hosted in
@@ -167,18 +167,24 @@ node A's neighborhood. Senders alternate across both nodes (Alice@A,
 Bob@B, Carol@A, Dave@B — node B pushes into a foreign neighborhood);
 subscriber on A lurks natively, subscriber on B lurks A's neighborhood
 via the `?neighborhood=` override from a completely different overlay.
-**Enforced result: subscriber A received 4/4**, ~1 s per message — the
-real many-to-many claim, since A received messages sent from *both*
-nodes. The demo gates PASS on subscriber A only: A is resident in the
-room's own neighborhood, so A getting all four is the multi-node proof.
-Subscriber B lurks a *foreign* neighborhood from a distant overlay (the
-~bin-12 case documented as unreliable below), so its count is reported
-as an **observation, not a pass condition** — gating on it would make
-the test flaky on a limitation we already disclose. In the recorded run
-B also happened to get 4/4 — a first positive data point for
-foreign-neighborhood rooms, not a guarantee. Operational note: the two
-nodes MUST stamp with different batches or two independent issuers
-allocate colliding stamp indices in the room's bucket (this run reused
+**Enforced result: subscriber A received 4/4**, ~1 s per message.
+
+What this proves, precisely (a round-3 review correctly flagged the
+earlier "many-to-many" wording as overstated): senders on **two
+independent nodes** both deliver into a shared room that **one reliable
+subscriber** reads in full. That is multi-node multi-*sender* → single
+reliable receiver — a many-to-**one** receive. It does *not* yet prove
+symmetric many-to-**many**, which needs a **second reliable
+subscriber** (a second node co-resident in the room's neighborhood via
+overlay mining) — not standable with the current two-node / one-batch
+setup. Subscriber B here lurks a *foreign* neighborhood from a distant
+overlay (the ~bin-12 unreliable case documented below), so its count is
+an **observation only**; it happened to get 4/4 in the recorded run — a
+first positive data point for foreign-neighborhood rooms, not a
+guarantee, and explicitly not the basis for the PASS. Operational note:
+the two nodes MUST stamp with different batches or two independent
+issuers allocate colliding stamp indices in the room's bucket (this run
+reused
 one batch across both; distinct batches are the clean setup).
 
 Two fixes made multi-message reception reliable: **continuous pullers**
@@ -290,7 +296,7 @@ open below.
 | `gsoc_two_updates.mjs` (same-address regression) | ✅ PASS after the re-stamp fix (failed 3× before it — see below) |
 | `pss_e2e.mjs` (topic broadcast) | ✅ PASS |
 | `rendezvous_demo.mjs` (3 msgs, one node) | ✅ PASS |
-| `multi_node_rendezvous.mjs` (2 nodes, 4 senders alternating) | ✅ PASS — subscriber A 4/4 (enforced); far-node B 4/4 (observed) |
+| `multi_node_rendezvous.mjs` (2 nodes, 4 senders alternating → 1 reliable receiver) | ✅ PASS — multi-node multi-sender; A 4/4 (enforced); far-node B 4/4 (observed). Many-to-**one**; symmetric many-to-many still TODO |
 
 Lab note: debug-build keccak made 2-byte-target mining take ~30 s
 (measured) and intermittently trip the request timeout; the workspace
@@ -366,6 +372,42 @@ bee); the mining budget + 2-job semaphore + cancellation bound the CPU
 cost but a flood of valid-batch requests can still occupy the miner.
 Rate-limiting / auth is a gateway-deployment decision.
 
+## Round 3 hardening (2026-07-13) — third external review
+
+A third reviewer found four issues in the round-2 fixes; all addressed:
+
+1. **Quiet bins stalled handover (Med)** — readiness was signalled only
+   after a *completed* pull page, but bee's server holds the Offer
+   indefinitely on a quiet bin (and our 20 s round timeout just reopens
+   the stream), so a legitimately-covering puller on a quiet bin never
+   became "ready", `all_ready` stayed false, and obsolete pullers
+   accumulated during churn. Readiness now fires inside `sync_once`
+   right after the `Get` is sent (stream open, request accepted),
+   **before** the blocking Offer read. Added `HANDOVER_MAX_OVERLAP`
+   (60 s) as a backstop so a permanently-wedged replacement peer can't
+   pin obsolete coverage forever.
+2. **Re-stamp monotonicity lost across restart (Med)** — round 2 made
+   re-stamps update only the in-memory timestamp, so a restart reloaded
+   the *original* stamp; under a clock rollback the next re-stamp could
+   re-emit a timestamp the network already saw. The `.stamps` sidecar
+   now stores exactly one fixed-size record per address and a re-stamp
+   overwrites it **in place** (`overwrite_stamp_record`, tracked by
+   per-address byte offset) — no file growth *and* the latest timestamp
+   persists. New `restamp_timestamp_survives_restart` regression test.
+3. **Mining cap bypassed under contention (Med)** — a zero-slot job
+   still spawned one worker, so N concurrent callers could run
+   `C + (N-1)` threads and the process-wide invariant was false. The
+   budget is now a proper counting semaphore (`MiningPool`,
+   condvar-based): a job with no free slot **waits** (cancellation-aware,
+   50 ms poll) rather than fabricating a worker, so aggregate threads
+   never exceed `C`. A cancelled/timed-out request returns
+   `PssMiningCancelled` from the wait.
+4. **Demo proved many-to-one, not many-to-many (Low)** — corrected the
+   claim (see "Multi-node multi-sender rendezvous" above): the demo
+   enforces multi-node multi-*sender* → one reliable receiver; symmetric
+   many-to-many (two reliable subscribers) is renamed as still-TODO,
+   not claimed.
+
 ## What remains (optional)
 
 1. **Arbitrary-neighborhood rooms**: reliable only when participants are
@@ -389,6 +431,11 @@ Rate-limiting / auth is a gateway-deployment decision.
    header (`ControlCommand::GetChunk` needs a `bypass_cache` flag) —
    without it a node can't read the *network's* view of a chunk it
    itself pushed, which actively misled the two-update diagnosis.
+8. **Symmetric many-to-many demo**: mine two node overlays into one
+   shared room neighborhood so **both** subscribers are reliable, and
+   enforce both in the demo — the true many-to-many proof the current
+   many-to-one `multi_node_rendezvous.mjs` doesn't reach. Needs a second
+   on-chain postage batch.
 
 ## Demo scripts
 

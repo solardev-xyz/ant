@@ -82,24 +82,34 @@ try { wsB.close(); } catch {}
 
 const setA = new Set(gotA);
 const setB = new Set(gotB);
-// PASS is gated on subscriber A ONLY: A is resident in the room's own
-// neighborhood, and A receiving messages sent from BOTH nodes is the
-// full multi-node many-to-many proof. Subscriber B lurks a *foreign*
-// neighborhood from a distant overlay — the ~bin-12 case PSS-GSOC.md
-// documents as unreliable — so its count is reported as an OBSERVATION,
-// never a gating condition (gating on it would make the test flaky on a
-// limitation we already disclose).
+// What this enforces, precisely: senders on TWO independent nodes both
+// deliver into a shared room that ONE reliable subscriber (A, resident
+// in the room's neighborhood) reads in full. That is multi-node
+// multi-SENDER → single reliable receiver — a many-to-one receive, not
+// yet symmetric many-to-many. Proving many-to-many needs a SECOND
+// reliable subscriber (a second node co-resident in the room
+// neighborhood, via overlay mining), which this two-node/one-batch
+// setup can't stand up. Subscriber B here lurks a *foreign*
+// neighborhood from a distant overlay (the ~bin-12 unreliable case
+// PSS-GSOC.md documents), so it's reported as an observation only.
 const aPass = sent.every((m) => setA.has(m));
 console.log(
-  `\n[A, enforced] received ${setA.size}/${sent.length}` +
-    `; [B, observed/best-effort] received ${setB.size}/${sent.length}`,
+  `\n[A, reliable receiver — enforced] received ${setA.size}/${sent.length}` +
+    `; [B, far-node — observed only] received ${setB.size}/${sent.length}`,
 );
 if (aPass) {
   const bNote =
     setB.size === sent.length
-      ? ' (far-node subscriber B also got all — a bonus, not required)'
-      : ` (far-node subscriber B got ${setB.size}/${sent.length}, within the documented limit)`;
-  console.log(`✅ MULTI-NODE RENDEZVOUS PASS — senders on two nodes, room delivered all to A${bNote}`);
+      ? ' (far-node B also got all — a bonus, not a proof of many-to-many)'
+      : ` (far-node B got ${setB.size}/${sent.length}, within the documented limit)`;
+  console.log(
+    `✅ MULTI-NODE MULTI-SENDER PASS — senders on two nodes both delivered ` +
+      `to the reliable receiver${bNote}`,
+  );
+  console.log(
+    'NOTE: this is many-to-one on the receive side; symmetric ' +
+      'many-to-many (2+ reliable subscribers) remains to be demonstrated.',
+  );
   process.exit(0);
 }
 console.log('❌ missing at A:', sent.filter((m) => !setA.has(m)));
