@@ -105,11 +105,14 @@ pub struct StampIssuer {
     /// Per-chunk stamp cache: maps a chunk address to the stamp already
     /// issued for it under this batch. Makes stamping **idempotent** —
     /// re-pushing a chunk (post-upload heal, a manual retry, an
-    /// interrupted-upload resume) returns the *same* stamp instead of
-    /// burning a fresh bucket index. Without this a chunk re-pushed N
-    /// times consumes N slots in its collision bucket, so a few heal
-    /// rounds can saturate an otherwise-roomy batch. Backed by the
-    /// append-only `.stamps` sidecar (see [`append_stamp_record`]).
+    /// interrupted-upload resume) reuses the same bucket **slot** instead
+    /// of burning a fresh index. Without this a chunk re-pushed N times
+    /// consumes N slots in its collision bucket, so a few heal rounds can
+    /// saturate an otherwise-roomy batch. The `(address → slot)` mapping
+    /// is persisted once per address to the `.stamps` sidecar (see
+    /// [`append_stamp_record`]); a re-stamp that only refreshes the
+    /// timestamp updates this map in memory and does *not* re-append
+    /// (see [`StampIssuer::refresh_cached_stamp`]).
     seen: HashMap<[u8; 32], [u8; STAMP_SIZE]>,
     /// Sidecar path the issued stamps are appended to (sibling of
     /// `persist_path`, `.stamps` extension). `None` for in-memory issuers.
@@ -512,6 +515,16 @@ impl StampIssuer {
         Ok(())
     }
 
+    /// Update the in-memory stamp for an already-recorded address without
+    /// touching the sidecar. Used when a re-stamp refreshes only the
+    /// timestamp/signature: the persisted `(address → slot)` record is
+    /// still valid, so re-appending it would grow the file unbounded for
+    /// no recovery benefit (the slot never changes). Later re-stamps read
+    /// the refreshed timestamp from here to keep advancing it.
+    fn refresh_cached_stamp(&mut self, addr: [u8; 32], stamp: [u8; STAMP_SIZE]) {
+        self.seen.insert(addr, stamp);
+    }
+
     /// Reserve the next index in the bucket the chunk address falls in.
     ///
     /// **Persistence**: when this issuer was built via
@@ -759,9 +772,17 @@ pub fn sign_stamp_bytes(
     // rejects it, so a GSOC update at its stable address would never
     // land on any storer (found live on mainnet, 2026-07-13: update #2
     // of a GSOC room was acked but silently dropped network-wide).
-    if let Some(stamp) = issuer.cached_stamp(chunk_address) {
-        let index: [u8; INDEX_SIZE] = stamp[32..40].try_into().expect("stamp layout");
-        let ts = unix_now_nanos_be();
+    if let Some(prev) = issuer.cached_stamp(chunk_address) {
+        let index: [u8; INDEX_SIZE] = prev[32..40].try_into().expect("stamp layout");
+        // Strictly-newer timestamp, guaranteed. bee's reserve rejects a
+        // same-(batch, index) put whose timestamp isn't greater than the
+        // stored one, so `now` alone is unsafe: coarse clock resolution
+        // (two re-stamps in one tick) or a backward clock step would
+        // re-create the very rejection this path fixes. Take
+        // `max(now, prev + 1)`.
+        let prev_ts = u64::from_be_bytes(prev[40..48].try_into().expect("stamp layout"));
+        let now = u64::from_be_bytes(unix_now_nanos_be());
+        let ts = now.max(prev_ts.saturating_add(1)).to_be_bytes();
         let digest = postage_sign_digest(chunk_address, &issuer.batch_id, &index, &ts);
         let sig = sign_handshake_data(secret, &digest)?;
         let mut fresh = [0u8; STAMP_SIZE];
@@ -769,7 +790,13 @@ pub fn sign_stamp_bytes(
         fresh[32..40].copy_from_slice(&index);
         fresh[40..48].copy_from_slice(&ts);
         fresh[48..113].copy_from_slice(&sig);
-        issuer.record_stamp(*chunk_address, fresh)?;
+        // In-memory only: the sidecar's job is crash recovery of the
+        // (address → slot) mapping, which is unchanged by a re-stamp.
+        // Appending a fresh record on every update would grow the file
+        // unbounded and slow startup scanning; the reloaded (older)
+        // timestamp is still safe because the next re-stamp re-applies
+        // the max(now, prev + 1) rule.
+        issuer.refresh_cached_stamp(*chunk_address, fresh);
         return Ok(fresh);
     }
 
@@ -990,32 +1017,63 @@ mod tests {
         let mut issuer = StampIssuer::new([0xcd; 32], 21, 16, false).unwrap();
         let chunk = [3u8; 32];
 
-        let first = sign_stamp_bytes(&secret, &mut issuer, &chunk).unwrap();
-        let second = sign_stamp_bytes(&secret, &mut issuer, &chunk).unwrap();
-
-        // Same slot: no extra bucket capacity consumed.
-        assert_eq!(&first[32..40], &second[32..40], "index must be reused");
-        assert_eq!(issuer.issued_count(), 1, "re-stamp must not burn a slot");
-        // Fresh, strictly newer timestamp — the property the storer's
-        // replacement check requires.
         let ts = |s: &[u8; STAMP_SIZE]| u64::from_be_bytes(s[40..48].try_into().unwrap());
-        assert!(
-            ts(&second) > ts(&first),
-            "timestamp must be strictly newer ({} vs {})",
-            ts(&second),
-            ts(&first)
-        );
-        // And the refreshed stamp still verifies against the owner.
+        let first = sign_stamp_bytes(&secret, &mut issuer, &chunk).unwrap();
+        // Rapid-fire re-stamps: each must be strictly newer than the
+        // last even inside one clock tick — the monotonic guarantee, not
+        // just "call unix_now again". A tight loop is the case coarse
+        // resolution would break.
+        let mut prev = first;
+        for _ in 0..50 {
+            let next = sign_stamp_bytes(&secret, &mut issuer, &chunk).unwrap();
+            assert_eq!(&next[32..40], &first[32..40], "index must be reused");
+            assert!(
+                ts(&next) > ts(&prev),
+                "timestamp must be strictly newer ({} vs {})",
+                ts(&next),
+                ts(&prev)
+            );
+            prev = next;
+        }
+        assert_eq!(issuer.issued_count(), 1, "re-stamp must not burn a slot");
+        // The refreshed stamp still verifies against the owner.
         verify_stamp_owner(
             &chunk,
-            &second,
+            &prev,
             &owner,
             issuer.batch_depth,
             issuer.bucket_depth,
         )
         .unwrap();
-        // The cache now holds the refreshed stamp, not the stale one.
-        assert_eq!(issuer.cached_stamp(&chunk).unwrap(), second);
+        // The cache now holds the latest refreshed stamp.
+        assert_eq!(issuer.cached_stamp(&chunk).unwrap(), prev);
+    }
+
+    /// Re-stamping must NOT append to the `.stamps` sidecar — the slot
+    /// record is unchanged, so repeated updates of one address must
+    /// leave the file size fixed (else a busy GSOC room grows it
+    /// unbounded and slows every restart's scan).
+    #[test]
+    fn restamp_does_not_grow_the_sidecar() {
+        let secret = random_secp256k1_secret();
+        let dir = tmpdir();
+        let path = dir.join("batch.bin");
+        let mut issuer = StampIssuer::open_or_new(path.clone(), [0x44; 32], 21, 16, true).unwrap();
+        let chunk = [0x5a; 32];
+
+        sign_stamp_bytes(&secret, &mut issuer, &chunk).unwrap();
+        let sidecar = path.with_extension("stamps");
+        let size_after_first = std::fs::metadata(&sidecar).unwrap().len();
+
+        for _ in 0..20 {
+            sign_stamp_bytes(&secret, &mut issuer, &chunk).unwrap();
+        }
+        let size_after_many = std::fs::metadata(&sidecar).unwrap().len();
+        assert_eq!(
+            size_after_first, size_after_many,
+            "re-stamps must not append new sidecar records"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The headroom predicates must flag a collision bucket as full once
