@@ -35,8 +35,9 @@ use crate::act::{compress_public_key, parse_public_key, public_key_of, shared_se
 use crate::bmt::bmt_hash_with_span;
 use crate::{keccak256, random_secp256k1_secret, CryptoError, SPAN_SIZE};
 use k256::PublicKey;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock, PoisonError};
+use std::time::Duration;
 
 /// Topic-hint length; also the BMT header length.
 pub const HINT_SIZE: usize = 8;
@@ -247,73 +248,103 @@ fn validate_targets(targets: &[Vec<u8>]) -> Result<(), CryptoError> {
     Ok(())
 }
 
-/// Process-wide budget of mining worker threads. Aggregate mining across
+/// Process-wide pool of mining worker threads. Aggregate mining across
 /// every concurrent [`wrap`] call is capped at the machine's parallelism
 /// (min 2) so an attacker who pins several `/pss/send` jobs can't
 /// oversubscribe the cores — total mining threads stay bounded no matter
-/// how many jobs run.
-static MINING_BUDGET: AtomicUsize = AtomicUsize::new(0);
-static MINING_CAP: OnceLock<usize> = OnceLock::new();
+/// how many jobs run. A job that can't get a slot **waits** (rather than
+/// spawning an unaccounted worker, which would let N callers run
+/// `C + (N-1)` threads and break the invariant); the wait is
+/// cancellation-aware so a disconnected/timed-out request doesn't block.
+static MINING_POOL: OnceLock<MiningPool> = OnceLock::new();
 
-/// An RAII claim on mining worker slots from [`MINING_BUDGET`]; returns
-/// exactly what it took on drop (covers early return, `?`, and panics).
-struct MiningThreads {
-    /// Slots actually taken from the budget (may be 0 under contention).
-    claimed: usize,
-    /// Worker threads to spawn — `max(claimed, 1)` so a fully-contended
-    /// job still makes progress single-threaded instead of deadlocking.
-    workers: usize,
+fn mining_pool() -> &'static MiningPool {
+    MINING_POOL.get_or_init(|| {
+        let cores = std::thread::available_parallelism()
+            .map_or(4, std::num::NonZero::get)
+            .max(2);
+        MiningPool::new(cores)
+    })
 }
 
-/// Atomically take up to `want` slots from `budget` via a CAS loop.
-/// Returns the amount actually taken (0 when fully contended). Pure over
-/// its argument so it's testable without touching the process globals.
-fn take_slots(budget: &AtomicUsize, want: usize) -> usize {
-    let mut avail = budget.load(Ordering::Relaxed);
-    loop {
-        let take = want.min(avail);
-        if take == 0 {
-            return 0;
-        }
-        match budget.compare_exchange_weak(avail, avail - take, Ordering::AcqRel, Ordering::Relaxed)
-        {
-            Ok(_) => return take,
-            Err(now) => avail = now,
+/// A counting semaphore of worker slots with a cancellation-aware wait.
+struct MiningPool {
+    avail: Mutex<usize>,
+    cv: Condvar,
+    cap: usize,
+}
+
+impl MiningPool {
+    fn new(cap: usize) -> Self {
+        Self {
+            avail: Mutex::new(cap),
+            cv: Condvar::new(),
+            cap,
         }
     }
+
+    /// Block until at least one slot is free, then take up to `desired`
+    /// (clamped to the pool cap). Returns `None` if `cancel` flips while
+    /// waiting — polled on a short timeout so a cancelled job never
+    /// blocks indefinitely. Never returns `Some(0)`: a live job always
+    /// gets ≥1 real, accounted slot, so the process-wide cap is exact.
+    fn acquire(&self, desired: usize, cancel: &AtomicBool) -> Option<usize> {
+        let want = desired.clamp(1, self.cap);
+        let mut avail = self.avail.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            if *avail >= 1 {
+                let take = want.min(*avail);
+                *avail -= take;
+                return Some(take);
+            }
+            let (guard, _timeout) = self
+                .cv
+                .wait_timeout(avail, Duration::from_millis(50))
+                .unwrap_or_else(PoisonError::into_inner);
+            avail = guard;
+        }
+    }
+
+    fn release(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        {
+            let mut avail = self.avail.lock().unwrap_or_else(PoisonError::into_inner);
+            *avail += n;
+        }
+        self.cv.notify_all();
+    }
+}
+
+/// An RAII claim on `claimed` pool slots; returns them on drop (covers
+/// early return, `?`, and panics).
+struct MiningThreads {
+    pool: &'static MiningPool,
+    claimed: usize,
 }
 
 impl MiningThreads {
-    /// Claim up to `desired` worker slots. Lazily seeds the budget to
-    /// the machine's parallelism on first use.
-    fn claim(desired: usize) -> Self {
-        let cap = *MINING_CAP.get_or_init(|| {
-            let cores = std::thread::available_parallelism()
-                .map_or(4, std::num::NonZero::get)
-                .max(2);
-            MINING_BUDGET.store(cores, Ordering::Relaxed);
-            cores
-        });
-        let want = desired.clamp(1, cap);
-        let claimed = take_slots(&MINING_BUDGET, want);
-        MiningThreads {
-            claimed,
-            // Fully contended (claimed 0): still run single-threaded so a
-            // job never deadlocks waiting on the budget.
-            workers: claimed.max(1),
-        }
+    /// Claim up to `desired` worker slots from the process-wide pool,
+    /// waiting (cancellation-aware) if none are free. `None` iff
+    /// `cancel` flipped before a slot became available.
+    fn claim(desired: usize, cancel: &AtomicBool) -> Option<Self> {
+        let pool = mining_pool();
+        let claimed = pool.acquire(desired, cancel)?;
+        Some(MiningThreads { pool, claimed })
     }
 
     fn count(&self) -> usize {
-        self.workers
+        self.claimed
     }
 }
 
 impl Drop for MiningThreads {
     fn drop(&mut self) {
-        if self.claimed > 0 {
-            MINING_BUDGET.fetch_add(self.claimed, Ordering::AcqRel);
-        }
+        self.pool.release(self.claimed);
     }
 }
 
@@ -338,13 +369,16 @@ fn mine(
 
     let found = AtomicBool::new(false);
     let winner: Mutex<Option<[u8; NONCE_SIZE]>> = Mutex::new(None);
-    // Claim worker threads from a process-wide budget so *aggregate*
+    // Claim worker threads from the process-wide pool so *aggregate*
     // mining across all concurrent jobs never exceeds the machine's
     // parallelism — two jobs of 16 workers each would otherwise
-    // oversubscribe every core. A guard returns the claim on completion
-    // (including panic/early return). At least one worker is always
-    // granted so a job under contention still makes progress.
-    let workers = MiningThreads::claim(16);
+    // oversubscribe every core. If none are free the claim waits
+    // (cancellation-aware): a cancelled/timed-out request returns here
+    // rather than spawning an unaccounted worker. The guard returns the
+    // slots on completion (including panic/early return).
+    let Some(workers) = MiningThreads::claim(16, cancel) else {
+        return Err(CryptoError::PssMiningCancelled);
+    };
 
     std::thread::scope(|scope| {
         for w in 0..workers.count() {
@@ -550,24 +584,57 @@ mod tests {
     }
 
     #[test]
-    fn mining_budget_take_is_bounded_and_balanced() {
-        // Uses a LOCAL budget so it can't race the global one that live
-        // `wrap` calls in other parallel tests share. Total taken across
-        // any number of concurrent claims never exceeds the pool, and a
-        // fully-drained pool yields 0 (→ single-threaded fallback).
-        let budget = AtomicUsize::new(8);
+    fn mining_pool_bounds_total_and_is_cancellation_aware() {
+        // A LOCAL pool so this can't race the global one that live
+        // `wrap` calls in other parallel tests share.
+        let pool = MiningPool::new(8);
+        let no_cancel = AtomicBool::new(false);
 
-        let a = take_slots(&budget, 1024);
-        assert_eq!(a, 8, "first claim takes the whole small pool");
-        assert_eq!(budget.load(Ordering::Relaxed), 0);
+        // First claim takes up to the whole pool; never more than cap.
+        let a = pool.acquire(1024, &no_cancel).unwrap();
+        assert_eq!(a, 8, "claim is clamped to the pool cap");
 
-        // Contended: nothing left to take.
-        assert_eq!(take_slots(&budget, 4), 0);
+        // Fully drained: a new claim with a pre-flipped cancel returns
+        // None immediately instead of spawning an unaccounted worker —
+        // this is the invariant the round-3 review required (no C+1).
+        let cancelled = AtomicBool::new(true);
+        assert!(
+            pool.acquire(4, &cancelled).is_none(),
+            "a cancelled claim must not fabricate a slot"
+        );
 
-        // Return some and re-take: never more than what's available.
-        budget.fetch_add(3, Ordering::AcqRel);
-        assert_eq!(take_slots(&budget, 10), 3);
-        assert_eq!(budget.load(Ordering::Relaxed), 0);
+        // Release some; the next claim gets exactly what's available.
+        pool.release(3);
+        let b = pool.acquire(10, &no_cancel).unwrap();
+        assert_eq!(b, 3, "claim never exceeds the available slots");
+
+        // Total outstanding (8 + 3 released then re-taken) never exceeds
+        // the cap: release everything and confirm a full re-claim.
+        pool.release(a);
+        pool.release(b);
+        let c = pool.acquire(1024, &no_cancel).unwrap();
+        assert_eq!(c, 8, "all slots recovered, cap intact");
+    }
+
+    #[test]
+    fn mining_pool_wait_wakes_on_release() {
+        use std::sync::Arc;
+        // One-slot pool: a second claimant blocks until the first frees
+        // its slot, proving acquire waits rather than over-committing.
+        let pool = Arc::new(MiningPool::new(1));
+        let held = pool.acquire(1, &AtomicBool::new(false)).unwrap();
+        assert_eq!(held, 1);
+
+        let p2 = Arc::clone(&pool);
+        let waiter = std::thread::spawn(move || {
+            // Blocks until the main thread releases below.
+            p2.acquire(1, &AtomicBool::new(false)).unwrap()
+        });
+
+        // Give the waiter time to park, then release.
+        std::thread::sleep(Duration::from_millis(120));
+        pool.release(held);
+        assert_eq!(waiter.join().unwrap(), 1, "waiter woke and took the slot");
     }
 
     #[test]
