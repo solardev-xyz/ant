@@ -123,6 +123,16 @@ pub struct StampIssuer {
     /// Sidecar path the issued stamps are written to (sibling of
     /// `persist_path`, `.stamps` extension). `None` for in-memory issuers.
     stamps_path: Option<PathBuf>,
+    /// Set when a *persistent* issuer's sidecar could not be made
+    /// writable (a v1 file whose migration to v2 failed). It is
+    /// distinct from an intentional in-memory issuer (`stamps_path`
+    /// `None`, this `false`): here the caller **expected** durability,
+    /// so [`sign_stamp_bytes`] refuses to issue — a stamp we can't
+    /// persist would push to the network and then lose its
+    /// address→slot mapping on restart, burning a fresh index on
+    /// re-push (and, at capacity, evicting another chunk or being
+    /// rejected on an immutable batch).
+    stamp_persistence_failed: bool,
 }
 
 /// Magic for the per-chunk stamp sidecar (Ant `STamp` Map).
@@ -254,6 +264,7 @@ impl StampIssuer {
                 seen: HashMap::new(),
                 stamp_record_count: 0,
                 stamps_path: None,
+                stamp_persistence_failed: false,
             };
             issuer.attach_stamp_store();
             return Ok(issuer);
@@ -322,6 +333,7 @@ impl StampIssuer {
             seen: HashMap::new(),
             stamp_record_count: 0,
             stamps_path: None,
+            stamp_persistence_failed: false,
         };
         issuer.attach_stamp_store();
         Ok(issuer)
@@ -377,6 +389,7 @@ impl StampIssuer {
             seen: HashMap::new(),
             stamp_record_count: 0,
             stamps_path: None,
+            stamp_persistence_failed: false,
         };
         issuer.attach_stamp_store();
         Ok(issuer)
@@ -397,13 +410,17 @@ impl StampIssuer {
                 self.stamp_record_count = loaded.physical_count;
                 self.stamps_path = Some(sidecar);
             } else {
-                // v1 migration failed: keep the recovered stamps in memory
-                // (re-pushes this session are still idempotent) but do NOT
-                // wire up the sidecar for appends — writing v2 records
-                // under the v1 header would corrupt it. The v1 file is
-                // left intact for a future restart to migrate.
+                // v1 migration failed. Appending v2 records under the v1
+                // header would corrupt it, so the sidecar is left intact
+                // for a future restart to migrate — but this issuer
+                // CANNOT persist new stamps. Mark persistence failed so
+                // `sign_stamp_bytes` refuses to issue: a stamp we can't
+                // record would push to the network and then lose its slot
+                // mapping on restart. (The recovered stamps stay in
+                // memory so reads / `has_stamp` still reflect reality.)
                 self.stamp_record_count = 0;
                 self.stamps_path = None;
+                self.stamp_persistence_failed = true;
             }
         }
     }
@@ -826,6 +843,20 @@ pub fn sign_stamp_bytes(
     issuer: &mut StampIssuer,
     chunk_address: &[u8; 32],
 ) -> Result<[u8; STAMP_SIZE], PostageError> {
+    // Refuse to issue when a persistent issuer's sidecar is broken.
+    // Failing closed here — before consuming a bucket index — is the
+    // only safe choice: a stamp we can't persist would push to the
+    // network and then vanish from our address→slot map on restart, so
+    // a re-push burns a fresh index and, at capacity, evicts another
+    // chunk (mutable) or is rejected (immutable). An *intentional*
+    // in-memory issuer (`stamp_persistence_failed` false) is unaffected.
+    if issuer.stamp_persistence_failed {
+        return Err(PostageError::Persist(
+            "stamp sidecar unavailable (v1 migration failed); refusing to issue a \
+             non-durable stamp — fix the data dir and restart to migrate"
+                .to_string(),
+        ));
+    }
     // Idempotent per chunk SLOT, not per stamp: an address we've stamped
     // before reuses its (bucket, index) — a re-push (heal / retry /
     // resume) costs no new bucket slot — but the timestamp is refreshed
@@ -1562,10 +1593,13 @@ mod tests {
     /// created), the loader must NOT append v2 records under the v1
     /// header — that would misalign framing and lose entries. Instead the
     /// v1 file is left untouched (a restart retries migration) and the
-    /// issuer runs in-memory-only this session. Regression for the
-    /// mixed-format-append hazard.
+    /// issuer, and stamping must FAIL closed (not silently issue a
+    /// non-durable stamp). Once migration can succeed again, the v1
+    /// records recover intact — no successfully issued stamp ever
+    /// disappears. Regression for the mixed-format-append + fail-open
+    /// hazards.
     #[test]
-    fn failed_v1_migration_leaves_file_intact_and_non_appendable() {
+    fn failed_v1_migration_fails_closed_then_recovers() {
         use std::io::Write as _;
         let secret = random_secp256k1_secret();
         let dir = tmpdir();
@@ -1596,25 +1630,50 @@ mod tests {
         let tmp = sidecar.with_extension("stamps.tmp");
         std::fs::create_dir(&tmp).unwrap();
 
+        {
+            let mut issuer = StampIssuer::open_or_new(path.clone(), batch, 21, 16, true).unwrap();
+            // The v1 record is recovered into memory (reads work)…
+            assert!(issuer.has_stamp(&a1), "records recovered in memory");
+            // …but stamping FAILS CLOSED — no non-durable stamp is issued
+            // (the old fail-open bug returned a pushable stamp here whose
+            // mapping would vanish on restart).
+            let a2 = [0xb2; 32];
+            assert!(
+                sign_stamp_bytes(&secret, &mut issuer, &a2).is_err(),
+                "must refuse to issue when persistence is broken"
+            );
+            // A re-stamp of a recovered address must also fail closed.
+            assert!(
+                sign_stamp_bytes(&secret, &mut issuer, &a1).is_err(),
+                "re-stamp must also refuse when persistence is broken"
+            );
+            // The v1 file is byte-identical — nothing was appended.
+            assert_eq!(
+                std::fs::read(&sidecar).unwrap(),
+                v1_bytes_before,
+                "v1 file must be untouched when migration fails"
+            );
+        }
+
+        // Clear the sabotage → a restart can now migrate. The v1 record
+        // recovers intact and stamping works again.
+        std::fs::remove_dir(&tmp).unwrap();
         let mut issuer = StampIssuer::open_or_new(path, batch, 21, 16, true).unwrap();
-        // The v1 record was still recovered into memory…
-        assert!(issuer.has_stamp(&a1), "records recovered in memory");
-        // …but the on-disk v1 file is untouched (no v2 records appended
-        // under its v1 header).
         assert_eq!(
-            std::fs::read(&sidecar).unwrap(),
-            v1_bytes_before,
-            "v1 file must be left intact when migration fails"
+            issuer.cached_stamp(&a1),
+            Some(s1),
+            "the recovered v1 stamp survives — no successfully issued stamp lost"
         );
-        // A new stamp must not corrupt the v1 file: persistence is off
-        // this session (in-memory only).
-        let a2 = [0xb2; 32];
-        sign_stamp_bytes(&secret, &mut issuer, &a2).unwrap();
+        // File is now v2 and stamping succeeds again.
         assert_eq!(
-            std::fs::read(&sidecar).unwrap(),
-            v1_bytes_before,
-            "no append to the v1 file after a failed migration"
+            u16::from_le_bytes({
+                let b = std::fs::read(&sidecar).unwrap();
+                [b[4], b[5]]
+            }),
+            STAMP_STORE_VERSION,
+            "migrated to v2 after the obstruction cleared"
         );
+        sign_stamp_bytes(&secret, &mut issuer, &[0xc3; 32]).expect("stamping works post-migration");
         std::fs::remove_dir_all(&dir).ok();
     }
 
