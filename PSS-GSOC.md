@@ -40,12 +40,23 @@ the "lurker" receive path.
 
 Interop is bidirectional and pinned by golden vectors on both sides — see
 `ant-crypto/tests/trojan_interop.rs` (unwraps `trojan_gen.jsonl`; emits
-`ant_pss_out.jsonl` for `go run ./cmd/trojan-vectors check`).
+`ant_pss_out.jsonl` for `go run ./cmd/trojan-vectors check`). Honest
+caveat: the bee→ant direction (60 golden chunks) runs in CI; the
+ant→bee direction is **manual** — the emit test is env-gated
+(`ANT_EMIT_PSS=1`) and the Go `check` step is run by hand, so the 3/3
+result is not re-verified automatically by the repo.
 
 **A light ant node can, today, send a PSS message to any bee full node
 and a GSOC update to any GSOC listener.**
 
-### Receive — DONE (GSOC proven live)
+### Receive — working (GSOC + PSS verified live; hardened 2026-07-13)
+
+The full path is wired and passed mainnet e2e (below). An external
+review then found real defects behind the green runs — a GSOC
+subscription only ever delivered its *first* update, and a closed-but-
+quiet WebSocket leaked its lurker — all fixed in the hardening pass
+(see **Hardening pass** below). "Verified" here means the listed runs
+passed, not that the path was defect-free.
 
 | Piece | Where | Verified |
 |---|---|---|
@@ -58,10 +69,15 @@ and a GSOC update to any GSOC listener.**
 
 `pullsync::sync_once(bin, start, want)` runs one page (Get → Offer →
 Want → Delivery), with a `want` closure so a lurker requests only the
-addresses it watches (Delivery bandwidth ≈ 0 when nothing matches).
-`messaging::classify()` turns a delivered chunk + `WatchState` into a
-`DecodedMessage`, trusting content not the delivering peer.
-`lurker::run` ties them together with neighborhood residency.
+addresses it watches. **The near-zero-delivery-bandwidth property is
+GSOC-only** (exact watched addresses): PSS mode must download every
+candidate CAC in the bin window to attempt unwrap, exactly like a bee
+full node's `TryUnwrap`. `messaging::classify()` turns a delivered
+chunk + `WatchState` into a `DecodedMessage` — content-trust holds for
+GSOC (SOC self-binding re-verified) and, since the hardening pass, for
+everything: `accept_delivery` rejects any delivery whose bytes don't
+hash to its address. `lurker::run` ties them together with
+neighborhood residency.
 
 ---
 
@@ -139,10 +155,13 @@ exact payload.
 The payoff: a **group channel with no central server**. A "room" is a
 shared PSS topic broadcast into a neighborhood; every participant lurks it
 and every participant can send. **Demo (`perf/pss-gsoc-demos/
-rendezvous_demo.mjs`): three independent senders (Alice/Bob/Carol) each
-broadcast to a shared room; the lurking participant received all 3/3
-exact messages.** Scale by running more ant nodes on the same room — the
-per-node reception mechanism is exactly what's proven here.
+rendezvous_demo.mjs`): one bee-js client against one ant node sent three
+serially-spaced messages (labelled Alice/Bob/Carol) into a shared room;
+the lurking subscription received all 3/3 exactly.** To be precise about
+what that proves: multi-*message* reception into one room through one
+node — not multi-node many-to-many (that requires N ant nodes on the
+same room and hasn't been run; nothing sender-side is per-node, but it's
+unproven until demonstrated).
 
 Two fixes made multi-message reception reliable: **continuous pullers**
 (the driver no longer aborts its pull tasks to re-dial, which had left a
@@ -155,6 +174,63 @@ but a light node far from an arbitrary neighborhood only reaches ~bin 12
 and reception is unreliable at that depth; a room in (or near) a
 participant's own neighborhood is reliably reachable. Mining participant
 overlays into a shared room neighborhood is the path to arbitrary rooms.
+
+## Hardening pass (2026-07-13) — external review, all findings fixed
+
+An independent adversarial review of the branch confirmed the crypto
+port (ECDH stripping, cipher, parity, EIP-191, `topic mod n` — no
+defects) but found seven real receive-path/API issues. All are fixed:
+
+1. **GSOC delivered only the first update, ever** (High). The dedup set
+   keyed on chunk address alone; GSOC reuses one stable address per
+   room, so update #2+ was dropped — and a spoofed first delivery could
+   poison the address. Fix: dedup on `(address, keccak(data))` in a
+   bounded oldest-first-eviction set (`lurker::Seen`); the old
+   clear-the-whole-set-at-cap behavior is gone too. The mainnet e2e
+   never caught this because it sent one update per subscription.
+2. **A closed-but-quiet WebSocket leaked its lurker** (High). The
+   node-side forwarder only noticed the dead subscriber while relaying
+   a message; with none arriving it blocked forever and the lurker (and
+   its pull streams) ran on. Fix: `forward_lurker_messages` selects on
+   `ack.closed()`; regression test
+   `lurker_forwarder_stops_when_quiet_subscriber_leaves`.
+3. **Subscribe/restart message gaps** (High). The old blocking 15 s
+   reside phase meant WS-open ≠ pulling; and a died puller's
+   replacement re-read the *current* cursor, skipping the outage. Fix:
+   pullers start immediately and coverage tops up on every
+   connectivity change (`peers.changed()`-driven); per-`(peer, bin)`
+   resume positions survive puller restarts; fresh pullers start
+   `PULL_BACKLOG` behind the cursor. Semantics are now explicitly
+   **at-least-once with bounded replay** near subscribe/handover —
+   content-keyed dedup collapses cross-peer duplicates.
+4. **`/pss/send` was an unauthenticated CPU-exhaustion path** (High).
+   Mining (up to ~2^24 BMT hashes on all cores for a 3-byte target) ran
+   before any batch check, uncancellable, unbounded concurrency. Fix:
+   batch usability pre-checked via `PostageList` *before* mining;
+   global 2-permit mining semaphore (503 when saturated); targets
+   deduped and capped at 64; `pss::wrap_cancellable` stops miner
+   threads on client disconnect or timeout.
+5. **Deliveries weren't bound to offers or content-validated** (Med).
+   `accept_delivery` now rejects unsolicited/duplicate addresses,
+   requires the 113-byte stamp, and verifies CAC BMT / SOC self-binding
+   — a peer can no longer replay a captured chunk under fresh
+   addresses to bypass dedup.
+6. **Unbounded lurker fan-out** (Med, partially addressed). Node-side
+   admission cap: at most 8 concurrent lurker subscriptions
+   (`MAX_LURKER_SUBSCRIPTIONS`); at the cap the subscription is
+   refused. Global bandwidth budgets and a shared watch registry that
+   fans one pull out to N subscribers remain open (below).
+7. **Ex-covering-peer pullers accumulated** (Med). The driver now keeps
+   a desired `(peer, bin)` set and retires obsolete pullers only once
+   replacement coverage is fully live — bounded puller set, no
+   coverage gap during handover.
+
+Also surfaced by the review and fixed here: two gateway tests were
+already red on the branch (`pss_send_falls_through_to_501` asserted the
+pre-implementation 501; the `/stamps` fixture forgot `usable: true`,
+which serde's `default_true` can't supply on an in-process channel) —
+neither we nor the reviewer had run the gateway suite. The full
+workspace is green again; `cargo fmt`/`clippy -D warnings` clean.
 
 ## What remains (optional)
 
@@ -170,6 +246,15 @@ overlays into a shared room neighborhood is the path to arbitrary rooms.
    avoid this. PSS topic-broadcast is the cleaner many-to-many vehicle.
 4. **Tuning**: residency budget / covering-peer count / bin window are
    conservative defaults; expose as env knobs for busy rooms.
+5. **Shared lurker registry + global budgets**: aggregate identical
+   topic/neighborhood watches into one pull pipeline fanned out to N
+   subscribers; add stream/bandwidth budgets across subscriptions (the
+   admission cap is the blunt interim tool).
+6. **True multi-node rendezvous demo**: N ant nodes on one room,
+   senders on distinct nodes — upgrades the 3-message demo into the
+   real many-to-many claim.
+7. **Automate ant→bee interop**: run `trojan-vectors check` in CI (or a
+   make target) so the reverse direction stops being a manual result.
 
 ## Demo scripts
 
