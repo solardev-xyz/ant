@@ -2461,6 +2461,13 @@ fn handle_control_command(
             use crate::lurker::{self, LurkerConfig};
             use crate::messaging::{DecodedMessage, WatchState};
 
+            /// Each subscription runs its own lurker — multi-peer pull
+            /// streams, and in PSS mode whole-bin chunk downloads — so
+            /// cap how many run at once.
+            const MAX_LURKER_SUBSCRIPTIONS: usize = 8;
+            static LURKER_PERMITS: tokio::sync::Semaphore =
+                tokio::sync::Semaphore::const_new(MAX_LURKER_SUBSCRIPTIONS);
+
             let watch = WatchState {
                 gsoc_addresses: gsoc_addresses.into_iter().collect(),
                 pss_topics,
@@ -2481,39 +2488,39 @@ fn handle_control_command(
                 target
             };
 
+            // Admission: at the cap, drop `ack` right away — the
+            // subscriber's stream closes instead of silently queueing
+            // unbounded lurkers.
+            let Ok(permit) = LURKER_PERMITS.try_acquire() else {
+                tracing::warn!(
+                    target: "ant_p2p::lurker",
+                    limit = MAX_LURKER_SUBSCRIPTIONS,
+                    "lurker subscription rejected: limit reached",
+                );
+                return;
+            };
+
             let control = control.clone();
             let peers = state.peers_watch.subscribe();
             let neighborhood_dial = state.neighborhood_dial_tx.clone();
-            let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<DecodedMessage>(64);
+            let (out_tx, out_rx) = tokio::sync::mpsc::channel::<DecodedMessage>(64);
 
-            // Forward decoded messages to the caller's ack stream; a send
-            // error (WS gone) drops `out_rx`, which stops the lurker.
+            // Forward decoded messages to the caller's ack stream; when
+            // the subscriber goes away — even silently, with no message
+            // ever arriving — the forwarder returns and drops `out_rx`,
+            // which stops the lurker.
+            tokio::spawn(forward_lurker_messages(out_rx, ack));
             tokio::spawn(async move {
-                while let Some(msg) = out_rx.recv().await {
-                    let frame = match msg {
-                        DecodedMessage::Gsoc { address, payload } => ControlAck::LurkerMessage {
-                            kind: "gsoc",
-                            key: hex::encode(address),
-                            payload,
-                        },
-                        DecodedMessage::Pss { topic, message } => ControlAck::LurkerMessage {
-                            kind: "pss",
-                            key: hex::encode(topic),
-                            payload: message,
-                        },
-                    };
-                    if ack.send(frame).await.is_err() {
-                        break;
-                    }
-                }
+                let _permit = permit; // held for the lurker's lifetime
+                lurker::run(
+                    control,
+                    peers,
+                    neighborhood_dial,
+                    LurkerConfig { target, watch },
+                    out_tx,
+                )
+                .await;
             });
-            tokio::spawn(lurker::run(
-                control,
-                peers,
-                neighborhood_dial,
-                LurkerConfig { target, watch },
-                out_tx,
-            ));
         }
         ControlCommand::GetBytes {
             reference,
@@ -7118,6 +7125,42 @@ fn build_swarm(keypair: Keypair) -> Result<Swarm<AntBehaviour>, RunError> {
     Ok(swarm)
 }
 
+/// Forward decoded lurker messages to a subscriber's ack channel.
+///
+/// Returns — dropping `out_rx`, which is what stops the lurker and its
+/// pull streams — as soon as the subscriber goes away, **even if no
+/// message ever arrives**: `ack.closed()` is selected alongside `recv()`.
+/// Without that, a quiet subscription whose WebSocket closed would block
+/// on `recv()` forever and leak the whole lurker.
+async fn forward_lurker_messages(
+    mut out_rx: tokio::sync::mpsc::Receiver<crate::messaging::DecodedMessage>,
+    ack: mpsc::Sender<ControlAck>,
+) {
+    use crate::messaging::DecodedMessage;
+    loop {
+        let msg = tokio::select! {
+            m = out_rx.recv() => m,
+            () = ack.closed() => None,
+        };
+        let Some(msg) = msg else { return };
+        let frame = match msg {
+            DecodedMessage::Gsoc { address, payload } => ControlAck::LurkerMessage {
+                kind: "gsoc",
+                key: hex::encode(address),
+                payload,
+            },
+            DecodedMessage::Pss { topic, message } => ControlAck::LurkerMessage {
+                kind: "pss",
+                key: hex::encode(topic),
+                payload: message,
+            },
+        };
+        if ack.send(frame).await.is_err() {
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7125,6 +7168,27 @@ mod tests {
 
     fn pid() -> PeerId {
         Keypair::generate_ed25519().public().to_peer_id()
+    }
+
+    /// Regression for the quiet-subscription leak: closing the
+    /// subscriber's ack stream must stop the forwarder (and thereby the
+    /// lurker, which watches `out_rx`'s closure) even when no message
+    /// ever flows.
+    #[tokio::test]
+    async fn lurker_forwarder_stops_when_quiet_subscriber_leaves() {
+        let (out_tx, out_rx) = mpsc::channel::<crate::messaging::DecodedMessage>(4);
+        let (ack_tx, ack_rx) = mpsc::channel::<ControlAck>(4);
+        let forwarder = tokio::spawn(forward_lurker_messages(out_rx, ack_tx));
+
+        // Subscriber goes away without a single message having arrived.
+        drop(ack_rx);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), forwarder)
+            .await
+            .expect("forwarder must return once the subscriber is gone")
+            .expect("forwarder must not panic");
+        // The lurker's sender now observes closure and shuts down.
+        assert!(out_tx.is_closed());
     }
 
     /// Build a hive hint whose overlay's first byte is `first` (zeros
