@@ -18,6 +18,7 @@
 //!   full node does when it `TryUnwrap`s every passing chunk. Callers
 //!   that only need GSOC leave `pss_secret` unset and pay nothing.
 
+use crate::lurker_registry::SharedWatch;
 use crate::messaging::{classify, DecodedMessage, WatchState};
 use crate::pullsync::{self, OfferedChunk};
 use crate::routing::{proximity, Overlay};
@@ -71,8 +72,11 @@ const MAX_BIN: u8 = 31;
 pub struct LurkerConfig {
     /// Overlay whose neighborhood we reside in and pull.
     pub target: [u8; 32],
-    /// What to decode (GSOC addresses, PSS topics + secret).
-    pub watch: WatchState,
+    /// What to decode (GSOC addresses, PSS topics + secret). Shared with
+    /// the registry, which grows/shrinks it as subscribers attach and
+    /// leave — the lurker re-reads it every pull round, so watch changes
+    /// take effect without restarting pullers or losing positions.
+    pub watch: SharedWatch,
 }
 
 /// Bounded delivered-chunk dedup, keyed by `(address, keccak(data))`.
@@ -130,23 +134,19 @@ pub async fn run(
     out: mpsc::Sender<DecodedMessage>,
 ) {
     let LurkerConfig { target, watch } = config;
-    if watch.is_empty() {
+    if watch
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_empty()
+    {
         return;
     }
-    let watch = Arc::new(watch);
     let seen: Arc<Mutex<Seen>> = Arc::new(Mutex::new(Seen::new()));
     // Last position each (peer, bin) puller synced to, shared with the
     // pullers. A replacement puller resumes where its predecessor
     // stopped instead of jumping to the peer's *current* cursor — which
     // would silently skip everything that arrived during the outage.
     let positions: Arc<Mutex<HashMap<(PeerId, u8), u64>>> = Arc::new(Mutex::new(HashMap::new()));
-    // Deeper bins only matter for PSS (unknown address); GSOC's base bin
-    // is exact.
-    let window = if watch.pss_topics.is_empty() {
-        0
-    } else {
-        PSS_BIN_WINDOW
-    };
 
     // One long-lived puller per (peer, bin). Pullers run **continuously** —
     // we top up coverage for newly-connected peers on each tick but never
@@ -172,6 +172,21 @@ pub async fn run(
         }
         // Drop handles for pullers that ended (peer dropped / stream died).
         active.retain(|_, h| !h.is_finished());
+
+        // Deeper bins only matter for PSS (unknown address); GSOC's base
+        // bin is exact. Re-read each pass: the registry may have added
+        // or removed PSS topics since the last one, and the desired-set
+        // handover below then grows or retires the deeper-bin pullers.
+        let window = if watch
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pss_topics
+            .is_empty()
+        {
+            0
+        } else {
+            PSS_BIN_WINDOW
+        };
 
         // Ensure a puller for each covering (peer, bin); add only the
         // missing ones so existing pullers keep running uninterrupted.
@@ -274,7 +289,7 @@ async fn pull_bin(
     peer_id: PeerId,
     bin: u8,
     mut start: u64,
-    watch: Arc<WatchState>,
+    watch: SharedWatch,
     seen: Arc<Mutex<Seen>>,
     positions: Arc<Mutex<HashMap<(PeerId, u8), u64>>>,
     out: mpsc::Sender<DecodedMessage>,
@@ -284,13 +299,26 @@ async fn pull_bin(
             return;
         }
         let round = pullsync::sync_once(&mut control, peer_id, bin, start, |o: &OfferedChunk| {
-            want(o, &watch)
+            want(o, &watch.read().unwrap_or_else(PoisonError::into_inner))
         });
         let page = match tokio::time::timeout(SYNC_ROUND_TIMEOUT, round).await {
             Ok(Ok(page)) => page,
-            Ok(Err(_)) => return, // stream/peer error → drop this puller
-            Err(_) => continue,   // long-block timeout → re-open at same start
+            Ok(Err(e)) => {
+                tracing::debug!(
+                    target: "ant_p2p::lurker",
+                    peer = %peer_id, bin, start, error = %e,
+                    "pull round failed; dropping puller",
+                );
+                return; // stream/peer error → drop this puller
+            }
+            Err(_) => continue, // long-block timeout → re-open at same start
         };
+        tracing::debug!(
+            target: "ant_p2p::lurker",
+            peer = %peer_id, bin, start, topmost = page.topmost,
+            delivered = page.chunks.len(),
+            "pull round",
+        );
         for chunk in &page.chunks {
             // Dedup one *content version* — the same chunk arrives from
             // several covering peers, but a GSOC update reuses its
@@ -302,7 +330,12 @@ async fn pull_bin(
             {
                 continue;
             }
-            if let Some(msg) = classify(&chunk.address, &chunk.data, &watch) {
+            let decoded = classify(
+                &chunk.address,
+                &chunk.data,
+                &watch.read().unwrap_or_else(PoisonError::into_inner),
+            );
+            if let Some(msg) = decoded {
                 tracing::info!(
                     target: "ant_p2p::lurker",
                     peer = %peer_id, bin, "lurker decoded a message",

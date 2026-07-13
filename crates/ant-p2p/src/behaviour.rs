@@ -780,6 +780,11 @@ struct SwarmState {
     /// network state, not the network state from before the fetch
     /// started.
     peers_watch: watch::Sender<Vec<(PeerId, Overlay)>>,
+    /// Shared lurker registry: one GSOC/PSS pull pipeline per target
+    /// neighborhood, fanned out to every WS subscriber on it (see
+    /// [`crate::lurker_registry`]). Per-node, not process-wide — tests
+    /// run several nodes in one process.
+    lurkers: crate::lurker_registry::Registry,
     /// Process-wide cap on concurrent `retrieve_chunk` calls. Cloned
     /// into every `RoutingFetcher` we build for any `GetBytes` /
     /// `GetBzz` request, so the cap applies across concurrent
@@ -960,6 +965,7 @@ impl SwarmState {
             disk_cache,
             chunk_record_dir,
             peers_watch: watch::channel(Vec::new()).0,
+            lurkers: crate::lurker_registry::Registry::new(),
             retrieval_inflight: Arc::new(Semaphore::new(RETRIEVAL_INFLIGHT_CAP)),
             verify_gate: Arc::new(Semaphore::new(1)),
             payment_notify: None,
@@ -2459,14 +2465,7 @@ fn handle_control_command(
             ack,
         } => {
             use crate::lurker::{self, LurkerConfig};
-            use crate::messaging::{DecodedMessage, WatchState};
-
-            /// Each subscription runs its own lurker — multi-peer pull
-            /// streams, and in PSS mode whole-bin chunk downloads — so
-            /// cap how many run at once.
-            const MAX_LURKER_SUBSCRIPTIONS: usize = 8;
-            static LURKER_PERMITS: tokio::sync::Semaphore =
-                tokio::sync::Semaphore::const_new(MAX_LURKER_SUBSCRIPTIONS);
+            use crate::messaging::WatchState;
 
             let watch = WatchState {
                 gsoc_addresses: gsoc_addresses.into_iter().collect(),
@@ -2488,39 +2487,44 @@ fn handle_control_command(
                 target
             };
 
-            // Admission: at the cap, drop `ack` right away — the
-            // subscriber's stream closes instead of silently queueing
-            // unbounded lurkers.
-            let Ok(permit) = LURKER_PERMITS.try_acquire() else {
+            // One lurker per neighborhood, shared: the registry attaches
+            // this subscriber to an existing pull pipeline for `target`
+            // (union watch, per-subscriber fan-out) or spawns one, and
+            // refuses when the distinct-neighborhood cap is reached —
+            // dropping `ack` then closes the subscriber's stream right
+            // away instead of silently queueing unbounded lurkers.
+            let control = control.clone();
+            let peers = state.peers_watch.subscribe();
+            let neighborhood_dial = state.neighborhood_dial_tx.clone();
+            let subscribed = state
+                .lurkers
+                .subscribe(target, watch, |shared_watch, out_tx| {
+                    tokio::spawn(lurker::run(
+                        control,
+                        peers,
+                        neighborhood_dial,
+                        LurkerConfig {
+                            target,
+                            watch: shared_watch,
+                        },
+                        out_tx,
+                    ))
+                });
+            let Some(out_rx) = subscribed else {
                 tracing::warn!(
                     target: "ant_p2p::lurker",
-                    limit = MAX_LURKER_SUBSCRIPTIONS,
-                    "lurker subscription rejected: limit reached",
+                    limit = crate::lurker_registry::MAX_LURKER_NEIGHBORHOODS,
+                    "lurker subscription rejected: neighborhood limit reached",
                 );
                 return;
             };
 
-            let control = control.clone();
-            let peers = state.peers_watch.subscribe();
-            let neighborhood_dial = state.neighborhood_dial_tx.clone();
-            let (out_tx, out_rx) = tokio::sync::mpsc::channel::<DecodedMessage>(64);
-
             // Forward decoded messages to the caller's ack stream; when
             // the subscriber goes away — even silently, with no message
             // ever arriving — the forwarder returns and drops `out_rx`,
-            // which stops the lurker.
+            // and the registry prunes the subscriber (tearing down the
+            // shared lurker once the last one leaves).
             tokio::spawn(forward_lurker_messages(out_rx, ack));
-            tokio::spawn(async move {
-                let _permit = permit; // held for the lurker's lifetime
-                lurker::run(
-                    control,
-                    peers,
-                    neighborhood_dial,
-                    LurkerConfig { target, watch },
-                    out_tx,
-                )
-                .await;
-            });
         }
         ControlCommand::GetBytes {
             reference,
