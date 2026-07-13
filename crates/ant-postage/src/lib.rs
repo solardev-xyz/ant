@@ -747,13 +747,30 @@ pub fn sign_stamp_bytes(
     issuer: &mut StampIssuer,
     chunk_address: &[u8; 32],
 ) -> Result<[u8; STAMP_SIZE], PostageError> {
-    // Idempotent per chunk: a chunk we've stamped before reuses its
-    // original stamp, so a re-push (heal / retry / resume) costs no new
-    // bucket slot. The network treats the same (chunk, batch, index, ts)
-    // stamp as a no-op replay rather than a double-spend, exactly what a
-    // re-delivery wants.
+    // Idempotent per chunk SLOT, not per stamp: an address we've stamped
+    // before reuses its (bucket, index) — a re-push (heal / retry /
+    // resume) costs no new bucket slot — but the timestamp is refreshed
+    // and the stamp re-signed, mirroring bee's stamper
+    // (`pkg/postage/stamper.go`: a known address gets
+    // `BatchTimestamp = unixTime()` before signing). Returning the
+    // byte-identical old stamp instead breaks single-owner-chunk
+    // *updates*: bee's reserve treats a same-(batch, index) put whose
+    // timestamp is not strictly newer as `ErrOverwriteNewerChunk` and
+    // rejects it, so a GSOC update at its stable address would never
+    // land on any storer (found live on mainnet, 2026-07-13: update #2
+    // of a GSOC room was acked but silently dropped network-wide).
     if let Some(stamp) = issuer.cached_stamp(chunk_address) {
-        return Ok(stamp);
+        let index: [u8; INDEX_SIZE] = stamp[32..40].try_into().expect("stamp layout");
+        let ts = unix_now_nanos_be();
+        let digest = postage_sign_digest(chunk_address, &issuer.batch_id, &index, &ts);
+        let sig = sign_handshake_data(secret, &digest)?;
+        let mut fresh = [0u8; STAMP_SIZE];
+        fresh[0..32].copy_from_slice(&issuer.batch_id);
+        fresh[32..40].copy_from_slice(&index);
+        fresh[40..48].copy_from_slice(&ts);
+        fresh[48..113].copy_from_slice(&sig);
+        issuer.record_stamp(*chunk_address, fresh)?;
+        return Ok(fresh);
     }
 
     let (index, ts) = issuer.increment(chunk_address)?;
@@ -958,6 +975,49 @@ mod tests {
         .unwrap();
     }
 
+    /// Re-stamping a known address must reuse its (bucket, index) slot
+    /// but refresh the timestamp and re-sign — bee's stamper semantics.
+    /// Returning the byte-identical cached stamp breaks SOC updates:
+    /// bee's reserve rejects a same-(batch, index) put whose timestamp
+    /// isn't strictly newer (`ErrOverwriteNewerChunk`), so a GSOC
+    /// update at its stable address never lands anywhere (found live
+    /// on mainnet 2026-07-13).
+    #[test]
+    fn restamp_reuses_slot_with_fresh_timestamp() {
+        let secret = random_secp256k1_secret();
+        let sk = k256::ecdsa::SigningKey::from_bytes(&secret.into()).unwrap();
+        let owner = ethereum_address_from_public_key(&*sk.verifying_key());
+        let mut issuer = StampIssuer::new([0xcd; 32], 21, 16, false).unwrap();
+        let chunk = [3u8; 32];
+
+        let first = sign_stamp_bytes(&secret, &mut issuer, &chunk).unwrap();
+        let second = sign_stamp_bytes(&secret, &mut issuer, &chunk).unwrap();
+
+        // Same slot: no extra bucket capacity consumed.
+        assert_eq!(&first[32..40], &second[32..40], "index must be reused");
+        assert_eq!(issuer.issued_count(), 1, "re-stamp must not burn a slot");
+        // Fresh, strictly newer timestamp — the property the storer's
+        // replacement check requires.
+        let ts = |s: &[u8; STAMP_SIZE]| u64::from_be_bytes(s[40..48].try_into().unwrap());
+        assert!(
+            ts(&second) > ts(&first),
+            "timestamp must be strictly newer ({} vs {})",
+            ts(&second),
+            ts(&first)
+        );
+        // And the refreshed stamp still verifies against the owner.
+        verify_stamp_owner(
+            &chunk,
+            &second,
+            &owner,
+            issuer.batch_depth,
+            issuer.bucket_depth,
+        )
+        .unwrap();
+        // The cache now holds the refreshed stamp, not the stale one.
+        assert_eq!(issuer.cached_stamp(&chunk).unwrap(), second);
+    }
+
     /// The headroom predicates must flag a collision bucket as full once
     /// it reaches capacity — the signal the upload path uses to refuse to
     /// stamp (and thus silently evict) on an under-sized batch.
@@ -1128,10 +1188,13 @@ mod tests {
         assert_eq!(issued_after_first, 1);
         assert!(issuer.has_stamp(&chunk));
 
-        // Re-stamp the same chunk several times: same bytes, no new index.
+        // Re-stamp the same chunk several times: the (bucket, index)
+        // slot is reused — no new index — but each stamp carries a
+        // fresh timestamp and signature (bee stamper semantics; a
+        // byte-identical replay would make SOC updates undeliverable).
         for _ in 0..5 {
             let again = sign_stamp_bytes(&secret, &mut issuer, &chunk).unwrap();
-            assert_eq!(again, first, "re-stamp must reuse the original stamp");
+            assert_eq!(&again[32..40], &first[32..40], "index slot is reused");
         }
         assert_eq!(
             issuer.issued_count(),
@@ -1147,7 +1210,7 @@ mod tests {
         sign_stamp_bytes(&secret, &mut issuer, &sibling).unwrap();
         assert!(issuer.bucket_is_full(&chunk));
         let after_full = sign_stamp_bytes(&secret, &mut issuer, &chunk).unwrap();
-        assert_eq!(after_full, first);
+        assert_eq!(&after_full[32..40], &first[32..40]);
     }
 
     /// The `.stamps` sidecar must survive a restart so a later heal
@@ -1170,11 +1233,12 @@ mod tests {
         assert!(path.with_extension("stamps").exists());
 
         // Reopen — the cache should rehydrate, so a re-stamp reuses the
-        // original and issues no new index.
+        // original slot (same index, fresh timestamp) and issues no new
+        // index.
         let mut reopened = StampIssuer::open_or_new(path, batch_id, 17, 16, true).unwrap();
         assert!(reopened.has_stamp(&chunk));
         let reused = sign_stamp_bytes(&secret, &mut reopened, &chunk).unwrap();
-        assert_eq!(reused, original);
+        assert_eq!(&reused[32..40], &original[32..40], "index slot is reused");
         assert_eq!(reopened.issued_count(), 1);
 
         std::fs::remove_dir_all(&dir).ok();
