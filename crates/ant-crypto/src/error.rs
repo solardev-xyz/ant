@@ -21,4 +21,6 @@ pub enum CryptoError {
     PssMessageTooLong,
     #[error("PSS targets must be 1..=3 bytes and all the same length")]
     PssInvalidTargets,
+    #[error("PSS nonce mining was cancelled")]
+    PssMiningCancelled,
 }

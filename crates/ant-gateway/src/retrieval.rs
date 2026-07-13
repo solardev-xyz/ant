@@ -891,7 +891,11 @@ pub async fn upload_pss(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    use ant_crypto::pss::{topic_from_string, wrap, Recipient, MAX_PAYLOAD_SIZE, MAX_TARGET_LEN};
+    use ant_crypto::pss::{
+        topic_from_string, wrap_cancellable, Recipient, MAX_PAYLOAD_SIZE, MAX_TARGET_LEN,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     if body.len() > MAX_PAYLOAD_SIZE {
         return json_error(
@@ -921,6 +925,19 @@ pub async fn upload_pss(
             "targets must be non-empty and all the same length",
         );
     }
+    // Duplicate targets change nothing about which addresses can match
+    // but make every mining iteration slower; drop them, and cap the
+    // list so a pathological request can't inflate the per-hash
+    // comparison cost.
+    targets.sort();
+    targets.dedup();
+    const MAX_PSS_TARGETS: usize = 64;
+    if targets.len() > MAX_PSS_TARGETS {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            format!("at most {MAX_PSS_TARGETS} distinct targets"),
+        );
+    }
 
     // Recipient: explicit key, or the topic-derived broadcast key.
     let recipient = match &query.recipient {
@@ -941,12 +958,55 @@ pub async fn upload_pss(
         Err(resp) => return resp,
     };
 
+    // Reject an unusable batch *before* burning CPU on mining: this
+    // route is unauthenticated, and a 3-byte target costs ~2^24 BMT
+    // hashes across all cores. The push stamps locally against a
+    // registered issuer, so "registered + usable" is exactly the bar the
+    // push itself would apply — just checked while it's still cheap.
+    if let Err(resp) = require_usable_batch(&handle, &batch_id).await {
+        return resp;
+    }
+
     let topic = topic_from_string(&topic_str);
     let msg = body.to_vec();
+    let timeout = request_timeout(&headers, CHUNK_REQUEST_TIMEOUT);
 
-    // Mining is CPU-heavy; keep it off the async runtime.
-    let wrapped =
-        tokio::task::spawn_blocking(move || wrap(&topic, &msg, &recipient, &targets)).await;
+    // At most a couple of concurrent mining jobs per gateway; everyone
+    // else waits briefly, then sheds with 503 instead of stacking
+    // unbounded CPU work.
+    static PSS_MINING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+    let Ok(Ok(permit)) = tokio::time::timeout(Duration::from_secs(10), PSS_MINING.acquire()).await
+    else {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "pss mining is busy; retry later",
+        );
+    };
+
+    // Mining is CPU-heavy; keep it off the async runtime — and make it
+    // stop when this request goes away (a client disconnect drops the
+    // handler future, and the guard flips the flag the miner threads
+    // poll) or when it exceeds the request timeout.
+    struct CancelOnDrop(Arc<AtomicBool>);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    let _cancel_guard = CancelOnDrop(Arc::clone(&cancel));
+    let mine_cancel = Arc::clone(&cancel);
+    let mining = tokio::task::spawn_blocking(move || {
+        wrap_cancellable(&topic, &msg, &recipient, &targets, &mine_cancel)
+    });
+    let Ok(wrapped) = tokio::time::timeout(timeout, mining).await else {
+        cancel.store(true, Ordering::Relaxed);
+        return json_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            format!("pss mining timed out after {}s", timeout.as_secs()),
+        );
+    };
+    drop(permit); // mining finished — release before the network round-trip
     let (addr, wire) = match wrapped {
         Ok(Ok(pair)) => pair,
         Ok(Err(e)) => return json_error(StatusCode::BAD_REQUEST, e.to_string()),
@@ -954,7 +1014,6 @@ pub async fn upload_pss(
     };
     tracing::debug!(target: "ant_gateway", pss_chunk = %hex::encode(addr), "pss send: mined trojan chunk");
 
-    let timeout = request_timeout(&headers, CHUNK_REQUEST_TIMEOUT);
     let guard = handle
         .activity
         .begin(GatewayRequestKind::Chunk, "pss-send".to_string());
@@ -1004,6 +1063,49 @@ pub async fn upload_pss(
             warn!(target: "ant_gateway", ?other, "unexpected ack from pss PushChunk");
             json_error(StatusCode::INTERNAL_SERVER_ERROR, "unexpected node ack")
         }
+    }
+}
+
+/// Pre-flight for `/pss/send`: the batch must be a **registered, usable
+/// issuer** on this node — the same bar (and the same "not usable"
+/// wording, so status mapping stays uniform) that `PushChunk` applies,
+/// just checked before mining instead of after.
+async fn require_usable_batch(handle: &GatewayHandle, batch_id: &[u8; 32]) -> Result<(), Response> {
+    let (ack_tx, ack_rx) = oneshot::channel();
+    if handle
+        .commands
+        .send(ControlCommand::PostageList { ack: ack_tx })
+        .await
+        .is_err()
+    {
+        return Err(node_unavailable());
+    }
+    let views = match tokio::time::timeout(Duration::from_secs(5), ack_rx).await {
+        Ok(Ok(ControlAck::PostageList(views))) => views,
+        Ok(Ok(other)) => {
+            warn!(target: "ant_gateway", ?other, "unexpected ack for postage list");
+            return Err(json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "unexpected node ack",
+            ));
+        }
+        _ => return Err(node_unavailable()),
+    };
+    let id_hex = hex::encode(batch_id);
+    let usable = views.iter().any(|v| {
+        v.enabled
+            && v.usable
+            && v.batch_id
+                .trim_start_matches("0x")
+                .eq_ignore_ascii_case(&id_hex)
+    });
+    if usable {
+        Ok(())
+    } else {
+        Err(json_error(
+            StatusCode::BAD_REQUEST,
+            format!("batch 0x{id_hex} not usable"),
+        ))
     }
 }
 
