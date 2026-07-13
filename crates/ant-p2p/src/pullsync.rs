@@ -271,18 +271,25 @@ pub async fn get_cursors(control: &mut Control, peer: PeerId) -> Result<Cursors,
 /// it watches, so Delivery bandwidth stays near zero when nothing
 /// matches. Returns the page's `topmost` and the delivered chunks.
 ///
-/// The server blocks until at least one chunk with `binID >= start`
-/// exists in the bin (or the stream is dropped), so callers must not
-/// impose a short read deadline on live bins.
-pub async fn sync_once<F>(
+/// `on_ready` fires once the stream is open and the `Get` has been sent
+/// and flushed — i.e. the peer accepted our request and we're now
+/// *waiting* for data. This is the point a lurker can treat the puller
+/// as "covering", **before** the server long-blocks on a quiet bin:
+/// the block is deliberate (the server holds the stream until a chunk
+/// with `binID >= start` arrives, or it's dropped), so callers must not
+/// impose a short read deadline on live bins, and readiness must not
+/// wait for the first `Offer` or it would never fire on a quiet bin.
+pub async fn sync_once<F, R>(
     control: &mut Control,
     peer: PeerId,
     bin: u8,
     start: u64,
     want: F,
+    on_ready: R,
 ) -> Result<SyncPage, PullsyncError>
 where
     F: Fn(&OfferedChunk) -> bool,
+    R: FnOnce(),
 {
     let proto = StreamProtocol::new(PROTOCOL_PULLSYNC);
     let mut stream = control
@@ -299,6 +306,10 @@ where
         },
     )
     .await?;
+    // Stream is live and the request is sent — the puller is covering
+    // this bin now, even if the server holds the Offer back until a
+    // chunk arrives. Signal before the (possibly indefinite) Offer read.
+    on_ready();
 
     let offer_bytes = read_delimited(&mut stream, MAX_FRAME).await?;
     let offer = Offer::decode(offer_bytes.as_slice())?;

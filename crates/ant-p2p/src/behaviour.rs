@@ -2441,6 +2441,7 @@ fn handle_control_command(
                     probe_bin,
                     sync_start,
                     |_offered| wanted.fetch_add(1, Ordering::Relaxed) < max_deliver,
+                    || {}, // probe is one-shot; no readiness signal needed
                 )
                 .await;
                 view.sync_ms = t1.elapsed().as_millis() as u64;
