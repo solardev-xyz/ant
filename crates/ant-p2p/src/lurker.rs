@@ -87,9 +87,32 @@ const MAX_BIN: u8 = 31;
 /// shared with the pullers. The epoch tag lets the driver discard a
 /// stale position after a peer wipes its reserve.
 type Positions = Arc<Mutex<HashMap<(PeerId, u8), (u64, u64)>>>;
-/// `(peer, bin)` pullers that have completed at least one pull round —
-/// the readiness signal the coordinated handover waits on.
-type ReadySet = Arc<Mutex<HashSet<(PeerId, u8)>>>;
+/// Readiness map: `(peer, bin) → generation` of the puller that marked
+/// it ready (stream open, `Get` sent). Tagged with a per-puller
+/// generation so a dying puller's [`ReadyGuard`] removes only *its own*
+/// entry on exit, never a newer replacement puller's — the handover
+/// waits on this, so a stale entry would falsely retire live coverage.
+type ReadySet = Arc<Mutex<HashMap<(PeerId, u8), u64>>>;
+
+/// Removes a puller's readiness the instant it exits (return, error, or
+/// handover abort) — not just at the next driver pass — so a puller that
+/// dies during the multi-second cursor-fetch window can't leave `ready`
+/// asserting coverage it no longer provides. Only removes the entry if
+/// it still carries this puller's generation.
+struct ReadyGuard {
+    ready: ReadySet,
+    key: (PeerId, u8),
+    generation: u64,
+}
+
+impl Drop for ReadyGuard {
+    fn drop(&mut self) {
+        let mut r = self.ready.lock().unwrap_or_else(PoisonError::into_inner);
+        if r.get(&self.key) == Some(&self.generation) {
+            r.remove(&self.key);
+        }
+    }
+}
 
 /// A live lurker subscription: the target neighborhood and what to watch.
 pub struct LurkerConfig {
@@ -181,7 +204,10 @@ pub async fn run(
     // covered. The coordinated handover retires an obsolete puller only
     // once every *replacement* it's covering for is in this set, so old
     // coverage is never dropped while its replacement is still dialing.
-    let ready: ReadySet = Arc::new(Mutex::new(HashSet::new()));
+    let ready: ReadySet = Arc::new(Mutex::new(HashMap::new()));
+    // Monotonic generation stamped on each spawned puller so its
+    // ReadyGuard removes only its own readiness entry (see [`ReadyGuard`]).
+    let mut next_generation: u64 = 0;
 
     // One long-lived puller per (peer, bin). Pullers run **continuously** —
     // we top up coverage for newly-connected peers on each tick but never
@@ -216,7 +242,7 @@ pub async fn run(
         ready
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .retain(|k| active.contains_key(k));
+            .retain(|k, _| active.contains_key(k));
 
         // Deeper bins only matter for PSS (unknown address); GSOC's base
         // bin is exact. Re-read each pass: the registry may have added
@@ -294,12 +320,14 @@ pub async fn run(
                     peer = %peer_id, bin, start, epoch = cursors.epoch,
                     resumed = resume.is_some(), "lurker pulling neighborhood bin",
                 );
+                next_generation += 1;
                 let handle = tokio::spawn(pull_bin(
                     control.clone(),
                     peer_id,
                     bin,
                     start,
                     cursors.epoch,
+                    next_generation,
                     Arc::clone(&watch),
                     Arc::clone(&seen),
                     Arc::clone(&positions),
@@ -326,7 +354,7 @@ pub async fn run(
         }
         let all_ready = {
             let r = ready.lock().unwrap_or_else(PoisonError::into_inner);
-            !desired.is_empty() && desired.iter().all(|k| r.contains(k))
+            !desired.is_empty() && desired.iter().all(|k| r.contains_key(k))
         };
         let retired: Vec<(PeerId, u8)> = active
             .keys()
@@ -352,7 +380,7 @@ pub async fn run(
         ready
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .retain(|k| active.contains_key(k));
+            .retain(|k, _| active.contains_key(k));
 
         // Wait for connectivity to change (top up new closer peers right
         // away) or the fallback tick. The pullers keep running
@@ -385,12 +413,22 @@ async fn pull_bin(
     bin: u8,
     mut start: u64,
     epoch: u64,
+    generation: u64,
     watch: SharedWatch,
     seen: Arc<Mutex<Seen>>,
     positions: Positions,
     ready: ReadySet,
     out: mpsc::Sender<DecodedMessage>,
 ) {
+    // Whenever this puller exits — return, stream error, or handover
+    // abort — its readiness is removed immediately (not just at the next
+    // driver pass), so it can't leave a stale entry that falsely passes
+    // the handover check during the multi-second cursor-fetch window.
+    let _ready_guard = ReadyGuard {
+        ready: Arc::clone(&ready),
+        key: (peer_id, bin),
+        generation,
+    };
     loop {
         if out.is_closed() {
             return;
@@ -406,7 +444,7 @@ async fn pull_bin(
             ready_c
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .insert((peer_id, bin));
+                .insert((peer_id, bin), generation);
         };
         let round = pullsync::sync_once(
             &mut control,
@@ -563,6 +601,43 @@ mod tests {
         assert!(seen.insert(&addr_for(0), b"x"), "oldest was evicted");
         assert_eq!(seen.order.len(), seen.set.len());
         assert!(seen.set.len() <= SEEN_CAP + 1);
+    }
+
+    #[test]
+    fn ready_guard_removes_own_entry_but_not_a_newer_generation() {
+        let ready: ReadySet = Arc::new(Mutex::new(HashMap::new()));
+        let key = (PeerId::random(), 12u8);
+
+        // A puller (gen 1) marks itself ready.
+        ready.lock().unwrap().insert(key, 1);
+        // Its guard drops → its own entry is removed.
+        {
+            let _g = ReadyGuard {
+                ready: Arc::clone(&ready),
+                key,
+                generation: 1,
+            };
+        }
+        assert!(
+            !ready.lock().unwrap().contains_key(&key),
+            "guard must remove its own readiness on exit"
+        );
+
+        // A replacement puller (gen 2) is ready; a *stale* gen-1 guard
+        // dropping late must NOT clobber the newer entry.
+        ready.lock().unwrap().insert(key, 2);
+        {
+            let _stale = ReadyGuard {
+                ready: Arc::clone(&ready),
+                key,
+                generation: 1,
+            };
+        }
+        assert_eq!(
+            ready.lock().unwrap().get(&key),
+            Some(&2),
+            "a stale-generation guard must not remove a newer puller's readiness"
+        );
     }
 
     #[test]
