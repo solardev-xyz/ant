@@ -483,6 +483,40 @@ receive-path demos re-verified on mainnet:
    recorded: re-run the *full-workspace* clippy after adding any new
    file, not just the touched crate.)
 
+## Round 5 hardening (2026-07-13) — fifth external review
+
+Two Medium (correctness), two Low; all fixed, workspace green,
+receive-path demos re-verified on mainnet.
+
+1. **Sidecar could still lose the only reusable slot (Med)** — the v2
+   loader *deleted* every v1 record on upgrade, and *discarded* a
+   checksum-failed record. For a **full** collision bucket that's not
+   "one extra re-stamp": an immutable batch then rejects the existing
+   chunk (`has_stamp` is false), and a mutable batch wraps the counter
+   and can evict another chunk. Reworked from in-place overwrite to
+   **append + compaction** (the round-3 reviewer's endorsed option):
+   re-stamps append a checksummed record instead of overwriting, so a
+   torn write only damages the trailing record and the address's
+   *previous* valid record still recovers its slot (load keeps the
+   highest-timestamp valid record per address); v1 files are
+   **migrated** (read and rewritten as v2, not deleted); growth is
+   bounded by atomic compaction (`rewrite_sidecar`, temp+rename) once
+   records exceed `live×2 + 64`. Four regression tests (v1 migration,
+   torn-latest fallback, bounded growth, restart monotonicity).
+2. **Readiness stale across a nonfatal timeout (Med)** — a successful
+   `Get` set readiness, but the expected 20 s quiet-bin timeout
+   `continue`d without clearing it; if the next stream open *wedged*,
+   the puller stayed alive with stale readiness, letting the handover
+   retire valid coverage (the task-exit `ReadyGuard` never fires for an
+   in-loop wedge). Now readiness is cleared at the top of every loop
+   iteration and re-set only after the new `Get` lands, so a wedged
+   reopen doesn't count as ready.
+3. **`mine_overlay` accepted impossible bits (Low)** — `min_bits > 256`
+   can never match a 256-bit overlay and would mine forever; rejected
+   up front.
+4. **Stale mining doc (Low)** — the pool comment still said "min 2";
+   corrected to actual-parallelism-fallback-1.
+
 ## What remains (optional)
 
 1. **Arbitrary-neighborhood rooms**: reliable only when participants are
