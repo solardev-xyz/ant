@@ -108,13 +108,16 @@ pub struct StampIssuer {
     /// interrupted-upload resume) reuses the same bucket **slot** instead
     /// of burning a fresh index. Without this a chunk re-pushed N times
     /// consumes N slots in its collision bucket, so a few heal rounds can
-    /// saturate an otherwise-roomy batch. The `(address → slot)` mapping
-    /// is persisted once per address to the `.stamps` sidecar (see
-    /// [`append_stamp_record`]); a re-stamp that only refreshes the
-    /// timestamp updates this map in memory and does *not* re-append
-    /// (see [`StampIssuer::refresh_cached_stamp`]).
+    /// saturate an otherwise-roomy batch. Each address has exactly one
+    /// fixed-size record in the `.stamps` sidecar; a re-stamp refreshes
+    /// that record **in place** (see [`StampIssuer::refresh_cached_stamp`])
+    /// so the file never grows on re-push *and* the latest timestamp
+    /// survives a restart (needed for the strictly-newer guarantee).
     seen: HashMap<[u8; 32], [u8; STAMP_SIZE]>,
-    /// Sidecar path the issued stamps are appended to (sibling of
+    /// Byte offset of each address's record in the sidecar, so a re-stamp
+    /// can overwrite it in place. Empty for in-memory issuers.
+    stamp_offsets: HashMap<[u8; 32], u64>,
+    /// Sidecar path the issued stamps are written to (sibling of
     /// `persist_path`, `.stamps` extension). `None` for in-memory issuers.
     stamps_path: Option<PathBuf>,
 }
@@ -226,6 +229,7 @@ impl StampIssuer {
                 buckets,
                 persist_path: Some(path),
                 seen: HashMap::new(),
+                stamp_offsets: HashMap::new(),
                 stamps_path: None,
             };
             issuer.attach_stamp_store();
@@ -293,6 +297,7 @@ impl StampIssuer {
             buckets,
             persist_path: Some(path),
             seen: HashMap::new(),
+            stamp_offsets: HashMap::new(),
             stamps_path: None,
         };
         issuer.attach_stamp_store();
@@ -347,6 +352,7 @@ impl StampIssuer {
             buckets: vec![0u32; n],
             persist_path,
             seen: HashMap::new(),
+            stamp_offsets: HashMap::new(),
             stamps_path: None,
         };
         issuer.attach_stamp_store();
@@ -362,7 +368,9 @@ impl StampIssuer {
     fn attach_stamp_store(&mut self) {
         if let Some(p) = &self.persist_path {
             let sidecar = stamps_sidecar_path(p);
-            self.seen = load_stamp_store(&sidecar, &self.batch_id);
+            let (seen, offsets) = load_stamp_store(&sidecar, &self.batch_id);
+            self.seen = seen;
+            self.stamp_offsets = offsets;
             self.stamps_path = Some(sidecar);
         }
     }
@@ -499,10 +507,11 @@ impl StampIssuer {
         self.seen.contains_key(addr)
     }
 
-    /// Remember the stamp issued for `addr` and, for persistent issuers,
-    /// append it to the `.stamps` sidecar (append + fsync) so a restart
-    /// recovers it. Append-only keeps this `O(1)` regardless of how many
-    /// chunks the batch has stamped.
+    /// Remember the stamp issued for a **new** `addr` and, for persistent
+    /// issuers, append its record to the `.stamps` sidecar (append +
+    /// fsync) so a restart recovers it. Records the record's byte offset
+    /// so a later re-stamp can overwrite it in place. `O(1)` regardless
+    /// of how many chunks the batch has stamped.
     fn record_stamp(
         &mut self,
         addr: [u8; 32],
@@ -510,19 +519,39 @@ impl StampIssuer {
     ) -> Result<(), PostageError> {
         self.seen.insert(addr, stamp);
         if let Some(path) = &self.stamps_path {
-            append_stamp_record(path, &self.batch_id, &addr, &stamp)?;
+            let offset = append_stamp_record(path, &self.batch_id, &addr, &stamp)?;
+            self.stamp_offsets.insert(addr, offset);
         }
         Ok(())
     }
 
-    /// Update the in-memory stamp for an already-recorded address without
-    /// touching the sidecar. Used when a re-stamp refreshes only the
-    /// timestamp/signature: the persisted `(address → slot)` record is
-    /// still valid, so re-appending it would grow the file unbounded for
-    /// no recovery benefit (the slot never changes). Later re-stamps read
-    /// the refreshed timestamp from here to keep advancing it.
-    fn refresh_cached_stamp(&mut self, addr: [u8; 32], stamp: [u8; STAMP_SIZE]) {
+    /// Refresh the stamp for an already-recorded address (a re-stamp that
+    /// only changed the timestamp/signature — the bucket slot is
+    /// unchanged). Updates the in-memory cache and, for persistent
+    /// issuers, overwrites the address's existing sidecar record **in
+    /// place** (no new record, so the file never grows on re-push) —
+    /// which also persists the refreshed timestamp, so a restart reloads
+    /// the *latest* stamp rather than a stale one. Without that, a
+    /// restart after a clock rollback could re-emit a timestamp the
+    /// network already saw and get the chunk rejected as not-newer.
+    fn refresh_cached_stamp(
+        &mut self,
+        addr: [u8; 32],
+        stamp: [u8; STAMP_SIZE],
+    ) -> Result<(), PostageError> {
         self.seen.insert(addr, stamp);
+        if let Some(path) = &self.stamps_path {
+            if let Some(&offset) = self.stamp_offsets.get(&addr) {
+                // Overwrite the existing fixed-size record in place.
+                overwrite_stamp_record(path, offset, &stamp)?;
+            } else {
+                // No known offset (e.g. loaded from a truncated file):
+                // fall back to appending a fresh record and track it.
+                let offset = append_stamp_record(path, &self.batch_id, &addr, &stamp)?;
+                self.stamp_offsets.insert(addr, offset);
+            }
+        }
+        Ok(())
     }
 
     /// Reserve the next index in the bucket the chunk address falls in.
@@ -790,13 +819,11 @@ pub fn sign_stamp_bytes(
         fresh[32..40].copy_from_slice(&index);
         fresh[40..48].copy_from_slice(&ts);
         fresh[48..113].copy_from_slice(&sig);
-        // In-memory only: the sidecar's job is crash recovery of the
-        // (address → slot) mapping, which is unchanged by a re-stamp.
-        // Appending a fresh record on every update would grow the file
-        // unbounded and slow startup scanning; the reloaded (older)
-        // timestamp is still safe because the next re-stamp re-applies
-        // the max(now, prev + 1) rule.
-        issuer.refresh_cached_stamp(*chunk_address, fresh);
+        // Persist the refreshed stamp by overwriting the address's
+        // existing sidecar record in place: no file growth on re-push,
+        // and the on-disk timestamp stays current so a restart can't
+        // reload a stale one and re-emit a timestamp the network saw.
+        issuer.refresh_cached_stamp(*chunk_address, fresh)?;
         return Ok(fresh);
     }
 
@@ -825,17 +852,22 @@ fn stamps_sidecar_path(persist: &Path) -> PathBuf {
 /// trailing record all yield whatever clean records precede the problem
 /// (or an empty map). A stale cache only ever costs a re-stamp, never
 /// correctness, so we never hard-fail issuer construction over it.
-fn load_stamp_store(path: &Path, batch_id: &[u8; 32]) -> HashMap<[u8; 32], [u8; STAMP_SIZE]> {
+#[allow(clippy::type_complexity)]
+fn load_stamp_store(
+    path: &Path,
+    batch_id: &[u8; 32],
+) -> (HashMap<[u8; 32], [u8; STAMP_SIZE]>, HashMap<[u8; 32], u64>) {
     let mut map = HashMap::new();
+    let mut offsets = HashMap::new();
     let Ok(bytes) = std::fs::read(path) else {
-        return map;
+        return (map, offsets);
     };
     if bytes.len() < STAMP_STORE_HEADER_LEN
         || &bytes[0..4] != STAMP_STORE_MAGIC
         || u16::from_le_bytes([bytes[4], bytes[5]]) != STORE_VERSION
         || &bytes[6..38] != batch_id.as_slice()
     {
-        return map;
+        return (map, offsets);
     }
     let mut off = STAMP_STORE_HEADER_LEN;
     while off + STAMP_RECORD_LEN <= bytes.len() {
@@ -844,21 +876,27 @@ fn load_stamp_store(path: &Path, batch_id: &[u8; 32]) -> HashMap<[u8; 32], [u8; 
         let mut stamp = [0u8; STAMP_SIZE];
         stamp.copy_from_slice(&bytes[off + 32..off + STAMP_RECORD_LEN]);
         map.insert(addr, stamp);
+        // A later duplicate record for the same address (from an older
+        // append-only file, pre in-place update) overwrites the earlier
+        // one — last write wins, and the offset tracks the last record.
+        offsets.insert(addr, off as u64);
         off += STAMP_RECORD_LEN;
     }
-    map
+    (map, offsets)
 }
 
 /// Append one `(addr, stamp)` record to the sidecar, creating it with a
 /// header first if absent, and fsync before returning so a restart
-/// recovers it. Append-only: re-pushes hit the in-memory cache and never
-/// reach here, so the file only grows by genuinely-new chunks.
+/// recovers it. Returns the byte offset the record was written at, so
+/// the caller can later overwrite it **in place** on a re-stamp (see
+/// [`overwrite_stamp_record`]) instead of appending a duplicate — the
+/// file therefore holds exactly one record per address.
 fn append_stamp_record(
     path: &Path,
     batch_id: &[u8; 32],
     addr: &[u8; 32],
     stamp: &[u8; STAMP_SIZE],
-) -> Result<(), PostageError> {
+) -> Result<u64, PostageError> {
     use std::io::Write as _;
 
     if let Some(parent) = path.parent() {
@@ -881,10 +919,45 @@ fn append_stamp_record(
         f.write_all(&header)
             .map_err(|e| PostageError::Persist(format!("{}: {e}", path.display())))?;
     }
+    // Offset of the record we're about to append (end of file in append
+    // mode: header if just created, else the current length).
+    let record_offset = if need_header {
+        STAMP_STORE_HEADER_LEN as u64
+    } else {
+        f.metadata()
+            .map_err(|e| PostageError::Persist(format!("{}: {e}", path.display())))?
+            .len()
+    };
     let mut rec = Vec::with_capacity(STAMP_RECORD_LEN);
     rec.extend_from_slice(addr);
     rec.extend_from_slice(stamp);
     f.write_all(&rec)
+        .map_err(|e| PostageError::Persist(format!("{}: {e}", path.display())))?;
+    f.sync_all()
+        .map_err(|e| PostageError::Persist(format!("{}: {e}", path.display())))?;
+    Ok(record_offset)
+}
+
+/// Overwrite the stamp bytes of an existing sidecar record in place (the
+/// `addr` prefix is unchanged, so only the [`STAMP_SIZE`] stamp at
+/// `record_offset + 32` is rewritten), then fsync. Used by a re-stamp to
+/// persist the refreshed timestamp without appending a duplicate, so the
+/// on-disk record stays current across a restart — the property the
+/// strictly-newer-timestamp guarantee depends on.
+fn overwrite_stamp_record(
+    path: &Path,
+    record_offset: u64,
+    stamp: &[u8; STAMP_SIZE],
+) -> Result<(), PostageError> {
+    use std::io::{Seek as _, SeekFrom, Write as _};
+
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|e| PostageError::Persist(format!("{}: {e}", path.display())))?;
+    f.seek(SeekFrom::Start(record_offset + 32))
+        .map_err(|e| PostageError::Persist(format!("{}: {e}", path.display())))?;
+    f.write_all(stamp)
         .map_err(|e| PostageError::Persist(format!("{}: {e}", path.display())))?;
     f.sync_all()
         .map_err(|e| PostageError::Persist(format!("{}: {e}", path.display())))?;
@@ -1072,6 +1145,62 @@ mod tests {
         assert_eq!(
             size_after_first, size_after_many,
             "re-stamps must not append new sidecar records"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The refreshed re-stamp timestamp must survive a restart: if it
+    /// weren't persisted, a restart (which reloads the sidecar) followed
+    /// by a re-stamp under a rolled-back clock would re-emit a timestamp
+    /// the network already saw, and peers would reject the chunk as
+    /// not-strictly-newer. In place of a real clock rollback we assert
+    /// the reloaded stamp equals the last one written (so the next
+    /// re-stamp's `max(now, prev+1)` builds on the true high-water mark).
+    #[test]
+    fn restamp_timestamp_survives_restart() {
+        let secret = random_secp256k1_secret();
+        let dir = tmpdir();
+        let path = dir.join("batch.bin");
+        let batch = [0x77; 32];
+        let chunk = [0x9c; 32];
+        let ts = |s: &[u8; STAMP_SIZE]| u64::from_be_bytes(s[40..48].try_into().unwrap());
+
+        // Issue, then re-stamp several times so the persisted record
+        // carries an advanced timestamp (not the original).
+        let last = {
+            let mut issuer = StampIssuer::open_or_new(path.clone(), batch, 21, 16, true).unwrap();
+            sign_stamp_bytes(&secret, &mut issuer, &chunk).unwrap();
+            let mut last = sign_stamp_bytes(&secret, &mut issuer, &chunk).unwrap();
+            for _ in 0..5 {
+                last = sign_stamp_bytes(&secret, &mut issuer, &chunk).unwrap();
+            }
+            last
+        };
+
+        // Restart: a fresh issuer reloads the sidecar. The reloaded stamp
+        // must be the LATEST written, not the original — otherwise the
+        // high-water mark is lost.
+        let mut reopened = StampIssuer::open_or_new(path.clone(), batch, 21, 16, true).unwrap();
+        let reloaded = reopened.cached_stamp(&chunk).expect("stamp recovered");
+        assert_eq!(
+            ts(&reloaded),
+            ts(&last),
+            "restart must reload the latest re-stamp timestamp, not a stale one"
+        );
+
+        // And the next re-stamp is still strictly newer than everything
+        // the network has seen, even though a new issuer instance began.
+        let after_restart = sign_stamp_bytes(&secret, &mut reopened, &chunk).unwrap();
+        assert!(
+            ts(&after_restart) > ts(&last),
+            "post-restart re-stamp must exceed the persisted high-water mark"
+        );
+        // In-place update: still exactly one record on disk.
+        let sidecar = path.with_extension("stamps");
+        assert_eq!(
+            std::fs::metadata(&sidecar).unwrap().len() as usize,
+            STAMP_STORE_HEADER_LEN + STAMP_RECORD_LEN,
+            "the sidecar must hold exactly one record for the one address"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
