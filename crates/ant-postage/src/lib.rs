@@ -986,7 +986,7 @@ mod tests {
     fn restamp_reuses_slot_with_fresh_timestamp() {
         let secret = random_secp256k1_secret();
         let sk = k256::ecdsa::SigningKey::from_bytes(&secret.into()).unwrap();
-        let owner = ethereum_address_from_public_key(&*sk.verifying_key());
+        let owner = ethereum_address_from_public_key(sk.verifying_key());
         let mut issuer = StampIssuer::new([0xcd; 32], 21, 16, false).unwrap();
         let chunk = [3u8; 32];
 
