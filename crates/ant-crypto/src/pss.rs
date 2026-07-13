@@ -250,12 +250,13 @@ fn validate_targets(targets: &[Vec<u8>]) -> Result<(), CryptoError> {
 
 /// Process-wide pool of mining worker threads. Aggregate mining across
 /// every concurrent [`wrap`] call is capped at the machine's parallelism
-/// (min 2) so an attacker who pins several `/pss/send` jobs can't
-/// oversubscribe the cores — total mining threads stay bounded no matter
-/// how many jobs run. A job that can't get a slot **waits** (rather than
-/// spawning an unaccounted worker, which would let N callers run
-/// `C + (N-1)` threads and break the invariant); the wait is
-/// cancellation-aware so a disconnected/timed-out request doesn't block.
+/// (`available_parallelism`, fallback 1 if it can't be detected) so an
+/// attacker who pins several `/pss/send` jobs can't oversubscribe the
+/// cores — total mining threads stay bounded no matter how many jobs
+/// run. A job that can't get a slot **waits** (rather than spawning an
+/// unaccounted worker, which would let N callers run `C + (N-1)` threads
+/// and break the invariant); the wait is cancellation-aware so a
+/// disconnected/timed-out request doesn't block.
 static MINING_POOL: OnceLock<MiningPool> = OnceLock::new();
 
 fn mining_pool() -> &'static MiningPool {
