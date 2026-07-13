@@ -172,6 +172,20 @@ pub fn wrap(
     recipient: &Recipient,
     targets: &[Vec<u8>],
 ) -> Result<([u8; 32], Vec<u8>), CryptoError> {
+    wrap_cancellable(topic, msg, recipient, targets, &AtomicBool::new(false))
+}
+
+/// [`wrap`] with a cooperative cancellation flag: the miner threads poll
+/// `cancel` and exit early when it flips, returning
+/// [`CryptoError::PssMiningCancelled`]. Lets a server stop paying for a
+/// mining job whose requester has disconnected or timed out.
+pub fn wrap_cancellable(
+    topic: &[u8; 32],
+    msg: &[u8],
+    recipient: &Recipient,
+    targets: &[Vec<u8>],
+    cancel: &AtomicBool,
+) -> Result<([u8; 32], Vec<u8>), CryptoError> {
     if msg.len() > MAX_PAYLOAD_SIZE {
         return Err(CryptoError::PssMessageTooLong);
     }
@@ -209,7 +223,7 @@ pub fn wrap(
     body_tail[..EPH_X_SIZE].copy_from_slice(&eph_compressed[1..33]);
     body_tail[EPH_X_SIZE..].copy_from_slice(&ciphertext);
 
-    let nonce = mine(hint, &body_tail, targets, odd)?;
+    let nonce = mine(hint, &body_tail, targets, odd, cancel)?;
 
     let mut body = [0u8; BODY_SIZE];
     body[..NONCE_SIZE].copy_from_slice(&nonce);
@@ -234,13 +248,14 @@ fn validate_targets(targets: &[Vec<u8>]) -> Result<(), CryptoError> {
 }
 
 /// Mine `nonce[0..4]` (with byte 28 parity fixed to `odd`) until the
-/// chunk address matches one of `targets`. Multi-threaded, first hit
-/// wins. Returns the winning 32-byte nonce.
+/// chunk address matches one of `targets`, or `cancel` flips. Multi-
+/// threaded, first hit wins. Returns the winning 32-byte nonce.
 fn mine(
     hint: [u8; HINT_SIZE],
     body_tail: &[u8; EPH_X_SIZE + CIPHERTEXT_SIZE],
     targets: &[Vec<u8>],
     odd: bool,
+    cancel: &AtomicBool,
 ) -> Result<[u8; NONCE_SIZE], CryptoError> {
     // Fixed nonce template: bytes 4..32 random, byte 28 parity-forced.
     let mut template = [0u8; NONCE_SIZE];
@@ -269,7 +284,7 @@ fn mine(
                 // Distinct starting counter per worker over nonce[0..4].
                 let mut counter = (w as u32).wrapping_mul(0x9E37_79B9);
                 loop {
-                    if found.load(Ordering::Relaxed) {
+                    if found.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed) {
                         return;
                     }
                     nonce[0..4].copy_from_slice(&counter.to_le_bytes());
@@ -288,8 +303,10 @@ fn mine(
         }
     });
 
+    // Workers only exit winnerless when the cancel flag flipped: the
+    // search space is re-randomized per call and effectively unbounded.
     let result = *winner.lock().unwrap();
-    result.ok_or(CryptoError::PssInvalidTargets)
+    result.ok_or(CryptoError::PssMiningCancelled)
 }
 
 /// The public key of this node's PSS key, SEC1-compressed (33 bytes) —
@@ -439,6 +456,23 @@ mod tests {
 
         // A different topic must not match.
         assert!(unwrap(&recipient_secret, &data, &[topic_from_string("other")]).is_none());
+    }
+
+    #[test]
+    fn wrap_cancellable_stops_without_a_result() {
+        // A pre-flipped cancel flag makes every miner thread exit on its
+        // first loop check — even against a 3-byte target that would
+        // otherwise take ~2^24 hashes.
+        let topic = topic_from_string("cancelled");
+        let err = wrap_cancellable(
+            &topic,
+            b"never mined",
+            &Recipient::TopicDerived,
+            &[vec![0xde, 0xad, 0xbe]],
+            &AtomicBool::new(true),
+        )
+        .unwrap_err();
+        assert!(matches!(err, CryptoError::PssMiningCancelled));
     }
 
     #[test]
