@@ -29,8 +29,20 @@ use tokio::task::JoinHandle;
 
 /// Cap on distinct neighborhoods with live pull pipelines. Each one is
 /// multi-peer pull streams and (PSS mode) whole-bin downloads; more
-/// subscribers on an existing neighborhood cost nothing extra.
+/// subscribers on an existing neighborhood cost nothing extra *to pull*.
 pub const MAX_LURKER_NEIGHBORHOODS: usize = 8;
+/// Cap on subscribers attached to one neighborhood. "Attaching is
+/// cheap" only for the shared pull; each subscriber still adds a
+/// fan-out channel and a routing pass per delivered message, and its
+/// topics widen the per-candidate PSS unwrap work — so it isn't *free*.
+/// Bounds an unauthenticated same-neighborhood subscription flood.
+const MAX_SUBSCRIBERS_PER_TARGET: usize = 64;
+/// Cap on the size of a lurker's union watch (distinct GSOC addresses +
+/// PSS topics). Every registered PSS topic is one more ECDH/unwrap
+/// attempt on *every* candidate chunk in the neighborhood, so an
+/// unbounded topic set is a CPU-amplification vector; refuse a
+/// subscription that would push the union past this.
+const MAX_UNION_WATCH: usize = 256;
 /// Per-subscriber fan-out buffer. A subscriber this far behind sheds.
 const SUBSCRIBER_BUFFER: usize = 64;
 /// How often the dispatcher sweeps for subscribers that left silently
@@ -82,16 +94,39 @@ impl Registry {
     where
         F: FnOnce(SharedWatch, mpsc::Sender<DecodedMessage>) -> JoinHandle<()>,
     {
+        // Reject an over-large single watch outright (before any lock
+        // work) — one subscription can't monopolize the union budget.
+        if watch_len(&watch) > MAX_UNION_WATCH {
+            return None;
+        }
         let (sub_tx, sub_rx) = mpsc::channel(SUBSCRIBER_BUFFER);
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
 
         if let Some(entry) = entries.get(&target) {
-            // Attach: extend the union watch, then join the fan-out.
-            entry
-                .watch
-                .write()
-                .unwrap_or_else(PoisonError::into_inner)
-                .merge_from(&watch);
+            // Attach — but bound the subscriber count and the union
+            // watch size first, so a same-neighborhood flood can't grow
+            // either without limit. A refused attach drops `sub_tx`;
+            // the caller closes the subscriber's stream.
+            {
+                let subs = entry
+                    .subscribers
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if subs.len() >= MAX_SUBSCRIBERS_PER_TARGET {
+                    return None;
+                }
+            }
+            {
+                let mut union = entry.watch.write().unwrap_or_else(PoisonError::into_inner);
+                // Would this attach push the union past the cap? Refuse
+                // rather than partially merge.
+                let mut probe = union.clone();
+                probe.merge_from(&watch);
+                if watch_len(&probe) > MAX_UNION_WATCH {
+                    return None;
+                }
+                *union = probe;
+            }
             entry
                 .subscribers
                 .lock()
@@ -135,6 +170,13 @@ impl Registry {
             .unwrap_or_else(PoisonError::into_inner)
             .len()
     }
+}
+
+/// Total watched items (GSOC addresses + PSS topics) — the union-budget
+/// measure. Each PSS topic is one more ECDH/unwrap attempt per candidate
+/// chunk, so both kinds count toward the same cap.
+fn watch_len(w: &WatchState) -> usize {
+    w.gsoc_addresses.len() + w.pss_topics.len()
 }
 
 /// Whether a decoded message is for this subscriber's watch.
@@ -397,5 +439,67 @@ mod tests {
                 async {}
             ))
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn per_target_subscriber_cap_bounds_a_flood() {
+        let reg = Registry::new();
+        let target = [3u8; 32];
+        // First subscriber spawns; the rest attach up to the cap.
+        let mut keep = Vec::new();
+        for i in 0..MAX_SUBSCRIBERS_PER_TARGET {
+            let mut a = [0u8; 32];
+            a[0] = u8::try_from(i % 251).unwrap();
+            a[1] = u8::try_from(i / 251).unwrap();
+            let rx = reg
+                .subscribe(target, gsoc_watch(a), |_w, _tx| tokio::spawn(async {}))
+                .expect("under the cap must attach");
+            keep.push(rx); // hold receivers so pruning can't free slots
+        }
+        // One past the cap is refused (same target).
+        assert!(reg
+            .subscribe(target, gsoc_watch([0xfe; 32]), |_w, _tx| tokio::spawn(
+                async {}
+            ))
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn union_watch_cap_refuses_oversize_and_overflowing_merges() {
+        let reg = Registry::new();
+        let target = [4u8; 32];
+
+        // A single oversize watch is refused outright.
+        let big = WatchState {
+            gsoc_addresses: (0..=MAX_UNION_WATCH as u32)
+                .map(|i| {
+                    let mut a = [0u8; 32];
+                    a[..4].copy_from_slice(&i.to_be_bytes());
+                    a
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert!(reg
+            .subscribe(target, big, |_w, _tx| tokio::spawn(async {}))
+            .is_none());
+
+        // Fill the union to the cap across many subscribers, then the
+        // next attach that would overflow it is refused.
+        let mut watch_full = WatchState::default();
+        for i in 0..MAX_UNION_WATCH as u32 {
+            let mut a = [0u8; 32];
+            a[..4].copy_from_slice(&i.to_be_bytes());
+            watch_full.gsoc_addresses.insert(a);
+        }
+        let _rx = reg
+            .subscribe(target, watch_full, |_w, _tx| tokio::spawn(async {}))
+            .expect("exactly at the cap is allowed");
+        // One more distinct address would overflow the union → refused.
+        assert!(reg
+            .subscribe(target, gsoc_watch([0xab; 32]), |_w, _tx| tokio::spawn(
+                async {}
+            ))
+            .is_none());
     }
 }
