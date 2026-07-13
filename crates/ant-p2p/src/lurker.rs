@@ -433,12 +433,26 @@ async fn pull_bin(
         if out.is_closed() {
             return;
         }
+        // Clear readiness before every (re)open. On a quiet bin the
+        // SYNC_ROUND_TIMEOUT fires and we loop back here to reopen; if
+        // that reopen *wedges* (stream open hangs), the puller is alive
+        // but no longer covering — leaving the previous round's readiness
+        // set would let the handover retire valid coverage. `mark_ready`
+        // re-sets it only once the new Get lands, so between reopen and a
+        // fresh Get this puller doesn't count as ready. (The task-exit
+        // ReadyGuard only fires when the whole task ends, which a wedge
+        // inside the loop never triggers.)
+        {
+            let mut r = ready.lock().unwrap_or_else(PoisonError::into_inner);
+            if r.get(&(peer_id, bin)) == Some(&generation) {
+                r.remove(&(peer_id, bin));
+            }
+        }
         // Mark this (peer, bin) ready the moment the stream opens and the
         // Get is sent — *not* after the first page. On a quiet bin the
-        // server holds the Offer indefinitely (and our SYNC_ROUND_TIMEOUT
-        // reopens the stream), so waiting for a page would leave a
-        // legitimately-covering puller "not ready" forever, stalling the
-        // handover and letting obsolete pullers pile up during churn.
+        // server holds the Offer indefinitely, so waiting for a page would
+        // leave a legitimately-covering puller "not ready" forever,
+        // stalling the handover and letting obsolete pullers pile up.
         let ready_c = Arc::clone(&ready);
         let mark_ready = move || {
             ready_c
