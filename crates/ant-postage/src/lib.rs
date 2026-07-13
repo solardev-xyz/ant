@@ -1706,9 +1706,14 @@ mod tests {
             // (the old fail-open bug returned a pushable stamp here whose
             // mapping would vanish on restart).
             let a2 = [0xb2; 32];
-            // The error must name the *specific* failure mode (migration
-            // here), not a generic/misleading reason.
+            // The error must keep the structured `Persist` classification
+            // (downstream callers may match on it) *and* name the
+            // specific failure mode (migration here).
             let err = sign_stamp_bytes(&secret, &mut issuer, &a2).unwrap_err();
+            assert!(
+                matches!(err, PostageError::Persist(_)),
+                "must stay classified as Persist, got: {err:?}"
+            );
             assert!(
                 err.to_string().contains("migration"),
                 "error should name the migration failure, got: {err}"
