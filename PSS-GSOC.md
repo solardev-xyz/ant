@@ -547,6 +547,25 @@ Two regression tests: a sabotaged v1 migration (temp path blocked)
 leaves the v1 file byte-identical and appends nothing; a file stuffed
 with garbage full frames compacts to the one live record on load.
 
+## Round 7 hardening (2026-07-13) — seventh external review
+
+One Medium: the round-6 "leave the sidecar unwritten and run
+in-memory" behaviour was **fail-open**. A persistent issuer whose v1
+migration failed had `stamps_path = None` — indistinguishable from an
+*intentional* in-memory issuer — so `sign_stamp_bytes` still returned a
+stamp. That stamp pushes to the network, but its address→slot mapping
+was never persisted, so after restart a re-push burns a fresh index
+(and, at capacity, evicts another chunk on a mutable batch or is
+rejected on an immutable one). Fix: an explicit `stamp_persistence_failed`
+state, set only when a *persistent* issuer's migration fails, distinct
+from an intentional in-memory issuer. `sign_stamp_bytes` now **fails
+closed** on it — refusing to issue *before* consuming a bucket index —
+so the node returns an upload error (operator fixes the data dir and
+restarts to migrate) rather than issuing an unrecoverable stamp. The
+regression test now asserts stamping fails while the sidecar is broken,
+then that clearing the obstruction lets a restart migrate and recover
+the v1 records intact — so no successfully-issued stamp can disappear.
+
 ## What remains (optional)
 
 1. **Arbitrary-neighborhood rooms**: reliable only when participants are
