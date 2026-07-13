@@ -123,16 +123,18 @@ pub struct StampIssuer {
     /// Sidecar path the issued stamps are written to (sibling of
     /// `persist_path`, `.stamps` extension). `None` for in-memory issuers.
     stamps_path: Option<PathBuf>,
-    /// Set when a *persistent* issuer's sidecar could not be made
-    /// writable (a v1 file whose migration to v2 failed). It is
+    /// `Some(reason)` when a *persistent* issuer's sidecar exists but
+    /// could not be made safe to write to — an unreadable file, an
+    /// un-removable foreign/corrupt or unknown-version header, a failed
+    /// v1→v2 migration, or a failed trailing-partial truncation. It is
     /// distinct from an intentional in-memory issuer (`stamps_path`
-    /// `None`, this `false`): here the caller **expected** durability,
-    /// so [`sign_stamp_bytes`] refuses to issue — a stamp we can't
-    /// persist would push to the network and then lose its
-    /// address→slot mapping on restart, burning a fresh index on
+    /// `None`, this `None`): here the caller **expected** durability, so
+    /// [`sign_stamp_bytes`] refuses to issue and surfaces `reason` — a
+    /// stamp we can't persist would push to the network and then lose
+    /// its address→slot mapping on restart, burning a fresh index on
     /// re-push (and, at capacity, evicting another chunk or being
     /// rejected on an immutable batch).
-    stamp_persistence_failed: bool,
+    stamp_persistence_failed: Option<&'static str>,
 }
 
 /// Magic for the per-chunk stamp sidecar (Ant `STamp` Map).
@@ -264,7 +266,7 @@ impl StampIssuer {
                 seen: HashMap::new(),
                 stamp_record_count: 0,
                 stamps_path: None,
-                stamp_persistence_failed: false,
+                stamp_persistence_failed: None,
             };
             issuer.attach_stamp_store();
             return Ok(issuer);
@@ -333,7 +335,7 @@ impl StampIssuer {
             seen: HashMap::new(),
             stamp_record_count: 0,
             stamps_path: None,
-            stamp_persistence_failed: false,
+            stamp_persistence_failed: None,
         };
         issuer.attach_stamp_store();
         Ok(issuer)
@@ -389,7 +391,7 @@ impl StampIssuer {
             seen: HashMap::new(),
             stamp_record_count: 0,
             stamps_path: None,
-            stamp_persistence_failed: false,
+            stamp_persistence_failed: None,
         };
         issuer.attach_stamp_store();
         Ok(issuer)
@@ -406,21 +408,25 @@ impl StampIssuer {
             let sidecar = stamps_sidecar_path(p);
             let loaded = load_stamp_store(&sidecar, &self.batch_id);
             self.seen = loaded.map;
-            if loaded.appendable {
-                self.stamp_record_count = loaded.physical_count;
-                self.stamps_path = Some(sidecar);
-            } else {
-                // v1 migration failed. Appending v2 records under the v1
-                // header would corrupt it, so the sidecar is left intact
-                // for a future restart to migrate — but this issuer
-                // CANNOT persist new stamps. Mark persistence failed so
-                // `sign_stamp_bytes` refuses to issue: a stamp we can't
-                // record would push to the network and then lose its slot
-                // mapping on restart. (The recovered stamps stay in
-                // memory so reads / `has_stamp` still reflect reality.)
-                self.stamp_record_count = 0;
-                self.stamps_path = None;
-                self.stamp_persistence_failed = true;
+            match loaded.unusable_reason {
+                None => {
+                    self.stamp_record_count = loaded.physical_count;
+                    self.stamps_path = Some(sidecar);
+                }
+                Some(reason) => {
+                    // The sidecar exists but can't be safely written
+                    // (unreadable, an un-removable bad header, a failed
+                    // migration, or a failed truncation). Appending under
+                    // it would corrupt framing and lose the mapping on
+                    // restart, so this issuer CANNOT persist new stamps.
+                    // Record the reason so `sign_stamp_bytes` fails closed
+                    // with an accurate operator message; a restart retries
+                    // recovery. (Recovered stamps stay in memory so reads
+                    // / `has_stamp` still reflect reality.)
+                    self.stamp_record_count = 0;
+                    self.stamps_path = None;
+                    self.stamp_persistence_failed = Some(reason);
+                }
             }
         }
     }
@@ -849,13 +855,12 @@ pub fn sign_stamp_bytes(
     // network and then vanish from our address→slot map on restart, so
     // a re-push burns a fresh index and, at capacity, evicts another
     // chunk (mutable) or is rejected (immutable). An *intentional*
-    // in-memory issuer (`stamp_persistence_failed` false) is unaffected.
-    if issuer.stamp_persistence_failed {
-        return Err(PostageError::Persist(
-            "stamp sidecar unavailable (v1 migration failed); refusing to issue a \
-             non-durable stamp — fix the data dir and restart to migrate"
-                .to_string(),
-        ));
+    // in-memory issuer (`stamp_persistence_failed` None) is unaffected.
+    if let Some(reason) = issuer.stamp_persistence_failed {
+        return Err(PostageError::Persist(format!(
+            "stamp sidecar unusable ({reason}); refusing to issue a non-durable \
+             stamp — fix the data dir and restart to recover"
+        )));
     }
     // Idempotent per chunk SLOT, not per stamp: an address we've stamped
     // before reuses its (bucket, index) — a re-push (heal / retry /
@@ -939,11 +944,14 @@ struct LoadedSidecar {
     /// Complete physical frames on disk (valid *and* checksum-invalid),
     /// so the compaction trigger accounts for torn frames too.
     physical_count: usize,
-    /// Whether it is safe to append v2 records to the on-disk file. Only
-    /// `false` when the file is v1 and migration to v2 failed — appending
-    /// then would misalign framing, so the issuer runs in-memory-only
-    /// this session and a restart retries migration.
-    appendable: bool,
+    /// `None` when the sidecar is safe to append to. `Some(reason)` when
+    /// the on-disk file exists but couldn't be validated *or* made safe
+    /// to write to — appending under it would corrupt framing and lose
+    /// the mapping on restart, so the issuer fails closed and surfaces
+    /// `reason` to the operator (the specific failure mode, not just
+    /// "migration"). `map` still carries whatever valid records we
+    /// parsed, for reads.
+    unusable_reason: Option<&'static str>,
 }
 
 impl LoadedSidecar {
@@ -953,22 +961,23 @@ impl LoadedSidecar {
         Self {
             map: HashMap::new(),
             physical_count: 0,
-            appendable: true,
+            unusable_reason: None,
         }
     }
 
-    /// The on-disk sidecar exists but couldn't be validated *or* made
-    /// safe to write to (unreadable, an un-removable foreign/corrupt
-    /// header, a failed migration, or a failed trailing-partial
-    /// truncation). Appending under it would corrupt framing and lose
-    /// the mapping on restart, so the issuer must fail closed. `map`
-    /// carries whatever valid records we did parse (for reads).
-    fn broken(map: HashMap<[u8; 32], [u8; STAMP_SIZE]>) -> Self {
+    /// The sidecar exists but can't be safely written; `reason` names the
+    /// specific failure mode for operator diagnostics.
+    fn broken(map: HashMap<[u8; 32], [u8; STAMP_SIZE]>, reason: &'static str) -> Self {
         Self {
             map,
             physical_count: 0,
-            appendable: false,
+            unusable_reason: Some(reason),
         }
+    }
+
+    #[cfg(test)]
+    fn appendable(&self) -> bool {
+        self.unusable_reason.is_none()
     }
 }
 
@@ -1017,7 +1026,7 @@ fn load_stamp_store(path: &Path, batch_id: &[u8; 32]) -> LoadedSidecar {
         // The file EXISTS but we can't read it (permissions, I/O error).
         // Appending under an unvalidated header would corrupt it, so fail
         // closed rather than treat it like a missing file.
-        Err(_) => return LoadedSidecar::broken(map),
+        Err(_) => return LoadedSidecar::broken(map, "sidecar unreadable (permissions or I/O)"),
     };
     // Foreign / corrupt header: appendable only if we can actually clear
     // the file first (a fresh append then starts clean). If removal fails
@@ -1031,7 +1040,7 @@ fn load_stamp_store(path: &Path, batch_id: &[u8; 32]) -> LoadedSidecar {
         return if removed_cleanly(path) {
             LoadedSidecar::empty()
         } else {
-            LoadedSidecar::broken(map)
+            LoadedSidecar::broken(map, "corrupt/foreign sidecar header could not be removed")
         };
     }
     let version = u16::from_le_bytes([bytes[4], bytes[5]]);
@@ -1044,7 +1053,7 @@ fn load_stamp_store(path: &Path, batch_id: &[u8; 32]) -> LoadedSidecar {
             return if removed_cleanly(path) {
                 LoadedSidecar::empty()
             } else {
-                LoadedSidecar::broken(map)
+                LoadedSidecar::broken(map, "unknown sidecar version could not be removed")
             };
         }
     };
@@ -1091,13 +1100,13 @@ fn load_stamp_store(path: &Path, batch_id: &[u8; 32]) -> LoadedSidecar {
             return LoadedSidecar {
                 map,
                 physical_count: live,
-                appendable: true,
+                unusable_reason: None,
             };
         }
         if !has_checksum {
             // v1 migration failed: don't append to the v1 file (framing
             // mismatch), but keep the parsed records for reads.
-            return LoadedSidecar::broken(map);
+            return LoadedSidecar::broken(map, "v1→v2 migration failed");
         }
         // v2 compaction failed: keep appending (same format is fine).
     }
@@ -1112,13 +1121,13 @@ fn load_stamp_store(path: &Path, batch_id: &[u8; 32]) -> LoadedSidecar {
             .and_then(|f| f.set_len(off as u64))
             .is_ok();
         if !truncated {
-            return LoadedSidecar::broken(map);
+            return LoadedSidecar::broken(map, "trailing-partial truncation failed");
         }
     }
     LoadedSidecar {
         map,
         physical_count: physical_frames,
-        appendable: true,
+        unusable_reason: None,
     }
 }
 
@@ -1693,6 +1702,13 @@ mod tests {
             // (the old fail-open bug returned a pushable stamp here whose
             // mapping would vanish on restart).
             let a2 = [0xb2; 32];
+            // The error must name the *specific* failure mode (migration
+            // here), not a generic/misleading reason.
+            let err = sign_stamp_bytes(&secret, &mut issuer, &a2).unwrap_err();
+            assert!(
+                err.to_string().contains("migration"),
+                "error should name the migration failure, got: {err}"
+            );
             assert!(
                 sign_stamp_bytes(&secret, &mut issuer, &a2).is_err(),
                 "must refuse to issue when persistence is broken"
@@ -1790,7 +1806,7 @@ mod tests {
         std::fs::create_dir(&sidecar).unwrap();
         let loaded = load_stamp_store(&sidecar, &[0x22; 32]);
         assert!(
-            !loaded.appendable,
+            !loaded.appendable(),
             "an unreadable existing sidecar must fail closed"
         );
         assert!(loaded.map.is_empty());
@@ -1821,7 +1837,7 @@ mod tests {
         if sabotage_effective {
             let loaded = load_stamp_store(&sidecar, &[0x11; 32]);
             assert!(
-                !loaded.appendable,
+                !loaded.appendable(),
                 "an un-removable foreign sidecar must fail closed"
             );
         }
