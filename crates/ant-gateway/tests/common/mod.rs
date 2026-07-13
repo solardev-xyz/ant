@@ -488,7 +488,9 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
         }
         // Live-network P2P surfaces the HTTP fixture doesn't model.
         ControlCommand::PullsyncProbe { ack, .. } => {
-            let _ = ack.send(ControlAck::PullsyncProbe(ant_control::PullsyncProbeView::default()));
+            let _ = ack.send(ControlAck::PullsyncProbe(
+                ant_control::PullsyncProbeView::default(),
+            ));
         }
         ControlCommand::LurkerSubscribe { .. } => {}
         ControlCommand::GetChunk { reference, ack } => {
