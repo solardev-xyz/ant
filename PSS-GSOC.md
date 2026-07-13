@@ -566,6 +566,26 @@ regression test now asserts stamping fails while the sidecar is broken,
 then that clearing the obstruction lets a restart migrate and recover
 the v1 records intact — so no successfully-issued stamp can disappear.
 
+## Round 8 hardening (2026-07-13) — eighth external review
+
+One Medium: the round-7 fail-closed state was reached only on the v1
+migration path; three *other* sidecar-load failures still returned
+`appendable = true` and could corrupt the file. (1) A non-`NotFound`
+read error was treated like a missing file. (2) A foreign/corrupt or
+unknown-version header was removed with the result **ignored** — if
+removal failed (e.g. a read-only parent directory keeps the file but
+leaves it writable), the malformed file stayed and subsequent appends
+went under its unvalidated header, rejected again on restart with the
+mapping lost. (3) A failed trailing-partial truncation left a
+misaligned tail that the next append would shift. Fix: the loader now
+returns appendable **only** on `NotFound` or a *successfully removed*
+file; every other read/removal/truncation failure yields a
+non-appendable result that activates `stamp_persistence_failed` (fail
+closed), keeping any parsed records in memory for reads. Two regression
+tests: a directory at the sidecar path (unreadable → fail closed) and a
+foreign header under a read-only parent dir (un-removable → fail
+closed, with a root-skip guard since permissions don't bind root).
+
 ## What remains (optional)
 
 1. **Arbitrary-neighborhood rooms**: reliable only when participants are
