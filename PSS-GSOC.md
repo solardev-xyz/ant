@@ -167,15 +167,19 @@ node A's neighborhood. Senders alternate across both nodes (Alice@A,
 Bob@B, Carol@A, Dave@B — node B pushes into a foreign neighborhood);
 subscriber on A lurks natively, subscriber on B lurks A's neighborhood
 via the `?neighborhood=` override from a completely different overlay.
-**Result: 4/4 delivered on BOTH subscribers**, ~1 s per message — the
-real many-to-many claim, senders and receivers on distinct nodes.
-Notably the far-node subscriber (the documented-unreliable case) went
-4/4 in this run; one good run doesn't retract the ~bin-12 reliability
-caveat below, but it's the first positive data point for foreign-
-neighborhood rooms. Operational note: the two nodes MUST stamp with
-different batches or two independent issuers allocate colliding stamp
-indices in the room's bucket (this run used one batch from a shared
-issuer lineage; distinct batches are the clean setup).
+**Enforced result: subscriber A received 4/4**, ~1 s per message — the
+real many-to-many claim, since A received messages sent from *both*
+nodes. The demo gates PASS on subscriber A only: A is resident in the
+room's own neighborhood, so A getting all four is the multi-node proof.
+Subscriber B lurks a *foreign* neighborhood from a distant overlay (the
+~bin-12 case documented as unreliable below), so its count is reported
+as an **observation, not a pass condition** — gating on it would make
+the test flaky on a limitation we already disclose. In the recorded run
+B also happened to get 4/4 — a first positive data point for
+foreign-neighborhood rooms, not a guarantee. Operational note: the two
+nodes MUST stamp with different batches or two independent issuers
+allocate colliding stamp indices in the room's bucket (this run reused
+one batch across both; distinct batches are the clean setup).
 
 Two fixes made multi-message reception reliable: **continuous pullers**
 (the driver no longer aborts its pull tasks to re-dial, which had left a
@@ -189,7 +193,13 @@ and reception is unreliable at that depth; a room in (or near) a
 participant's own neighborhood is reliably reachable. Mining participant
 overlays into a shared room neighborhood is the path to arbitrary rooms.
 
-## Hardening pass (2026-07-13) — external review, all findings fixed
+## Hardening pass (2026-07-13) — two external review rounds
+
+> Round 2 (a second reviewer) found seven more issues in the round-1
+> fixes; all are now addressed in the "Round 2 hardening" section below.
+> This section documents round 1.
+
+## Round 1 — external review
 
 An independent adversarial review of the branch confirmed the crypto
 port (ECDH stripping, cipher, parity, EIP-191, `topic mod n` — no
@@ -280,7 +290,7 @@ open below.
 | `gsoc_two_updates.mjs` (same-address regression) | ✅ PASS after the re-stamp fix (failed 3× before it — see below) |
 | `pss_e2e.mjs` (topic broadcast) | ✅ PASS |
 | `rendezvous_demo.mjs` (3 msgs, one node) | ✅ PASS |
-| `multi_node_rendezvous.mjs` (2 nodes, 4 senders alternating) | ✅ PASS — 4/4 on both subscribers |
+| `multi_node_rendezvous.mjs` (2 nodes, 4 senders alternating) | ✅ PASS — subscriber A 4/4 (enforced); far-node B 4/4 (observed) |
 
 Lab note: debug-build keccak made 2-byte-target mining take ~30 s
 (measured) and intermittently trip the request timeout; the workspace
@@ -295,11 +305,66 @@ neighborhood: the first subscriber spawns it, later ones attach, a
 dispatcher fans each decoded message out to exactly the matching
 subscribers, and the lurker follows the live **union** watch (shared
 `RwLock<WatchState>`, re-read per round — joins/leaves never restart
-pullers or lose resume positions). Budgets: ≤8 distinct neighborhoods
-(attaching is free), and a subscriber 64 messages behind sheds instead
-of head-of-line-blocking the rest. This supersedes the interim
-per-subscription cap and closes the shared-fan-out half of review
-finding #6; global bandwidth budgets remain open.
+pullers or lose resume positions). Budgets: ≤8 distinct neighborhoods,
+≤64 subscribers per neighborhood, ≤256 union-watch items (each PSS
+topic is per-candidate-chunk ECDH work, so it's capped too), and a
+subscriber 64 messages behind sheds instead of head-of-line-blocking
+the rest. Attaching to an existing neighborhood is cheap *to pull*
+(shared stream) but not free — it still adds a fan-out channel, a
+per-message routing pass, and unwrap work — hence the caps. Supersedes
+the interim per-subscription semaphore and closes the shared-fan-out
+half of review finding #6; **global** (cross-neighborhood) bandwidth
+budgets remain open.
+
+## Round 2 hardening (2026-07-13) — second external review
+
+A second reviewer found seven issues in the round-1 fixes; all
+addressed:
+
+1. **Epoch-blind resume (High)** — saved pull positions were keyed
+   `(peer, bin) → start` with no reserve epoch. A peer that wipes its
+   reserve resets its cursors, so an old (high) position would park the
+   puller above every new binID forever. Now positions are
+   `(peer, bin) → (epoch, start)` and the driver discards a position
+   whose epoch doesn't match the freshly-fetched cursor's — bee's
+   puller drops saved intervals on epoch change for the same reason.
+2. **Sequential cursor fetch / no timeout (Med)** — coverage setup
+   awaited `get_cursors` peer-by-peer with no bound, so one silent
+   closest peer stalled all later pullers. Now fetches run concurrently
+   (`join_all`) each under a 5 s `CURSOR_FETCH_TIMEOUT`.
+3. **Handover didn't wait for live coverage (Med)** — a replacement
+   puller was considered "covering" the instant it was `spawn`ed, so
+   obsolete pullers could be retired before the replacement opened a
+   stream. Now a puller is marked **ready** only after its first
+   completed pull round, and the handover retires old coverage only
+   once every desired `(peer, bin)` is ready.
+4. **Deliveries not bound to the full offered identity (Med)** — the
+   wanted set was address-only and delivery validation only checked
+   stamp length. Now `sync_once` retains the offered `(batchID,
+   stampHash)` per address and `accept_delivery` recomputes
+   `keccak(stamp)` and requires it to match one offered identity —
+   bee's own `(address, batchID, stampHash)` binding.
+5. **Non-monotonic re-stamp timestamp (Med)** — the re-stamp used the
+   raw wall clock; equal clock resolution or a backward step would
+   re-create the `ErrOverwriteNewerChunk` rejection it fixes. Now
+   `ts = max(now, prev + 1)`, guaranteeing strictly-newer.
+6. **Unbounded sidecar growth (part of #5)** — every re-stamp appended
+   and fsynced a new `.stamps` record, growing the file without bound
+   for a busy GSOC room and slowing startup scans. Re-stamps now update
+   the in-memory stamp only (the persisted slot record is unchanged);
+   the sidecar stays one record per address.
+7. **Unbounded same-neighborhood subscriptions + mining threads
+   (High)** — see the registry caps above (subscribers/union-watch),
+   and mining now claims worker threads from a **process-wide budget**
+   (`ant-crypto`) so aggregate mining across all `/pss/send` jobs never
+   exceeds the machine's core count — two jobs of 16 workers can no
+   longer oversubscribe every core. Authentication of `/pss/send`
+   (still unauthenticated, like bee's) remains a deployment concern.
+
+Not a full fix, disclosed: `/pss/send` is still unauthenticated (matches
+bee); the mining budget + 2-job semaphore + cancellation bound the CPU
+cost but a flood of valid-batch requests can still occupy the miner.
+Rate-limiting / auth is a gateway-deployment decision.
 
 ## What remains (optional)
 

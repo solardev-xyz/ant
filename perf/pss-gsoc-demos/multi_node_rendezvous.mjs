@@ -82,9 +82,24 @@ try { wsB.close(); } catch {}
 
 const setA = new Set(gotA);
 const setB = new Set(gotB);
-console.log(`\n[A] received ${setA.size}/${sent.length}; [B] received ${setB.size}/${sent.length} (best-effort)`);
-if (sent.every((m) => setA.has(m))) {
-  console.log('✅ MULTI-NODE RENDEZVOUS PASS — senders on two nodes, room delivered all');
+// PASS is gated on subscriber A ONLY: A is resident in the room's own
+// neighborhood, and A receiving messages sent from BOTH nodes is the
+// full multi-node many-to-many proof. Subscriber B lurks a *foreign*
+// neighborhood from a distant overlay — the ~bin-12 case PSS-GSOC.md
+// documents as unreliable — so its count is reported as an OBSERVATION,
+// never a gating condition (gating on it would make the test flaky on a
+// limitation we already disclose).
+const aPass = sent.every((m) => setA.has(m));
+console.log(
+  `\n[A, enforced] received ${setA.size}/${sent.length}` +
+    `; [B, observed/best-effort] received ${setB.size}/${sent.length}`,
+);
+if (aPass) {
+  const bNote =
+    setB.size === sent.length
+      ? ' (far-node subscriber B also got all — a bonus, not required)'
+      : ` (far-node subscriber B got ${setB.size}/${sent.length}, within the documented limit)`;
+  console.log(`✅ MULTI-NODE RENDEZVOUS PASS — senders on two nodes, room delivered all to A${bNote}`);
   process.exit(0);
 }
 console.log('❌ missing at A:', sent.filter((m) => !setA.has(m)));
