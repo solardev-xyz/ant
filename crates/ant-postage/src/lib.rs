@@ -391,10 +391,20 @@ impl StampIssuer {
     fn attach_stamp_store(&mut self) {
         if let Some(p) = &self.persist_path {
             let sidecar = stamps_sidecar_path(p);
-            let (seen, record_count) = load_stamp_store(&sidecar, &self.batch_id);
-            self.seen = seen;
-            self.stamp_record_count = record_count;
-            self.stamps_path = Some(sidecar);
+            let loaded = load_stamp_store(&sidecar, &self.batch_id);
+            self.seen = loaded.map;
+            if loaded.appendable {
+                self.stamp_record_count = loaded.physical_count;
+                self.stamps_path = Some(sidecar);
+            } else {
+                // v1 migration failed: keep the recovered stamps in memory
+                // (re-pushes this session are still idempotent) but do NOT
+                // wire up the sidecar for appends — writing v2 records
+                // under the v1 header would corrupt it. The v1 file is
+                // left intact for a future restart to migrate.
+                self.stamp_record_count = 0;
+                self.stamps_path = None;
+            }
         }
     }
 
@@ -891,6 +901,30 @@ fn stamp_timestamp(stamp: &[u8; STAMP_SIZE]) -> u64 {
     u64::from_be_bytes(stamp[40..48].try_into().expect("stamp layout"))
 }
 
+/// Result of loading a stamp sidecar.
+struct LoadedSidecar {
+    /// Latest valid stamp per address.
+    map: HashMap<[u8; 32], [u8; STAMP_SIZE]>,
+    /// Complete physical frames on disk (valid *and* checksum-invalid),
+    /// so the compaction trigger accounts for torn frames too.
+    physical_count: usize,
+    /// Whether it is safe to append v2 records to the on-disk file. Only
+    /// `false` when the file is v1 and migration to v2 failed — appending
+    /// then would misalign framing, so the issuer runs in-memory-only
+    /// this session and a restart retries migration.
+    appendable: bool,
+}
+
+impl LoadedSidecar {
+    fn empty() -> Self {
+        Self {
+            map: HashMap::new(),
+            physical_count: 0,
+            appendable: true,
+        }
+    }
+}
+
 /// Load the per-chunk stamp sidecar into `(stamp map, physical record
 /// count)`. Best-effort and self-healing:
 ///
@@ -911,20 +945,17 @@ fn stamp_timestamp(stamp: &[u8; STAMP_SIZE]) -> u64 {
 ///
 /// A stale/dropped entry only ever costs a re-stamp, never a wrong
 /// stamp, so issuer construction never hard-fails over the sidecar.
-fn load_stamp_store(
-    path: &Path,
-    batch_id: &[u8; 32],
-) -> (HashMap<[u8; 32], [u8; STAMP_SIZE]>, usize) {
+fn load_stamp_store(path: &Path, batch_id: &[u8; 32]) -> LoadedSidecar {
     let mut map: HashMap<[u8; 32], [u8; STAMP_SIZE]> = HashMap::new();
     let Ok(bytes) = std::fs::read(path) else {
-        return (map, 0);
+        return LoadedSidecar::empty();
     };
     if bytes.len() < STAMP_STORE_HEADER_LEN
         || &bytes[0..4] != STAMP_STORE_MAGIC
         || &bytes[6..38] != batch_id.as_slice()
     {
         let _ = std::fs::remove_file(path);
-        return (map, 0);
+        return LoadedSidecar::empty();
     }
     let version = u16::from_le_bytes([bytes[4], bytes[5]]);
     let (record_len, has_checksum) = match version {
@@ -933,15 +964,20 @@ fn load_stamp_store(
         _ => {
             // Unknown future/foreign version: drop it rather than guess.
             let _ = std::fs::remove_file(path);
-            return (map, 0);
+            return LoadedSidecar::empty();
         }
     };
 
-    // Newest-timestamp-wins per address; keep only checksum-valid records.
+    // Newest-timestamp-wins per address, keeping only checksum-valid
+    // records. Count *every complete physical frame* (valid or not)
+    // separately: a checksum-invalid frame still occupies disk space, so
+    // it must count toward the compaction trigger or repeated torn
+    // writes could grow the file past the bound without ever compacting.
     let mut best_ts: HashMap<[u8; 32], u64> = HashMap::new();
     let mut off = STAMP_STORE_HEADER_LEN;
-    let mut valid_records = 0usize;
+    let mut physical_frames = 0usize;
     while off + record_len <= bytes.len() {
+        physical_frames += 1;
         let mut addr = [0u8; 32];
         addr.copy_from_slice(&bytes[off..off + 32]);
         let mut stamp = [0u8; STAMP_SIZE];
@@ -950,7 +986,6 @@ fn load_stamp_store(
             || bytes[off + 32 + STAMP_SIZE..off + record_len]
                 == stamp_record_checksum(&addr, &stamp);
         if ok {
-            valid_records += 1;
             let ts = stamp_timestamp(&stamp);
             if best_ts.get(&addr).is_none_or(|&prev| ts >= prev) {
                 best_ts.insert(addr, ts);
@@ -960,63 +995,75 @@ fn load_stamp_store(
         off += record_len;
     }
 
-    // Migrate v1 forward, or compact a v2 file that has grown past a
-    // small multiple of its live entries. Either way the file ends up as
-    // one v2 record per address; on failure keep whatever we parsed.
-    let needs_compaction =
-        !has_checksum || valid_records > map.len() * STAMP_COMPACT_FACTOR + STAMP_COMPACT_FLOOR;
-    if needs_compaction && rewrite_sidecar(path, batch_id, &map).is_ok() {
-        let live = map.len();
-        return (map, live);
+    // v1 files MUST be migrated before any append: appending a 149-byte
+    // v2 record under a v1 (145-byte) header would misalign framing and
+    // silently lose records on the next load. So if migration fails for a
+    // v1 file, mark the sidecar non-appendable — the caller keeps the
+    // in-memory map but does NOT append this session (a restart retries
+    // migration), rather than corrupting the file. A v2 file whose
+    // compaction fails is still safe to append to (same format), so it
+    // stays appendable.
+    let over_threshold = physical_frames > map.len() * STAMP_COMPACT_FACTOR + STAMP_COMPACT_FLOOR;
+    if !has_checksum || over_threshold {
+        if rewrite_sidecar(path, batch_id, &map).is_ok() {
+            let live = map.len();
+            return LoadedSidecar {
+                map,
+                physical_count: live,
+                appendable: true,
+            };
+        }
+        if !has_checksum {
+            // v1 migration failed: don't append to the v1 file.
+            return LoadedSidecar {
+                map,
+                physical_count: physical_frames,
+                appendable: false,
+            };
+        }
+        // v2 compaction failed: keep appending (same format is fine).
     }
-    // Compaction not needed or it failed: keep the parsed map. Truncate
-    // any trailing partial below so at least framing stays aligned.
     // Truncate a trailing partial record so the next append is aligned.
     if off < bytes.len() {
         if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
             let _ = f.set_len(off as u64);
         }
     }
-    (map, valid_records)
+    LoadedSidecar {
+        map,
+        physical_count: physical_frames,
+        appendable: true,
+    }
 }
 
-/// Rewrite the sidecar atomically (temp file + fsync + rename) with
-/// exactly one v2 record per live address. Used to migrate a v1 file and
-/// to compact a v2 file whose re-stamp appends have accumulated.
+/// Rewrite the sidecar with exactly one v2 record per live address, via
+/// the crash-durable [`atomic_write`] (temp write + fsync + rename +
+/// **parent-dir fsync**, so the rename itself survives a crash). Used to
+/// migrate a v1 file and to compact a v2 file whose re-stamp appends have
+/// accumulated.
 fn rewrite_sidecar(
     path: &Path,
     batch_id: &[u8; 32],
     live: &HashMap<[u8; 32], [u8; STAMP_SIZE]>,
 ) -> Result<(), PostageError> {
-    use std::io::Write as _;
-
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| PostageError::Persist(format!("{}: {e}", path.display())))?;
         }
     }
-    let tmp = path.with_extension("stamps.tmp");
-    {
-        let mut f = std::fs::File::create(&tmp)
-            .map_err(|e| PostageError::Persist(format!("{}: {e}", tmp.display())))?;
-        let mut buf = Vec::with_capacity(STAMP_STORE_HEADER_LEN + live.len() * STAMP_RECORD_LEN);
-        buf.extend_from_slice(STAMP_STORE_MAGIC);
-        buf.extend_from_slice(&STAMP_STORE_VERSION.to_le_bytes());
-        buf.extend_from_slice(batch_id);
-        for (addr, stamp) in live {
-            buf.extend_from_slice(addr);
-            buf.extend_from_slice(stamp);
-            buf.extend_from_slice(&stamp_record_checksum(addr, stamp));
-        }
-        f.write_all(&buf)
-            .map_err(|e| PostageError::Persist(format!("{}: {e}", tmp.display())))?;
-        f.sync_all()
-            .map_err(|e| PostageError::Persist(format!("{}: {e}", tmp.display())))?;
+    let mut buf = Vec::with_capacity(STAMP_STORE_HEADER_LEN + live.len() * STAMP_RECORD_LEN);
+    buf.extend_from_slice(STAMP_STORE_MAGIC);
+    buf.extend_from_slice(&STAMP_STORE_VERSION.to_le_bytes());
+    buf.extend_from_slice(batch_id);
+    for (addr, stamp) in live {
+        buf.extend_from_slice(addr);
+        buf.extend_from_slice(stamp);
+        buf.extend_from_slice(&stamp_record_checksum(addr, stamp));
     }
-    std::fs::rename(&tmp, path)
-        .map_err(|e| PostageError::Persist(format!("{}: {e}", path.display())))?;
-    Ok(())
+    let tmp = path.with_extension("stamps.tmp");
+    atomic_write(&tmp, path, &buf)
+        .map_err(|e| PostageError::Persist(format!("{}: {e}", path.display())))
 }
 
 /// Append one checksummed `(addr, stamp)` record to the sidecar,
@@ -1508,6 +1555,112 @@ mod tests {
             2,
             "two v2 records after migration"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// If v1 migration FAILS (e.g. the temp rewrite path can't be
+    /// created), the loader must NOT append v2 records under the v1
+    /// header — that would misalign framing and lose entries. Instead the
+    /// v1 file is left untouched (a restart retries migration) and the
+    /// issuer runs in-memory-only this session. Regression for the
+    /// mixed-format-append hazard.
+    #[test]
+    fn failed_v1_migration_leaves_file_intact_and_non_appendable() {
+        use std::io::Write as _;
+        let secret = random_secp256k1_secret();
+        let dir = tmpdir();
+        let path = dir.join("batch.bin");
+        let batch = [0x88; 32];
+        let sidecar = path.with_extension("stamps");
+
+        // Hand-write a v1 file with one record.
+        let a1 = [0xa1; 32];
+        let mut s1 = [0u8; STAMP_SIZE];
+        s1[0..32].copy_from_slice(&batch);
+        s1[40..48].copy_from_slice(&1234u64.to_be_bytes());
+        {
+            std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+            let mut f = std::fs::File::create(&sidecar).unwrap();
+            f.write_all(STAMP_STORE_MAGIC).unwrap();
+            f.write_all(&STAMP_STORE_VERSION_V1.to_le_bytes()).unwrap();
+            f.write_all(&batch).unwrap();
+            f.write_all(&a1).unwrap();
+            f.write_all(&s1).unwrap();
+        }
+        let v1_bytes_before = std::fs::read(&sidecar).unwrap();
+
+        // Sabotage migration: occupy the exact temp rewrite path
+        // (`rewrite_sidecar` uses `<sidecar>.with_extension("stamps.tmp")`)
+        // with a directory so `atomic_write`'s File::create fails, while
+        // the v1 file itself stays readable/writable.
+        let tmp = sidecar.with_extension("stamps.tmp");
+        std::fs::create_dir(&tmp).unwrap();
+
+        let mut issuer = StampIssuer::open_or_new(path, batch, 21, 16, true).unwrap();
+        // The v1 record was still recovered into memory…
+        assert!(issuer.has_stamp(&a1), "records recovered in memory");
+        // …but the on-disk v1 file is untouched (no v2 records appended
+        // under its v1 header).
+        assert_eq!(
+            std::fs::read(&sidecar).unwrap(),
+            v1_bytes_before,
+            "v1 file must be left intact when migration fails"
+        );
+        // A new stamp must not corrupt the v1 file: persistence is off
+        // this session (in-memory only).
+        let a2 = [0xb2; 32];
+        sign_stamp_bytes(&secret, &mut issuer, &a2).unwrap();
+        assert_eq!(
+            std::fs::read(&sidecar).unwrap(),
+            v1_bytes_before,
+            "no append to the v1 file after a failed migration"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Corrupt (checksum-invalid) full frames still occupy disk, so they
+    /// must count toward the compaction trigger — otherwise a stream of
+    /// torn full-record writes could grow the file past the bound without
+    /// ever compacting. Here we stuff the file with garbage full-length
+    /// frames and confirm the next load compacts them away.
+    #[test]
+    fn corrupt_frames_count_toward_compaction() {
+        use std::io::Write as _;
+        let secret = random_secp256k1_secret();
+        let dir = tmpdir();
+        let path = dir.join("batch.bin");
+        let batch = [0x99; 32];
+        let sidecar = path.with_extension("stamps");
+        let chunk = [0x5a; 32];
+
+        // One real record, then a pile of full-length garbage frames
+        // (valid framing, bad checksum) well past the compaction floor.
+        {
+            let mut issuer = StampIssuer::open_or_new(path.clone(), batch, 21, 16, true).unwrap();
+            sign_stamp_bytes(&secret, &mut issuer, &chunk).unwrap();
+        }
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&sidecar)
+                .unwrap();
+            for _ in 0..(STAMP_COMPACT_FLOOR + 5) {
+                f.write_all(&[0x00u8; STAMP_RECORD_LEN]).unwrap(); // zero addr+stamp, checksum won't match
+            }
+        }
+        let records_before = (std::fs::metadata(&sidecar).unwrap().len() as usize
+            - STAMP_STORE_HEADER_LEN)
+            / STAMP_RECORD_LEN;
+        assert!(records_before > STAMP_COMPACT_FLOOR);
+
+        // Reopen: the corrupt frames counted toward the trigger, so the
+        // file is compacted down to just the one live record.
+        let reopened = StampIssuer::open_or_new(path, batch, 21, 16, true).unwrap();
+        assert!(reopened.has_stamp(&chunk));
+        let records_after = (std::fs::metadata(&sidecar).unwrap().len() as usize
+            - STAMP_STORE_HEADER_LEN)
+            / STAMP_RECORD_LEN;
+        assert_eq!(records_after, 1, "corrupt frames must be compacted away");
         std::fs::remove_dir_all(&dir).ok();
     }
 
