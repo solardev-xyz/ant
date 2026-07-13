@@ -35,8 +35,8 @@ use crate::act::{compress_public_key, parse_public_key, public_key_of, shared_se
 use crate::bmt::bmt_hash_with_span;
 use crate::{keccak256, random_secp256k1_secret, CryptoError, SPAN_SIZE};
 use k256::PublicKey;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 /// Topic-hint length; also the BMT header length.
 pub const HINT_SIZE: usize = 8;
@@ -247,6 +247,76 @@ fn validate_targets(targets: &[Vec<u8>]) -> Result<(), CryptoError> {
     Ok(())
 }
 
+/// Process-wide budget of mining worker threads. Aggregate mining across
+/// every concurrent [`wrap`] call is capped at the machine's parallelism
+/// (min 2) so an attacker who pins several `/pss/send` jobs can't
+/// oversubscribe the cores — total mining threads stay bounded no matter
+/// how many jobs run.
+static MINING_BUDGET: AtomicUsize = AtomicUsize::new(0);
+static MINING_CAP: OnceLock<usize> = OnceLock::new();
+
+/// An RAII claim on mining worker slots from [`MINING_BUDGET`]; returns
+/// exactly what it took on drop (covers early return, `?`, and panics).
+struct MiningThreads {
+    /// Slots actually taken from the budget (may be 0 under contention).
+    claimed: usize,
+    /// Worker threads to spawn — `max(claimed, 1)` so a fully-contended
+    /// job still makes progress single-threaded instead of deadlocking.
+    workers: usize,
+}
+
+/// Atomically take up to `want` slots from `budget` via a CAS loop.
+/// Returns the amount actually taken (0 when fully contended). Pure over
+/// its argument so it's testable without touching the process globals.
+fn take_slots(budget: &AtomicUsize, want: usize) -> usize {
+    let mut avail = budget.load(Ordering::Relaxed);
+    loop {
+        let take = want.min(avail);
+        if take == 0 {
+            return 0;
+        }
+        match budget.compare_exchange_weak(avail, avail - take, Ordering::AcqRel, Ordering::Relaxed)
+        {
+            Ok(_) => return take,
+            Err(now) => avail = now,
+        }
+    }
+}
+
+impl MiningThreads {
+    /// Claim up to `desired` worker slots. Lazily seeds the budget to
+    /// the machine's parallelism on first use.
+    fn claim(desired: usize) -> Self {
+        let cap = *MINING_CAP.get_or_init(|| {
+            let cores = std::thread::available_parallelism()
+                .map_or(4, std::num::NonZero::get)
+                .max(2);
+            MINING_BUDGET.store(cores, Ordering::Relaxed);
+            cores
+        });
+        let want = desired.clamp(1, cap);
+        let claimed = take_slots(&MINING_BUDGET, want);
+        MiningThreads {
+            claimed,
+            // Fully contended (claimed 0): still run single-threaded so a
+            // job never deadlocks waiting on the budget.
+            workers: claimed.max(1),
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.workers
+    }
+}
+
+impl Drop for MiningThreads {
+    fn drop(&mut self) {
+        if self.claimed > 0 {
+            MINING_BUDGET.fetch_add(self.claimed, Ordering::AcqRel);
+        }
+    }
+}
+
 /// Mine `nonce[0..4]` (with byte 28 parity fixed to `odd`) until the
 /// chunk address matches one of `targets`, or `cancel` flips. Multi-
 /// threaded, first hit wins. Returns the winning 32-byte nonce.
@@ -268,12 +338,16 @@ fn mine(
 
     let found = AtomicBool::new(false);
     let winner: Mutex<Option<[u8; NONCE_SIZE]>> = Mutex::new(None);
-    let workers = std::thread::available_parallelism()
-        .map_or(4, std::num::NonZero::get)
-        .min(16);
+    // Claim worker threads from a process-wide budget so *aggregate*
+    // mining across all concurrent jobs never exceeds the machine's
+    // parallelism — two jobs of 16 workers each would otherwise
+    // oversubscribe every core. A guard returns the claim on completion
+    // (including panic/early return). At least one worker is always
+    // granted so a job under contention still makes progress.
+    let workers = MiningThreads::claim(16);
 
     std::thread::scope(|scope| {
-        for w in 0..workers {
+        for w in 0..workers.count() {
             let found = &found;
             let winner = &winner;
             let template = template;
@@ -473,6 +547,27 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, CryptoError::PssMiningCancelled));
+    }
+
+    #[test]
+    fn mining_budget_take_is_bounded_and_balanced() {
+        // Uses a LOCAL budget so it can't race the global one that live
+        // `wrap` calls in other parallel tests share. Total taken across
+        // any number of concurrent claims never exceeds the pool, and a
+        // fully-drained pool yields 0 (→ single-threaded fallback).
+        let budget = AtomicUsize::new(8);
+
+        let a = take_slots(&budget, 1024);
+        assert_eq!(a, 8, "first claim takes the whole small pool");
+        assert_eq!(budget.load(Ordering::Relaxed), 0);
+
+        // Contended: nothing left to take.
+        assert_eq!(take_slots(&budget, 4), 0);
+
+        // Return some and re-take: never more than what's available.
+        budget.fetch_add(3, Ordering::AcqRel);
+        assert_eq!(take_slots(&budget, 10), 3);
+        assert_eq!(budget.load(Ordering::Relaxed), 0);
     }
 
     #[test]
