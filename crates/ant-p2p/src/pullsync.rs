@@ -32,7 +32,7 @@ use futures::io::{AsyncReadExt, AsyncWriteExt};
 use libp2p::{PeerId, StreamProtocol};
 use libp2p_stream::Control;
 use prost::Message;
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 /// Cursor stream protocol id.
 pub const PROTOCOL_PULLSYNC_CURSORS: &str = "/swarm/pullsync/1.4.0/cursors";
@@ -238,6 +238,12 @@ fn to_32(v: &[u8]) -> Option<[u8; 32]> {
     v.try_into().ok()
 }
 
+/// Solicited deliveries, keyed by address → the offered `(batchID,
+/// stampHash)` identities we set a want bit for. A delivery is accepted
+/// only if its address is present and its stamp matches one of these
+/// tuples (bee binds the full identity, not just the address).
+type WantedIdentities = HashMap<[u8; 32], Vec<([u8; 32], [u8; 32])>>;
+
 // --- client exchanges ---
 
 /// Fetch the peer's per-bin reserve cursors and epoch.
@@ -307,19 +313,18 @@ where
     }
 
     // Decide wants; build the LSB-first bit vector bee expects, and keep
-    // the wanted address set so each delivery can be checked against what
-    // was actually solicited.
+    // the full offered identity — (address, batchID, stampHash), exactly
+    // what bee's own client matches deliveries against — so each
+    // delivery can be checked against what was actually solicited. Keyed
+    // by address (that's all a Delivery carries directly) with the
+    // offered stamp identities behind it; a SOC updated mid-page can
+    // legitimately appear twice under one address with two identities.
     let mut bits = BitVec::with_len(offer.chunks.len());
-    let mut wanted: HashSet<[u8; 32]> = HashSet::new();
+    let mut wanted: WantedIdentities = HashMap::new();
+    let mut want_count: usize = 0;
     for (i, c) in offer.chunks.iter().enumerate() {
         match (to_32(&c.address), to_32(&c.batch_id), to_32(&c.stamp_hash)) {
             (Some(address), Some(batch_id), Some(stamp_hash)) if address != [0u8; 32] => {
-                // A duplicate offer entry (same address twice in one page)
-                // is never wanted twice: one delivery slot per address
-                // keeps the wanted-set accounting exact.
-                if wanted.contains(&address) {
-                    continue;
-                }
                 let oc = OfferedChunk {
                     address,
                     batch_id,
@@ -327,7 +332,11 @@ where
                 };
                 if want(&oc) {
                     bits.set(i);
-                    wanted.insert(address);
+                    wanted
+                        .entry(address)
+                        .or_default()
+                        .push((batch_id, stamp_hash));
+                    want_count += 1;
                 }
             }
             (None, _, _) => {
@@ -338,9 +347,6 @@ where
             _ => {} // zero-address / malformed identity: skip (never wanted)
         }
     }
-
-    // Number of deliveries to expect = popcount of the want vector.
-    let want_count = wanted.len();
     tracing::debug!(
         target: "ant_p2p::pullsync",
         peer = %peer, bin, start, topmost = offer.topmost,
@@ -380,13 +386,17 @@ where
 /// placeholder (server no longer holds the chunk), `Ok(Some)` for a
 /// solicited, well-formed, content-valid chunk, `Err` for anything a
 /// well-behaved bee never sends — an address we didn't ask for (or asked
-/// for and already received), a malformed stamp, or chunk bytes that
-/// don't hash to the claimed address. The content check (CAC BMT or SOC
+/// for and already received), a malformed stamp, a stamp that doesn't
+/// carry the *offered* postage identity, or chunk bytes that don't hash
+/// to the claimed address. Identity matching mirrors bee's client
+/// (`pkg/pullsync/pullsync.go`): the delivered stamp's batch ID and its
+/// keccak hash must equal the `(batchID, stampHash)` from the Offer
+/// entry we set the want bit for. The content check (CAC BMT or SOC
 /// self-binding, bee's own put-time validation) is what stops a
 /// malicious peer replaying one captured chunk under ever-fresh
 /// addresses to bypass downstream dedup.
 fn accept_delivery(
-    wanted: &mut HashSet<[u8; 32]>,
+    wanted: &mut WantedIdentities,
     d: Delivery,
 ) -> Result<Option<DeliveredChunk>, PullsyncError> {
     if d.address.is_empty() {
@@ -397,17 +407,34 @@ fn accept_delivery(
             "delivery address not 32 bytes".into(),
         ));
     };
-    if !wanted.remove(&address) {
+    let Some(identities) = wanted.get_mut(&address) else {
         return Err(PullsyncError::Protocol(format!(
             "unsolicited delivery for {}",
             hex::encode(address)
         )));
-    }
+    };
     if d.stamp.len() != STAMP_SIZE {
         return Err(PullsyncError::Protocol(format!(
             "delivery stamp is {} bytes, expected {STAMP_SIZE}",
             d.stamp.len()
         )));
+    }
+    // Bind the delivered stamp to the offered (batchID, stampHash) —
+    // bee's stampHash is keccak over the 113-byte marshaled stamp.
+    let batch_id: [u8; 32] = d.stamp[0..32].try_into().expect("stamp layout");
+    let stamp_hash = ant_crypto::keccak256(&d.stamp);
+    let Some(pos) = identities
+        .iter()
+        .position(|id| *id == (batch_id, stamp_hash))
+    else {
+        return Err(PullsyncError::Protocol(format!(
+            "delivery stamp does not match the offered identity for {}",
+            hex::encode(address)
+        )));
+    };
+    identities.swap_remove(pos);
+    if identities.is_empty() {
+        wanted.remove(&address);
     }
     if !cac_valid(&address, &d.data) && !soc_valid(&address, &d.data) {
         return Err(PullsyncError::Protocol(
@@ -512,24 +539,30 @@ mod tests {
     }
 
     #[test]
-    fn accept_delivery_vets_solicitation_stamp_and_content() {
+    fn accept_delivery_vets_solicitation_stamp_identity_and_content() {
         let (address, wire) = ant_crypto::cac_new(b"pullsync delivery").unwrap();
         let delivery = |addr: Vec<u8>, data: Vec<u8>, stamp: Vec<u8>| Delivery {
             address: addr,
             data,
             stamp,
         };
+        // The stamp a well-behaved server would deliver, and the offered
+        // identity that must match it: (batchID = stamp[0..32],
+        // stampHash = keccak(stamp)).
+        let stamp = vec![0u8; STAMP_SIZE];
+        let identity = ([0u8; 32], ant_crypto::keccak256(&stamp));
+        let want_one = |addr: [u8; 32], id: ([u8; 32], [u8; 32])| HashMap::from([(addr, vec![id])]);
 
         // Placeholder (empty address): skipped, not an error.
-        let mut wanted = HashSet::from([address]);
+        let mut wanted = want_one(address, identity);
         let got = accept_delivery(&mut wanted, delivery(Vec::new(), Vec::new(), Vec::new()));
         assert!(matches!(got, Ok(None)));
 
-        // Solicited, well-stamped, content-valid: accepted and consumed
-        // from the wanted set.
+        // Solicited, identity-matched, content-valid: accepted and
+        // consumed from the wanted set.
         let ok = accept_delivery(
             &mut wanted,
-            delivery(address.to_vec(), wire.clone(), vec![0u8; STAMP_SIZE]),
+            delivery(address.to_vec(), wire.clone(), stamp.clone()),
         )
         .unwrap()
         .expect("valid delivery");
@@ -539,15 +572,15 @@ mod tests {
         // The same address again is a replay: no longer solicited.
         let replay = accept_delivery(
             &mut wanted,
-            delivery(address.to_vec(), wire.clone(), vec![0u8; STAMP_SIZE]),
+            delivery(address.to_vec(), wire.clone(), stamp.clone()),
         );
         assert!(replay.is_err(), "duplicate delivery must be rejected");
 
         // Unsolicited address outright.
-        let mut wanted = HashSet::from([address]);
+        let mut wanted = want_one(address, identity);
         let unsolicited = accept_delivery(
             &mut wanted,
-            delivery(vec![0x77; 32], wire.clone(), vec![0u8; STAMP_SIZE]),
+            delivery(vec![0x77; 32], wire.clone(), stamp.clone()),
         );
         assert!(unsolicited.is_err());
 
@@ -559,14 +592,23 @@ mod tests {
         );
         assert!(short_stamp.is_err());
 
+        // Solicited address, but the delivered stamp is not the one the
+        // Offer promised — a substituted batch/stamp must be rejected
+        // (bee matches the full (address, batchID, stampHash) tuple).
+        let mut wanted = want_one(address, identity);
+        let mut other_stamp = vec![0u8; STAMP_SIZE];
+        other_stamp[0] = 0xEE; // different batch id → different identity
+        let substituted = accept_delivery(
+            &mut wanted,
+            delivery(address.to_vec(), wire.clone(), other_stamp),
+        );
+        assert!(substituted.is_err(), "stamp identity must match the offer");
+
         // Solicited, stamped, but the data doesn't hash to the address —
         // a captured chunk replayed under a fresh (solicited) address.
         let forged_addr = [0x55u8; 32];
-        let mut wanted = HashSet::from([forged_addr]);
-        let forged = accept_delivery(
-            &mut wanted,
-            delivery(forged_addr.to_vec(), wire, vec![0u8; STAMP_SIZE]),
-        );
+        let mut wanted = want_one(forged_addr, identity);
+        let forged = accept_delivery(&mut wanted, delivery(forged_addr.to_vec(), wire, stamp));
         assert!(forged.is_err(), "content must hash to the claimed address");
     }
 
