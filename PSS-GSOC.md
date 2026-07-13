@@ -154,14 +154,28 @@ exact payload.
 
 The payoff: a **group channel with no central server**. A "room" is a
 shared PSS topic broadcast into a neighborhood; every participant lurks it
-and every participant can send. **Demo (`perf/pss-gsoc-demos/
+and every participant can send. Demo (`perf/pss-gsoc-demos/
 rendezvous_demo.mjs`): one bee-js client against one ant node sent three
-serially-spaced messages (labelled Alice/Bob/Carol) into a shared room;
-the lurking subscription received all 3/3 exactly.** To be precise about
-what that proves: multi-*message* reception into one room through one
-node — not multi-node many-to-many (that requires N ant nodes on the
-same room and hasn't been run; nothing sender-side is per-node, but it's
-unproven until demonstrated).
+serially-spaced messages into a shared room; the lurking subscription
+received all 3/3 — multi-*message* reception through one node.
+
+## TRUE multi-node rendezvous — PASS on mainnet (2026-07-13)
+
+`perf/pss-gsoc-demos/multi_node_rendezvous.mjs`: **two independent ant
+nodes** (fresh overlays `1b63…` and `cb8c…`), one shared room hosted in
+node A's neighborhood. Senders alternate across both nodes (Alice@A,
+Bob@B, Carol@A, Dave@B — node B pushes into a foreign neighborhood);
+subscriber on A lurks natively, subscriber on B lurks A's neighborhood
+via the `?neighborhood=` override from a completely different overlay.
+**Result: 4/4 delivered on BOTH subscribers**, ~1 s per message — the
+real many-to-many claim, senders and receivers on distinct nodes.
+Notably the far-node subscriber (the documented-unreliable case) went
+4/4 in this run; one good run doesn't retract the ~bin-12 reliability
+caveat below, but it's the first positive data point for foreign-
+neighborhood rooms. Operational note: the two nodes MUST stamp with
+different batches or two independent issuers allocate colliding stamp
+indices in the room's bucket (this run used one batch from a shared
+issuer lineage; distinct batches are the clean setup).
 
 Two fixes made multi-message reception reliable: **continuous pullers**
 (the driver no longer aborts its pull tasks to re-dial, which had left a
@@ -232,6 +246,61 @@ which serde's `default_true` can't supply on an in-process channel) —
 neither we nor the reviewer had run the gateway suite. The full
 workspace is green again; `cargo fmt`/`clippy -D warnings` clean.
 
+### The second same-address bug (found live, 2026-07-13)
+
+Re-verifying the dedup fix on mainnet (`gsoc_two_updates_diag.mjs`:
+send two different payloads to ONE GSOC address, require both via the
+subscription) still failed — update #2 was 201-acked but **never
+arrived at any storer**. Page-level pullsync logs showed all five
+covering peers offering+delivering update #1 within ~2 s and then
+*zero* offers for #2. Root cause was ours, in `ant-postage`:
+`sign_stamp_bytes` returned the byte-identical cached stamp for a
+known address (same index, same timestamp), and bee's reserve rejects
+a same-`(batch, index)` put whose timestamp is not strictly newer
+(`ErrOverwriteNewerChunk`) — receipt green, chunk dropped,
+network-wide. Bee's own stamper reuses the slot but refreshes the
+timestamp and re-signs (`pkg/postage/stamper.go`); ant now does
+exactly that. After the fix the two-update test **passes live**
+(update #2 delivered over the WS ~2 s after push).
+
+Two morals worth pinning: (1) the client-side dedup bug (finding #1)
+and this server-acceptance bug were stacked — fixing either alone
+still loses every GSOC update after the first, and only a live
+two-update test could prove the pair closed; (2) the first diagnostic
+falsely blamed the receive side because `GET /chunks` has no cache
+bypass and happily served our own pre-push local copy as "network"
+state — a gateway parity gap (bee honours `swarm-cache: false`) still
+open below.
+
+### Post-hardening mainnet verification (2026-07-13, batch 5)
+
+| Test | Result |
+|---|---|
+| `gsoc_e2e.mjs` (single update) | ✅ PASS |
+| `gsoc_two_updates.mjs` (same-address regression) | ✅ PASS after the re-stamp fix (failed 3× before it — see below) |
+| `pss_e2e.mjs` (topic broadcast) | ✅ PASS |
+| `rendezvous_demo.mjs` (3 msgs, one node) | ✅ PASS |
+| `multi_node_rendezvous.mjs` (2 nodes, 4 senders alternating) | ✅ PASS — 4/4 on both subscribers |
+
+Lab note: debug-build keccak made 2-byte-target mining take ~30 s
+(measured) and intermittently trip the request timeout; the workspace
+`Cargo.toml` now pins `opt-level = 3` for `sha3`/`keccak`/`ant-crypto`
+in the dev profile so lab daemons mine at production speed (~2 s
+mine+push).
+
+### Shared lurker registry (2026-07-13)
+
+`ant_p2p::lurker_registry` now keys one pull pipeline per target
+neighborhood: the first subscriber spawns it, later ones attach, a
+dispatcher fans each decoded message out to exactly the matching
+subscribers, and the lurker follows the live **union** watch (shared
+`RwLock<WatchState>`, re-read per round — joins/leaves never restart
+pullers or lose resume positions). Budgets: ≤8 distinct neighborhoods
+(attaching is free), and a subscriber 64 messages behind sheds instead
+of head-of-line-blocking the rest. This supersedes the interim
+per-subscription cap and closes the shared-fan-out half of review
+finding #6; global bandwidth budgets remain open.
+
 ## What remains (optional)
 
 1. **Arbitrary-neighborhood rooms**: reliable only when participants are
@@ -246,15 +315,15 @@ workspace is green again; `cargo fmt`/`clippy -D warnings` clean.
    avoid this. PSS topic-broadcast is the cleaner many-to-many vehicle.
 4. **Tuning**: residency budget / covering-peer count / bin window are
    conservative defaults; expose as env knobs for busy rooms.
-5. **Shared lurker registry + global budgets**: aggregate identical
-   topic/neighborhood watches into one pull pipeline fanned out to N
-   subscribers; add stream/bandwidth budgets across subscriptions (the
-   admission cap is the blunt interim tool).
-6. **True multi-node rendezvous demo**: N ant nodes on one room,
-   senders on distinct nodes — upgrades the 3-message demo into the
-   real many-to-many claim.
-7. **Automate ant→bee interop**: run `trojan-vectors check` in CI (or a
+5. **Global bandwidth budgets**: the registry (done, above) gives
+   shared fan-out and a neighborhood cap; per-node stream/bandwidth
+   budgets across all pipelines remain.
+6. **Automate ant→bee interop**: run `trojan-vectors check` in CI (or a
    make target) so the reverse direction stops being a manual result.
+7. **`GET /chunks` cache bypass**: honour bee's `swarm-cache: false`
+   header (`ControlCommand::GetChunk` needs a `bypass_cache` flag) —
+   without it a node can't read the *network's* view of a chunk it
+   itself pushed, which actively misled the two-update diagnosis.
 
 ## Demo scripts
 

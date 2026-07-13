@@ -107,3 +107,15 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+# PSS/GSOC nonce mining is hot keccak: at debug opt-level a 2-byte
+# trojan target takes ~30 s (measured live) and trips the 60 s request
+# timeout, where a release build mines it in well under a second. Keep
+# the hash kernels optimized even in dev builds so the mainnet lab
+# (debug antd + demo scripts) behaves like production.
+[profile.dev.package.sha3]
+opt-level = 3
+[profile.dev.package.keccak]
+opt-level = 3
+[profile.dev.package.ant-crypto]
+opt-level = 3
