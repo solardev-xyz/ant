@@ -517,6 +517,36 @@ receive-path demos re-verified on mainnet.
 4. **Stale mining doc (Low)** — the pool comment still said "min 2";
    corrected to actual-parallelism-fallback-1.
 
+## Round 6 hardening (2026-07-13) — sixth external review
+
+Three second-order issues in the round-5 append+compaction rework (one
+Med, two Low); all fixed, workspace green, receive-path demos
+re-verified on mainnet.
+
+1. **Failed v1 migration permitted mixed-format appends (Med)** — if
+   `rewrite_sidecar` failed migrating a v1 file, the loader kept the v1
+   file and later appended 149-byte v2 records under its 145-byte v1
+   header, misaligning framing and losing entries on the next load —
+   reproducing the very full-bucket failure the patch fixes. `load` now
+   returns `{map, physical_count, appendable}`; `appendable` is `false`
+   exactly when a v1 file's migration failed, and the issuer then keeps
+   the recovered stamps in memory but leaves `stamps_path = None`
+   (in-memory only this session, v1 file untouched, restart retries
+   migration) rather than corrupting it.
+2. **Compaction rename wasn't crash-durable (Low)** — `rewrite_sidecar`
+   now delegates to the existing `atomic_write` helper, which fsyncs the
+   parent directory after the rename; the hand-rolled version skipped
+   that, so a crash could lose the rename.
+3. **Corrupt frames escaped the compaction counter (Low)** — the loader
+   counted only checksum-valid records, so torn full frames sat on disk
+   forever without triggering compaction. It now counts every complete
+   physical frame, so torn frames are compacted away and can't grow the
+   file past the bound.
+
+Two regression tests: a sabotaged v1 migration (temp path blocked)
+leaves the v1 file byte-identical and appends nothing; a file stuffed
+with garbage full frames compacts to the one live record on load.
+
 ## What remains (optional)
 
 1. **Arbitrary-neighborhood rooms**: reliable only when participants are
