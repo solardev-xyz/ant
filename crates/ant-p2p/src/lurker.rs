@@ -21,32 +21,38 @@
 use crate::messaging::{classify, DecodedMessage, WatchState};
 use crate::pullsync::{self, OfferedChunk};
 use crate::routing::{proximity, Overlay};
+use ant_crypto::keccak256;
 use libp2p::PeerId;
 use libp2p_stream::Control;
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
-/// Cap on the dedup set before it's cleared (bounds memory on a busy
-/// bin; a cleared entry can at worst re-deliver one message).
+/// Cap on the dedup set; beyond it the **oldest** entries are evicted
+/// (never the whole set — a wholesale clear would re-deliver everything
+/// a busy bin re-offers). An evicted entry can at worst re-deliver one
+/// old message.
 const SEEN_CAP: usize = 8192;
 /// Bound on a single blocking live-sync round. The server long-blocks on
 /// an empty bin, so we cap each round to periodically re-dial toward the
 /// neighborhood and re-pick a deeper covering peer.
 const SYNC_ROUND_TIMEOUT: Duration = Duration::from_secs(20);
-/// Time budget spent dialing toward the target neighborhood and waiting
-/// for deeper covering peers to connect before each pull. A light node
-/// isn't resident in an arbitrary neighborhood, so — like the retrieval
-/// path's dial-and-await-deeper — we spend real time pulling the actual
-/// storers (which sit at the network storage radius, ~bin 11–14) into our
-/// connection set before pulling.
-const RESIDE_BUDGET: Duration = Duration::from_secs(15);
-/// One reside wait step.
-const RESIDE_STEP: Duration = Duration::from_millis(700);
-/// How often the driver re-dials, re-picks covering peers, and restarts
-/// its pull tasks so it tracks peer churn.
+/// How long the driver waits after a connectivity change before topping
+/// up coverage — coalesces a burst of peer churn into one pass.
+const TOPUP_DEBOUNCE: Duration = Duration::from_millis(700);
+/// Fallback tick: how often the driver re-dials and re-picks covering
+/// peers even when connectivity is quiet.
 const RE_RESIDE_INTERVAL: Duration = Duration::from_secs(30);
+/// How far behind a peer's cursor a **fresh** (peer, bin) puller starts.
+/// A light node takes seconds to dial the neighborhood's storers into
+/// its connection set; a message that landed on a storer just before we
+/// read its cursor would live below `cursor + 1` and be skipped forever.
+/// Pulling a short backlog closes that window at the cost of bounded
+/// replay near subscribe/handover time — the seen-set dedups across
+/// peers, so delivery is at-least-once, not N-times. Replaced pullers
+/// don't use this: they resume exactly where their predecessor stopped.
+const PULL_BACKLOG: u64 = 8;
 /// Number of closest connected peers to pull from concurrently. A
 /// freshly-pushed chunk lands on the storer(s) nearest its address and
 /// replicates outward; pulling several covering peers catches it
@@ -69,6 +75,46 @@ pub struct LurkerConfig {
     pub watch: WatchState,
 }
 
+/// Bounded delivered-chunk dedup, keyed by `(address, keccak(data))`.
+///
+/// The key must include the content: GSOC deliberately reuses one stable
+/// SOC address for every update, so keying by address alone would drop
+/// every update after the first — and would let an invalid first
+/// delivery poison the address for the real one. Including the address
+/// keeps distinct watched SOCs distinct even if two ever carried equal
+/// bytes. Eviction is oldest-first, never wholesale.
+struct Seen {
+    set: HashSet<[u8; 64]>,
+    order: VecDeque<[u8; 64]>,
+}
+
+impl Seen {
+    fn new() -> Self {
+        Self {
+            set: HashSet::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    /// Record `(address, content)`; `false` if this exact version was
+    /// already seen (another covering peer usually delivers it too).
+    fn insert(&mut self, address: &[u8; 32], data: &[u8]) -> bool {
+        let mut key = [0u8; 64];
+        key[..32].copy_from_slice(address);
+        key[32..].copy_from_slice(&keccak256(data));
+        if !self.set.insert(key) {
+            return false;
+        }
+        self.order.push_back(key);
+        if self.order.len() > SEEN_CAP {
+            if let Some(oldest) = self.order.pop_front() {
+                self.set.remove(&oldest);
+            }
+        }
+        true
+    }
+}
+
 /// Run the lurker until `out` is closed (subscriber gone) or the peer
 /// source ends. Emits every decoded GSOC/PSS message for the watch set.
 ///
@@ -88,7 +134,12 @@ pub async fn run(
         return;
     }
     let watch = Arc::new(watch);
-    let seen: Arc<Mutex<HashSet<[u8; 32]>>> = Arc::new(Mutex::new(HashSet::new()));
+    let seen: Arc<Mutex<Seen>> = Arc::new(Mutex::new(Seen::new()));
+    // Last position each (peer, bin) puller synced to, shared with the
+    // pullers. A replacement puller resumes where its predecessor
+    // stopped instead of jumping to the peer's *current* cursor — which
+    // would silently skip everything that arrived during the outage.
+    let positions: Arc<Mutex<HashMap<(PeerId, u8), u64>>> = Arc::new(Mutex::new(HashMap::new()));
     // Deeper bins only matter for PSS (unknown address); GSOC's base bin
     // is exact.
     let window = if watch.pss_topics.is_empty() {
@@ -99,28 +150,38 @@ pub async fn run(
 
     // One long-lived puller per (peer, bin). Pullers run **continuously** —
     // we top up coverage for newly-connected peers on each tick but never
-    // abort a live puller, so a message is never dropped in a gap while the
-    // driver re-dials (an earlier design aborted-and-restarted every tick
-    // and lost messages that arrived during the re-reside window).
-    let mut active: std::collections::HashMap<(PeerId, u8), tokio::task::JoinHandle<()>> =
-        std::collections::HashMap::new();
-
-    // Dial deep into the neighborhood once up front so the first pullers
-    // hit real storers (a light node isn't resident by default).
-    reside(&mut peers, neighborhood_dial.as_ref(), &out, &target).await;
+    // abort a live puller (except in the coordinated handover below, and
+    // only once its replacement is live), so a message is never dropped
+    // in a gap while the driver re-dials (an earlier design
+    // aborted-and-restarted every tick and lost messages that arrived
+    // during the re-reside window).
+    let mut active: HashMap<(PeerId, u8), tokio::task::JoinHandle<()>> = HashMap::new();
 
     loop {
         if out.is_closed() {
             break;
+        }
+        // Keep dialing toward the target every pass. Pullers start
+        // immediately on whatever peers are already connected (no
+        // blocking reside phase — the first pullers matter for messages
+        // arriving *now*), and coverage deepens as closer peers connect:
+        // each connectivity change re-runs this top-up within
+        // `TOPUP_DEBOUNCE`.
+        if let Some(dial) = &neighborhood_dial {
+            let _ = dial.try_send(target);
         }
         // Drop handles for pullers that ended (peer dropped / stream died).
         active.retain(|_, h| !h.is_finished());
 
         // Ensure a puller for each covering (peer, bin); add only the
         // missing ones so existing pullers keep running uninterrupted.
-        for (peer_id, peer_overlay) in closest_n(&peers, &target, COVERING_PEERS) {
+        let mut desired: HashSet<(PeerId, u8)> = HashSet::new();
+        for (peer_id, peer_overlay) in closest_n(&mut peers, &target, COVERING_PEERS) {
             let base_bin = proximity(&peer_overlay, &target);
             let top_bin = base_bin.saturating_add(window).min(MAX_BIN);
+            for bin in base_bin..=top_bin {
+                desired.insert((peer_id, bin));
+            }
             if (base_bin..=top_bin).all(|b| active.contains_key(&(peer_id, b))) {
                 continue; // already fully covered
             }
@@ -131,15 +192,28 @@ pub async fn run(
                 if active.contains_key(&(peer_id, bin)) {
                     continue;
                 }
-                let start = cursors
-                    .cursors
-                    .get(bin as usize)
-                    .copied()
-                    .unwrap_or(0)
-                    .saturating_add(1);
+                // Resume a replaced puller exactly where it stopped; a
+                // fresh (peer, bin) starts a short backlog behind the
+                // cursor (see PULL_BACKLOG).
+                let resume = positions
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(&(peer_id, bin))
+                    .copied();
+                let start = resume.unwrap_or_else(|| {
+                    cursors
+                        .cursors
+                        .get(bin as usize)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(1)
+                        .saturating_sub(PULL_BACKLOG)
+                        .max(1)
+                });
                 tracing::info!(
                     target: "ant_p2p::lurker",
-                    peer = %peer_id, bin, start, "lurker pulling neighborhood bin",
+                    peer = %peer_id, bin, start, resumed = resume.is_some(),
+                    "lurker pulling neighborhood bin",
                 );
                 let handle = tokio::spawn(pull_bin(
                     control.clone(),
@@ -148,20 +222,40 @@ pub async fn run(
                     start,
                     Arc::clone(&watch),
                     Arc::clone(&seen),
+                    Arc::clone(&positions),
                     out.clone(),
                 ));
                 active.insert((peer_id, bin), handle);
             }
         }
 
-        // Hold residency and wait before the next top-up. The pullers keep
-        // running throughout — no gap.
+        // Coordinated handover: a peer that fell out of the covering set
+        // keeps its pullers until every desired (peer, bin) is live, then
+        // they're retired — churn never gaps coverage, but the puller set
+        // can't grow without bound as closest-peers turn over either.
+        if !desired.is_empty() && desired.iter().all(|k| active.contains_key(k)) {
+            active.retain(|k, h| {
+                if desired.contains(k) {
+                    true
+                } else {
+                    h.abort();
+                    false
+                }
+            });
+        }
+
+        // Wait for connectivity to change (top up new closer peers right
+        // away) or the fallback tick. The pullers keep running
+        // throughout — no gap.
         tokio::select! {
             () = out.closed() => break,
+            changed = peers.changed() => {
+                if changed.is_err() {
+                    break; // peer source gone: node shutting down
+                }
+                tokio::time::sleep(TOPUP_DEBOUNCE).await;
+            }
             () = tokio::time::sleep(RE_RESIDE_INTERVAL) => {}
-        }
-        if let Some(dial) = &neighborhood_dial {
-            let _ = dial.try_send(target);
         }
     }
     for (_, h) in active {
@@ -174,13 +268,15 @@ pub async fn run(
 /// this puller) or the subscriber leaves. A round timeout is *not* fatal:
 /// the server long-blocks on a quiet bin, so a timeout just means "no new
 /// chunk yet" and we re-open at the same `start`.
+#[allow(clippy::too_many_arguments)]
 async fn pull_bin(
     mut control: Control,
     peer_id: PeerId,
     bin: u8,
     mut start: u64,
     watch: Arc<WatchState>,
-    seen: Arc<Mutex<HashSet<[u8; 32]>>>,
+    seen: Arc<Mutex<Seen>>,
+    positions: Arc<Mutex<HashMap<(PeerId, u8), u64>>>,
     out: mpsc::Sender<DecodedMessage>,
 ) {
     loop {
@@ -196,17 +292,15 @@ async fn pull_bin(
             Err(_) => continue,   // long-block timeout → re-open at same start
         };
         for chunk in &page.chunks {
+            // Dedup one *content version* — the same chunk arrives from
+            // several covering peers, but a GSOC update reuses its
+            // address with new content and must still go through.
+            if !seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(&chunk.address, &chunk.data)
             {
-                let mut s = seen
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if !s.insert(chunk.address) {
-                    continue;
-                }
-                if s.len() > SEEN_CAP {
-                    s.clear();
-                    s.insert(chunk.address);
-                }
+                continue;
             }
             if let Some(msg) = classify(&chunk.address, &chunk.data, &watch) {
                 tracing::info!(
@@ -219,17 +313,24 @@ async fn pull_bin(
             }
         }
         start = page.topmost.saturating_add(1);
+        // Publish how far this (peer, bin) got so a replacement puller
+        // resumes here rather than skipping the gap.
+        positions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert((peer_id, bin), start);
     }
 }
 
 /// The `n` connected peers whose overlays are closest to `target`,
-/// deepest first.
+/// deepest first. Marks the snapshot seen (`borrow_and_update`) so the
+/// driver's `changed()` wait really waits for the *next* change.
 fn closest_n(
-    peers: &watch::Receiver<Vec<(PeerId, Overlay)>>,
+    peers: &mut watch::Receiver<Vec<(PeerId, Overlay)>>,
     target: &[u8; 32],
     n: usize,
 ) -> Vec<(PeerId, Overlay)> {
-    let mut v: Vec<(PeerId, Overlay)> = peers.borrow().clone();
+    let mut v: Vec<(PeerId, Overlay)> = peers.borrow_and_update().clone();
     // Deepest proximity first (descending).
     v.sort_by_key(|(_, ov)| std::cmp::Reverse(proximity(ov, target)));
     v.truncate(n);
@@ -248,56 +349,6 @@ fn want(offered: &OfferedChunk, watch: &WatchState) -> bool {
     !watch.pss_topics.is_empty()
 }
 
-/// Dial toward `target` for the full [`RESIDE_BUDGET`], pulling the
-/// neighborhood's actual storers into our connection set before we pull.
-/// A light node isn't resident in an arbitrary neighborhood, and the
-/// storers sit at the network storage radius — so, like the retrieval
-/// path, we keep re-issuing the neighborhood dial the whole time rather
-/// than stopping at the first plateau (deep peers can take several
-/// seconds and multiple dial rounds to connect). Returns early only if
-/// we hit the deepest possible bin or the subscriber leaves.
-async fn reside(
-    peers: &mut watch::Receiver<Vec<(PeerId, Overlay)>>,
-    neighborhood_dial: Option<&mpsc::Sender<[u8; 32]>>,
-    out: &mpsc::Sender<DecodedMessage>,
-    target: &[u8; 32],
-) {
-    let start = tokio::time::Instant::now();
-    while start.elapsed() < RESIDE_BUDGET && !out.is_closed() {
-        if let Some(dial) = neighborhood_dial {
-            let _ = dial.try_send(*target);
-        }
-        if current_proximity(peers, target) >= MAX_BIN {
-            return; // can't get any deeper
-        }
-        tokio::select! {
-            () = out.closed() => return,
-            r = peers.changed() => if r.is_err() { return; },
-            () = tokio::time::sleep(RESIDE_STEP) => {}
-        }
-    }
-}
-
-/// Highest proximity to `target` among connected peers (0 if none).
-fn current_proximity(peers: &watch::Receiver<Vec<(PeerId, Overlay)>>, target: &[u8; 32]) -> u8 {
-    closest_connected(peers, target).map_or(0, |(_, ov)| proximity(&ov, target))
-}
-
-/// The connected peer whose overlay is closest to `target`.
-fn closest_connected(
-    peers: &watch::Receiver<Vec<(PeerId, Overlay)>>,
-    target: &[u8; 32],
-) -> Option<(PeerId, Overlay)> {
-    peers
-        .borrow()
-        .iter()
-        .min_by(|(_, a), (_, b)| {
-            // Larger proximity to target = closer.
-            proximity(b, target).cmp(&proximity(a, target))
-        })
-        .copied()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,18 +360,59 @@ mod tests {
     }
 
     #[test]
-    fn closest_connected_picks_highest_proximity() {
+    fn closest_n_orders_deepest_first_and_marks_seen() {
         let target = overlay(0xff);
-        let (tx, rx) = watch::channel(vec![
+        let (tx, mut rx) = watch::channel(vec![
             (PeerId::random(), overlay(0x00)),
             (PeerId::random(), overlay(0xf0)), // shares top nibble → closest
             (PeerId::random(), overlay(0x80)),
         ]);
-        let (pid, ov) = closest_connected(&rx, &target).unwrap();
-        assert_eq!(ov, overlay(0xf0));
-        // and the peer id matches the 0xf0 entry
-        assert_eq!(pid, rx.borrow()[1].0);
+        let expect_closest = rx.borrow()[1].0;
+        let picked = closest_n(&mut rx, &target, 2);
+        assert_eq!(picked.len(), 2);
+        assert_eq!(picked[0].1, overlay(0xf0));
+        assert_eq!(picked[0].0, expect_closest);
+        assert_eq!(picked[1].1, overlay(0x80));
+        // borrow_and_update marked the snapshot seen.
+        assert!(!rx.has_changed().unwrap());
         drop(tx);
+    }
+
+    #[test]
+    fn seen_passes_gsoc_updates_and_dedups_exact_versions() {
+        let mut seen = Seen::new();
+        let addr = [0xaau8; 32];
+        // First GSOC update at the stable address.
+        assert!(seen.insert(&addr, b"update-1"));
+        // The same version re-delivered by another covering peer: deduped.
+        assert!(!seen.insert(&addr, b"update-1"));
+        // A NEW update reusing the same address must pass — this is the
+        // whole point of keying on (address, content), not address alone.
+        assert!(seen.insert(&addr, b"update-2"));
+        // An invalid/spoofed delivery must not poison the address for a
+        // later legitimate version.
+        assert!(seen.insert(&addr, b"garbage"));
+        assert!(seen.insert(&addr, b"update-3"));
+    }
+
+    #[test]
+    fn seen_evicts_oldest_first_not_wholesale() {
+        let mut seen = Seen::new();
+        let addr_for = |i: usize| {
+            let mut a = [0u8; 32];
+            a[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            a
+        };
+        for i in 0..=SEEN_CAP {
+            assert!(seen.insert(&addr_for(i), b"x"));
+        }
+        // Only the single oldest entry was evicted; a recent one is
+        // still deduped (a wholesale clear would forget it).
+        assert!(!seen.insert(&addr_for(SEEN_CAP), b"x"));
+        assert!(!seen.insert(&addr_for(1), b"x"));
+        assert!(seen.insert(&addr_for(0), b"x"), "oldest was evicted");
+        assert_eq!(seen.order.len(), seen.set.len());
+        assert!(seen.set.len() <= SEEN_CAP + 1);
     }
 
     #[test]
