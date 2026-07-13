@@ -27,10 +27,12 @@
 //! wire codec + exchange.
 
 use crate::sinks::HEADERS_MAX;
+use ant_crypto::{cac_valid, soc_valid};
 use futures::io::{AsyncReadExt, AsyncWriteExt};
 use libp2p::{PeerId, StreamProtocol};
 use libp2p_stream::Control;
 use prost::Message;
+use std::collections::HashSet;
 
 /// Cursor stream protocol id.
 pub const PROTOCOL_PULLSYNC_CURSORS: &str = "/swarm/pullsync/1.4.0/cursors";
@@ -114,8 +116,10 @@ pub struct OfferedChunk {
     pub stamp_hash: [u8; 32],
 }
 
-/// A chunk delivered over pullsync: raw address, `span ‖ payload` data,
-/// and the 113-byte stamp. Content/SOC validation is the caller's job.
+/// A chunk delivered over pullsync: address, `span ‖ payload` data, and
+/// the 113-byte stamp. Already vetted by [`accept_delivery`]: solicited
+/// in this page's Want, stamp well-sized, and the data hashes to the
+/// address (valid CAC or self-bound SOC).
 #[derive(Clone, Debug)]
 pub struct DeliveredChunk {
     pub address: [u8; 32],
@@ -302,11 +306,20 @@ where
         });
     }
 
-    // Decide wants; build the LSB-first bit vector bee expects.
+    // Decide wants; build the LSB-first bit vector bee expects, and keep
+    // the wanted address set so each delivery can be checked against what
+    // was actually solicited.
     let mut bits = BitVec::with_len(offer.chunks.len());
+    let mut wanted: HashSet<[u8; 32]> = HashSet::new();
     for (i, c) in offer.chunks.iter().enumerate() {
         match (to_32(&c.address), to_32(&c.batch_id), to_32(&c.stamp_hash)) {
             (Some(address), Some(batch_id), Some(stamp_hash)) if address != [0u8; 32] => {
+                // A duplicate offer entry (same address twice in one page)
+                // is never wanted twice: one delivery slot per address
+                // keeps the wanted-set accounting exact.
+                if wanted.contains(&address) {
+                    continue;
+                }
                 let oc = OfferedChunk {
                     address,
                     batch_id,
@@ -314,6 +327,7 @@ where
                 };
                 if want(&oc) {
                     bits.set(i);
+                    wanted.insert(address);
                 }
             }
             (None, _, _) => {
@@ -326,7 +340,7 @@ where
     }
 
     // Number of deliveries to expect = popcount of the want vector.
-    let want_count = (0..offer.chunks.len()).filter(|&i| bits.get(i)).count();
+    let want_count = wanted.len();
 
     write_delimited(
         &mut stream,
@@ -338,30 +352,15 @@ where
 
     // Read exactly popcount(bitvector) deliveries, in offer order over the
     // set bits. A dropped chunk arrives as an empty placeholder that still
-    // consumes a slot.
+    // consumes a slot. Every real delivery must be one we solicited and
+    // must validate against its own address (see `accept_delivery`).
     let mut chunks = Vec::with_capacity(want_count);
     for _ in 0..want_count {
         let d_bytes = read_delimited(&mut stream, MAX_FRAME).await?;
         let d = Delivery::decode(d_bytes.as_slice())?;
-        if d.address.is_empty() {
-            continue; // placeholder for a chunk the server no longer holds
+        if let Some(chunk) = accept_delivery(&mut wanted, d)? {
+            chunks.push(chunk);
         }
-        let Some(address) = to_32(&d.address) else {
-            return Err(PullsyncError::Protocol(
-                "delivery address not 32 bytes".into(),
-            ));
-        };
-        if !d.stamp.is_empty() && d.stamp.len() != STAMP_SIZE {
-            return Err(PullsyncError::Protocol(format!(
-                "delivery stamp is {} bytes, expected {STAMP_SIZE}",
-                d.stamp.len()
-            )));
-        }
-        chunks.push(DeliveredChunk {
-            address,
-            data: d.data,
-            stamp: d.stamp,
-        });
     }
 
     let _ = stream.close().await;
@@ -369,6 +368,51 @@ where
         topmost: offer.topmost,
         chunks,
     })
+}
+
+/// Vet one Delivery frame against the solicited set: `Ok(None)` for a
+/// placeholder (server no longer holds the chunk), `Ok(Some)` for a
+/// solicited, well-formed, content-valid chunk, `Err` for anything a
+/// well-behaved bee never sends — an address we didn't ask for (or asked
+/// for and already received), a malformed stamp, or chunk bytes that
+/// don't hash to the claimed address. The content check (CAC BMT or SOC
+/// self-binding, bee's own put-time validation) is what stops a
+/// malicious peer replaying one captured chunk under ever-fresh
+/// addresses to bypass downstream dedup.
+fn accept_delivery(
+    wanted: &mut HashSet<[u8; 32]>,
+    d: Delivery,
+) -> Result<Option<DeliveredChunk>, PullsyncError> {
+    if d.address.is_empty() {
+        return Ok(None);
+    }
+    let Some(address) = to_32(&d.address) else {
+        return Err(PullsyncError::Protocol(
+            "delivery address not 32 bytes".into(),
+        ));
+    };
+    if !wanted.remove(&address) {
+        return Err(PullsyncError::Protocol(format!(
+            "unsolicited delivery for {}",
+            hex::encode(address)
+        )));
+    }
+    if d.stamp.len() != STAMP_SIZE {
+        return Err(PullsyncError::Protocol(format!(
+            "delivery stamp is {} bytes, expected {STAMP_SIZE}",
+            d.stamp.len()
+        )));
+    }
+    if !cac_valid(&address, &d.data) && !soc_valid(&address, &d.data) {
+        return Err(PullsyncError::Protocol(
+            "delivery data does not hash to its address".into(),
+        ));
+    }
+    Ok(Some(DeliveredChunk {
+        address,
+        data: d.data,
+        stamp: d.stamp,
+    }))
 }
 
 /// A little bit vector with bee's layout: `len/8 + 1` bytes, bit `i` at
@@ -386,6 +430,7 @@ impl BitVec {
     fn set(&mut self, i: usize) {
         self.bytes[i / 8] |= 1 << (i % 8);
     }
+    #[cfg(test)]
     fn get(&self, i: usize) -> bool {
         self.bytes[i / 8] & (1 << (i % 8)) != 0
     }
@@ -458,6 +503,65 @@ mod tests {
         w.encode(&mut buf).unwrap();
         // bee: Want{BitVector: 0x01} → 0a0101
         assert_eq!(hex::encode(&buf), "0a0101");
+    }
+
+    #[test]
+    fn accept_delivery_vets_solicitation_stamp_and_content() {
+        let (address, wire) = ant_crypto::cac_new(b"pullsync delivery").unwrap();
+        let delivery = |addr: Vec<u8>, data: Vec<u8>, stamp: Vec<u8>| Delivery {
+            address: addr,
+            data,
+            stamp,
+        };
+
+        // Placeholder (empty address): skipped, not an error.
+        let mut wanted = HashSet::from([address]);
+        let got = accept_delivery(&mut wanted, delivery(Vec::new(), Vec::new(), Vec::new()));
+        assert!(matches!(got, Ok(None)));
+
+        // Solicited, well-stamped, content-valid: accepted and consumed
+        // from the wanted set.
+        let ok = accept_delivery(
+            &mut wanted,
+            delivery(address.to_vec(), wire.clone(), vec![0u8; STAMP_SIZE]),
+        )
+        .unwrap()
+        .expect("valid delivery");
+        assert_eq!(ok.address, address);
+        assert!(wanted.is_empty());
+
+        // The same address again is a replay: no longer solicited.
+        let replay = accept_delivery(
+            &mut wanted,
+            delivery(address.to_vec(), wire.clone(), vec![0u8; STAMP_SIZE]),
+        );
+        assert!(replay.is_err(), "duplicate delivery must be rejected");
+
+        // Unsolicited address outright.
+        let mut wanted = HashSet::from([address]);
+        let unsolicited = accept_delivery(
+            &mut wanted,
+            delivery(vec![0x77; 32], wire.clone(), vec![0u8; STAMP_SIZE]),
+        );
+        assert!(unsolicited.is_err());
+
+        // Solicited but the stamp is malformed (empty included — bee
+        // always sends a 113-byte stamp).
+        let short_stamp = accept_delivery(
+            &mut wanted,
+            delivery(address.to_vec(), wire.clone(), Vec::new()),
+        );
+        assert!(short_stamp.is_err());
+
+        // Solicited, stamped, but the data doesn't hash to the address —
+        // a captured chunk replayed under a fresh (solicited) address.
+        let forged_addr = [0x55u8; 32];
+        let mut wanted = HashSet::from([forged_addr]);
+        let forged = accept_delivery(
+            &mut wanted,
+            delivery(forged_addr.to_vec(), wire, vec![0u8; STAMP_SIZE]),
+        );
+        assert!(forged.is_err(), "content must hash to the claimed address");
     }
 
     #[test]
