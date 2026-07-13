@@ -260,9 +260,11 @@ static MINING_POOL: OnceLock<MiningPool> = OnceLock::new();
 
 fn mining_pool() -> &'static MiningPool {
     MINING_POOL.get_or_init(|| {
-        let cores = std::thread::available_parallelism()
-            .map_or(4, std::num::NonZero::get)
-            .max(2);
+        // The cap is exactly the machine's parallelism (fallback 1 if it
+        // can't be detected) — no floor, so a single-core host runs one
+        // mining thread total rather than oversubscribing. `acquire`
+        // always grants ≥1 slot, so a job still makes progress.
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
         MiningPool::new(cores)
     })
 }
@@ -315,24 +317,35 @@ impl MiningPool {
         {
             let mut avail = self.avail.lock().unwrap_or_else(PoisonError::into_inner);
             *avail += n;
+            // Slots outstanding are only ever created by `acquire` and
+            // returned by exactly one matching `release` (the RAII drop),
+            // so availability can never exceed the cap. Guard it anyway
+            // so a future accounting bug fails loud in debug builds.
+            debug_assert!(*avail <= self.cap, "mining pool over-released past cap");
         }
         self.cv.notify_all();
     }
+
+    #[cfg(test)]
+    fn available(&self) -> usize {
+        *self.avail.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
-/// An RAII claim on `claimed` pool slots; returns them on drop (covers
-/// early return, `?`, and panics).
-struct MiningThreads {
-    pool: &'static MiningPool,
+/// An RAII claim on `claimed` pool slots; returns them to `pool` on drop
+/// (covers early return, `?`, and panics). Lifetime-parameterized so
+/// production claims from the `'static` process pool while tests claim
+/// from a local pool with no global-state race.
+struct MiningThreads<'a> {
+    pool: &'a MiningPool,
     claimed: usize,
 }
 
-impl MiningThreads {
-    /// Claim up to `desired` worker slots from the process-wide pool,
-    /// waiting (cancellation-aware) if none are free. `None` iff
-    /// `cancel` flipped before a slot became available.
-    fn claim(desired: usize, cancel: &AtomicBool) -> Option<Self> {
-        let pool = mining_pool();
+impl<'a> MiningThreads<'a> {
+    /// Claim up to `desired` worker slots from `pool`, waiting
+    /// (cancellation-aware) if none are free. `None` iff `cancel`
+    /// flipped before a slot became available.
+    fn claim_from(pool: &'a MiningPool, desired: usize, cancel: &AtomicBool) -> Option<Self> {
         let claimed = pool.acquire(desired, cancel)?;
         Some(MiningThreads { pool, claimed })
     }
@@ -342,7 +355,14 @@ impl MiningThreads {
     }
 }
 
-impl Drop for MiningThreads {
+impl MiningThreads<'static> {
+    /// Claim from the process-wide pool.
+    fn claim(desired: usize, cancel: &AtomicBool) -> Option<Self> {
+        Self::claim_from(mining_pool(), desired, cancel)
+    }
+}
+
+impl Drop for MiningThreads<'_> {
     fn drop(&mut self) {
         self.pool.release(self.claimed);
     }
@@ -584,36 +604,50 @@ mod tests {
     }
 
     #[test]
-    fn mining_pool_bounds_total_and_is_cancellation_aware() {
+    fn mining_pool_bounds_total_via_raii_claims() {
         // A LOCAL pool so this can't race the global one that live
-        // `wrap` calls in other parallel tests share.
+        // `wrap` calls in other parallel tests share. Exercised through
+        // the RAII MiningThreads guard (claim + drop) so release is
+        // always balanced against claim — the earlier version leaked
+        // fabricated slots by calling release() with counts it never
+        // acquired, pushing availability past the cap.
         let pool = MiningPool::new(8);
         let no_cancel = AtomicBool::new(false);
+        assert_eq!(pool.available(), 8);
 
-        // First claim takes up to the whole pool; never more than cap.
-        let a = pool.acquire(1024, &no_cancel).unwrap();
-        assert_eq!(a, 8, "claim is clamped to the pool cap");
+        {
+            // One claim takes the whole pool (clamped to cap).
+            let a = MiningThreads::claim_from(&pool, 1024, &no_cancel).unwrap();
+            assert_eq!(a.count(), 8, "claim is clamped to the pool cap");
+            assert_eq!(pool.available(), 0);
+            assert!(pool.available() <= pool.cap);
 
-        // Fully drained: a new claim with a pre-flipped cancel returns
-        // None immediately instead of spawning an unaccounted worker —
-        // this is the invariant the round-3 review required (no C+1).
-        let cancelled = AtomicBool::new(true);
-        assert!(
-            pool.acquire(4, &cancelled).is_none(),
-            "a cancelled claim must not fabricate a slot"
+            // Drained + pre-flipped cancel → None, never a fabricated
+            // slot (the no-C+1 invariant from round 3).
+            let cancelled = AtomicBool::new(true);
+            assert!(
+                MiningThreads::claim_from(&pool, 4, &cancelled).is_none(),
+                "a cancelled claim must not fabricate a slot"
+            );
+            // `a` still holds all 8 — availability never exceeds cap.
+            assert!(pool.available() <= pool.cap);
+        }
+        // `a` dropped → exactly its 8 slots returned, never more.
+        assert_eq!(
+            pool.available(),
+            8,
+            "RAII drop returns exactly what was claimed"
         );
+        assert!(pool.available() <= pool.cap);
 
-        // Release some; the next claim gets exactly what's available.
-        pool.release(3);
-        let b = pool.acquire(10, &no_cancel).unwrap();
-        assert_eq!(b, 3, "claim never exceeds the available slots");
-
-        // Total outstanding (8 + 3 released then re-taken) never exceeds
-        // the cap: release everything and confirm a full re-claim.
-        pool.release(a);
-        pool.release(b);
-        let c = pool.acquire(1024, &no_cancel).unwrap();
-        assert_eq!(c, 8, "all slots recovered, cap intact");
+        // Two partial claims coexist and never over-subscribe.
+        {
+            let x = MiningThreads::claim_from(&pool, 5, &no_cancel).unwrap();
+            let y = MiningThreads::claim_from(&pool, 5, &no_cancel).unwrap();
+            assert_eq!(x.count() + y.count(), 8, "two claims split exactly the cap");
+            assert_eq!(pool.available(), 0);
+        }
+        assert_eq!(pool.available(), 8, "both drops restore the cap exactly");
     }
 
     #[test]
