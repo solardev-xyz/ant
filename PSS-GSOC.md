@@ -183,9 +183,40 @@ an **observation only**; it happened to get 4/4 in the recorded run — a
 first positive data point for foreign-neighborhood rooms, not a
 guarantee, and explicitly not the basis for the PASS. Operational note:
 the two nodes MUST stamp with different batches or two independent
-issuers allocate colliding stamp indices in the room's bucket (this run
-reused
-one batch across both; distinct batches are the clean setup).
+issuers allocate colliding stamp indices in the room's bucket; the
+clean two-batch run (batch 5 for A, a freshly-bought batch for B) also
+passed 4/4.
+
+## Symmetric many-to-many rendezvous — PASS on mainnet (2026-07-13)
+
+The real many-to-many proof (`perf/pss-gsoc-demos/symmetric_rendezvous.mjs`),
+enabled by buying a second postage batch. Instead of one reliable
+receiver, **both** nodes are placed co-resident in the room's
+neighborhood so **both** reliably receive:
+
+- `crates/ant-crypto/examples/mine_overlay.rs` mines an `overlay_nonce`
+  (the exact `overlay_from_ethereum_address` derivation) so a node's
+  overlay lands within N bits of a target. Node B's identity was mined
+  to `3507ab03…`, **18 bits** shared with node A's `3507822b…` — both
+  deep inside the `0x3507` neighborhood, so each natively resides there
+  (no `?neighborhood=` override needed; both subscribe to their own
+  neighborhood).
+- Senders alternate across both nodes (Alice@A, Bob@B, Carol@A, Dave@B),
+  each stamping with its own distinct batch.
+- **PASS enforced on BOTH subscribers: A 4/4 and B 4/4**, ~1 s per
+  message, both nodes' logs clean (0 false-rejects, 0 panics). Two
+  independent nodes, senders and receivers on both — genuine
+  many-to-many, not the earlier many-to-one.
+
+Buying the batch (for reproducing): the daemon pays on-chain buys from
+its **node-identity EOA** (`<data-dir>/identity.json` → `eth`), *not*
+from `--postage-owner-key` (which only signs stamps). So the funded key
+must be the node's identity `signing_key`, and then
+`POST /stamps/{amount}/{depth}` (amount in PLUR, cost = `amount ×
+2^depth`, depth > 16) buys a batch owned by that EOA. We bought depth
+20, amount 1e10 (~1.05 xBZZ, ~8.7-day TTL). A node stamping that batch
+just needs `--postage-owner-key` = the batch owner; its own identity is
+irrelevant to stamping.
 
 Two fixes made multi-message reception reliable: **continuous pullers**
 (the driver no longer aborts its pull tasks to re-dial, which had left a
@@ -296,7 +327,8 @@ open below.
 | `gsoc_two_updates.mjs` (same-address regression) | ✅ PASS after the re-stamp fix (failed 3× before it — see below) |
 | `pss_e2e.mjs` (topic broadcast) | ✅ PASS |
 | `rendezvous_demo.mjs` (3 msgs, one node) | ✅ PASS |
-| `multi_node_rendezvous.mjs` (2 nodes, 4 senders alternating → 1 reliable receiver) | ✅ PASS — multi-node multi-sender; A 4/4 (enforced); far-node B 4/4 (observed). Many-to-**one**; symmetric many-to-many still TODO |
+| `multi_node_rendezvous.mjs` (2 nodes, 4 senders → 1 reliable receiver) | ✅ PASS — multi-node multi-sender, many-to-**one**; A 4/4 enforced; also passed with two distinct batches |
+| `symmetric_rendezvous.mjs` (2 co-resident nodes, 4 senders → **2** reliable receivers) | ✅ PASS — genuine many-to-**many**; **A 4/4 AND B 4/4 both enforced**, both logs clean |
 
 Lab note: debug-build keccak made 2-byte-target mining take ~30 s
 (measured) and intermittently trip the request timeout; the workspace
@@ -402,11 +434,13 @@ A third reviewer found four issues in the round-2 fixes; all addressed:
    50 ms poll) rather than fabricating a worker, so aggregate threads
    never exceed `C`. A cancelled/timed-out request returns
    `PssMiningCancelled` from the wait.
-4. **Demo proved many-to-one, not many-to-many (Low)** — corrected the
-   claim (see "Multi-node multi-sender rendezvous" above): the demo
-   enforces multi-node multi-*sender* → one reliable receiver; symmetric
-   many-to-many (two reliable subscribers) is renamed as still-TODO,
-   not claimed.
+4. **Demo proved many-to-one, not many-to-many (Low)** — first corrected
+   the claim (the original demo enforces multi-node multi-*sender* → one
+   reliable receiver), then **fully resolved it**: bought a second batch,
+   mined both node overlays into one shared neighborhood, and the new
+   `symmetric_rendezvous.mjs` enforces BOTH subscribers 4/4 — genuine
+   many-to-many, PASS on mainnet (see "Symmetric many-to-many
+   rendezvous" above).
 
 ## What remains (optional)
 
@@ -431,11 +465,9 @@ A third reviewer found four issues in the round-2 fixes; all addressed:
    header (`ControlCommand::GetChunk` needs a `bypass_cache` flag) —
    without it a node can't read the *network's* view of a chunk it
    itself pushed, which actively misled the two-update diagnosis.
-8. **Symmetric many-to-many demo**: mine two node overlays into one
-   shared room neighborhood so **both** subscribers are reliable, and
-   enforce both in the demo — the true many-to-many proof the current
-   many-to-one `multi_node_rendezvous.mjs` doesn't reach. Needs a second
-   on-chain postage batch.
+8. ~~**Symmetric many-to-many demo**~~ — **DONE** (2026-07-13): bought a
+   second batch, mined both overlays into one neighborhood,
+   `symmetric_rendezvous.mjs` enforces both subscribers 4/4 on mainnet.
 
 ## Demo scripts
 
