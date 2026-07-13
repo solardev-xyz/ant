@@ -601,6 +601,19 @@ refusing to issue…`. Field and attachment comments de-v1-specifically
 reworded; the regression test now asserts the error names the actual
 failure mode. No behavior change — diagnostics only.
 
+## Round 10 hardening (2026-07-13) — tenth external review
+
+One Low (cosmetic): the round-9 sidecar reasons were returned through
+`PostageError::Persist`, whose display prefix was "persist bucket
+counters", so operators saw `persist bucket counters: stamp sidecar
+unusable (...)`. Two fixes: generalized the `Persist` prefix to
+`persist postage state` (accurate for both the bucket-counter file and
+the stamp sidecar's disk writes — nothing string-matches the old
+prefix), and switched the `sign_stamp_bytes` refuse-to-issue guard to
+the prefix-free `Msg` variant (it's a refusal, not a persist-to-disk
+op), so it now reads `stamp sidecar unusable (<reason>); refusing to
+issue…` with no misleading prefix. Cosmetic (error text) only.
+
 ## What remains (optional)
 
 1. **Arbitrary-neighborhood rooms**: reliable only when participants are
