@@ -586,6 +586,21 @@ tests: a directory at the sidecar path (unreadable → fail closed) and a
 foreign header under a read-only parent dir (un-removable → fail
 closed, with a root-skip guard since permissions don't bind root).
 
+## Round 9 hardening (2026-07-13) — ninth external review
+
+One Low (diagnostics): round 8 generalized the fail-closed set, but the
+`stamp_persistence_failed` boolean and the `sign_stamp_bytes` error
+still said "v1 migration failed" for *every* case, so an operator hit
+by a permissions/IO or malformed-v2 failure got a misleading message.
+Replaced the boolean with `Option<&'static str>` carrying the specific
+reason ("sidecar unreadable (permissions or I/O)", "corrupt/foreign
+sidecar header could not be removed", "unknown sidecar version could
+not be removed", "v1→v2 migration failed", "trailing-partial truncation
+failed"); the error now reads `stamp sidecar unusable (<reason>);
+refusing to issue…`. Field and attachment comments de-v1-specifically
+reworded; the regression test now asserts the error names the actual
+failure mode. No behavior change — diagnostics only.
+
 ## What remains (optional)
 
 1. **Arbitrary-neighborhood rooms**: reliable only when participants are
