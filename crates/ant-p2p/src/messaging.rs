@@ -47,6 +47,22 @@ impl WatchState {
     pub fn is_empty(&self) -> bool {
         self.gsoc_addresses.is_empty() && self.pss_topics.is_empty()
     }
+
+    /// Grow this watch to also cover `other` — the union operation the
+    /// lurker registry applies when a subscriber attaches to an
+    /// existing neighborhood lurker.
+    pub fn merge_from(&mut self, other: &WatchState) {
+        self.gsoc_addresses
+            .extend(other.gsoc_addresses.iter().copied());
+        for t in &other.pss_topics {
+            if !self.pss_topics.contains(t) {
+                self.pss_topics.push(*t);
+            }
+        }
+        if self.pss_secret.is_none() {
+            self.pss_secret = other.pss_secret;
+        }
+    }
 }
 
 /// A decoded message ready to hand to a subscriber.

@@ -341,6 +341,12 @@ where
 
     // Number of deliveries to expect = popcount of the want vector.
     let want_count = wanted.len();
+    tracing::debug!(
+        target: "ant_p2p::pullsync",
+        peer = %peer, bin, start, topmost = offer.topmost,
+        offered = offer.chunks.len(), wanted = want_count,
+        "pullsync page",
+    );
 
     write_delimited(
         &mut stream,

@@ -1,0 +1,401 @@
+//! Shared lurker registry — one pull pipeline per neighborhood, fanned
+//! out to every subscriber.
+//!
+//! Without this, N WebSocket subscriptions on the same rendezvous room
+//! each ran their own lurker: N × (covering peers × bins) pull streams
+//! and, in PSS mode, N copies of every candidate chunk download. The
+//! registry keys lurkers by **target neighborhood**: the first
+//! subscriber spawns the lurker, later ones attach to it, and a
+//! dispatcher forwards each decoded message to exactly the subscribers
+//! whose watch matches it. The lurker itself watches the **union** of
+//! all subscribers' watch sets (shared `RwLock<WatchState>`, re-read
+//! per pull round, so joins and leaves take effect without restarting
+//! pullers or losing resume positions).
+//!
+//! Budgets enforced here:
+//! - at most [`MAX_LURKER_NEIGHBORHOODS`] distinct targets have live
+//!   pull pipelines (subscribers per target are unbounded — attaching
+//!   is just a channel);
+//! - a slow subscriber sheds: fan-out uses `try_send`, so a client
+//!   that stopped draining its 64-message buffer loses messages
+//!   instead of head-of-line-blocking every other subscriber.
+
+use crate::messaging::{DecodedMessage, WatchState};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
+/// Cap on distinct neighborhoods with live pull pipelines. Each one is
+/// multi-peer pull streams and (PSS mode) whole-bin downloads; more
+/// subscribers on an existing neighborhood cost nothing extra.
+pub const MAX_LURKER_NEIGHBORHOODS: usize = 8;
+/// Per-subscriber fan-out buffer. A subscriber this far behind sheds.
+const SUBSCRIBER_BUFFER: usize = 64;
+/// How often the dispatcher sweeps for subscribers that left silently
+/// (receiver dropped with no message ever flowing to notice it by).
+const PRUNE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The union watch a registry lurker follows, shared so the registry
+/// can grow/shrink it as subscribers come and go.
+pub type SharedWatch = Arc<RwLock<WatchState>>;
+
+/// One subscriber: its own (non-union) watch, used to route messages,
+/// and the channel its gateway forwarder drains.
+struct Subscriber {
+    watch: WatchState,
+    tx: mpsc::Sender<DecodedMessage>,
+}
+
+struct Entry {
+    subscribers: Arc<Mutex<Vec<Subscriber>>>,
+    watch: SharedWatch,
+    lurker: JoinHandle<()>,
+}
+
+/// Cheap-to-clone handle on the per-node registry. Deliberately not a
+/// process-wide static: tests run several nodes in one process and
+/// their lurkers must not cross-wire.
+#[derive(Clone, Default)]
+pub struct Registry {
+    entries: Arc<Mutex<HashMap<[u8; 32], Entry>>>,
+}
+
+impl Registry {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Attach a subscriber to `target`'s lurker, spawning it via
+    /// `spawn_lurker(shared_watch, out_tx)` if this is the first
+    /// subscriber for the neighborhood. Returns the subscriber's
+    /// message stream, or `None` when the neighborhood cap is reached
+    /// (the caller should refuse the subscription).
+    pub fn subscribe<F>(
+        &self,
+        target: [u8; 32],
+        watch: WatchState,
+        spawn_lurker: F,
+    ) -> Option<mpsc::Receiver<DecodedMessage>>
+    where
+        F: FnOnce(SharedWatch, mpsc::Sender<DecodedMessage>) -> JoinHandle<()>,
+    {
+        let (sub_tx, sub_rx) = mpsc::channel(SUBSCRIBER_BUFFER);
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+
+        if let Some(entry) = entries.get(&target) {
+            // Attach: extend the union watch, then join the fan-out.
+            entry
+                .watch
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .merge_from(&watch);
+            entry
+                .subscribers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(Subscriber { watch, tx: sub_tx });
+            return Some(sub_rx);
+        }
+
+        if entries.len() >= MAX_LURKER_NEIGHBORHOODS {
+            return None;
+        }
+
+        // First subscriber: spawn the lurker on the union watch (== this
+        // watch, for now) and the dispatcher that fans its output out.
+        let shared: SharedWatch = Arc::new(RwLock::new(watch.clone()));
+        let subscribers = Arc::new(Mutex::new(vec![Subscriber { watch, tx: sub_tx }]));
+        let (out_tx, out_rx) = mpsc::channel::<DecodedMessage>(SUBSCRIBER_BUFFER);
+        let lurker = spawn_lurker(Arc::clone(&shared), out_tx);
+        tokio::spawn(dispatch(
+            Arc::clone(&self.entries),
+            target,
+            out_rx,
+            Arc::clone(&subscribers),
+            Arc::clone(&shared),
+        ));
+        entries.insert(
+            target,
+            Entry {
+                subscribers,
+                watch: shared,
+                lurker,
+            },
+        );
+        Some(sub_rx)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+}
+
+/// Whether a decoded message is for this subscriber's watch.
+fn matches(msg: &DecodedMessage, watch: &WatchState) -> bool {
+    match msg {
+        DecodedMessage::Gsoc { address, .. } => watch.gsoc_addresses.contains(address),
+        DecodedMessage::Pss { topic, .. } => watch.pss_topics.contains(topic),
+    }
+}
+
+/// Fan the lurker's decoded messages out to matching subscribers, prune
+/// the ones that left, and tear the whole entry down when the last one
+/// goes. Dropping `out_rx` on exit is what stops the lurker (it selects
+/// on its sender's closure), so no abort is needed for the graceful
+/// path; the handle is aborted too, belt-and-braces.
+async fn dispatch(
+    entries: Arc<Mutex<HashMap<[u8; 32], Entry>>>,
+    target: [u8; 32],
+    mut out_rx: mpsc::Receiver<DecodedMessage>,
+    subscribers: Arc<Mutex<Vec<Subscriber>>>,
+    shared: SharedWatch,
+) {
+    let mut prune_tick = tokio::time::interval(PRUNE_INTERVAL);
+    prune_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            msg = out_rx.recv() => {
+                let Some(msg) = msg else { break }; // lurker gone (peer source ended)
+                let mut subs = subscribers.lock().unwrap_or_else(PoisonError::into_inner);
+                subs.retain(|s| {
+                    if !matches(&msg, &s.watch) {
+                        return !s.tx.is_closed();
+                    }
+                    match s.tx.try_send(msg.clone()) {
+                        Ok(()) => true,
+                        // Shed the slow: a subscriber 64 messages behind
+                        // loses this one rather than blocking the rest.
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            tracing::warn!(
+                                target: "ant_p2p::lurker",
+                                "subscriber buffer full; dropping one message for it",
+                            );
+                            true
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => false,
+                    }
+                });
+                drop(subs);
+            }
+            _ = prune_tick.tick() => {
+                subscribers
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .retain(|s| !s.tx.is_closed());
+            }
+        }
+
+        // Shrink the union watch to the remaining subscribers; if none
+        // remain, remove the entry (re-checking emptiness under both
+        // locks so a subscriber attaching right now isn't torn down).
+        let mut entries_guard = entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let subs = subscribers.lock().unwrap_or_else(PoisonError::into_inner);
+        if subs.is_empty() {
+            if let Some(entry) = entries_guard.remove(&target) {
+                entry.lurker.abort();
+            }
+            return; // drops out_rx → lurker halts even if abort raced
+        }
+        let mut union = WatchState::default();
+        for s in subs.iter() {
+            union.merge_from(&s.watch);
+        }
+        *shared.write().unwrap_or_else(PoisonError::into_inner) = union;
+    }
+
+    // Lurker ended on its own (peer source gone): drop the entry so a
+    // future subscribe can start fresh.
+    let mut entries_guard = entries.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(entry) = entries_guard.remove(&target) {
+        entry.lurker.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn gsoc_watch(addr: [u8; 32]) -> WatchState {
+        WatchState {
+            gsoc_addresses: HashSet::from([addr]),
+            ..Default::default()
+        }
+    }
+
+    /// A stub lurker: forwards messages from a side channel into the
+    /// registry's out channel, standing in for the real pull pipeline.
+    fn stub_lurker(
+        feed: &mut Option<mpsc::Sender<DecodedMessage>>,
+    ) -> impl FnOnce(SharedWatch, mpsc::Sender<DecodedMessage>) -> JoinHandle<()> + '_ {
+        move |_watch, out_tx| {
+            let (feed_tx, mut feed_rx) = mpsc::channel::<DecodedMessage>(16);
+            *feed = Some(feed_tx);
+            tokio::spawn(async move {
+                while let Some(m) = feed_rx.recv().await {
+                    if out_tx.send(m).await.is_err() {
+                        return;
+                    }
+                }
+            })
+        }
+    }
+
+    fn gsoc_msg(addr: [u8; 32]) -> DecodedMessage {
+        DecodedMessage::Gsoc {
+            address: addr,
+            payload: b"m".to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn one_lurker_fans_out_selectively() {
+        let reg = Registry::new();
+        let target = [7u8; 32];
+        let (addr_a, addr_b) = ([0xaa; 32], [0xbb; 32]);
+
+        let mut feed = None;
+        let mut rx_a = reg
+            .subscribe(target, gsoc_watch(addr_a), stub_lurker(&mut feed))
+            .unwrap();
+        let feed = feed.expect("first subscriber spawns the lurker");
+        // Second subscriber on the same target: NO second lurker.
+        let mut spawned_again = false;
+        let mut rx_b = reg
+            .subscribe(target, gsoc_watch(addr_b), |_w, _tx| {
+                spawned_again = true;
+                tokio::spawn(async {})
+            })
+            .unwrap();
+        assert!(
+            !spawned_again,
+            "same-target subscriber must attach, not spawn"
+        );
+        assert_eq!(reg.len(), 1);
+
+        feed.send(gsoc_msg(addr_a)).await.unwrap();
+        feed.send(gsoc_msg(addr_b)).await.unwrap();
+
+        // Each subscriber gets exactly its own address's message.
+        let got_a = tokio::time::timeout(Duration::from_secs(2), rx_a.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(got_a, DecodedMessage::Gsoc { address, .. } if address == addr_a));
+        let got_b = tokio::time::timeout(Duration::from_secs(2), rx_b.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(got_b, DecodedMessage::Gsoc { address, .. } if address == addr_b));
+        assert!(rx_a.try_recv().is_err(), "A must not see B's message");
+    }
+
+    #[tokio::test]
+    async fn union_watch_grows_and_shrinks_and_entry_tears_down() {
+        let reg = Registry::new();
+        let target = [9u8; 32];
+        let (addr_a, addr_b) = ([0x11; 32], [0x22; 32]);
+
+        let mut feed = None;
+        let mut shared_probe = None;
+        let rx_a = reg
+            .subscribe(target, gsoc_watch(addr_a), |w, tx| {
+                shared_probe = Some(Arc::clone(&w));
+                let mut slot = Some(tx);
+                let (feed_tx, mut feed_rx) = mpsc::channel::<DecodedMessage>(16);
+                feed = Some(feed_tx);
+                let out_tx = slot.take().unwrap();
+                tokio::spawn(async move {
+                    while let Some(m) = feed_rx.recv().await {
+                        if out_tx.send(m).await.is_err() {
+                            return;
+                        }
+                    }
+                })
+            })
+            .unwrap();
+        let shared = shared_probe.unwrap();
+        let feed = feed.unwrap();
+        let rx_b = reg
+            .subscribe(target, gsoc_watch(addr_b), |_w, _tx| tokio::spawn(async {}))
+            .unwrap();
+
+        // Union now contains both addresses.
+        {
+            let w = shared.read().unwrap();
+            assert!(w.gsoc_addresses.contains(&addr_a) && w.gsoc_addresses.contains(&addr_b));
+        }
+
+        // B leaves; the next dispatched message triggers the prune and
+        // the union shrinks back to A only.
+        drop(rx_b);
+        feed.send(gsoc_msg(addr_a)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !shared.read().unwrap().gsoc_addresses.contains(&addr_b) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("union must shrink after B leaves");
+
+        // A leaves too: entry is removed and a new subscribe respawns.
+        drop(rx_a);
+        feed.send(gsoc_msg(addr_a)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if reg.len() == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("entry must tear down after the last subscriber leaves");
+
+        let mut respawned = false;
+        let _rx = reg
+            .subscribe(target, gsoc_watch(addr_a), |_w, _tx| {
+                respawned = true;
+                tokio::spawn(async {})
+            })
+            .unwrap();
+        assert!(
+            respawned,
+            "fresh subscribe after teardown spawns a new lurker"
+        );
+    }
+
+    #[tokio::test]
+    async fn neighborhood_cap_refuses_new_targets_only() {
+        let reg = Registry::new();
+        for i in 0..MAX_LURKER_NEIGHBORHOODS {
+            let mut t = [0u8; 32];
+            t[0] = u8::try_from(i).unwrap();
+            assert!(reg
+                .subscribe(t, gsoc_watch([1; 32]), |_w, _tx| tokio::spawn(async {}))
+                .is_some());
+        }
+        // A new target is refused…
+        assert!(reg
+            .subscribe([0xff; 32], gsoc_watch([1; 32]), |_w, _tx| tokio::spawn(
+                async {}
+            ))
+            .is_none());
+        // …but attaching to an existing one still works.
+        assert!(reg
+            .subscribe([0u8; 32], gsoc_watch([2; 32]), |_w, _tx| tokio::spawn(
+                async {}
+            ))
+            .is_some());
+    }
+}
