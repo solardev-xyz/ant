@@ -52,6 +52,14 @@ const TOPUP_DEBOUNCE: Duration = Duration::from_millis(700);
 /// Fallback tick: how often the driver re-dials and re-picks covering
 /// peers even when connectivity is quiet.
 const RE_RESIDE_INTERVAL: Duration = Duration::from_secs(30);
+/// Backstop on coordinated handover: an obsolete puller is normally
+/// retired only once every desired replacement is ready, but if a
+/// desired peer can never open a stream (permanently unresponsive), the
+/// replacements would never all become ready and obsolete pullers would
+/// accumulate without bound. After this long as obsolete, a puller is
+/// retired regardless — bounding the puller set even against a wedged
+/// peer, at the cost of a possible brief coverage dip in that rare case.
+const HANDOVER_MAX_OVERLAP: Duration = Duration::from_mins(1);
 /// How far behind a peer's cursor a **fresh** (peer, bin) puller starts.
 /// A light node takes seconds to dial the neighborhood's storers into
 /// its connection set; a message that landed on a storer just before we
@@ -183,6 +191,10 @@ pub async fn run(
     // aborted-and-restarted every tick and lost messages that arrived
     // during the re-reside window).
     let mut active: HashMap<(PeerId, u8), tokio::task::JoinHandle<()>> = HashMap::new();
+    // When each currently-obsolete (not-desired) puller first became
+    // obsolete, so the handover backstop can force-retire one that has
+    // outlived HANDOVER_MAX_OVERLAP waiting for a wedged replacement.
+    let mut obsolete_since: HashMap<(PeerId, u8), tokio::time::Instant> = HashMap::new();
 
     loop {
         if out.is_closed() {
@@ -300,29 +312,47 @@ pub async fn run(
 
         // Coordinated handover: a peer that fell out of the covering set
         // keeps its pullers until every desired (peer, bin) has a
-        // **ready** puller (one that has actually pulled a page), then
-        // they're retired — churn never gaps coverage, but the puller set
-        // can't grow without bound as closest-peers turn over either.
+        // **ready** puller (stream open, Get sent), then they're retired
+        // — churn never gaps coverage, but the puller set can't grow
+        // without bound as closest-peers turn over either.
+        let now = tokio::time::Instant::now();
+        // Track how long each obsolete puller has been obsolete; drop the
+        // timers for pullers that are desired again or already gone.
+        obsolete_since.retain(|k, _| active.contains_key(k) && !desired.contains(k));
+        for k in active.keys() {
+            if !desired.contains(k) {
+                obsolete_since.entry(*k).or_insert(now);
+            }
+        }
         let all_ready = {
             let r = ready.lock().unwrap_or_else(PoisonError::into_inner);
             !desired.is_empty() && desired.iter().all(|k| r.contains(k))
         };
-        if all_ready {
-            let retired: Vec<(PeerId, u8)> = active
-                .keys()
-                .filter(|k| !desired.contains(*k))
-                .copied()
-                .collect();
-            for k in retired {
-                if let Some(h) = active.remove(&k) {
-                    h.abort();
-                }
+        let retired: Vec<(PeerId, u8)> = active
+            .keys()
+            .filter(|k| !desired.contains(*k))
+            .filter(|k| {
+                // Retire when replacements are all live, OR as a backstop
+                // when this puller has been obsolete past the deadline
+                // (a desired replacement that can never open a stream
+                // must not pin obsolete coverage forever).
+                all_ready
+                    || obsolete_since
+                        .get(*k)
+                        .is_some_and(|t| now.duration_since(*t) >= HANDOVER_MAX_OVERLAP)
+            })
+            .copied()
+            .collect();
+        for k in retired {
+            if let Some(h) = active.remove(&k) {
+                h.abort();
             }
-            ready
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .retain(|k| active.contains_key(k));
+            obsolete_since.remove(&k);
         }
+        ready
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|k| active.contains_key(k));
 
         // Wait for connectivity to change (top up new closer peers right
         // away) or the fallback tick. The pullers keep running
@@ -365,9 +395,27 @@ async fn pull_bin(
         if out.is_closed() {
             return;
         }
-        let round = pullsync::sync_once(&mut control, peer_id, bin, start, |o: &OfferedChunk| {
-            want(o, &watch.read().unwrap_or_else(PoisonError::into_inner))
-        });
+        // Mark this (peer, bin) ready the moment the stream opens and the
+        // Get is sent — *not* after the first page. On a quiet bin the
+        // server holds the Offer indefinitely (and our SYNC_ROUND_TIMEOUT
+        // reopens the stream), so waiting for a page would leave a
+        // legitimately-covering puller "not ready" forever, stalling the
+        // handover and letting obsolete pullers pile up during churn.
+        let ready_c = Arc::clone(&ready);
+        let mark_ready = move || {
+            ready_c
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert((peer_id, bin));
+        };
+        let round = pullsync::sync_once(
+            &mut control,
+            peer_id,
+            bin,
+            start,
+            |o: &OfferedChunk| want(o, &watch.read().unwrap_or_else(PoisonError::into_inner)),
+            mark_ready,
+        );
         let page = match tokio::time::timeout(SYNC_ROUND_TIMEOUT, round).await {
             Ok(Ok(page)) => page,
             Ok(Err(e)) => {
@@ -380,13 +428,6 @@ async fn pull_bin(
             }
             Err(_) => continue, // long-block timeout → re-open at same start
         };
-        // A completed round (even an empty one) means the stream opened
-        // and this (peer, bin) is genuinely covering — the signal the
-        // driver's handover waits for before retiring old coverage.
-        ready
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert((peer_id, bin));
         tracing::debug!(
             target: "ant_p2p::lurker",
             peer = %peer_id, bin, start, topmost = page.topmost,
