@@ -3,9 +3,13 @@
 //! light nodes co-resident in one rendezvous-room neighborhood (so both
 //! reliably receive), used by the symmetric many-to-many PSS demo.
 //!
-//! Usage:
-//!   cargo run -p ant-crypto --example mine_overlay -- \
-//!     <eth_hex(40)> <network_id> <target_overlay_hex(64)> <min_bits>
+//! Usage (args: eth address hex, network id, target overlay hex, min
+//! matching bits):
+//!
+//! ```text
+//! cargo run -p ant-crypto --example mine_overlay -- \
+//!     <eth_hex> <network_id> <target_overlay_hex> <min_bits>
+//! ```
 //!
 //! Prints the winning `overlay_nonce` (hex), the resulting overlay, and
 //! the proximity (leading matching bits) to the target.
