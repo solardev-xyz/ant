@@ -63,7 +63,7 @@ pub enum PostageError {
     Msg(String),
     #[error("bucket full")]
     BucketFull,
-    #[error("persist bucket counters: {0}")]
+    #[error("persist postage state: {0}")]
     Persist(String),
     #[error("load bucket counters: {0}")]
     Load(String),
@@ -857,7 +857,10 @@ pub fn sign_stamp_bytes(
     // chunk (mutable) or is rejected (immutable). An *intentional*
     // in-memory issuer (`stamp_persistence_failed` None) is unaffected.
     if let Some(reason) = issuer.stamp_persistence_failed {
-        return Err(PostageError::Persist(format!(
+        // `Msg` (no display prefix) — this is a refuse-to-issue, not a
+        // persist-to-disk failure, so it must not carry the "persist
+        // postage state:" prefix. The message stands alone.
+        return Err(PostageError::Msg(format!(
             "stamp sidecar unusable ({reason}); refusing to issue a non-durable \
              stamp — fix the data dir and restart to recover"
         )));
