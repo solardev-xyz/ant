@@ -39,6 +39,13 @@ const SEEN_CAP: usize = 8192;
 /// an empty bin, so we cap each round to periodically re-dial toward the
 /// neighborhood and re-pick a deeper covering peer.
 const SYNC_ROUND_TIMEOUT: Duration = Duration::from_secs(20);
+/// Bound on a per-peer cursor fetch during coverage setup. The cursor
+/// exchange is a quick request/response (unlike the long-blocking sync
+/// round), so a peer that hasn't answered in this long is silent — we
+/// skip it this pass rather than let it stall every other peer's
+/// coverage. Fetches also run concurrently, so this is a per-peer, not
+/// a cumulative, bound.
+const CURSOR_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the driver waits after a connectivity change before topping
 /// up coverage — coalesces a burst of peer churn into one pass.
 const TOPUP_DEBOUNCE: Duration = Duration::from_millis(700);
@@ -67,6 +74,14 @@ const COVERING_PEERS: usize = 5;
 const PSS_BIN_WINDOW: u8 = 3;
 /// Highest proximity-order bin.
 const MAX_BIN: u8 = 31;
+
+/// Per-`(peer, bin)` resume position `(reserve_epoch, next_start)`,
+/// shared with the pullers. The epoch tag lets the driver discard a
+/// stale position after a peer wipes its reserve.
+type Positions = Arc<Mutex<HashMap<(PeerId, u8), (u64, u64)>>>;
+/// `(peer, bin)` pullers that have completed at least one pull round —
+/// the readiness signal the coordinated handover waits on.
+type ReadySet = Arc<Mutex<HashSet<(PeerId, u8)>>>;
 
 /// A live lurker subscription: the target neighborhood and what to watch.
 pub struct LurkerConfig {
@@ -142,16 +157,28 @@ pub async fn run(
         return;
     }
     let seen: Arc<Mutex<Seen>> = Arc::new(Mutex::new(Seen::new()));
-    // Last position each (peer, bin) puller synced to, shared with the
-    // pullers. A replacement puller resumes where its predecessor
-    // stopped instead of jumping to the peer's *current* cursor — which
-    // would silently skip everything that arrived during the outage.
-    let positions: Arc<Mutex<HashMap<(PeerId, u8), u64>>> = Arc::new(Mutex::new(HashMap::new()));
+    // Last position each (peer, bin) puller synced to, tagged with the
+    // peer's reserve epoch, shared with the pullers. A replacement
+    // puller resumes where its predecessor stopped instead of jumping to
+    // the peer's *current* cursor — which would silently skip everything
+    // that arrived during the outage. The epoch tag matters: a peer that
+    // wiped its reserve resets its cursors, and resuming an old (now
+    // absurdly high) position would park the puller above every new
+    // binID forever. Bee's puller likewise drops saved intervals on an
+    // epoch change; we drop the saved position and start fresh from the
+    // new cursor.
+    let positions: Positions = Arc::new(Mutex::new(HashMap::new()));
+    // (peer, bin) pullers that have completed at least one successful
+    // pull round — proof the stream actually opened and the bin is
+    // covered. The coordinated handover retires an obsolete puller only
+    // once every *replacement* it's covering for is in this set, so old
+    // coverage is never dropped while its replacement is still dialing.
+    let ready: ReadySet = Arc::new(Mutex::new(HashSet::new()));
 
     // One long-lived puller per (peer, bin). Pullers run **continuously** —
     // we top up coverage for newly-connected peers on each tick but never
     // abort a live puller (except in the coordinated handover below, and
-    // only once its replacement is live), so a message is never dropped
+    // only once its replacement is ready), so a message is never dropped
     // in a gap while the driver re-dials (an earlier design
     // aborted-and-restarted every tick and lost messages that arrived
     // during the re-reside window).
@@ -170,8 +197,14 @@ pub async fn run(
         if let Some(dial) = &neighborhood_dial {
             let _ = dial.try_send(target);
         }
-        // Drop handles for pullers that ended (peer dropped / stream died).
+        // Drop handles for pullers that ended (peer dropped / stream
+        // died), and forget their readiness so a dead puller can't keep
+        // satisfying the handover gate.
         active.retain(|_, h| !h.is_finished());
+        ready
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|k| active.contains_key(k));
 
         // Deeper bins only matter for PSS (unknown address); GSOC's base
         // bin is exact. Re-read each pass: the registry may have added
@@ -188,56 +221,77 @@ pub async fn run(
             PSS_BIN_WINDOW
         };
 
-        // Ensure a puller for each covering (peer, bin); add only the
-        // missing ones so existing pullers keep running uninterrupted.
+        // Which covering (peer, bin)s do we want, and which peers still
+        // need a cursor fetch to start a missing puller? Fetch those
+        // cursors concurrently (bounded) so one silent peer can't stall
+        // every other peer's coverage.
         let mut desired: HashSet<(PeerId, u8)> = HashSet::new();
+        let mut need_cursors: Vec<(PeerId, u8, u8)> = Vec::new();
         for (peer_id, peer_overlay) in closest_n(&mut peers, &target, COVERING_PEERS) {
             let base_bin = proximity(&peer_overlay, &target);
             let top_bin = base_bin.saturating_add(window).min(MAX_BIN);
             for bin in base_bin..=top_bin {
                 desired.insert((peer_id, bin));
             }
-            if (base_bin..=top_bin).all(|b| active.contains_key(&(peer_id, b))) {
-                continue; // already fully covered
+            if (base_bin..=top_bin).any(|b| !active.contains_key(&(peer_id, b))) {
+                need_cursors.push((peer_id, base_bin, top_bin));
             }
-            let Ok(cursors) = pullsync::get_cursors(&mut control.clone(), peer_id).await else {
-                continue;
+        }
+        let fetches = need_cursors
+            .into_iter()
+            .map(|(peer_id, base_bin, top_bin)| {
+                let mut ctl = control.clone();
+                async move {
+                    let cursors = tokio::time::timeout(
+                        CURSOR_FETCH_TIMEOUT,
+                        pullsync::get_cursors(&mut ctl, peer_id),
+                    )
+                    .await;
+                    (peer_id, base_bin, top_bin, cursors)
+                }
+            });
+        let results = futures::future::join_all(fetches).await;
+
+        for (peer_id, base_bin, top_bin, cursors) in results {
+            let Ok(Ok(cursors)) = cursors else {
+                continue; // timed out or errored → try again next pass
             };
             for bin in base_bin..=top_bin {
                 if active.contains_key(&(peer_id, bin)) {
                     continue;
                 }
-                // Resume a replaced puller exactly where it stopped; a
-                // fresh (peer, bin) starts a short backlog behind the
-                // cursor (see PULL_BACKLOG).
+                let cursor = cursors.cursors.get(bin as usize).copied().unwrap_or(0);
+                // Resume a replaced puller where it stopped — but only if
+                // the peer's reserve epoch is unchanged. A wiped reserve
+                // resets cursors, so an old position would resume above
+                // the new binIDs and skip every fresh update. On an epoch
+                // change (or a fresh (peer, bin)) start a short backlog
+                // behind the current cursor instead.
                 let resume = positions
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .get(&(peer_id, bin))
-                    .copied();
+                    .copied()
+                    .filter(|(epoch, _)| *epoch == cursors.epoch)
+                    .map(|(_, start)| start);
                 let start = resume.unwrap_or_else(|| {
-                    cursors
-                        .cursors
-                        .get(bin as usize)
-                        .copied()
-                        .unwrap_or(0)
-                        .saturating_add(1)
-                        .saturating_sub(PULL_BACKLOG)
-                        .max(1)
+                    cursor.saturating_add(1).saturating_sub(PULL_BACKLOG).max(1)
                 });
                 tracing::info!(
                     target: "ant_p2p::lurker",
-                    peer = %peer_id, bin, start, resumed = resume.is_some(),
-                    "lurker pulling neighborhood bin",
+                    peer = %peer_id, bin, start, epoch = cursors.epoch,
+                    resumed = resume.is_some(), "lurker pulling neighborhood bin",
                 );
                 let handle = tokio::spawn(pull_bin(
                     control.clone(),
                     peer_id,
                     bin,
                     start,
+                    cursors.epoch,
                     Arc::clone(&watch),
                     Arc::clone(&seen),
                     Arc::clone(&positions),
+                    Arc::clone(&ready),
                     out.clone(),
                 ));
                 active.insert((peer_id, bin), handle);
@@ -245,18 +299,29 @@ pub async fn run(
         }
 
         // Coordinated handover: a peer that fell out of the covering set
-        // keeps its pullers until every desired (peer, bin) is live, then
+        // keeps its pullers until every desired (peer, bin) has a
+        // **ready** puller (one that has actually pulled a page), then
         // they're retired — churn never gaps coverage, but the puller set
         // can't grow without bound as closest-peers turn over either.
-        if !desired.is_empty() && desired.iter().all(|k| active.contains_key(k)) {
-            active.retain(|k, h| {
-                if desired.contains(k) {
-                    true
-                } else {
+        let all_ready = {
+            let r = ready.lock().unwrap_or_else(PoisonError::into_inner);
+            !desired.is_empty() && desired.iter().all(|k| r.contains(k))
+        };
+        if all_ready {
+            let retired: Vec<(PeerId, u8)> = active
+                .keys()
+                .filter(|k| !desired.contains(*k))
+                .copied()
+                .collect();
+            for k in retired {
+                if let Some(h) = active.remove(&k) {
                     h.abort();
-                    false
                 }
-            });
+            }
+            ready
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retain(|k| active.contains_key(k));
         }
 
         // Wait for connectivity to change (top up new closer peers right
@@ -289,9 +354,11 @@ async fn pull_bin(
     peer_id: PeerId,
     bin: u8,
     mut start: u64,
+    epoch: u64,
     watch: SharedWatch,
     seen: Arc<Mutex<Seen>>,
-    positions: Arc<Mutex<HashMap<(PeerId, u8), u64>>>,
+    positions: Positions,
+    ready: ReadySet,
     out: mpsc::Sender<DecodedMessage>,
 ) {
     loop {
@@ -313,6 +380,13 @@ async fn pull_bin(
             }
             Err(_) => continue, // long-block timeout → re-open at same start
         };
+        // A completed round (even an empty one) means the stream opened
+        // and this (peer, bin) is genuinely covering — the signal the
+        // driver's handover waits for before retiring old coverage.
+        ready
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert((peer_id, bin));
         tracing::debug!(
             target: "ant_p2p::lurker",
             peer = %peer_id, bin, start, topmost = page.topmost,
@@ -346,12 +420,14 @@ async fn pull_bin(
             }
         }
         start = page.topmost.saturating_add(1);
-        // Publish how far this (peer, bin) got so a replacement puller
-        // resumes here rather than skipping the gap.
+        // Publish how far this (peer, bin) got, tagged with the reserve
+        // epoch it was read under, so a replacement puller resumes here
+        // rather than skipping the gap — but only while the epoch holds
+        // (the driver discards the position on an epoch change).
         positions
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert((peer_id, bin), start);
+            .insert((peer_id, bin), (epoch, start));
     }
 }
 
