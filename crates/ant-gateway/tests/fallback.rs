@@ -54,10 +54,12 @@ async fn tier_b_writes_fall_through_to_501() {
     assert_eq!(json["message"], "not implemented in ant");
 }
 
-/// `GET /pss/...` is permanently-501 per PLAN.md Appendix B; verify the
-/// catch-all covers it.
+/// `/pss/send` graduated from the 501 catch-all (PLAN.md Appendix B) to
+/// a real route on the pss-gsoc branch: the handler now answers — here
+/// with 400 for a malformed target ("0x"-prefixed, not bare hex) —
+/// instead of falling through to "not implemented".
 #[tokio::test]
-async fn pss_send_falls_through_to_501() {
+async fn pss_send_is_routed_not_501() {
     let router = status_only_router(snapshot_with_one_peer());
     let resp = send(
         router,
@@ -68,5 +70,5 @@ async fn pss_send_falls_through_to_501() {
             .unwrap(),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
