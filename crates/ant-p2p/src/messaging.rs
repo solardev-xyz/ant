@@ -67,6 +67,11 @@ pub enum DecodedMessage {
 /// `address` is the chunk's routed address; `data` is its wire data
 /// (`span(8) ‖ payload` for a CAC, or `id(32) ‖ sig(65) ‖ inner_cac` for
 /// a SOC — the two forms bee's handlers distinguish).
+///
+/// Callers must hand in chunks whose `data` has already been validated
+/// against `address` (pullsync's `accept_delivery` does — CAC BMT or SOC
+/// self-binding), so `address` here is a genuine content binding; GSOC
+/// additionally re-verifies the SOC signature below.
 #[must_use]
 pub fn classify(address: &[u8; 32], data: &[u8], watch: &WatchState) -> Option<DecodedMessage> {
     // GSOC: a single-owner chunk whose self-bound address we watch.
