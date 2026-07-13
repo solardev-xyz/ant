@@ -47,6 +47,13 @@ fn main() {
     let network_id: u64 = args[2].parse().expect("network_id");
     let target: [u8; 32] = hex_to(&args[3]);
     let min_bits: u32 = args[4].parse().expect("min_bits");
+    // A 32-byte overlay has at most 256 bits to match; anything above
+    // that can never be satisfied and would mine forever. (Even 64+ is
+    // astronomically unlikely, but 256 is the hard impossibility.)
+    assert!(
+        min_bits <= 256,
+        "min_bits must be <= 256 (an overlay is 256 bits); {min_bits} can never match"
+    );
 
     let mut tries: u64 = 0;
     loop {
