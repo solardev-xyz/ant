@@ -442,6 +442,47 @@ A third reviewer found four issues in the round-2 fixes; all addressed:
    many-to-many, PASS on mainnet (see "Symmetric many-to-many
    rendezvous" above).
 
+## Round 4 hardening (2026-07-13) — fourth external review
+
+Four issues (2 Med, 2 Low); all fixed, workspace clippy CI gate green,
+receive-path demos re-verified on mainnet:
+
+1. **Sidecar not crash-recoverable (Med)** — the loader ignored an
+   incomplete trailing record but didn't truncate it, so the next
+   append wrote at the malformed EOF and permanently shifted record
+   framing; and the non-atomic 113-byte in-place overwrite had no
+   checksum, so a torn record was trusted. Format bumped to **v2**:
+   each record carries a 4-byte `keccak(addr‖stamp)` checksum (verified
+   on load, torn records discarded — fixed framing means one bad record
+   never shifts its neighbours); the loader truncates any trailing
+   partial to the last valid boundary; a foreign/v1 header is removed so
+   a fresh append starts clean. Two regression tests (partial
+   truncation, checksum-mismatch discard). Verified live: batch 5's v1
+   sidecar auto-migrated to v2 (3 aligned records) with no stamping
+   disruption.
+2. **Stale readiness → false handover (Med)** — readiness was set after
+   `Get` but a puller that died on stream error returned without
+   removing it, and cleanup only ran at the next driver pass (after the
+   up-to-5 s cursor fetch). A puller dying in that window stayed
+   "ready", could let `all_ready` pass, and abort valid obsolete
+   coverage → gap. Readiness is now `(peer, bin) → generation`; each
+   puller holds a `ReadyGuard` that removes its entry the instant it
+   exits (any path) but only if the generation still matches, so a
+   late-dropping stale puller can't clobber a newer replacement.
+3. **Mining cap oversubscribed 1-CPU hosts; test over-released (Low)** —
+   the cap forced parallelism to ≥2, contradicting the machine-core
+   bound; and the test fabricated slots by releasing counts it never
+   acquired (8→11, masked by the clamp). Cap is now the real
+   parallelism (fallback 1, no floor); `MiningThreads` is
+   lifetime-parameterized so the test exercises RAII claims against a
+   local pool and asserts `available ≤ cap`.
+4. **Clippy CI gate was failing (Low)** — the `mine_overlay` example's
+   usage doc tripped `clippy::doc_markdown` (5 errors), failing the
+   warnings-denied workspace clippy CI runs. A prior full-clippy pass
+   predated the example. Fenced the usage block as a code block. (Lesson
+   recorded: re-run the *full-workspace* clippy after adding any new
+   file, not just the touched crate.)
+
 ## What remains (optional)
 
 1. **Arbitrary-neighborhood rooms**: reliable only when participants are
