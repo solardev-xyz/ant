@@ -606,13 +606,24 @@ failure mode. No behavior change — diagnostics only.
 One Low (cosmetic): the round-9 sidecar reasons were returned through
 `PostageError::Persist`, whose display prefix was "persist bucket
 counters", so operators saw `persist bucket counters: stamp sidecar
-unusable (...)`. Two fixes: generalized the `Persist` prefix to
-`persist postage state` (accurate for both the bucket-counter file and
-the stamp sidecar's disk writes — nothing string-matches the old
-prefix), and switched the `sign_stamp_bytes` refuse-to-issue guard to
-the prefix-free `Msg` variant (it's a refusal, not a persist-to-disk
-op), so it now reads `stamp sidecar unusable (<reason>); refusing to
-issue…` with no misleading prefix. Cosmetic (error text) only.
+unusable (...)`. Fix: generalized the `Persist` prefix to `persist
+postage state` (accurate for both the bucket-counter file and the stamp
+sidecar's disk writes — nothing string-matches the old prefix), so the
+error now reads `persist postage state: stamp sidecar unusable
+(<reason>); refusing to issue…`. Error-text only. (Round 11 then
+reverted a companion change that had switched the `sign_stamp_bytes`
+guard to the `Msg` variant — see below.)
+
+## Round 11 hardening (2026-07-13) — eleventh external review
+
+One Low: round 10 had also switched the `sign_stamp_bytes`
+refuse-to-issue guard from `PostageError::Persist` to the generic `Msg`
+variant. That changed the public error *classification* — observable to
+downstream callers — so it was not "cosmetic-only" as claimed. Reverted
+to `Persist` (no caller currently distinguishes the variants, so HTTP
+behavior was unchanged either way, but keeping the structured variant
+preserves the contract). The accurate `persist postage state:` prefix
+from round 10 stays.
 
 ## What remains (optional)
 

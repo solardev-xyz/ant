@@ -857,10 +857,11 @@ pub fn sign_stamp_bytes(
     // chunk (mutable) or is rejected (immutable). An *intentional*
     // in-memory issuer (`stamp_persistence_failed` None) is unaffected.
     if let Some(reason) = issuer.stamp_persistence_failed {
-        // `Msg` (no display prefix) — this is a refuse-to-issue, not a
-        // persist-to-disk failure, so it must not carry the "persist
-        // postage state:" prefix. The message stands alone.
-        return Err(PostageError::Msg(format!(
+        // Keep the structured `Persist` classification (downstream
+        // callers may match on it); its "persist postage state:" prefix
+        // is accurate here — the sidecar is postage state we couldn't
+        // persist, which is why we refuse to issue.
+        return Err(PostageError::Persist(format!(
             "stamp sidecar unusable ({reason}); refusing to issue a non-durable \
              stamp — fix the data dir and restart to recover"
         )));
