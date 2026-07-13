@@ -947,6 +947,8 @@ struct LoadedSidecar {
 }
 
 impl LoadedSidecar {
+    /// No prior state, and it is safe to start a fresh append — the file
+    /// is genuinely absent (or was cleanly removed).
     fn empty() -> Self {
         Self {
             map: HashMap::new(),
@@ -954,14 +956,44 @@ impl LoadedSidecar {
             appendable: true,
         }
     }
+
+    /// The on-disk sidecar exists but couldn't be validated *or* made
+    /// safe to write to (unreadable, an un-removable foreign/corrupt
+    /// header, a failed migration, or a failed trailing-partial
+    /// truncation). Appending under it would corrupt framing and lose
+    /// the mapping on restart, so the issuer must fail closed. `map`
+    /// carries whatever valid records we did parse (for reads).
+    fn broken(map: HashMap<[u8; 32], [u8; STAMP_SIZE]>) -> Self {
+        Self {
+            map,
+            physical_count: 0,
+            appendable: false,
+        }
+    }
+}
+
+/// Remove `path`, treating an already-absent file as success. Returns
+/// `false` only when the file exists and could *not* be removed (e.g. a
+/// read-only parent directory), in which case a foreign/corrupt sidecar
+/// stays on disk and must not be appended to.
+fn removed_cleanly(path: &Path) -> bool {
+    match std::fs::remove_file(path) {
+        Ok(()) => true,
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
 }
 
 /// Load the per-chunk stamp sidecar into `(stamp map, physical record
 /// count)`. Best-effort and self-healing:
 ///
-/// - A missing file, or a header whose magic / batch-id doesn't match,
-///   yields an empty map (a foreign file is removed so a fresh append
-///   starts clean).
+/// - A genuinely **missing** file (`NotFound`) yields an empty,
+///   appendable result. A file that exists but can't be validated *and*
+///   made safe to write — unreadable, a foreign/corrupt header that
+///   can't be removed, a failed migration, or a failed trailing-partial
+///   truncation — is marked **non-appendable** (`appendable = false`),
+///   so the issuer fails closed rather than append under an unvalidated
+///   header and lose the mapping on restart. A foreign header that IS
+///   cleanly removed is appendable (fresh start).
 /// - A **v1** file (no checksums) is *migrated*, not discarded: its
 ///   records are read and the file is rewritten as v2, so no reusable
 ///   slot is lost across the upgrade.
@@ -978,24 +1010,42 @@ impl LoadedSidecar {
 /// stamp, so issuer construction never hard-fails over the sidecar.
 fn load_stamp_store(path: &Path, batch_id: &[u8; 32]) -> LoadedSidecar {
     let mut map: HashMap<[u8; 32], [u8; STAMP_SIZE]> = HashMap::new();
-    let Ok(bytes) = std::fs::read(path) else {
-        return LoadedSidecar::empty();
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        // Genuinely absent → a fresh append is safe.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return LoadedSidecar::empty(),
+        // The file EXISTS but we can't read it (permissions, I/O error).
+        // Appending under an unvalidated header would corrupt it, so fail
+        // closed rather than treat it like a missing file.
+        Err(_) => return LoadedSidecar::broken(map),
     };
+    // Foreign / corrupt header: appendable only if we can actually clear
+    // the file first (a fresh append then starts clean). If removal fails
+    // — e.g. a read-only directory keeps the malformed file but leaves it
+    // writable — appending v2 records beneath the bad header would be
+    // rejected on restart and lose the mapping, so fail closed.
     if bytes.len() < STAMP_STORE_HEADER_LEN
         || &bytes[0..4] != STAMP_STORE_MAGIC
         || &bytes[6..38] != batch_id.as_slice()
     {
-        let _ = std::fs::remove_file(path);
-        return LoadedSidecar::empty();
+        return if removed_cleanly(path) {
+            LoadedSidecar::empty()
+        } else {
+            LoadedSidecar::broken(map)
+        };
     }
     let version = u16::from_le_bytes([bytes[4], bytes[5]]);
     let (record_len, has_checksum) = match version {
         STAMP_STORE_VERSION => (STAMP_RECORD_LEN, true),
         STAMP_STORE_VERSION_V1 => (STAMP_RECORD_LEN_V1, false),
         _ => {
-            // Unknown future/foreign version: drop it rather than guess.
-            let _ = std::fs::remove_file(path);
-            return LoadedSidecar::empty();
+            // Unknown future/foreign version: drop it rather than guess —
+            // same appendable-only-if-removed rule as a bad header.
+            return if removed_cleanly(path) {
+                LoadedSidecar::empty()
+            } else {
+                LoadedSidecar::broken(map)
+            };
         }
     };
 
@@ -1045,19 +1095,24 @@ fn load_stamp_store(path: &Path, batch_id: &[u8; 32]) -> LoadedSidecar {
             };
         }
         if !has_checksum {
-            // v1 migration failed: don't append to the v1 file.
-            return LoadedSidecar {
-                map,
-                physical_count: physical_frames,
-                appendable: false,
-            };
+            // v1 migration failed: don't append to the v1 file (framing
+            // mismatch), but keep the parsed records for reads.
+            return LoadedSidecar::broken(map);
         }
         // v2 compaction failed: keep appending (same format is fine).
     }
     // Truncate a trailing partial record so the next append is aligned.
+    // If the truncation itself fails, the next append would write at the
+    // misaligned EOF and shift framing — so fail closed rather than
+    // append onto an untruncated tail.
     if off < bytes.len() {
-        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
-            let _ = f.set_len(off as u64);
+        let truncated = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .and_then(|f| f.set_len(off as u64))
+            .is_ok();
+        if !truncated {
+            return LoadedSidecar::broken(map);
         }
     }
     LoadedSidecar {
@@ -1720,6 +1775,59 @@ mod tests {
             - STAMP_STORE_HEADER_LEN)
             / STAMP_RECORD_LEN;
         assert_eq!(records_after, 1, "corrupt frames must be compacted away");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A sidecar that EXISTS but can't be read (a non-`NotFound` error)
+    /// must fail closed, not be treated like a missing file — appending
+    /// under an unvalidated header would corrupt it. Simulated with a
+    /// directory at the sidecar path, which `std::fs::read` errors on
+    /// (not `NotFound`) on every platform.
+    #[test]
+    fn unreadable_sidecar_fails_closed() {
+        let dir = tmpdir();
+        let sidecar = dir.join("x.stamps");
+        std::fs::create_dir(&sidecar).unwrap();
+        let loaded = load_stamp_store(&sidecar, &[0x22; 32]);
+        assert!(
+            !loaded.appendable,
+            "an unreadable existing sidecar must fail closed"
+        );
+        assert!(loaded.map.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A foreign/corrupt-header sidecar is only appendable if it can be
+    /// cleared first. If removal fails (e.g. a read-only parent directory
+    /// keeps the file but leaves it writable), it must fail closed —
+    /// appending v2 records under the bad header would be rejected on
+    /// restart and lose the mapping.
+    #[cfg(unix)]
+    #[test]
+    fn unremovable_foreign_sidecar_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmpdir();
+        let sub = dir.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let sidecar = sub.join("x.stamps");
+        // Bad magic, long enough to pass the length check.
+        std::fs::write(&sidecar, [0xEEu8; 64]).unwrap();
+        // Read-only parent: the file can be read but not unlinked.
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // Under root, permissions don't bind — the sabotage is
+        // ineffective, so only assert when removal genuinely fails.
+        let sabotage_effective = std::fs::remove_file(&sidecar).is_err();
+        if sabotage_effective {
+            let loaded = load_stamp_store(&sidecar, &[0x11; 32]);
+            assert!(
+                !loaded.appendable,
+                "an un-removable foreign sidecar must fail closed"
+            );
+        }
+
+        // Restore perms so cleanup can run.
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).ok();
         std::fs::remove_dir_all(&dir).ok();
     }
 
