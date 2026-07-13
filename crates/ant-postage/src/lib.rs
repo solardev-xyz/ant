@@ -124,10 +124,20 @@ pub struct StampIssuer {
 
 /// Magic for the per-chunk stamp sidecar (Ant `STamp` Map).
 const STAMP_STORE_MAGIC: &[u8; 4] = b"ASTM";
+/// Sidecar format version. v2 adds a per-record checksum so a torn
+/// in-place overwrite (the 113-byte stamp write is not atomic) is
+/// detected and discarded on load rather than trusted. A v1 file (no
+/// checksum) is simply ignored on upgrade — the worst case is that
+/// every address re-stamps once, never a wrong stamp.
+const STAMP_STORE_VERSION: u16 = 2;
 /// Sidecar header: `magic(4) + version(2) + batch_id(32)`.
 const STAMP_STORE_HEADER_LEN: usize = 38;
-/// One appended record: chunk address(32) + stamp([`STAMP_SIZE`]).
-const STAMP_RECORD_LEN: usize = 32 + STAMP_SIZE;
+/// Trailing checksum on each record: first 4 bytes of
+/// `keccak256(addr ‖ stamp)`. Detects a torn record from a
+/// crash-interrupted write.
+const STAMP_CHECKSUM_LEN: usize = 4;
+/// One record: chunk address(32) + stamp([`STAMP_SIZE`]) + checksum(4).
+const STAMP_RECORD_LEN: usize = 32 + STAMP_SIZE + STAMP_CHECKSUM_LEN;
 
 /// Snapshot of a [`StampIssuer`]'s capacity and fill, suitable for
 /// ops dashboards and pre-flight upload checks. Returned by
@@ -543,7 +553,7 @@ impl StampIssuer {
         if let Some(path) = &self.stamps_path {
             if let Some(&offset) = self.stamp_offsets.get(&addr) {
                 // Overwrite the existing fixed-size record in place.
-                overwrite_stamp_record(path, offset, &stamp)?;
+                overwrite_stamp_record(path, offset, &addr, &stamp)?;
             } else {
                 // No known offset (e.g. loaded from a truncated file):
                 // fall back to appending a fresh record and track it.
@@ -847,11 +857,35 @@ fn stamps_sidecar_path(persist: &Path) -> PathBuf {
     persist.with_extension("stamps")
 }
 
-/// Load the per-chunk stamp sidecar into a map. Best-effort: a missing
-/// file, a bad magic/version, a batch-id mismatch, or a truncated
-/// trailing record all yield whatever clean records precede the problem
-/// (or an empty map). A stale cache only ever costs a re-stamp, never
-/// correctness, so we never hard-fail issuer construction over it.
+/// The 4-byte record checksum: first bytes of `keccak256(addr ‖ stamp)`.
+fn stamp_record_checksum(addr: &[u8; 32], stamp: &[u8; STAMP_SIZE]) -> [u8; STAMP_CHECKSUM_LEN] {
+    let mut h = Keccak256::default();
+    h.update(addr);
+    h.update(stamp);
+    let digest = h.finalize();
+    let mut c = [0u8; STAMP_CHECKSUM_LEN];
+    c.copy_from_slice(&digest[..STAMP_CHECKSUM_LEN]);
+    c
+}
+
+/// Load the per-chunk stamp sidecar into `(stamp, offset)` maps.
+/// Best-effort and self-healing:
+///
+/// - A missing file, or a header whose magic / version / batch-id don't
+///   match, yields empty maps. A mismatched-but-present file (e.g. an
+///   old v1 sidecar on upgrade) is **removed** so the next append
+///   recreates a clean v2 file rather than appending v2 records after a
+///   foreign header.
+/// - Each fixed-size record's checksum is verified; a record that fails
+///   (a torn in-place overwrite) is skipped — its address just
+///   re-stamps fresh later. Fixed framing means one bad record never
+///   shifts the others.
+/// - Any trailing bytes that don't form a whole record (a crash
+///   mid-append) are **truncated** off, so the next append writes at a
+///   valid record boundary instead of permanently shifting framing.
+///
+/// A stale/dropped entry only ever costs a re-stamp, never a wrong
+/// stamp, so issuer construction never hard-fails over the sidecar.
 #[allow(clippy::type_complexity)]
 fn load_stamp_store(
     path: &Path,
@@ -864,9 +898,11 @@ fn load_stamp_store(
     };
     if bytes.len() < STAMP_STORE_HEADER_LEN
         || &bytes[0..4] != STAMP_STORE_MAGIC
-        || u16::from_le_bytes([bytes[4], bytes[5]]) != STORE_VERSION
+        || u16::from_le_bytes([bytes[4], bytes[5]]) != STAMP_STORE_VERSION
         || &bytes[6..38] != batch_id.as_slice()
     {
+        // Foreign / stale header: drop it so a fresh append starts clean.
+        let _ = std::fs::remove_file(path);
         return (map, offsets);
     }
     let mut off = STAMP_STORE_HEADER_LEN;
@@ -874,13 +910,22 @@ fn load_stamp_store(
         let mut addr = [0u8; 32];
         addr.copy_from_slice(&bytes[off..off + 32]);
         let mut stamp = [0u8; STAMP_SIZE];
-        stamp.copy_from_slice(&bytes[off + 32..off + STAMP_RECORD_LEN]);
-        map.insert(addr, stamp);
-        // A later duplicate record for the same address (from an older
-        // append-only file, pre in-place update) overwrites the earlier
-        // one — last write wins, and the offset tracks the last record.
-        offsets.insert(addr, off as u64);
+        stamp.copy_from_slice(&bytes[off + 32..off + 32 + STAMP_SIZE]);
+        let stored_cksum = &bytes[off + 32 + STAMP_SIZE..off + STAMP_RECORD_LEN];
+        if stored_cksum == stamp_record_checksum(&addr, &stamp) {
+            // Last valid write for an address wins; offset tracks it.
+            map.insert(addr, stamp);
+            offsets.insert(addr, off as u64);
+        }
+        // A checksum-failed record keeps its slot (fixed framing); its
+        // address is simply absent from the map.
         off += STAMP_RECORD_LEN;
+    }
+    // Truncate a trailing partial record so the next append is aligned.
+    if off < bytes.len() {
+        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
+            let _ = f.set_len(off as u64);
+        }
     }
     (map, offsets)
 }
@@ -914,13 +959,14 @@ fn append_stamp_record(
     if need_header {
         let mut header = Vec::with_capacity(STAMP_STORE_HEADER_LEN);
         header.extend_from_slice(STAMP_STORE_MAGIC);
-        header.extend_from_slice(&STORE_VERSION.to_le_bytes());
+        header.extend_from_slice(&STAMP_STORE_VERSION.to_le_bytes());
         header.extend_from_slice(batch_id);
         f.write_all(&header)
             .map_err(|e| PostageError::Persist(format!("{}: {e}", path.display())))?;
     }
     // Offset of the record we're about to append (end of file in append
-    // mode: header if just created, else the current length).
+    // mode: header if just created, else the current length — the loader
+    // has already truncated any trailing partial, so this is aligned).
     let record_offset = if need_header {
         STAMP_STORE_HEADER_LEN as u64
     } else {
@@ -931,6 +977,7 @@ fn append_stamp_record(
     let mut rec = Vec::with_capacity(STAMP_RECORD_LEN);
     rec.extend_from_slice(addr);
     rec.extend_from_slice(stamp);
+    rec.extend_from_slice(&stamp_record_checksum(addr, stamp));
     f.write_all(&rec)
         .map_err(|e| PostageError::Persist(format!("{}: {e}", path.display())))?;
     f.sync_all()
@@ -938,26 +985,32 @@ fn append_stamp_record(
     Ok(record_offset)
 }
 
-/// Overwrite the stamp bytes of an existing sidecar record in place (the
-/// `addr` prefix is unchanged, so only the [`STAMP_SIZE`] stamp at
-/// `record_offset + 32` is rewritten), then fsync. Used by a re-stamp to
-/// persist the refreshed timestamp without appending a duplicate, so the
-/// on-disk record stays current across a restart — the property the
-/// strictly-newer-timestamp guarantee depends on.
+/// Overwrite an existing sidecar record's stamp **and checksum** in
+/// place (the 32-byte `addr` prefix is unchanged, so
+/// `STAMP_SIZE + STAMP_CHECKSUM_LEN` bytes at `record_offset + 32` are
+/// rewritten), then fsync. Used by a re-stamp to persist the refreshed
+/// timestamp without appending a duplicate, so the on-disk record stays
+/// current across a restart. The write isn't atomic, but a crash
+/// mid-overwrite leaves a checksum that won't match the stamp, so the
+/// loader discards the torn record rather than trusting it.
 fn overwrite_stamp_record(
     path: &Path,
     record_offset: u64,
+    addr: &[u8; 32],
     stamp: &[u8; STAMP_SIZE],
 ) -> Result<(), PostageError> {
     use std::io::{Seek as _, SeekFrom, Write as _};
 
+    let mut buf = Vec::with_capacity(STAMP_SIZE + STAMP_CHECKSUM_LEN);
+    buf.extend_from_slice(stamp);
+    buf.extend_from_slice(&stamp_record_checksum(addr, stamp));
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .open(path)
         .map_err(|e| PostageError::Persist(format!("{}: {e}", path.display())))?;
     f.seek(SeekFrom::Start(record_offset + 32))
         .map_err(|e| PostageError::Persist(format!("{}: {e}", path.display())))?;
-    f.write_all(stamp)
+    f.write_all(&buf)
         .map_err(|e| PostageError::Persist(format!("{}: {e}", path.display())))?;
     f.sync_all()
         .map_err(|e| PostageError::Persist(format!("{}: {e}", path.display())))?;
@@ -1201,6 +1254,98 @@ mod tests {
             std::fs::metadata(&sidecar).unwrap().len() as usize,
             STAMP_STORE_HEADER_LEN + STAMP_RECORD_LEN,
             "the sidecar must hold exactly one record for the one address"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A crash mid-append leaves a trailing partial record. The loader
+    /// must truncate it so the *next* append writes at a valid boundary
+    /// — otherwise framing shifts permanently and every later record
+    /// fails to reload.
+    #[test]
+    fn sidecar_truncates_trailing_partial_record_on_load() {
+        use std::io::Write as _;
+        let secret = random_secp256k1_secret();
+        let dir = tmpdir();
+        let path = dir.join("batch.bin");
+        let batch = [0x33; 32];
+        let sidecar = path.with_extension("stamps");
+
+        let chunk_a = [0xa1; 32];
+        {
+            let mut issuer = StampIssuer::open_or_new(path.clone(), batch, 21, 16, true).unwrap();
+            sign_stamp_bytes(&secret, &mut issuer, &chunk_a).unwrap();
+        }
+        // Simulate a torn append: 20 stray bytes after the good record.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&sidecar)
+                .unwrap();
+            f.write_all(&[0x77u8; 20]).unwrap();
+        }
+        assert_eq!(
+            std::fs::metadata(&sidecar).unwrap().len() as usize,
+            STAMP_STORE_HEADER_LEN + STAMP_RECORD_LEN + 20
+        );
+
+        // Reopen: the partial is truncated and the good record recovered.
+        let chunk_b = [0xb2; 32];
+        let mut issuer = StampIssuer::open_or_new(path.clone(), batch, 21, 16, true).unwrap();
+        assert!(issuer.has_stamp(&chunk_a), "intact record must survive");
+        assert_eq!(
+            std::fs::metadata(&sidecar).unwrap().len() as usize,
+            STAMP_STORE_HEADER_LEN + STAMP_RECORD_LEN,
+            "trailing partial must be truncated on load"
+        );
+        // A new append lands at the aligned boundary and reloads cleanly.
+        sign_stamp_bytes(&secret, &mut issuer, &chunk_b).unwrap();
+        drop(issuer);
+        let reopened = StampIssuer::open_or_new(path, batch, 21, 16, true).unwrap();
+        assert!(reopened.has_stamp(&chunk_a) && reopened.has_stamp(&chunk_b));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A torn in-place overwrite yields a record whose checksum no longer
+    /// matches its stamp. The loader must discard that one record (its
+    /// address just re-stamps later) while keeping the others — fixed
+    /// framing means one corrupt record never shifts its neighbours.
+    #[test]
+    fn sidecar_discards_checksum_mismatched_record() {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+        let secret = random_secp256k1_secret();
+        let dir = tmpdir();
+        let path = dir.join("batch.bin");
+        let batch = [0x44; 32];
+        let sidecar = path.with_extension("stamps");
+
+        let chunk_a = [0xaa; 32];
+        let chunk_b = [0xbb; 32];
+        {
+            let mut issuer = StampIssuer::open_or_new(path.clone(), batch, 21, 16, true).unwrap();
+            sign_stamp_bytes(&secret, &mut issuer, &chunk_a).unwrap();
+            sign_stamp_bytes(&secret, &mut issuer, &chunk_b).unwrap();
+        }
+        // Corrupt one byte inside the FIRST record's stamp region without
+        // fixing its checksum → simulates a torn write.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&sidecar)
+                .unwrap();
+            // First record's stamp starts at header + 32 (past the addr).
+            f.seek(SeekFrom::Start((STAMP_STORE_HEADER_LEN + 32 + 5) as u64))
+                .unwrap();
+            f.write_all(&[0xFF]).unwrap();
+        }
+        let reopened = StampIssuer::open_or_new(path, batch, 21, 16, true).unwrap();
+        assert!(
+            !reopened.has_stamp(&chunk_a),
+            "checksum-mismatched record must be discarded"
+        );
+        assert!(
+            reopened.has_stamp(&chunk_b),
+            "the intact neighbour must still load (framing unshifted)"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
