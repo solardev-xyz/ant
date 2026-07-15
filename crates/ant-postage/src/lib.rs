@@ -135,6 +135,15 @@ pub struct StampIssuer {
     /// re-push (and, at capacity, evicting another chunk or being
     /// rejected on an immutable batch).
     stamp_persistence_failed: Option<&'static str>,
+    /// Advisory exclusive lock on `<persist_path>.lock`, held for the
+    /// issuer's lifetime. Two issuers over one store — a second daemon,
+    /// a stray CLI — would each hand out the same `(batch, bucket,
+    /// index)` and double-issue toward the network, and a concurrent
+    /// compaction `rename` could strand the other handle's `O_APPEND`
+    /// write in an unlinked inode. `None` for in-memory issuers. A
+    /// separate lock file (never renamed) so compaction can't detach
+    /// the lock from its inode.
+    _store_lock: Option<std::fs::File>,
 }
 
 /// Magic for the per-chunk stamp sidecar (Ant `STamp` Map).
@@ -237,6 +246,7 @@ impl StampIssuer {
         immutable: bool,
     ) -> Result<Self, PostageError> {
         if path.exists() {
+            let store_lock = acquire_store_lock(&path)?;
             let bytes = std::fs::read(&path)
                 .map_err(|e| PostageError::Load(format!("{}: {e}", path.display())))?;
             let header = decode_header(&bytes)?;
@@ -267,6 +277,7 @@ impl StampIssuer {
                 stamp_record_count: 0,
                 stamps_path: None,
                 stamp_persistence_failed: None,
+                _store_lock: Some(store_lock),
             };
             issuer.attach_stamp_store();
             return Ok(issuer);
@@ -321,6 +332,7 @@ impl StampIssuer {
     /// previously bought without a sidecar registry — the filename is
     /// the batch id and the header carries the rest.
     pub fn open_existing(path: PathBuf) -> Result<Self, PostageError> {
+        let store_lock = acquire_store_lock(&path)?;
         let bytes = std::fs::read(&path)
             .map_err(|e| PostageError::Load(format!("{}: {e}", path.display())))?;
         let header = decode_header(&bytes)?;
@@ -336,6 +348,7 @@ impl StampIssuer {
             stamp_record_count: 0,
             stamps_path: None,
             stamp_persistence_failed: None,
+            _store_lock: Some(store_lock),
         };
         issuer.attach_stamp_store();
         Ok(issuer)
@@ -381,6 +394,10 @@ impl StampIssuer {
         let n = 1usize
             .checked_shl(u32::from(bucket_depth))
             .ok_or_else(|| PostageError::Msg("bucket bitmap too large".into()))?;
+        let store_lock = persist_path
+            .as_deref()
+            .map(acquire_store_lock)
+            .transpose()?;
         let mut issuer = Self {
             batch_id,
             batch_depth,
@@ -392,8 +409,26 @@ impl StampIssuer {
             stamp_record_count: 0,
             stamps_path: None,
             stamp_persistence_failed: None,
+            _store_lock: store_lock,
         };
         issuer.attach_stamp_store();
+        // Fresh counters (this branch only runs when the counter file
+        // was absent) next to a sidecar that already records issued
+        // stamps means the counter file was deleted or recreated: the
+        // counters are behind what the network has seen, and issuing
+        // would re-use `(batch, bucket, index)` tuples. Fail closed —
+        // the recovered stamps stay readable, but no new stamp is
+        // issued until the operator restores the counter file or
+        // removes the sidecar with it.
+        if issuer.persist_path.is_some()
+            && !issuer.seen.is_empty()
+            && issuer.stamp_persistence_failed.is_none()
+        {
+            issuer.stamp_persistence_failed = Some(
+                "sidecar records issued stamps but the counter file was missing/recreated \
+                 (counters behind the network)",
+            );
+        }
         Ok(issuer)
     }
 
@@ -934,6 +969,40 @@ pub fn sign_stamp_bytes(
 /// `<batch>.stamps`).
 fn stamps_sidecar_path(persist: &Path) -> PathBuf {
     persist.with_extension("stamps")
+}
+
+/// Take the store's advisory exclusive lock (`<counter path>.lock`),
+/// failing fast if another process (or another issuer in this one)
+/// already holds it. See the `_store_lock` field docs for why the lock
+/// lives on a dedicated never-renamed file.
+fn acquire_store_lock(persist: &Path) -> Result<std::fs::File, PostageError> {
+    let mut os = persist.as_os_str().to_owned();
+    os.push(".lock");
+    let lock_path = PathBuf::from(os);
+    if let Some(parent) = lock_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| PostageError::Persist(format!("{}: {e}", lock_path.display())))?;
+        }
+    }
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| PostageError::Persist(format!("{}: {e}", lock_path.display())))?;
+    match f.try_lock() {
+        Ok(()) => Ok(f),
+        Err(std::fs::TryLockError::WouldBlock) => Err(PostageError::Persist(format!(
+            "postage store {} is locked by another issuer/process — two issuers over one \
+             store would double-issue (batch, bucket, index) tuples",
+            persist.display()
+        ))),
+        Err(std::fs::TryLockError::Error(e)) => Err(PostageError::Persist(format!(
+            "{}: acquiring store lock: {e}",
+            lock_path.display()
+        ))),
+    }
 }
 
 /// The 4-byte record checksum: first bytes of `keccak256(addr ‖ stamp)`.
@@ -1952,6 +2021,60 @@ mod tests {
             "poisoned issuer must fail closed as Persist, got: {err:?}"
         );
         assert!(err.to_string().contains("torn sidecar append"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two issuers over one store double-issue `(batch, bucket, index)`
+    /// tuples, and a concurrent compaction rename can strand the other
+    /// handle's append in an unlinked inode — the store lock refuses the
+    /// second issuer outright.
+    #[test]
+    fn second_issuer_on_the_same_store_is_refused() {
+        let dir = tmpdir();
+        let path = dir.join("c.bin");
+        let batch = [0x55u8; 32];
+        let first = StampIssuer::open_or_new(path.clone(), batch, 17, 16, false).unwrap();
+        let second = StampIssuer::open_or_new(path.clone(), batch, 17, 16, false);
+        assert!(
+            matches!(second, Err(PostageError::Persist(ref m)) if m.contains("locked")),
+            "second issuer must be refused while the first holds the lock, got: {second:?}"
+        );
+        // Dropping the first releases the lock; a successor opens fine.
+        drop(first);
+        assert!(StampIssuer::open_or_new(path, batch, 17, 16, false).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A surviving `.stamps` sidecar next to a missing/recreated counter
+    /// file means the counters are behind indices the network has seen —
+    /// issuing would re-use them. Must fail closed, not silently accept.
+    #[test]
+    fn surviving_sidecar_with_fresh_counters_fails_closed() {
+        let secret = random_secp256k1_secret();
+        let dir = tmpdir();
+        let path = dir.join("c.bin");
+        let batch = [0x66u8; 32];
+        let a1 = [0xAB; 32];
+        {
+            let mut issuer = StampIssuer::open_or_new(path.clone(), batch, 17, 16, false).unwrap();
+            sign_stamp_bytes(&secret, &mut issuer, &a1).unwrap();
+        }
+        // Counter file vanishes (operator mistake, partial restore);
+        // the sidecar survives.
+        std::fs::remove_file(&path).unwrap();
+
+        let mut issuer = StampIssuer::open_or_new(path.clone(), batch, 17, 16, false).unwrap();
+        assert!(issuer.has_stamp(&a1), "recovered stamps stay readable");
+        let err = sign_stamp_bytes(&secret, &mut issuer, &[0xCD; 32]).unwrap_err();
+        assert!(
+            matches!(err, PostageError::Persist(_)),
+            "must fail closed as Persist, got: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("counter file was missing/recreated"),
+            "error should name the incoherence, got: {err}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

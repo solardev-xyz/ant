@@ -278,6 +278,14 @@ const MAX_BACKOFF: Duration = Duration::from_mins(1);
 /// identify has round-tripped makes bee stall for the full 10 s, then disconnect.
 /// This cap is the longest we'll wait before opening the BZZ stream anyway.
 const HANDSHAKE_IDENTIFY_WAIT: Duration = Duration::from_secs(3);
+/// How far below the peer's bin cursor a default `PullsyncProbe` starts:
+/// a historical page the server answers immediately, sized to show a
+/// handful of real chunks.
+const PROBE_BACKLOG: u64 = 8;
+/// Overall bound on the probe's sync page — strictly below the control
+/// server's 20 s `NETWORK_COMMAND_TIMEOUT` so the probe always acks
+/// before the dispatcher gives up (no orphaned probe tasks).
+const PROBE_SYNC_TIMEOUT: Duration = Duration::from_secs(15);
 /// Grace window we give libp2p-identify auto-promotion and the `UPnP` behaviour
 /// to settle before warning the operator that no globally-routable external
 /// address has been registered. `UPnP`'s SSDP search round-trip is typically
@@ -2431,19 +2439,41 @@ fn handle_control_command(
                     }
                 };
 
-                let sync_start = start.unwrap_or(cursor_for_bin.saturating_add(1));
+                // Default to a *historical* page (start ≤ cursor): the
+                // server answers immediately with what it has. The old
+                // default (cursor+1) opened a live request that blocks
+                // until the next chunk arrives — on a quiet bin that
+                // meant every probe "timed out" and orphaned its task,
+                // making the probe useless as a diagnostic. Callers who
+                // really want the live-block behavior pass `start`.
+                let sync_start =
+                    start.unwrap_or_else(|| cursor_for_bin.saturating_sub(PROBE_BACKLOG));
                 view.start = sync_start;
                 let wanted = AtomicUsize::new(0);
                 let t1 = std::time::Instant::now();
-                let page = pullsync::sync_once(
-                    &mut control.clone(),
-                    peer_id,
-                    probe_bin,
-                    sync_start,
-                    |_offered| wanted.fetch_add(1, Ordering::Relaxed) < max_deliver,
-                    || {}, // probe is one-shot; no readiness signal needed
+                // Self-bound below the control server's 20 s dispatch
+                // timeout so the probe always acks a view (with an error
+                // string if need be) instead of orphaning the task after
+                // the server has already given up on it.
+                let page = match tokio::time::timeout(
+                    PROBE_SYNC_TIMEOUT,
+                    pullsync::sync_once(
+                        &mut control.clone(),
+                        peer_id,
+                        probe_bin,
+                        sync_start,
+                        |_offered| wanted.fetch_add(1, Ordering::Relaxed) < max_deliver,
+                        || {}, // probe is one-shot; no readiness signal needed
+                    ),
                 )
-                .await;
+                .await
+                {
+                    Ok(page) => page,
+                    Err(_) => Err(crate::pullsync::PullsyncError::Protocol(format!(
+                        "probe sync timed out after {}s (live bin? pass an explicit start)",
+                        PROBE_SYNC_TIMEOUT.as_secs()
+                    ))),
+                };
                 view.sync_ms = t1.elapsed().as_millis() as u64;
                 match page {
                     Ok(p) => {

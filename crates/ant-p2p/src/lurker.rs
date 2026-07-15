@@ -82,6 +82,17 @@ const COVERING_PEERS: usize = 5;
 const PSS_BIN_WINDOW: u8 = 3;
 /// Highest proximity-order bin.
 const MAX_BIN: u8 = 31;
+/// After this many *consecutive* timed-out (quiet) rounds, a puller
+/// re-probes the peer's cursors before trusting it again. `on_ready`
+/// fires on the Get send — before any byte comes back — so without a
+/// liveness check a peer that accepts streams and never responds (or
+/// silently wiped its reserve, changing its epoch) would count as
+/// coverage forever: a free censorship lever. A probe that fails, times
+/// out, or reports a different epoch retires the puller so the driver
+/// rotates in a live peer; a genuinely quiet bin passes the probe
+/// cheaply. With `SYNC_ROUND_TIMEOUT` this probes roughly once a minute
+/// on an idle bin.
+const STALENESS_PROBE_ROUNDS: u32 = 3;
 
 /// Per-`(peer, bin)` resume position `(reserve_epoch, next_start)`,
 /// shared with the pullers. The epoch tag lets the driver discard a
@@ -526,6 +537,9 @@ async fn pull_bin(
         key: (peer_id, bin),
         generation,
     };
+    // Consecutive timed-out rounds since the last sign of life — drives
+    // the staleness probe below.
+    let mut idle_rounds: u32 = 0;
     loop {
         if out.is_closed() {
             return;
@@ -575,8 +589,33 @@ async fn pull_bin(
                 );
                 return; // stream/peer error → drop this puller
             }
-            Err(_) => continue, // long-block timeout → re-open at same start
+            // Long-block timeout: normally just a quiet bin → re-open at
+            // the same start. But every STALENESS_PROBE_ROUNDS of pure
+            // silence, verify the peer is actually alive and still on
+            // the reserve epoch we're pulling under — a wedged peer or a
+            // wiped reserve looks *identical* to a quiet bin from here
+            // and would otherwise hold this coverage slot forever.
+            Err(_) => {
+                idle_rounds += 1;
+                if idle_rounds >= STALENESS_PROBE_ROUNDS {
+                    idle_rounds = 0;
+                    match pullsync::get_cursors(&mut control, peer_id).await {
+                        Ok(c) if c.epoch == epoch => {} // alive, same reserve
+                        outcome => {
+                            tracing::debug!(
+                                target: "ant_p2p::lurker",
+                                peer = %peer_id, bin,
+                                alive = outcome.is_ok(),
+                                "staleness probe failed or epoch changed; rotating puller",
+                            );
+                            return; // driver re-picks a live peer
+                        }
+                    }
+                }
+                continue;
+            }
         };
+        idle_rounds = 0;
         tracing::debug!(
             target: "ant_p2p::lurker",
             peer = %peer_id, bin, start, topmost = page.topmost,
