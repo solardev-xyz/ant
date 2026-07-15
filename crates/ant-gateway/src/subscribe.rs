@@ -180,7 +180,43 @@ async fn run_subscription(
 fn close_frame(code: u16, reason: &str) -> Message {
     Message::Close(Some(CloseFrame {
         code,
-        // Close reasons are capped at 123 bytes by RFC 6455.
-        reason: reason.chars().take(120).collect::<String>().into(),
+        reason: truncate_close_reason(reason).into(),
     }))
+}
+
+/// RFC 6455 caps a Close payload at 125 bytes, 2 of which are the code —
+/// so the reason must fit 123 **bytes**, not chars. Truncate on a char
+/// boundary at or below 120 bytes; a char-count cap would let a
+/// multibyte-UTF-8 reason overflow the frame and make the send fail
+/// (dropping the reason entirely — the very thing the frame exists for).
+fn truncate_close_reason(reason: &str) -> &str {
+    if reason.len() <= 120 {
+        return reason;
+    }
+    let mut end = 120;
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    &reason[..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_close_reason;
+
+    #[test]
+    fn close_reason_truncates_on_byte_boundaries() {
+        // Short ASCII passes through untouched.
+        assert_eq!(truncate_close_reason("cap reached"), "cap reached");
+        // Long ASCII cuts at exactly 120 bytes.
+        let long = "x".repeat(200);
+        assert_eq!(truncate_close_reason(&long).len(), 120);
+        // Multibyte: 3-byte chars, 120 not on a boundary (40×3 = 120 is,
+        // so use 4-byte emoji: 120/4 = 30 exact; shift with a prefix).
+        let tricky = format!("ab{}", "\u{1F980}".repeat(40)); // 2 + 160 bytes
+        let cut = truncate_close_reason(&tricky);
+        assert!(cut.len() <= 120, "must fit RFC 6455's byte budget");
+        assert!(cut.is_char_boundary(cut.len()), "must stay valid UTF-8");
+        assert_eq!(cut.len(), 118); // 2 + 29×4 — boundary below 120
+    }
 }

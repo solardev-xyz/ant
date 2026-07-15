@@ -186,6 +186,26 @@ mod tests {
         out
     }
 
+    /// The documented `1..=4096` contract is enforced at BOTH ends: bee
+    /// rejects an empty SOC payload, so building one would sign a chunk
+    /// the network refuses (round-14 residual: the check existed, the
+    /// test pinning it didn't).
+    #[test]
+    fn build_gsoc_chunk_rejects_empty_and_oversize_payloads() {
+        let identifier = identifier_from_string("bounds");
+        let secret = gsoc_mine(&[0u8; 32], &identifier, 1).unwrap();
+        assert!(matches!(
+            build_gsoc_chunk(&secret, &identifier, b""),
+            Err(CryptoError::InvalidChunkPayload)
+        ));
+        assert!(matches!(
+            build_gsoc_chunk(&secret, &identifier, &[0u8; 4097]),
+            Err(CryptoError::InvalidChunkPayload)
+        ));
+        assert!(build_gsoc_chunk(&secret, &identifier, &[0u8; 1]).is_ok());
+        assert!(build_gsoc_chunk(&secret, &identifier, &[0u8; 4096]).is_ok());
+    }
+
     // Vectors below are tool-verified against @ethersphere/bee-js 12.2.2.
 
     #[test]

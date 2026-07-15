@@ -231,6 +231,16 @@ impl Seen {
 /// defeating the very redundancy the covering set exists for. Reserving
 /// first (keeping the cross-puller mutual exclusion) and rolling back on
 /// an uncommitted drop restores at-least-once.
+///
+/// Known residual (accepted): if a *second* puller dedup-skips this
+/// chunk while the reservation is uncommitted and the holder is then
+/// aborted, the rollback lands after the skipper already moved past it.
+/// Actual loss additionally requires the chunk to sit more than
+/// `PULL_BACKLOG` back in the bin's history for every other covering
+/// peer — the aborted puller's own position is published per *page*, so
+/// its replacement re-pulls the unfinished page — which stacks three
+/// independent rarities. Closing it entirely would need cross-puller
+/// delivery sequencing; not worth the coupling.
 struct SeenReservation {
     seen: Arc<Mutex<Seen>>,
     key: [u8; 64],
