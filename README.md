@@ -92,8 +92,28 @@ the still-open items.
   - `antctl chequebook cash-self [--submit]`                — Tier-1 SWAP self-test: signs a 1-PLUR EIP-712 cheque against `CHEQUEBOOK_ADDRESS`, eth_call's `cashChequeBeneficiary` from our own EOA (free), and with `--submit` actually broadcasts the tx (~$0.0001 in xDAI). Proves bit-exact bee EIP-712 / ECDSA compatibility — first live run on Gnosis mainnet at block `46019699`, tx `0x643bb08e…e308`.
 - **Operator tooling — local.** `antctl status`, `antop` (live TUI
   with Peers / Routing / Retrieval / Gateway / Requests tabs), `antctl
-  version`, `antctl peers reset`, and `antctl get` for downloads with
-  live progress.
+  version`, `antctl peers reset`, `antctl get` for downloads with
+  live progress, and `antctl pullsync` to probe the pullsync-client
+  path against a live peer.
+
+### Messaging (PSS + GSOC — send *and* receive on a light node)
+
+- **PSS send (`/pss/send/{topic}/{targets}`).** Bee-compatible trojan
+  chunks (ElGamal ECDH, keccak-CTR, nonce mining with a precomputed
+  BMT sibling path), stamped and pushed from the light node.
+  Interop locked by bee-generated golden vectors.
+- **GSOC authoring.** bee-js-compatible `gsocMine` key mining +
+  EIP-191 SOC signing (`ant-crypto::gsoc`), uploaded via `POST /soc`.
+- **Receive — the lurker (`ant-p2p::lurker`).** Bee has no push
+  delivery to light nodes, so ant *pulls*: the node drives bee's
+  pullsync 1.4.0 protocol against peers covering the target
+  neighborhood and decodes watched GSOC/PSS chunks locally. One
+  shared pull pipeline per neighborhood fans out to all subscribers
+  (`lurker_registry`), with admission caps, keep-alive'd WebSockets
+  (`/gsoc/subscribe/{address}`, `/pss/subscribe/{topic}`), staleness
+  rotation of dead peers, and at-least-once delivery semantics.
+  Verified end-to-end on mainnet, including a symmetric many-to-many
+  rendezvous between two light nodes.
 
 ## What's not here yet
 
@@ -193,7 +213,7 @@ the still-open items.
 | [`ant-node`](crates/ant-node) | High-level orchestrator wiring `ant-p2p`, `ant-retrieval`, caches, gateway, `UploadRuntime`, and `SwapConfig`. |
 | [`ant-p2p`](crates/ant-p2p) | libp2p host, BZZ handshake (now exposing peer EOA + welcome), Hive peer exchange, pseudosettle driver, `/swarm/swap/1.0.0/swap` listener + dialer with `CreditLedger` + `OutboundLedger`. |
 | [`ant-retrieval`](crates/ant-retrieval) | Fetcher, ordered joiner with ranges, mantaray walker + recursive trie writer, splitter, pushsync client, in-memory + SQLite caches, bee-parity accounting mirror. |
-| [`ant-gateway`](crates/ant-gateway) | Bee-shaped HTTP API (`/bytes`, `/bzz`, `/chunks`, HEAD, Range, plus Tier-A status / stub endpoints, plus `POST /chunks` and `POST /bzz` upload endpoints). |
+| [`ant-gateway`](crates/ant-gateway) | Bee-shaped HTTP API (`/bytes`, `/bzz`, `/chunks`, HEAD, Range, plus Tier-A status / stub endpoints, plus `POST /chunks` and `POST /bzz` upload endpoints, plus PSS/GSOC messaging: `/pss/send` and the `/gsoc/subscribe` + `/pss/subscribe` WebSockets). |
 | [`ant-control`](crates/ant-control) | Wire types for the `antd` ↔ `antctl` Unix-socket control protocol. |
 | [`ant-crypto`](crates/ant-crypto) | secp256k1, keccak256, BMT, CAC/SOC validation, overlay derivation. |
 | [`ant-postage`](crates/ant-postage) | EIP-191 stamp issuer with crash-safe bucket-counter persistence. |

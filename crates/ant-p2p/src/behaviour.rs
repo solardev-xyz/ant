@@ -7199,12 +7199,12 @@ async fn forward_lurker_messages(
         let Some(msg) = msg else { return };
         let frame = match msg {
             DecodedMessage::Gsoc { address, payload } => ControlAck::LurkerMessage {
-                kind: "gsoc",
+                kind: ant_control::LurkerMessageKind::Gsoc,
                 key: hex::encode(address),
                 payload,
             },
             DecodedMessage::Pss { topic, message } => ControlAck::LurkerMessage {
-                kind: "pss",
+                kind: ant_control::LurkerMessageKind::Pss,
                 key: hex::encode(topic),
                 payload: message,
             },

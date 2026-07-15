@@ -519,9 +519,9 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
                 .or_else(|| pss_topics.first().map(hex::encode))
                 .unwrap_or_default();
             let kind = if gsoc_addresses.is_empty() {
-                "pss"
+                ant_control::LurkerMessageKind::Pss
             } else {
-                "gsoc"
+                ant_control::LurkerMessageKind::Gsoc
             };
             let _ = ack
                 .send(ControlAck::LurkerMessage {
@@ -530,6 +530,14 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
                     payload: b"fixture-lurker-payload".to_vec(),
                 })
                 .await;
+            // An all-0xCD address models a LIVE subscription: hold the
+            // ack sender open until the gateway side hangs up, so tests
+            // can exercise keep-alive traffic without racing a
+            // node-side close. Everything else closes after the single
+            // delivery (exercising the close-with-reason path).
+            if gsoc_addresses.contains(&[0xCD; 32]) {
+                tokio::spawn(async move { ack.closed().await });
+            }
         }
         ControlCommand::GetChunk { reference, ack } => {
             let reply = match fetcher.fetch(reference).await {

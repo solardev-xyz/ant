@@ -18,7 +18,17 @@
 //!   is just a channel);
 //! - a slow subscriber sheds: fan-out uses `try_send`, so a client
 //!   that stopped draining its 64-message buffer loses messages
-//!   instead of head-of-line-blocking every other subscriber.
+//!   instead of head-of-line-blocking every other subscriber. Shedding
+//!   is **silent by design**: the WebSocket wire carries bee-compatible
+//!   binary payload frames only, so there is no in-band "you lagged"
+//!   signal to send without breaking bee-js clients — delivery is
+//!   documented as best-effort/at-least-once and dropped messages are
+//!   logged server-side.
+//!
+//! Known limitation: the union watch carries at most one `pss_secret`
+//! ([`WatchState::merge_from`] keeps the first) — moot today because
+//! every subscription on one node shares the node's secret (or none),
+//! but a future per-subscriber-key design would need a `Vec` here.
 
 use crate::messaging::{DecodedMessage, WatchState};
 use std::collections::HashMap;
@@ -108,10 +118,16 @@ impl Registry {
             // either without limit. A refused attach drops `sub_tx`;
             // the caller closes the subscriber's stream.
             {
-                let subs = entry
+                let mut subs = entry
                     .subscribers
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
+                // Count only live subscribers toward the cap: the
+                // dispatcher's prune runs every PRUNE_INTERVAL, so
+                // without this a burst of connect/disconnect could hold
+                // slots for dead receivers for up to 10s and refuse a
+                // legitimate attach.
+                subs.retain(|s| !s.tx.is_closed());
                 if subs.len() >= MAX_SUBSCRIBERS_PER_TARGET {
                     return None;
                 }

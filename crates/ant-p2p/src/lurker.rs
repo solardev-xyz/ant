@@ -125,6 +125,29 @@ impl Drop for ReadyGuard {
     }
 }
 
+/// A puller `JoinHandle` that aborts its task when dropped.
+///
+/// The registry tears a shared lurker down with `JoinHandle::abort()` on
+/// the *driver* task; a bare abort would drop the driver's `active` map
+/// and **detach** every puller (a dropped `JoinHandle` never aborts), so
+/// up to `COVERING_PEERS × bins` pullers would keep pulling until their
+/// next `out.is_closed()` check — up to `SYNC_ROUND_TIMEOUT` each. With
+/// this wrapper, dropping the map aborts them all immediately, however
+/// the driver ends.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl AbortOnDrop {
+    fn is_finished(&self) -> bool {
+        self.0.is_finished()
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// A live lurker subscription: the target neighborhood and what to watch.
 pub struct LurkerConfig {
     /// Overlay whose neighborhood we reside in and pull.
@@ -324,7 +347,7 @@ pub async fn run(
     // in a gap while the driver re-dials (an earlier design
     // aborted-and-restarted every tick and lost messages that arrived
     // during the re-reside window).
-    let mut active: HashMap<(PeerId, u8), tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut active: HashMap<(PeerId, u8), AbortOnDrop> = HashMap::new();
     // When each currently-obsolete (not-desired) puller first became
     // obsolete, so the handover backstop can force-retire one that has
     // outlived HANDOVER_MAX_OVERLAP waiting for a wedged replacement.
@@ -442,7 +465,7 @@ pub async fn run(
                     Arc::clone(&ready),
                     out.clone(),
                 ));
-                active.insert((peer_id, bin), handle);
+                active.insert((peer_id, bin), AbortOnDrop(handle));
             }
         }
 
@@ -480,9 +503,7 @@ pub async fn run(
             .copied()
             .collect();
         for k in retired {
-            if let Some(h) = active.remove(&k) {
-                h.abort();
-            }
+            drop(active.remove(&k)); // AbortOnDrop aborts the puller
             obsolete_since.remove(&k);
         }
         ready
@@ -504,9 +525,7 @@ pub async fn run(
             () = tokio::time::sleep(RE_RESIDE_INTERVAL) => {}
         }
     }
-    for (_, h) in active {
-        h.abort();
-    }
+    // `active` drops here; AbortOnDrop retires every remaining puller.
 }
 
 /// Live-pull one bin from one peer, forwarding decoded messages. Runs

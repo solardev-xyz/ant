@@ -608,6 +608,15 @@ pub struct StreamRange {
     pub end_inclusive: u64,
 }
 
+/// The transport a lurker message was decoded from (house style: typed,
+/// not stringly — the wire form stays `"gsoc"`/`"pss"` via serde).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LurkerMessageKind {
+    Gsoc,
+    Pss,
+}
+
 /// Node-loop reply to a [`ControlCommand`]. Serialized back to the client as
 /// `Response::Ok`, `Response::Bytes`, `Response::BzzBytes`,
 /// `Response::Progress`, or `Response::Error` depending on the variant.
@@ -681,11 +690,10 @@ pub enum ControlAck {
     /// Terminal ack on `PullsyncProbe`.
     PullsyncProbe(PullsyncProbeView),
     /// Non-terminal streaming frame on `LurkerSubscribe`: one decoded
-    /// GSOC/PSS message. `kind` is `"gsoc"` or `"pss"`; `key` is the SOC
-    /// address (gsoc) or topic (pss) as lowercase hex; `payload` is the
-    /// application bytes.
+    /// GSOC/PSS message. `key` is the SOC address (gsoc) or topic (pss)
+    /// as lowercase hex; `payload` is the application bytes.
     LurkerMessage {
-        kind: &'static str,
+        kind: LurkerMessageKind,
         key: String,
         payload: Vec<u8>,
     },
