@@ -1,6 +1,6 @@
 [package]
 name = "ant-chain"
-version = "0.5.41"
+version = "0.5.42"
 edition.workspace = true
 license.workspace = true
 
