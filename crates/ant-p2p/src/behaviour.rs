@@ -278,6 +278,14 @@ const MAX_BACKOFF: Duration = Duration::from_mins(1);
 /// identify has round-tripped makes bee stall for the full 10 s, then disconnect.
 /// This cap is the longest we'll wait before opening the BZZ stream anyway.
 const HANDSHAKE_IDENTIFY_WAIT: Duration = Duration::from_secs(3);
+/// How far below the peer's bin cursor a default `PullsyncProbe` starts:
+/// a historical page the server answers immediately, sized to show a
+/// handful of real chunks.
+const PROBE_BACKLOG: u64 = 8;
+/// Overall bound on the probe's sync page — strictly below the control
+/// server's 20 s `NETWORK_COMMAND_TIMEOUT` so the probe always acks
+/// before the dispatcher gives up (no orphaned probe tasks).
+const PROBE_SYNC_TIMEOUT: Duration = Duration::from_secs(15);
 /// Grace window we give libp2p-identify auto-promotion and the `UPnP` behaviour
 /// to settle before warning the operator that no globally-routable external
 /// address has been registered. `UPnP`'s SSDP search round-trip is typically
@@ -780,6 +788,11 @@ struct SwarmState {
     /// network state, not the network state from before the fetch
     /// started.
     peers_watch: watch::Sender<Vec<(PeerId, Overlay)>>,
+    /// Shared lurker registry: one GSOC/PSS pull pipeline per target
+    /// neighborhood, fanned out to every WS subscriber on it (see
+    /// [`crate::lurker_registry`]). Per-node, not process-wide — tests
+    /// run several nodes in one process.
+    lurkers: crate::lurker_registry::Registry,
     /// Process-wide cap on concurrent `retrieve_chunk` calls. Cloned
     /// into every `RoutingFetcher` we build for any `GetBytes` /
     /// `GetBzz` request, so the cap applies across concurrent
@@ -960,6 +973,7 @@ impl SwarmState {
             disk_cache,
             chunk_record_dir,
             peers_watch: watch::channel(Vec::new()).0,
+            lurkers: crate::lurker_registry::Registry::new(),
             retrieval_inflight: Arc::new(Semaphore::new(RETRIEVAL_INFLIGHT_CAP)),
             verify_gate: Arc::new(Semaphore::new(1)),
             payment_notify: None,
@@ -2368,6 +2382,199 @@ fn handle_control_command(
                 };
                 let _ = ack.send(reply);
             });
+        }
+        ControlCommand::PullsyncProbe {
+            target,
+            bin,
+            start,
+            max_deliver,
+            ack,
+        } => {
+            use crate::pullsync;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            // Pick the connected peer closest to the target overlay — the
+            // one whose reserve most likely holds the neighborhood's
+            // chunks. Fall back to any peer if routing is empty but the
+            // peer snapshot isn't.
+            let peer = state
+                .routing
+                .closest_peer(&target, &[])
+                .or_else(|| state.peers_watch.subscribe().borrow().first().copied());
+            let Some((peer_id, peer_overlay)) = peer else {
+                let _ = ack.send(ControlAck::PullsyncProbe(ant_control::PullsyncProbeView {
+                    error: "no connected peer to probe (wait for handshakes)".into(),
+                    ..Default::default()
+                }));
+                return;
+            };
+            // The chunks near `target` sit in the server's proximity-order
+            // bin to that address, unless the caller pinned a bin.
+            let probe_bin =
+                bin.unwrap_or_else(|| crate::routing::proximity(&peer_overlay, &target));
+            let control = control.clone();
+            tokio::spawn(async move {
+                let mut view = ant_control::PullsyncProbeView {
+                    peer_overlay: hex::encode(peer_overlay),
+                    peer_id: peer_id.to_string(),
+                    bin: probe_bin,
+                    ..Default::default()
+                };
+
+                let t0 = std::time::Instant::now();
+                let cursors = pullsync::get_cursors(&mut control.clone(), peer_id).await;
+                view.cursors_ms = t0.elapsed().as_millis() as u64;
+                let cursor_for_bin = match cursors {
+                    Ok(c) => {
+                        view.cursors_ok = true;
+                        view.epoch = c.epoch;
+                        let cur = c.cursors.get(probe_bin as usize).copied().unwrap_or(0);
+                        view.bin_cursor = cur;
+                        cur
+                    }
+                    Err(e) => {
+                        view.error = format!("cursors: {e}");
+                        let _ = ack.send(ControlAck::PullsyncProbe(view));
+                        return;
+                    }
+                };
+
+                // Default to a *historical* page (start ≤ cursor): the
+                // server answers immediately with what it has. The old
+                // default (cursor+1) opened a live request that blocks
+                // until the next chunk arrives — on a quiet bin that
+                // meant every probe "timed out" and orphaned its task,
+                // making the probe useless as a diagnostic. Callers who
+                // really want the live-block behavior pass `start`.
+                let sync_start =
+                    start.unwrap_or_else(|| cursor_for_bin.saturating_sub(PROBE_BACKLOG));
+                view.start = sync_start;
+                let wanted = AtomicUsize::new(0);
+                let t1 = std::time::Instant::now();
+                // Self-bound below the control server's 20 s dispatch
+                // timeout so the probe always acks a view (with an error
+                // string if need be) instead of orphaning the task after
+                // the server has already given up on it.
+                let page = match tokio::time::timeout(
+                    PROBE_SYNC_TIMEOUT,
+                    pullsync::sync_once(
+                        &mut control.clone(),
+                        peer_id,
+                        probe_bin,
+                        sync_start,
+                        |_offered| wanted.fetch_add(1, Ordering::Relaxed) < max_deliver,
+                        || {}, // probe is one-shot; no readiness signal needed
+                    ),
+                )
+                .await
+                {
+                    Ok(page) => page,
+                    Err(_) => Err(crate::pullsync::PullsyncError::Protocol(format!(
+                        "probe sync timed out after {}s (live bin? pass an explicit start)",
+                        PROBE_SYNC_TIMEOUT.as_secs()
+                    ))),
+                };
+                view.sync_ms = t1.elapsed().as_millis() as u64;
+                match page {
+                    Ok(p) => {
+                        view.sync_ok = true;
+                        view.topmost = p.topmost;
+                        view.offered = wanted.load(Ordering::Relaxed);
+                        view.delivered = p.chunks.len();
+                    }
+                    Err(e) => {
+                        view.error = format!("sync: {e}");
+                    }
+                }
+                let _ = ack.send(ControlAck::PullsyncProbe(view));
+            });
+        }
+        ControlCommand::LurkerSubscribe {
+            target,
+            gsoc_addresses,
+            pss_topics,
+            ack,
+        } => {
+            use crate::lurker::{self, LurkerConfig};
+            use crate::messaging::WatchState;
+
+            let watch = WatchState {
+                gsoc_addresses: gsoc_addresses.into_iter().collect(),
+                pss_topics,
+                // No persisted node PSS key yet: topic-broadcast reception
+                // only (the topic-derived key handles it). Directed PSS to
+                // the node's key lands when a pss.key is persisted.
+                pss_secret: None,
+            };
+            if watch.is_empty() {
+                // Nothing to watch — tell the subscriber why before the
+                // stream closes (a bare drop looks like a node failure
+                // and invites a blind retry loop).
+                send_terminal_ack(
+                    &ack,
+                    ControlAck::Error {
+                        message: "lurker subscription rejected: nothing to watch".to_string(),
+                    },
+                );
+                return;
+            }
+            // All-zeros target → the node's own neighborhood (where PSS
+            // messages addressed to us land).
+            let target = if target == [0u8; 32] {
+                *state.routing.base()
+            } else {
+                target
+            };
+
+            // One lurker per neighborhood, shared: the registry attaches
+            // this subscriber to an existing pull pipeline for `target`
+            // (union watch, per-subscriber fan-out) or spawns one, and
+            // refuses when the distinct-neighborhood cap is reached —
+            // dropping `ack` then closes the subscriber's stream right
+            // away instead of silently queueing unbounded lurkers.
+            let control = control.clone();
+            let peers = state.peers_watch.subscribe();
+            let neighborhood_dial = state.neighborhood_dial_tx.clone();
+            let subscribed = state
+                .lurkers
+                .subscribe(target, watch, |shared_watch, out_tx| {
+                    tokio::spawn(lurker::run(
+                        control,
+                        peers,
+                        neighborhood_dial,
+                        LurkerConfig {
+                            target,
+                            watch: shared_watch,
+                        },
+                        out_tx,
+                    ))
+                });
+            let Some(out_rx) = subscribed else {
+                tracing::warn!(
+                    target: "ant_p2p::lurker",
+                    limit = crate::lurker_registry::MAX_LURKER_NEIGHBORHOODS,
+                    "lurker subscription rejected: neighborhood limit reached",
+                );
+                // Surface the rejection so the gateway can close the
+                // WebSocket with a reason instead of a bare drop.
+                send_terminal_ack(
+                    &ack,
+                    ControlAck::Error {
+                        message: format!(
+                            "lurker subscription rejected: neighborhood limit reached ({})",
+                            crate::lurker_registry::MAX_LURKER_NEIGHBORHOODS
+                        ),
+                    },
+                );
+                return;
+            };
+
+            // Forward decoded messages to the caller's ack stream; when
+            // the subscriber goes away — even silently, with no message
+            // ever arriving — the forwarder returns and drops `out_rx`,
+            // and the registry prunes the subscriber (tearing down the
+            // shared lurker once the last one leaves).
+            tokio::spawn(forward_lurker_messages(out_rx, ack));
         }
         ControlCommand::GetBytes {
             reference,
@@ -6972,6 +7179,42 @@ fn build_swarm(keypair: Keypair) -> Result<Swarm<AntBehaviour>, RunError> {
     Ok(swarm)
 }
 
+/// Forward decoded lurker messages to a subscriber's ack channel.
+///
+/// Returns — dropping `out_rx`, which is what stops the lurker and its
+/// pull streams — as soon as the subscriber goes away, **even if no
+/// message ever arrives**: `ack.closed()` is selected alongside `recv()`.
+/// Without that, a quiet subscription whose WebSocket closed would block
+/// on `recv()` forever and leak the whole lurker.
+async fn forward_lurker_messages(
+    mut out_rx: tokio::sync::mpsc::Receiver<crate::messaging::DecodedMessage>,
+    ack: mpsc::Sender<ControlAck>,
+) {
+    use crate::messaging::DecodedMessage;
+    loop {
+        let msg = tokio::select! {
+            m = out_rx.recv() => m,
+            () = ack.closed() => None,
+        };
+        let Some(msg) = msg else { return };
+        let frame = match msg {
+            DecodedMessage::Gsoc { address, payload } => ControlAck::LurkerMessage {
+                kind: ant_control::LurkerMessageKind::Gsoc,
+                key: hex::encode(address),
+                payload,
+            },
+            DecodedMessage::Pss { topic, message } => ControlAck::LurkerMessage {
+                kind: ant_control::LurkerMessageKind::Pss,
+                key: hex::encode(topic),
+                payload: message,
+            },
+        };
+        if ack.send(frame).await.is_err() {
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6979,6 +7222,27 @@ mod tests {
 
     fn pid() -> PeerId {
         Keypair::generate_ed25519().public().to_peer_id()
+    }
+
+    /// Regression for the quiet-subscription leak: closing the
+    /// subscriber's ack stream must stop the forwarder (and thereby the
+    /// lurker, which watches `out_rx`'s closure) even when no message
+    /// ever flows.
+    #[tokio::test]
+    async fn lurker_forwarder_stops_when_quiet_subscriber_leaves() {
+        let (out_tx, out_rx) = mpsc::channel::<crate::messaging::DecodedMessage>(4);
+        let (ack_tx, ack_rx) = mpsc::channel::<ControlAck>(4);
+        let forwarder = tokio::spawn(forward_lurker_messages(out_rx, ack_tx));
+
+        // Subscriber goes away without a single message having arrived.
+        drop(ack_rx);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), forwarder)
+            .await
+            .expect("forwarder must return once the subscriber is gone")
+            .expect("forwarder must not panic");
+        // The lurker's sender now observes closure and shuts down.
+        assert!(out_tx.is_closed());
     }
 
     /// Build a hive hint whose overlay's first byte is `first` (zeros

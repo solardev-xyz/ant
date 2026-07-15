@@ -1467,26 +1467,42 @@ async fn build_upload_runtime(
                 batch_hex,
             ));
         }
-        let store_path = postage_dir.join(format!("{}.bin", hex::encode(batch_id)));
-        let issuer = ant_postage::StampIssuer::open_or_new(
-            store_path.clone(),
-            batch_id,
-            meta.depth,
-            meta.bucket_depth,
-            meta.immutable,
-        )
-        .map_err(|e| anyhow!("StampIssuer: {e}"))?;
-        tracing::info!(
-            target: "antd",
-            batch = %format!("0x{}", hex::encode(batch_id)),
-            owner = %format!("0x{}", hex::encode(meta.batch_owner_eth)),
-            depth = meta.depth,
-            bucket_depth = meta.bucket_depth,
-            immutable = meta.immutable,
-            store = %store_path.display(),
-            "pre-registered operator postage batch",
-        );
-        issuers.insert(batch_id, issuer);
+        // The postage-dir scan above may have already reloaded this
+        // batch's store — and it holds the store's exclusive lock, so
+        // re-opening here would refuse against *ourselves* and fail the
+        // boot. The on-chain owner check above still ran; the reloaded
+        // issuer's counters/sidecar are strictly fresher than a re-open.
+        match issuers.entry(batch_id) {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                tracing::info!(
+                    target: "antd",
+                    batch = %format!("0x{}", hex::encode(batch_id)),
+                    "operator postage batch already reloaded from the postage dir",
+                );
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                let store_path = postage_dir.join(format!("{}.bin", hex::encode(batch_id)));
+                let issuer = ant_postage::StampIssuer::open_or_new(
+                    store_path.clone(),
+                    batch_id,
+                    meta.depth,
+                    meta.bucket_depth,
+                    meta.immutable,
+                )
+                .map_err(|e| anyhow!("StampIssuer: {e}"))?;
+                tracing::info!(
+                    target: "antd",
+                    batch = %format!("0x{}", hex::encode(batch_id)),
+                    owner = %format!("0x{}", hex::encode(meta.batch_owner_eth)),
+                    depth = meta.depth,
+                    bucket_depth = meta.bucket_depth,
+                    immutable = meta.immutable,
+                    store = %store_path.display(),
+                    "pre-registered operator postage batch",
+                );
+                slot.insert(issuer);
+            }
+        }
     }
 
     // 3. Rediscover owned batches from chain (bee-parity recovery). A

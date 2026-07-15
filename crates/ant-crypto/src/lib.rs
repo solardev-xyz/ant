@@ -8,9 +8,14 @@ pub mod act;
 pub mod bmt;
 pub mod encryption;
 mod error;
+pub mod gsoc;
+pub mod pss;
 pub mod soc;
 
-pub use bmt::{bmt_hash_with_span, bmt_root, cac_new, cac_valid, CHUNK_SIZE, SPAN_SIZE};
+pub use bmt::{
+    bmt_hash_with_span, bmt_root, cac_new, cac_valid, first_segment_address,
+    first_segment_siblings, BMT_DEPTH, CHUNK_SIZE, SPAN_SIZE,
+};
 pub use encryption::{
     decrypt_chunk, decrypt_chunk_parts, encrypt_chunk_unpadded, random_encryption_key,
     stream_xor_in_place, DecryptError, KEY_LENGTH, REFERENCE_SIZE,

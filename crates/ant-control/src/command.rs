@@ -8,7 +8,9 @@
 //! module, which is `#[cfg(unix)]`-gated; Windows builds get the types
 //! without the socket I/O.
 
-use crate::protocol::{AccountingSnapshotView, GetProgress, PostageStatusView, UploadJobView};
+use crate::protocol::{
+    AccountingSnapshotView, GetProgress, PostageStatusView, PullsyncProbeView, UploadJobView,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -76,6 +78,46 @@ pub enum ControlCommand {
     GetChunkRaw {
         reference: [u8; 32],
         ack: oneshot::Sender<ControlAck>,
+    },
+    /// Run a bounded pullsync probe against the closest connected peer to
+    /// `target`: fetch its per-bin reserve cursors, then pull one page of
+    /// bin `bin` starting at binID `start`, requesting the delivery of
+    /// every offered chunk (bounded by `max_deliver`). This is the
+    /// GSOC/PSS lurker's underlying operation and the Exp-1 viability
+    /// probe (does a mainnet full node serve pullsync to our light peer?).
+    /// The node selects the peer via its routing table's proximity order.
+    /// The ack is [`ControlAck::PullsyncProbe`].
+    PullsyncProbe {
+        /// Overlay to select the closest connected peer to (and, by
+        /// default, the bin is that peer's proximity order to it).
+        target: [u8; 32],
+        /// Bin to pull. `None` = the closest peer's proximity-order bin
+        /// to `target` (the neighborhood bin a lurker cares about).
+        bin: Option<u8>,
+        /// Start binID (inclusive). `None` = a historical page just
+        /// below the peer's cursor (answered immediately — see
+        /// `PROBE_BACKLOG`); an explicit start past the cursor
+        /// live-blocks until the next chunk arrives.
+        start: Option<u64>,
+        /// Cap on chunks whose delivery to actually request this page.
+        max_deliver: usize,
+        ack: oneshot::Sender<ControlAck>,
+    },
+    /// Start a GSOC/PSS lurker subscription: reside in the `target`
+    /// neighborhood, pull its bin live, and stream every decoded message
+    /// matching the watch set back as [`ControlAck::LurkerMessage`]
+    /// frames until the receiver is dropped. Backs the gateway's
+    /// `GET /gsoc/subscribe/{address}` and `GET /pss/subscribe/{topic}`
+    /// WebSocket endpoints. `target` all-zeros means "the node's own
+    /// overlay" (the neighborhood PSS messages to this node land in).
+    LurkerSubscribe {
+        target: [u8; 32],
+        /// Exact GSOC SOC addresses to watch (precise, offer-time filter).
+        gsoc_addresses: Vec<[u8; 32]>,
+        /// PSS topics to watch (`keccak256(topic_string)`); reception uses
+        /// the node's PSS key if present, else topic-broadcast.
+        pss_topics: Vec<[u8; 32]>,
+        ack: mpsc::Sender<ControlAck>,
     },
     /// Walk the manifest at `reference`, resolve `path`, then join the
     /// resulting chunk tree into a single `Vec<u8>`. Acks with
@@ -568,6 +610,15 @@ pub struct StreamRange {
     pub end_inclusive: u64,
 }
 
+/// The transport a lurker message was decoded from (house style: typed,
+/// not stringly — the wire form stays `"gsoc"`/`"pss"` via serde).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LurkerMessageKind {
+    Gsoc,
+    Pss,
+}
+
 /// Node-loop reply to a [`ControlCommand`]. Serialized back to the client as
 /// `Response::Ok`, `Response::Bytes`, `Response::BzzBytes`,
 /// `Response::Progress`, or `Response::Error` depending on the variant.
@@ -637,6 +688,16 @@ pub enum ControlAck {
     /// traversed content tree could be retrieved.
     Retrievable {
         retrievable: bool,
+    },
+    /// Terminal ack on `PullsyncProbe`.
+    PullsyncProbe(PullsyncProbeView),
+    /// Non-terminal streaming frame on `LurkerSubscribe`: one decoded
+    /// GSOC/PSS message. `key` is the SOC address (gsoc) or topic (pss)
+    /// as lowercase hex; `payload` is the application bytes.
+    LurkerMessage {
+        kind: LurkerMessageKind,
+        key: String,
+        payload: Vec<u8>,
     },
     /// Successful `UploadStart`.
     UploadStarted {

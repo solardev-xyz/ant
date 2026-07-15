@@ -486,6 +486,59 @@ async fn handle_command(fetcher: &DirFetcher, cmd: ControlCommand) {
             };
             let _ = ack.send(reply);
         }
+        // Live-network P2P surfaces the HTTP fixture doesn't model.
+        ControlCommand::PullsyncProbe { ack, .. } => {
+            let _ = ack.send(ControlAck::PullsyncProbe(
+                ant_control::PullsyncProbeView::default(),
+            ));
+        }
+        // Fixture lurker: a watched GSOC address of all-0xEE simulates
+        // the registry's neighborhood-cap rejection (terminal Error →
+        // the gateway closes the WS with a reason); anything else
+        // delivers one fixture message and then ends the subscription
+        // (ack drop → node-side close). Enough surface to exercise the
+        // WebSocket handler end-to-end without a live network.
+        ControlCommand::LurkerSubscribe {
+            gsoc_addresses,
+            pss_topics,
+            ack,
+            ..
+        } => {
+            if gsoc_addresses.contains(&[0xEE; 32]) {
+                let _ = ack
+                    .send(ControlAck::Error {
+                        message: "lurker subscription rejected: neighborhood limit reached (8)"
+                            .into(),
+                    })
+                    .await;
+                return;
+            }
+            let key = gsoc_addresses
+                .first()
+                .map(hex::encode)
+                .or_else(|| pss_topics.first().map(hex::encode))
+                .unwrap_or_default();
+            let kind = if gsoc_addresses.is_empty() {
+                ant_control::LurkerMessageKind::Pss
+            } else {
+                ant_control::LurkerMessageKind::Gsoc
+            };
+            let _ = ack
+                .send(ControlAck::LurkerMessage {
+                    kind,
+                    key,
+                    payload: b"fixture-lurker-payload".to_vec(),
+                })
+                .await;
+            // An all-0xCD address models a LIVE subscription: hold the
+            // ack sender open until the gateway side hangs up, so tests
+            // can exercise keep-alive traffic without racing a
+            // node-side close. Everything else closes after the single
+            // delivery (exercising the close-with-reason path).
+            if gsoc_addresses.contains(&[0xCD; 32]) {
+                tokio::spawn(async move { ack.closed().await });
+            }
+        }
         ControlCommand::GetChunk { reference, ack } => {
             let reply = match fetcher.fetch(reference).await {
                 Ok(data) => {

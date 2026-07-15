@@ -206,6 +206,12 @@ fn enabled_postage_router() -> axum::Router {
         if let ControlCommand::PostageList { ack } = cmd {
             let view = PostageStatusView {
                 enabled: true,
+                // Explicit: the Rust `Default` is `false`. The serde
+                // `default_true` only kicks in when *deserializing* a
+                // missing field — this in-process ack never goes
+                // through serde, so without this line the fixture
+                // models a refuted batch and the test fails.
+                usable: true,
                 batch_id: TEST_BATCH_0X.to_string(),
                 batch_depth: 24,
                 bucket_depth: 16,

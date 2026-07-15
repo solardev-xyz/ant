@@ -58,6 +58,8 @@ mod status;
 #[cfg(feature = "http-api")]
 mod stewardship;
 #[cfg(feature = "http-api")]
+mod subscribe;
+#[cfg(feature = "http-api")]
 mod tags;
 
 #[cfg(feature = "http-api")]

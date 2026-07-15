@@ -865,6 +865,265 @@ pub async fn upload_chunk(
     }
 }
 
+/// Query params for `POST /pss/send/{topic}/{targets}`.
+#[derive(serde::Deserialize)]
+pub struct PssSendQuery {
+    /// Optional recipient PSS public key (hex, SEC1 compressed or
+    /// uncompressed). Absent ⇒ bee's topic-derived broadcast key.
+    recipient: Option<String>,
+}
+
+/// `POST /pss/send/{topic}/{targets}` — wrap `body` as a PSS trojan
+/// chunk addressed to one of `targets` (comma-separated overlay-address
+/// hex prefixes, ≤3 bytes each), stamp it, and pushsync it. `topic` is a
+/// string hashed with keccak256 (bee's `NewTopic`). With `?recipient=`
+/// the payload is ECIES-encrypted to that key; without it, to the
+/// topic-derived key so any node registered on the topic can read it.
+///
+/// Bee exposes the same route (`bee/pkg/api/pss.go`); ant can send from a
+/// light node (only the ephemeral wrap + a usable postage batch are
+/// needed). Returns 201 on success. Mining is CPU-bound and runs on a
+/// blocking thread.
+pub async fn upload_pss(
+    State(handle): State<GatewayHandle>,
+    Path((topic_str, targets_str)): Path<(String, String)>,
+    Query(query): Query<PssSendQuery>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    use ant_crypto::pss::{
+        topic_from_string, wrap_cancellable, Recipient, MAX_PAYLOAD_SIZE, MAX_TARGET_LEN,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    if body.len() > MAX_PAYLOAD_SIZE {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            format!("pss message exceeds {MAX_PAYLOAD_SIZE} bytes"),
+        );
+    }
+
+    // Parse targets: comma-separated hex prefixes, all the same length,
+    // 1..=3 bytes each (bee's API cap).
+    let mut targets: Vec<Vec<u8>> = Vec::new();
+    for t in targets_str.split(',') {
+        let t = t.trim();
+        match hex::decode(t) {
+            Ok(bytes) if !bytes.is_empty() && bytes.len() <= MAX_TARGET_LEN => targets.push(bytes),
+            _ => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "each target must be 1..=3 bytes of hex",
+                );
+            }
+        }
+    }
+    if targets.is_empty() || targets.iter().any(|t| t.len() != targets[0].len()) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "targets must be non-empty and all the same length",
+        );
+    }
+    // Duplicate targets change nothing about which addresses can match
+    // but make every mining iteration slower; drop them, and cap the
+    // list so a pathological request can't inflate the per-hash
+    // comparison cost.
+    targets.sort();
+    targets.dedup();
+    const MAX_PSS_TARGETS: usize = 64;
+    if targets.len() > MAX_PSS_TARGETS {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            format!("at most {MAX_PSS_TARGETS} distinct targets"),
+        );
+    }
+
+    // Recipient: explicit key, or the topic-derived broadcast key.
+    let recipient = match &query.recipient {
+        Some(hex_pk) => match hex::decode(hex_pk.trim())
+            .ok()
+            .and_then(|b| Recipient::from_sec1(&b).ok())
+        {
+            Some(r) => r,
+            None => {
+                return json_error(StatusCode::BAD_REQUEST, "invalid recipient public key");
+            }
+        },
+        None => Recipient::TopicDerived,
+    };
+
+    let (stamp, batch_id) = match parse_stamp_or_batch(&headers) {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    // A pre-signed stamp binds a chunk *address*, but the trojan address
+    // is mined server-side and unknowable to the client in advance — the
+    // stamp could never cover it. Reject explicitly rather than parse it
+    // and silently stamp with the local issuer instead.
+    if stamp.is_some() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "pre-signed swarm-postage-stamp is not supported on /pss/send (the trojan \
+             address is mined server-side); pass swarm-postage-batch-id",
+        );
+    }
+
+    // Reject an unusable batch *before* burning CPU on mining: this
+    // route is unauthenticated, and a 3-byte target costs ~2^24 BMT
+    // hashes across all cores. The push stamps locally against a
+    // registered issuer, so "registered + usable" is exactly the bar the
+    // push itself would apply — just checked while it's still cheap.
+    if let Err(resp) = require_usable_batch(&handle, &batch_id).await {
+        return resp;
+    }
+
+    let topic = topic_from_string(&topic_str);
+    let msg = body.to_vec();
+    // ONE budget for the whole request: mining and the push-ack wait
+    // draw down the same deadline, so the worst case is `timeout`, not
+    // 2×`timeout` (mining alone can eat the full budget on deep targets).
+    let timeout = request_timeout(&headers, CHUNK_REQUEST_TIMEOUT);
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    // At most a couple of concurrent mining jobs per gateway; everyone
+    // else waits briefly, then sheds with 503 instead of stacking
+    // unbounded CPU work.
+    static PSS_MINING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+    let Ok(Ok(permit)) = tokio::time::timeout(Duration::from_secs(10), PSS_MINING.acquire()).await
+    else {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "pss mining is busy; retry later",
+        );
+    };
+
+    // Mining is CPU-heavy; keep it off the async runtime — and make it
+    // stop when this request goes away (a client disconnect drops the
+    // handler future, and the guard flips the flag the miner threads
+    // poll) or when it exceeds the request timeout.
+    struct CancelOnDrop(Arc<AtomicBool>);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    let _cancel_guard = CancelOnDrop(Arc::clone(&cancel));
+    let mine_cancel = Arc::clone(&cancel);
+    let mining = tokio::task::spawn_blocking(move || {
+        wrap_cancellable(&topic, &msg, &recipient, &targets, &mine_cancel)
+    });
+    let Ok(wrapped) = tokio::time::timeout_at(deadline, mining).await else {
+        cancel.store(true, Ordering::Relaxed);
+        return json_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            format!("pss mining timed out after {}s", timeout.as_secs()),
+        );
+    };
+    drop(permit); // mining finished — release before the network round-trip
+    let (addr, wire) = match wrapped {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => return json_error(StatusCode::BAD_REQUEST, e.to_string()),
+        Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "pss wrap task failed"),
+    };
+    tracing::debug!(target: "ant_gateway", pss_chunk = %hex::encode(addr), "pss send: mined trojan chunk");
+
+    let guard = handle
+        .activity
+        .begin(GatewayRequestKind::Chunk, "pss-send".to_string());
+
+    let (ack_tx, ack_rx) = oneshot::channel::<ControlAck>();
+    let cmd = ControlCommand::PushChunk {
+        wire,
+        batch_id,
+        stamp: None,
+        require_deep: false,
+        ack: ack_tx,
+    };
+    if handle.commands.send(cmd).await.is_err() {
+        return node_unavailable();
+    }
+    guard.update(0, 1, 1, 0);
+
+    let ack = match tokio::time::timeout_at(deadline, ack_rx).await {
+        Ok(Ok(ack)) => ack,
+        Ok(Err(_)) => return node_unavailable(),
+        Err(_) => {
+            return json_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("pss send timed out after {}s", timeout.as_secs()),
+            );
+        }
+    };
+
+    match ack {
+        ControlAck::ChunkUploaded { .. } => {
+            guard.update(1, 1, 0, body.len() as u64);
+            StatusCode::CREATED.into_response()
+        }
+        ControlAck::Error { message } => {
+            let status = if message.starts_with("uploads not configured") {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else if message.contains("not usable") {
+                StatusCode::BAD_REQUEST
+            } else if message.contains("rejected by") && message.contains("not found on-chain") {
+                StatusCode::UNPROCESSABLE_ENTITY
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            json_error(status, message)
+        }
+        other => {
+            warn!(target: "ant_gateway", ?other, "unexpected ack from pss PushChunk");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "unexpected node ack")
+        }
+    }
+}
+
+/// Pre-flight for `/pss/send`: the batch must be a **registered, usable
+/// issuer** on this node — the same bar (and the same "not usable"
+/// wording, so status mapping stays uniform) that `PushChunk` applies,
+/// just checked before mining instead of after.
+async fn require_usable_batch(handle: &GatewayHandle, batch_id: &[u8; 32]) -> Result<(), Response> {
+    let (ack_tx, ack_rx) = oneshot::channel();
+    if handle
+        .commands
+        .send(ControlCommand::PostageList { ack: ack_tx })
+        .await
+        .is_err()
+    {
+        return Err(node_unavailable());
+    }
+    let views = match tokio::time::timeout(Duration::from_secs(5), ack_rx).await {
+        Ok(Ok(ControlAck::PostageList(views))) => views,
+        Ok(Ok(other)) => {
+            warn!(target: "ant_gateway", ?other, "unexpected ack for postage list");
+            return Err(json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "unexpected node ack",
+            ));
+        }
+        _ => return Err(node_unavailable()),
+    };
+    let id_hex = hex::encode(batch_id);
+    let usable = views.iter().any(|v| {
+        v.enabled
+            && v.usable
+            && v.batch_id
+                .trim_start_matches("0x")
+                .eq_ignore_ascii_case(&id_hex)
+    });
+    if usable {
+        Ok(())
+    } else {
+        Err(json_error(
+            StatusCode::BAD_REQUEST,
+            format!("batch 0x{id_hex} not usable"),
+        ))
+    }
+}
+
 /// `POST /soc/{owner}/{id}` — accept a single-owner-chunk's inner CAC
 /// payload, validate the signature, then stamp + pushsync the SOC. The
 /// path carries the 32-byte `id` and the 20-byte `owner` Ethereum

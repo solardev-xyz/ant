@@ -2499,3 +2499,31 @@ async fn post_soc_maps_pushsync_failure_to_502() {
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
 }
+
+/// `/pss/send` must reject an unusable batch *before* nonce mining: the
+/// fixture node has no registered batches, so the request fails fast
+/// with the standard "not usable" message instead of spending ~2^24 BMT
+/// hashes on the 3-byte target and only then learning the batch is
+/// bogus.
+#[tokio::test]
+async fn pss_send_rejects_unusable_batch_before_mining() {
+    let router = handle_with_fixture_node();
+    let started = std::time::Instant::now();
+    let resp = send(
+        router,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/pss/send/test-topic/aabbcc")
+            .header("swarm-postage-batch-id", "11".repeat(32))
+            .body(Body::from("hello"))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let text = String::from_utf8_lossy(&body_bytes(resp).await).into_owned();
+    assert!(text.contains("not usable"), "got: {text}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "must fail fast, not mine"
+    );
+}
