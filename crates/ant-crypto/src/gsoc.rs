@@ -83,8 +83,9 @@ pub fn identifier_from_string(s: &str) -> [u8; SOC_ID_SIZE] {
 /// identifier, proximity)`: candidate secrets are `0xb33, 0xb34, …`
 /// encoded as 32-byte big-endian scalars; the first whose
 /// `keccak256(identifier ‖ owner)` shares `>= proximity` leading bits
-/// with `target_overlay` wins. Returns `None` if none is found within
-/// `0xffff` attempts (bee-js throws there).
+/// with `target_overlay` wins. Fails with
+/// [`CryptoError::GsocMiningExhausted`] if none is found within `0xffff`
+/// attempts (bee-js throws there).
 ///
 /// `proximity` is bee-js's default of 12 in typical use; the resulting
 /// secret is shared implicitly — both ends recompute it — so the caller
@@ -106,7 +107,7 @@ pub fn gsoc_mine(
             return Ok(secret);
         }
     }
-    Err(CryptoError::GsocMineExhausted)
+    Err(CryptoError::GsocMiningExhausted)
 }
 
 /// A GSOC message ready to upload as a single-owner chunk.
@@ -143,6 +144,12 @@ pub fn build_gsoc_chunk(
     identifier: &[u8; SOC_ID_SIZE],
     payload: &[u8],
 ) -> Result<GsocChunk, CryptoError> {
+    // Enforce the documented lower bound too: `cac_new` only caps the
+    // upper end, but bee rejects an empty SOC payload, so building one
+    // here would sign a chunk the network refuses.
+    if payload.is_empty() {
+        return Err(CryptoError::InvalidChunkPayload);
+    }
     let (cac_addr, cac_data) = cac_new(payload).ok_or(CryptoError::InvalidChunkPayload)?;
     let owner = owner_of(secret)?;
     let address = soc_address(identifier, &owner);

@@ -551,6 +551,44 @@ impl BitVec {
 mod tests {
     use super::*;
 
+    // --- negative framing: what a malicious/broken peer can send ---
+
+    /// An advertised frame length past the cap must be refused before a
+    /// single body byte is read (no allocation, no draining).
+    #[tokio::test]
+    async fn read_delimited_rejects_oversized_frame() {
+        // varint 0xFFFF (65535) > max 1024.
+        let mut wire: &[u8] = &[0xFF, 0xFF, 0x03, 0x00];
+        let err = read_delimited(&mut wire, 1024).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("too large"));
+    }
+
+    /// A frame that promises more bytes than the stream delivers fails
+    /// with a clean EOF error, not a hang or a short read.
+    #[tokio::test]
+    async fn read_delimited_rejects_truncated_frame() {
+        let mut wire: &[u8] = &[10, 0xAA, 0xBB]; // says 10, carries 2
+        let err = read_delimited(&mut wire, 1024).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    /// A varint that never terminates (all continuation bits) is cut
+    /// off at 10 bytes — the u64 maximum — instead of read forever.
+    #[tokio::test]
+    async fn read_delimited_rejects_runaway_varint() {
+        let mut wire: &[u8] = &[0x80; 16];
+        let err = read_delimited(&mut wire, 1024).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// Junk bytes in place of a protobuf Offer must decode-fail (the
+    /// caller aborts the page — framing can't be resynchronized).
+    #[test]
+    fn offer_decode_rejects_junk() {
+        assert!(Offer::decode(&[0xC7u8, 0x01, 0xFF, 0xFF][..]).is_err());
+    }
+
     // Golden protobuf vectors from bee's own pb types (cmd/pullvec).
 
     #[test]

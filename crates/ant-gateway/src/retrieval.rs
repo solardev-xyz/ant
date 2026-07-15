@@ -953,10 +953,21 @@ pub async fn upload_pss(
         None => Recipient::TopicDerived,
     };
 
-    let (_stamp, batch_id) = match parse_stamp_or_batch(&headers) {
+    let (stamp, batch_id) = match parse_stamp_or_batch(&headers) {
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
+    // A pre-signed stamp binds a chunk *address*, but the trojan address
+    // is mined server-side and unknowable to the client in advance — the
+    // stamp could never cover it. Reject explicitly rather than parse it
+    // and silently stamp with the local issuer instead.
+    if stamp.is_some() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "pre-signed swarm-postage-stamp is not supported on /pss/send (the trojan \
+             address is mined server-side); pass swarm-postage-batch-id",
+        );
+    }
 
     // Reject an unusable batch *before* burning CPU on mining: this
     // route is unauthenticated, and a 3-byte target costs ~2^24 BMT
@@ -969,7 +980,11 @@ pub async fn upload_pss(
 
     let topic = topic_from_string(&topic_str);
     let msg = body.to_vec();
+    // ONE budget for the whole request: mining and the push-ack wait
+    // draw down the same deadline, so the worst case is `timeout`, not
+    // 2×`timeout` (mining alone can eat the full budget on deep targets).
     let timeout = request_timeout(&headers, CHUNK_REQUEST_TIMEOUT);
+    let deadline = tokio::time::Instant::now() + timeout;
 
     // At most a couple of concurrent mining jobs per gateway; everyone
     // else waits briefly, then sheds with 503 instead of stacking
@@ -999,7 +1014,7 @@ pub async fn upload_pss(
     let mining = tokio::task::spawn_blocking(move || {
         wrap_cancellable(&topic, &msg, &recipient, &targets, &mine_cancel)
     });
-    let Ok(wrapped) = tokio::time::timeout(timeout, mining).await else {
+    let Ok(wrapped) = tokio::time::timeout_at(deadline, mining).await else {
         cancel.store(true, Ordering::Relaxed);
         return json_error(
             StatusCode::GATEWAY_TIMEOUT,
@@ -1031,7 +1046,7 @@ pub async fn upload_pss(
     }
     guard.update(0, 1, 1, 0);
 
-    let ack = match tokio::time::timeout(timeout, ack_rx).await {
+    let ack = match tokio::time::timeout_at(deadline, ack_rx).await {
         Ok(Ok(ack)) => ack,
         Ok(Err(_)) => return node_unavailable(),
         Err(_) => {

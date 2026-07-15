@@ -38,6 +38,14 @@ fn unwraps_every_bee_produced_trojan_chunk() {
             .unwrap_or_else(|| panic!("ant failed to unwrap bee chunk: {case}"));
         assert_eq!(got.0, topic, "topic mismatch on {case}");
         assert_eq!(got.1, want_msg, "message mismatch on {case}");
+        // The vector's address must be the BMT hash ant computes for the
+        // wire data — the binding a storer (and our pullsync delivery
+        // vetting) enforces, not just the payload round-trip.
+        let want_addr = h32(v["chunk_addr_hex"].as_str().unwrap());
+        let (span, payload) = data.split_at(8);
+        let addr = ant_crypto::bmt_hash_with_span(span.try_into().unwrap(), payload)
+            .unwrap_or_else(|| panic!("bmt hash failed on {case}"));
+        assert_eq!(addr, want_addr, "chunk address mismatch on {case}");
         n += 1;
     }
     assert!(n >= 60, "expected the full bee vector set, got {n}");
@@ -93,7 +101,8 @@ fn bee_fixed_recipient_key_consistency() {
 /// Emit ant-wrapped chunks for bee's Go `check` tool. Run with:
 ///   `ANT_EMIT_PSS=1` cargo test -p ant-crypto --test `trojan_interop` `emit_ant`
 /// then in the bee tree:
-///   go run ./cmd/trojan-vectors check < `scratchpad/ant_pss_out.jsonl`
+///   go run ./cmd/trojan-vectors check < `$TMPDIR/ant_pss_out.jsonl`
+/// (override the output directory with `ANT_EMIT_PSS_DIR`).
 #[test]
 fn emit_ant_wrapped_for_bee_check() {
     if std::env::var("ANT_EMIT_PSS").is_err() {
@@ -102,11 +111,17 @@ fn emit_ant_wrapped_for_bee_check() {
     use std::io::Write;
     let recipient_priv = h32("5c3f9a1d2e4b6c8d0f1a2b3c4d5e6f70819293a4b5c6d7e8f90a1b2c3d4e5f60");
     let recipient_pub = public_key_of(&recipient_priv).unwrap();
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../scratchpad/ant_pss_out.jsonl"
-    );
-    let mut f = std::fs::File::create(path).unwrap();
+    // Write to the temp dir (or an explicit override), not into the
+    // repo tree — the old repo-root `scratchpad/` wasn't gitignored and
+    // the create panicked when the directory didn't exist.
+    let dir = std::env::var("ANT_EMIT_PSS_DIR").unwrap_or_else(|_| {
+        std::env::temp_dir()
+            .to_str()
+            .expect("temp dir is utf-8")
+            .to_string()
+    });
+    let path = format!("{dir}/ant_pss_out.jsonl");
+    let mut f = std::fs::File::create(&path).unwrap();
     for (i, (t, msg)) in [
         ("test", &b""[..]),
         ("pss-demo", &b"hi"[..]),

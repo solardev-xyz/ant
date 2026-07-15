@@ -101,6 +101,75 @@ pub fn bmt_hash_with_span(span: &[u8; SPAN_SIZE], payload: &[u8]) -> Option<[u8;
     Some(out)
 }
 
+/// Number of levels between a leaf and the BMT root (`log2(BRANCHES)`).
+pub const BMT_DEPTH: usize = 7;
+
+/// Precomputed sibling path for **first-segment mining**: when a search
+/// varies only the first 32-byte segment of a chunk (PSS nonce mining
+/// does exactly this), the other 127 leaves — and therefore the sibling
+/// subtree hash at every level of leaf 0's Merkle path — are fixed per
+/// job. Rehashing the full 128-leaf tree per attempt costs 127 pair
+/// hashes; folding the varying leaf up the precomputed path costs
+/// [`BMT_DEPTH`] = 7, a ~16× cut in keccak work per attempt.
+///
+/// Returns the fixed sibling node at each level (level 0 = leaf 1, then
+/// the roots of the subtrees covering segments `[2^k, 2^(k+1))`), or
+/// `None` if `payload` exceeds [`CHUNK_SIZE`]. The first segment's
+/// content in `payload` is irrelevant (it never feeds a sibling).
+#[must_use]
+pub fn first_segment_siblings(payload: &[u8]) -> Option<[[u8; SEGMENT_SIZE]; BMT_DEPTH]> {
+    if payload.len() > CHUNK_SIZE {
+        return None;
+    }
+    let mut nodes = vec![0u8; CHUNK_SIZE];
+    nodes[..payload.len()].copy_from_slice(payload);
+    let mut siblings = [[0u8; SEGMENT_SIZE]; BMT_DEPTH];
+    let mut len = BRANCHES;
+    let mut level = 0;
+    while len > 1 {
+        // Node 1 of this level pairs with the varying node 0 — and is
+        // built purely from fixed segments, so it can be captured now.
+        siblings[level].copy_from_slice(&nodes[SEGMENT_SIZE..2 * SEGMENT_SIZE]);
+        let half = len / 2;
+        for i in 0..half {
+            let l = i * 2 * SEGMENT_SIZE;
+            let pair = &nodes[l..l + 2 * SEGMENT_SIZE];
+            let mut h = Keccak256::new();
+            h.update(pair);
+            let digest = h.finalize();
+            nodes[i * SEGMENT_SIZE..(i + 1) * SEGMENT_SIZE].copy_from_slice(&digest);
+        }
+        len = half;
+        level += 1;
+    }
+    Some(siblings)
+}
+
+/// Chunk address for a mined first segment: fold `first` up the
+/// precomputed sibling path (see [`first_segment_siblings`]) and mix in
+/// the span. Byte-identical to
+/// `bmt_hash_with_span(span, full_payload_with_first_segment)`.
+#[must_use]
+pub fn first_segment_address(
+    span: &[u8; SPAN_SIZE],
+    siblings: &[[u8; SEGMENT_SIZE]; BMT_DEPTH],
+    first: &[u8; SEGMENT_SIZE],
+) -> [u8; SEGMENT_SIZE] {
+    let mut acc = *first;
+    for sibling in siblings {
+        let mut h = Keccak256::new();
+        h.update(acc);
+        h.update(sibling);
+        acc.copy_from_slice(&h.finalize());
+    }
+    let mut h = Keccak256::new();
+    h.update(span);
+    h.update(acc);
+    let mut out = [0u8; SEGMENT_SIZE];
+    out.copy_from_slice(&h.finalize());
+    out
+}
+
 /// Validate a content-addressed chunk: the wire bytes are
 /// `span (8 LE) || payload (<= 4096)`, the address is the BMT hash with span.
 ///
@@ -222,5 +291,60 @@ mod tests {
         let mut wire = vec![0u8; SPAN_SIZE + CHUNK_SIZE + 1];
         wire[0] = 1; // any non-zero span
         assert!(!cac_valid(&[0u8; SEGMENT_SIZE], &wire));
+    }
+
+    /// The mining fast path (precomputed sibling fold) must be
+    /// byte-identical to the full tree hash for every first segment —
+    /// this is what keeps the >10× mining speedup from silently
+    /// changing which addresses get mined (bee interop).
+    #[test]
+    fn first_segment_fold_matches_full_bmt() {
+        // Deterministic pseudo-random full-size and partial payloads.
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for &len in &[CHUNK_SIZE, CHUNK_SIZE - 100, 200, 33, 32] {
+            let mut payload = vec![0u8; len];
+            for b in &mut payload {
+                *b = next() as u8;
+            }
+            let span = (len as u64).to_le_bytes();
+            let siblings = first_segment_siblings(&payload).unwrap();
+            for _ in 0..16 {
+                let mut first = [0u8; SEGMENT_SIZE];
+                for b in &mut first {
+                    *b = next() as u8;
+                }
+                // The reference: splice the segment in and hash the
+                // whole tree.
+                let mut full = payload.clone();
+                let n = first.len().min(full.len());
+                full[..n].copy_from_slice(&first[..n]);
+                // The full payload always has a complete first segment
+                // in the mining use (BODY_SIZE = CHUNK_SIZE); for the
+                // short cases extend to at least one segment.
+                if full.len() < SEGMENT_SIZE {
+                    full.resize(SEGMENT_SIZE, 0);
+                    full[..SEGMENT_SIZE].copy_from_slice(&first);
+                }
+                let want = bmt_hash_with_span(&span, &full).unwrap();
+                // But siblings were computed over the ORIGINAL payload
+                // length — recompute for the resized case.
+                let siblings = if full.len() == payload.len() {
+                    siblings
+                } else {
+                    first_segment_siblings(&full).unwrap()
+                };
+                assert_eq!(
+                    first_segment_address(&span, &siblings, &first),
+                    want,
+                    "len {len}"
+                );
+            }
+        }
     }
 }

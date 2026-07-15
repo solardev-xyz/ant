@@ -745,9 +745,13 @@ fn main() -> Result<()> {
                             v.start, v.topmost, v.offered, v.delivered, v.sync_ms,
                         );
                         println!("cursors_ok={}  sync_ok={}", v.cursors_ok, v.sync_ok);
-                    } else {
-                        println!(
-                            "peer {} — probe error: {}",
+                    }
+                    // A failed probe must fail the command — scripts key
+                    // off the exit code, not the rendered text. In
+                    // --json mode the view has already been printed.
+                    if !v.error.is_empty() {
+                        bail!(
+                            "pullsync probe failed (peer {}): {}",
                             v.peer_overlay.get(..12).unwrap_or("(none)"),
                             v.error
                         );

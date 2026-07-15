@@ -401,14 +401,24 @@ fn mine(
         return Err(CryptoError::PssMiningCancelled);
     };
 
+    // Only the nonce (leaf 0 of the BMT) varies per attempt; every other
+    // leaf is fixed for the job. Precompute leaf 0's sibling path once
+    // and fold each candidate nonce up it: 7 pair hashes + the span mix
+    // per attempt instead of a full 127-hash tree — ~16× less keccak
+    // work, which also proportionally shrinks how long one deep-target
+    // job can hold the mining pool's slots (head-of-line blocking).
+    let mut body = [0u8; BODY_SIZE];
+    body[NONCE_SIZE..].copy_from_slice(body_tail);
+    let siblings =
+        crate::bmt::first_segment_siblings(&body).ok_or(CryptoError::InvalidChunkPayload)?;
+    let siblings = &siblings;
+
     std::thread::scope(|scope| {
         for w in 0..workers.count() {
             let found = &found;
             let winner = &winner;
             let template = template;
             scope.spawn(move || {
-                let mut candidate = [0u8; BODY_SIZE];
-                candidate[NONCE_SIZE..].copy_from_slice(body_tail);
                 let mut nonce = template;
                 // Distinct starting counter per worker over nonce[0..4].
                 let mut counter = (w as u32).wrapping_mul(0x9E37_79B9);
@@ -417,14 +427,12 @@ fn mine(
                         return;
                     }
                     nonce[0..4].copy_from_slice(&counter.to_le_bytes());
-                    candidate[..NONCE_SIZE].copy_from_slice(&nonce);
-                    if let Some(addr) = bmt_hash_with_span(&hint, &candidate) {
-                        if targets.iter().any(|t| addr[..t.len()] == t[..]) {
-                            if !found.swap(true, Ordering::AcqRel) {
-                                *winner.lock().unwrap() = Some(nonce);
-                            }
-                            return;
+                    let addr = crate::bmt::first_segment_address(&hint, siblings, &nonce);
+                    if targets.iter().any(|t| addr[..t.len()] == t[..]) {
+                        if !found.swap(true, Ordering::AcqRel) {
+                            *winner.lock().unwrap() = Some(nonce);
                         }
+                        return;
                     }
                     counter = counter.wrapping_add(1);
                 }

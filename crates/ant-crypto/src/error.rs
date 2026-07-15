@@ -14,7 +14,7 @@ pub enum CryptoError {
     #[error("recovered overlay does not match declared overlay")]
     OverlayMismatch,
     #[error("gsoc mining exhausted its attempt budget without a match")]
-    GsocMineExhausted,
+    GsocMiningExhausted,
     #[error("chunk payload must be 1..=4096 bytes")]
     InvalidChunkPayload,
     #[error("PSS message exceeds the maximum payload size")]

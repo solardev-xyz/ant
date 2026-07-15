@@ -22,8 +22,9 @@ A from-scratch Rust implementation of a Swarm light node with upload and postage
 
 ### Non-Goals (v1)
 
-- Full node features: chunk storage/forwarding, pullsync, storage/bandwidth incentives, staking, redistribution lottery.
-- PSS / GSOC messaging.
+- Full node features: chunk storage/forwarding, storage/bandwidth incentives, staking, redistribution lottery.
+  - *Amended:* a **pullsync client** (not server) shipped with the messaging work below — the light node drives bee's pullsync 1.4.0 protocol to *receive* neighborhood chunks. Serving pullsync to peers remains a non-goal.
+- ~~PSS / GSOC messaging.~~ **Graduated (2026-07):** send *and* receive shipped on the light node — `/pss/send`, `POST /soc` GSOC authoring, and `/gsoc/subscribe` + `/pss/subscribe` WebSocket reception via the pullsync-client "lurker" (`ant-p2p::lurker`, one shared pull pipeline per neighborhood). Interop-tested against bee (golden vectors) and verified on mainnet. Appendix B and the endpoint matrix reflect the graduation.
 - Cheque cashing (we send cheques, never receive them as a consumer-class node).
 - Exotic libp2p transports (QUIC, WebRTC, WebSocket, relay) on mobile. May be enabled later for desktop / Pi behind cargo feature flags.
 - 32-bit ARM (Pi Zero / Pi 1) as a first-class target — best-effort only.
@@ -1839,11 +1840,13 @@ is the "drop-in" line.
 
 What stays out of scope for the drop-in claim:
 
-- `/pinning/*`, `/pss/*`, `/gsoc/*`, `/transactions[/{hash}]`,
-  `/auth`, `/refresh`, `/chequebook/cashout/{peer}` — permanently
-  `501` by design (Appendix B + §5.8 + D.2.4). bee returns these
-  too on a `bee-mode=light` install with the relevant subsystems
-  disabled, so unmodified consumers don't trip on them.
+- `/pinning/*`, `/transactions[/{hash}]`, `/auth`, `/refresh`,
+  `/chequebook/cashout/{peer}` — permanently `501` by design
+  (Appendix B + §5.8 + D.2.4). bee returns these too on a
+  `bee-mode=light` install with the relevant subsystems disabled,
+  so unmodified consumers don't trip on them. (`/pss/*` and
+  `/gsoc/*` were on this list until the messaging graduation —
+  they're real routes now, see Tier B+ in Appendix C.)
 - `POST /bytes` (split-without-manifest) — bee accepts this, ant
   returns 501; bee-js's `uploadFile` always uses `POST /bzz`, so
   the gap doesn't actually hit consumers in practice. Worth fixing
@@ -2393,13 +2396,20 @@ data costs argue for a ≤ 5 MB Play Store download).
 
 ## Appendix B — Bee spec sections we deliberately do **not** implement
 
-- Pullsync
+- Pullsync **server** (serving reserve pages to peers). *The pullsync
+  **client** graduated with the messaging work: the light node drives
+  bee's pullsync 1.4.0 protocol to receive neighborhood chunks
+  (`ant-p2p::pullsync` + `lurker`).*
 - Storage incentives / redistribution game
 - Staking contract
-- PSS / GSOC messaging
+- ~~PSS / GSOC messaging~~ — **graduated (2026-07)**: send + receive on
+  the light node (`/pss/send`, GSOC via `POST /soc`,
+  `/gsoc/subscribe/{address}` + `/pss/subscribe/{topic}` WebSockets).
+  See §Non-Goals amendment.
 - ACT (access control trie)
 - Feeds beyond basic SOC usage
-- Trojan chunks
+- ~~Trojan chunks~~ — graduated with PSS (bee-compatible trojan
+  construction + unwrap, golden-vector interop-tested).
 - Cheque cashing
 - Advanced redundancy (erasure-coded uploads) — parked for v2
 
@@ -2419,7 +2429,8 @@ Tied directly to the milestones in §9.
 |---|---|---|---|
 | **A — Read-only / ultra-light** | Read endpoints (`/bzz`, `/bytes`, `/chunks`, status, peers, topology, addresses); stub wallet/stamps/chequebook returning empty/zero in a bee-shaped way; `beeMode = "ultra-light"`. | End of **M2** | Any bee-shaped read client (browsers, gateway proxies, scripts that only download) works against `antd` with zero changes. |
 | **B — Read + write / light** | All Tier A endpoints + uploads, tags, stamps (buy/topup/dilute), feeds/SOCs, chequebook deposit, wallet balances; `beeMode = "light"`. | End of **M3** | Full `bee-js` API surface for the protocol subset Ant supports; uploaders, publishing tools, and feed-driven apps work unchanged. |
-| **Permanently absent** | Anything in Appendix B (PSS, GSOC, pullsync, transactions, staking, ACT, restricted/admin API). | Never | Endpoints return `501 Not Implemented` with `{code:501, message:"not implemented in ant"}` so consumers can branch. |
+| **B+ — Messaging** | `/pss/send/{topic}/{targets}`, GSOC authoring via `POST /soc/{owner}/{id}`, and receive via `/gsoc/subscribe/{address}` + `/pss/subscribe/{topic}` WebSockets (bee-js `gsocSubscribe`/`pssSubscribe`-compatible binary frames). | Landed post-M3 (2026-07) | Real-time messaging dApps (chat, collaborative docs, presence) against a light node — send **and** receive, no full node required. |
+| **Permanently absent** | Anything still in Appendix B (pullsync *server*, transactions, staking, ACT, restricted/admin API). | Never | Endpoints return `501 Not Implemented` with `{code:501, message:"not implemented in ant"}` so consumers can branch. |
 
 ### C.2 Process & configuration compatibility
 
@@ -2531,7 +2542,9 @@ Methods listed are the ones we serve; bee's other methods on the same path retur
 | `/stewardship/{address}` | GET, PUT | B | Reupload helper; uses `ant-pushsync`. |
 | `/envelope/{address}` | POST | B | Stamp envelope for already-existing chunks. |
 | `/grantee`, `/grantee/{address}` | POST, GET, PATCH | B | ACT grantee lists (bee `pkg/api/accesscontrol.go`); `swarm-act*` headers on the upload/download endpoints. |
-| `/pss/*`, `/gsoc/*` | * | — | **501** — Appendix B. |
+| `/pss/send/{topic}/{targets}` | POST | B+ | PSS trojan send from the light node (`?recipient=` for directed encryption; topic-derived broadcast key otherwise). |
+| `/pss/subscribe/{topic}` | GET (WS) | B+ | PSS reception via the pullsync-client lurker (`?neighborhood=` overrides the lurked target for rendezvous rooms). |
+| `/gsoc/subscribe/{address}` | GET (WS) | B+ | GSOC reception: watches the exact SOC address, binary frames per update (bee-js `gsocSubscribe`-compatible). |
 | `/transactions`, `/transactions/{hash}` | * | — | **501** — admin/restricted API. |
 | `/reservestate`, `/chainstate`, `/redistributionstate`, `/stake/*` | * | — | **501** — full-node only (Appendix B). |
 | `/auth`, `/refresh` | * | — | **501** — restricted-API auth. |
@@ -2553,7 +2566,7 @@ In addition to the strategy in §10:
 
 ### C.7 Out of scope by design
 
-- Anything in Appendix B (Pullsync, storage incentives, staking, PSS / GSOC, ACT, cheque cashing, advanced redundancy).
+- Anything still in Appendix B (pullsync *server*, storage incentives, staking, ACT, cheque cashing, advanced redundancy). PSS/GSOC and the pullsync client graduated — see the Non-Goals amendment and Tier B+.
 - Restricted / admin API behind bee's `restricted: true` mode; `/auth` and `/refresh` are 501.
 - Multi-instance configurations (`bee` running with separate API + debug API ports). We only expose the unified API surface bee added in 2.0+.
 - Byte-level compatibility of `data-dir/statestore` and `data-dir/localstore`. Migrating an existing bee data directory into Ant is **not** supported; only the `keys/swarm.key` file carries over.
