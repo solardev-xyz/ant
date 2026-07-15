@@ -62,7 +62,9 @@ enum Command {
         /// Force a specific bin instead of the peer's proximity to target.
         #[arg(long)]
         bin: Option<u8>,
-        /// Start binID (default: the peer's cursor for the bin → new only).
+        /// Start binID (default: a historical page just below the peer's
+        /// cursor, answered immediately; pass a start past the cursor to
+        /// live-block on the next arrival).
         #[arg(long)]
         start: Option<u64>,
         /// Max chunk deliveries to request this page.
