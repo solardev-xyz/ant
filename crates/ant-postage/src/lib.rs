@@ -642,12 +642,13 @@ impl StampIssuer {
         };
         if let Err(e) = append_stamp_record(&path, &self.batch_id, &addr, &stamp) {
             if !e.rolled_back {
-                // A torn frame is stuck mid-file and a later successful
-                // append would bury it, checksum-killing everything after
-                // the tear on the next load. Poison the issuer: no more
-                // appends this session, the tear stays at EOF, and the
-                // loader's trailing-partial truncation heals it on
-                // restart.
+                // A torn frame is stuck at EOF and a later successful
+                // append would bury it mid-file, checksum-killing
+                // everything after the tear on the next load. Poison the
+                // issuer: no more appends this session, so the tear
+                // stays at EOF where the loader heals it on restart —
+                // trailing-partial truncation for a torn record, the
+                // empty/header-prefix recovery for a torn FIRST append.
                 self.stamp_persistence_failed =
                     Some("torn sidecar append could not be rolled back");
             }
@@ -1103,6 +1104,37 @@ fn load_stamp_store(path: &Path, batch_id: &[u8; 32]) -> LoadedSidecar {
         // closed rather than treat it like a missing file.
         Err(_) => return LoadedSidecar::broken(map, "sidecar unreadable (permissions or I/O)"),
     };
+    // An EXISTING but empty file provably contains zero records, so it is
+    // exactly as safe as an absent one — the first append writes a fresh
+    // header. Two real paths land here: a torn FIRST append rolled back
+    // to length 0, and a crash between `open(create)` and the header
+    // write. Classifying it as a corrupt header would wedge the store
+    // permanently over a file with nothing in it.
+    if bytes.is_empty() {
+        return LoadedSidecar::empty();
+    }
+    // A file shorter than the header that is a byte-prefix of OUR
+    // expected v2 header is a torn first append whose rollback also
+    // failed (partial write stopped mid-header, nothing else can
+    // produce this shape for this batch). Zero records existed, so
+    // truncating to empty is provably safe and un-wedges the store; if
+    // the truncate fails, fall through to the fail-closed rule below.
+    if bytes.len() < STAMP_STORE_HEADER_LEN {
+        let mut expect = Vec::with_capacity(STAMP_STORE_HEADER_LEN);
+        expect.extend_from_slice(STAMP_STORE_MAGIC);
+        expect.extend_from_slice(&STAMP_STORE_VERSION.to_le_bytes());
+        expect.extend_from_slice(batch_id);
+        if expect.starts_with(&bytes) {
+            let truncated = std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .and_then(|f| f.set_len(0))
+                .is_ok();
+            if truncated {
+                return LoadedSidecar::empty();
+            }
+        }
+    }
     // Foreign / corrupt header: **fail closed, never delete.** A header
     // that doesn't parse is indistinguishable from OUR file with a
     // flipped bit — deleting it would silently discard every recorded
@@ -2021,6 +2053,51 @@ mod tests {
             "poisoned issuer must fail closed as Persist, got: {err:?}"
         );
         assert!(err.to_string().contains("torn sidecar append"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Round-14 residual #1: a torn FIRST append rolled back to length 0
+    /// leaves an existing empty sidecar — which provably holds zero
+    /// records and must load as empty/appendable, not wedge the store as
+    /// "corrupt header" until an operator deletes an empty file. Same
+    /// for the un-rolled-back variant: a partial write that stopped
+    /// mid-header is a byte-prefix of our expected header and is
+    /// truncated back to empty on load.
+    #[test]
+    fn zero_byte_and_torn_header_sidecars_recover_on_load() {
+        let dir = tmpdir();
+        let batch = [0x77u8; 32];
+
+        // Case A: rollback left an existing 0-byte file.
+        let empty = dir.join("a.stamps");
+        std::fs::write(&empty, b"").unwrap();
+        let loaded = load_stamp_store(&empty, &batch);
+        assert!(loaded.appendable(), "an empty sidecar must load as fresh");
+        assert!(loaded.map.is_empty());
+        // …and a subsequent append works normally.
+        append_stamp_record(&empty, &batch, &[0xA1; 32], &[0x01; STAMP_SIZE]).unwrap();
+        assert_eq!(load_stamp_store(&empty, &batch).map.len(), 1);
+
+        // Case B: rollback failed too — a partial write stopped
+        // mid-header. The bytes are a prefix of OUR expected header, so
+        // the loader truncates to empty instead of failing closed.
+        let torn = dir.join("b.stamps");
+        let mut expect = Vec::new();
+        expect.extend_from_slice(STAMP_STORE_MAGIC);
+        expect.extend_from_slice(&STAMP_STORE_VERSION.to_le_bytes());
+        expect.extend_from_slice(&batch);
+        std::fs::write(&torn, &expect[..10]).unwrap();
+        let loaded = load_stamp_store(&torn, &batch);
+        assert!(loaded.appendable(), "a torn first header must recover");
+        assert_eq!(std::fs::metadata(&torn).unwrap().len(), 0);
+
+        // Case C: a short file that is NOT a prefix of our header is
+        // foreign/corrupt and still fails closed, untouched.
+        let foreign = dir.join("c.stamps");
+        std::fs::write(&foreign, [0xEE; 10]).unwrap();
+        let loaded = load_stamp_store(&foreign, &batch);
+        assert!(!loaded.appendable(), "foreign short file must fail closed");
+        assert_eq!(std::fs::metadata(&foreign).unwrap().len(), 10);
         std::fs::remove_dir_all(&dir).ok();
     }
 
