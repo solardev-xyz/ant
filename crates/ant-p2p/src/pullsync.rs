@@ -246,23 +246,50 @@ type WantedIdentities = HashMap<[u8; 32], Vec<([u8; 32], [u8; 32])>>;
 
 // --- client exchanges ---
 
-/// Fetch the peer's per-bin reserve cursors and epoch.
-pub async fn get_cursors(control: &mut Control, peer: PeerId) -> Result<Cursors, PullsyncError> {
-    let proto = StreamProtocol::new(PROTOCOL_PULLSYNC_CURSORS);
-    let mut stream = control
-        .open_stream(peer, proto)
-        .await
-        .map_err(|e| PullsyncError::OpenStream(e.to_string()))?;
-    headers_preamble(&mut stream).await?;
+/// Deadline on the whole `/cursors` round-trip. Unlike the live-bin
+/// Offer read (which legitimately blocks indefinitely on a quiet bin),
+/// the cursor exchange is a quick request/response: a peer that hasn't
+/// answered by now is silent, and without a bound here the stream and
+/// its driving task leak forever. Callers may impose tighter budgets.
+const CURSORS_RTT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-    write_delimited(&mut stream, &Syn {}).await?;
-    let ack_bytes = read_delimited(&mut stream, MAX_FRAME).await?;
-    let ack = Ack::decode(ack_bytes.as_slice())?;
-    let _ = stream.close().await;
-    Ok(Cursors {
-        cursors: ack.cursors,
-        epoch: ack.epoch,
+/// Per-frame deadline after the server has already committed to a page.
+/// Once the `Offer` has arrived the server has materialized its chunk
+/// list, so the `Want` write and every subsequent `Delivery` frame
+/// should flow promptly — a peer that stalls mid-page would otherwise
+/// hold the stream (and the puller's slot in the covering set) forever.
+const POST_OFFER_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Fetch the peer's per-bin reserve cursors and epoch. Bounded by
+/// [`CURSORS_RTT_TIMEOUT`]; the cursor list is validated to at most
+/// [`MAX_BINS`] entries so downstream `cursors[bin]` indexing can't be
+/// grown into a lie by a malicious peer.
+pub async fn get_cursors(control: &mut Control, peer: PeerId) -> Result<Cursors, PullsyncError> {
+    tokio::time::timeout(CURSORS_RTT_TIMEOUT, async {
+        let proto = StreamProtocol::new(PROTOCOL_PULLSYNC_CURSORS);
+        let mut stream = control
+            .open_stream(peer, proto)
+            .await
+            .map_err(|e| PullsyncError::OpenStream(e.to_string()))?;
+        headers_preamble(&mut stream).await?;
+
+        write_delimited(&mut stream, &Syn {}).await?;
+        let ack_bytes = read_delimited(&mut stream, MAX_FRAME).await?;
+        let ack = Ack::decode(ack_bytes.as_slice())?;
+        let _ = stream.close().await;
+        if ack.cursors.len() > MAX_BINS {
+            return Err(PullsyncError::Protocol(format!(
+                "peer sent {} cursors (max {MAX_BINS})",
+                ack.cursors.len()
+            )));
+        }
+        Ok(Cursors {
+            cursors: ack.cursors,
+            epoch: ack.epoch,
+        })
     })
+    .await
+    .map_err(|_| PullsyncError::Protocol("cursors round-trip timed out".into()))?
 }
 
 /// Run one pullsync page against `peer` for `bin` starting at binID
@@ -365,25 +392,62 @@ where
         "pullsync page",
     );
 
-    write_delimited(
-        &mut stream,
-        &Want {
-            bit_vector: bits.into_bytes(),
-        },
+    // From here the server has committed to a page, so every frame is
+    // bounded: a peer stalling after its Offer must not hold the stream
+    // (and this puller's covering-set slot) forever.
+    let stalled = || PullsyncError::Protocol("peer stalled after Offer".into());
+    tokio::time::timeout(
+        POST_OFFER_FRAME_TIMEOUT,
+        write_delimited(
+            &mut stream,
+            &Want {
+                bit_vector: bits.into_bytes(),
+            },
+        ),
     )
-    .await?;
+    .await
+    .map_err(|_| stalled())??;
 
     // Read exactly popcount(bitvector) deliveries, in offer order over the
     // set bits. A dropped chunk arrives as an empty placeholder that still
     // consumes a slot. Every real delivery must be one we solicited and
     // must validate against its own address (see `accept_delivery`).
+    //
+    // A delivery that fails vetting is **skipped, not fatal** — bee's
+    // client likewise joins per-chunk errors and keeps consuming the
+    // page. Erroring out here would refuse to advance `topmost`, so a
+    // peer injecting one junk chunk per page could park the puller on
+    // the same interval forever. Framing/decode failures still abort:
+    // after those the stream can't be resynchronized.
     let mut chunks = Vec::with_capacity(want_count);
+    let mut rejected: usize = 0;
     for _ in 0..want_count {
-        let d_bytes = read_delimited(&mut stream, MAX_FRAME).await?;
+        let d_bytes = tokio::time::timeout(
+            POST_OFFER_FRAME_TIMEOUT,
+            read_delimited(&mut stream, MAX_FRAME),
+        )
+        .await
+        .map_err(|_| stalled())??;
         let d = Delivery::decode(d_bytes.as_slice())?;
-        if let Some(chunk) = accept_delivery(&mut wanted, d)? {
-            chunks.push(chunk);
+        match accept_delivery(&mut wanted, d) {
+            Ok(Some(chunk)) => chunks.push(chunk),
+            Ok(None) => {} // placeholder: server no longer holds it
+            Err(e) => {
+                rejected += 1;
+                tracing::debug!(
+                    target: "ant_p2p::pullsync",
+                    peer = %peer, bin, error = %e,
+                    "rejecting invalid delivery (page continues)",
+                );
+            }
         }
+    }
+    if rejected > 0 {
+        tracing::warn!(
+            target: "ant_p2p::pullsync",
+            peer = %peer, bin, rejected,
+            "peer sent invalid deliveries in a pullsync page",
+        );
     }
 
     let _ = stream.close().await;

@@ -28,14 +28,19 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 /// chunk fetches; mirror the daemon-side `TREE_COMMAND_TIMEOUT` plus a
 /// little headroom so the client doesn't bail before the daemon does.
 const TREE_TIMEOUT: Duration = Duration::from_secs(75);
+/// Probe budget: the daemon dispatches `PullsyncProbe` under its 20 s
+/// `NETWORK_COMMAND_TIMEOUT` and the probe task self-bounds below that,
+/// so the client only needs to outlast the daemon by a little — not the
+/// old 75 s tree budget, which left a 55 s window where the daemon had
+/// long given up but the client still sat waiting.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(25);
 
 const fn timeout_for(request: &Request) -> Duration {
     match request {
-        Request::GetBytes { .. }
-        | Request::GetBzz { .. }
-        | Request::UploadFollow { .. }
-        // A pullsync page can long-block server-side on an empty live bin.
-        | Request::PullsyncProbe { .. } => TREE_TIMEOUT,
+        Request::GetBytes { .. } | Request::GetBzz { .. } | Request::UploadFollow { .. } => {
+            TREE_TIMEOUT
+        }
+        Request::PullsyncProbe { .. } => PROBE_TIMEOUT,
         _ => DEFAULT_TIMEOUT,
     }
 }
