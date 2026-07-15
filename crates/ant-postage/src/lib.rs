@@ -605,7 +605,19 @@ impl StampIssuer {
         let Some(path) = self.stamps_path.clone() else {
             return Ok(()); // in-memory issuer
         };
-        append_stamp_record(&path, &self.batch_id, &addr, &stamp)?;
+        if let Err(e) = append_stamp_record(&path, &self.batch_id, &addr, &stamp) {
+            if !e.rolled_back {
+                // A torn frame is stuck mid-file and a later successful
+                // append would bury it, checksum-killing everything after
+                // the tear on the next load. Poison the issuer: no more
+                // appends this session, the tear stays at EOF, and the
+                // loader's trailing-partial truncation heals it on
+                // restart.
+                self.stamp_persistence_failed =
+                    Some("torn sidecar append could not be rolled back");
+            }
+            return Err(PostageError::Persist(e.msg));
+        }
         self.stamp_record_count += 1;
         if self.stamp_record_count > self.seen.len() * STAMP_COMPACT_FACTOR + STAMP_COMPACT_FLOOR {
             rewrite_sidecar(&path, &self.batch_id, &self.seen)?;
@@ -985,28 +997,18 @@ impl LoadedSidecar {
     }
 }
 
-/// Remove `path`, treating an already-absent file as success. Returns
-/// `false` only when the file exists and could *not* be removed (e.g. a
-/// read-only parent directory), in which case a foreign/corrupt sidecar
-/// stays on disk and must not be appended to.
-fn removed_cleanly(path: &Path) -> bool {
-    match std::fs::remove_file(path) {
-        Ok(()) => true,
-        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
-    }
-}
-
 /// Load the per-chunk stamp sidecar into `(stamp map, physical record
 /// count)`. Best-effort and self-healing:
 ///
 /// - A genuinely **missing** file (`NotFound`) yields an empty,
-///   appendable result. A file that exists but can't be validated *and*
-///   made safe to write — unreadable, a foreign/corrupt header that
-///   can't be removed, a failed migration, or a failed trailing-partial
-///   truncation — is marked **non-appendable** (`appendable = false`),
-///   so the issuer fails closed rather than append under an unvalidated
-///   header and lose the mapping on restart. A foreign header that IS
-///   cleanly removed is appendable (fresh start).
+///   appendable result. A file that exists but can't be validated —
+///   unreadable, a corrupt/foreign/unknown-version header, a failed
+///   migration, or a failed trailing-partial truncation — is marked
+///   **non-appendable** and is **never deleted**: a bad header is
+///   indistinguishable from our own file with a flipped bit, and
+///   deleting it would trade one corrupt byte for the whole batch's
+///   slot mappings. The issuer fails closed and the operator repairs
+///   or removes the file explicitly.
 /// - A **v1** file (no checksums) is *migrated*, not discarded: its
 ///   records are read and the file is rewritten as v2, so no reusable
 ///   slot is lost across the upgrade.
@@ -1032,34 +1034,27 @@ fn load_stamp_store(path: &Path, batch_id: &[u8; 32]) -> LoadedSidecar {
         // closed rather than treat it like a missing file.
         Err(_) => return LoadedSidecar::broken(map, "sidecar unreadable (permissions or I/O)"),
     };
-    // Foreign / corrupt header: appendable only if we can actually clear
-    // the file first (a fresh append then starts clean). If removal fails
-    // — e.g. a read-only directory keeps the malformed file but leaves it
-    // writable — appending v2 records beneath the bad header would be
-    // rejected on restart and lose the mapping, so fail closed.
+    // Foreign / corrupt header: **fail closed, never delete.** A header
+    // that doesn't parse is indistinguishable from OUR file with a
+    // flipped bit — deleting it would silently discard every recorded
+    // slot mapping (the whole batch's issued indices) over one byte of
+    // corruption, and the network would then see re-issued indices.
+    // Per-record corruption costs one record; header corruption must not
+    // cost everything. The operator removes or restores the file and
+    // restarts (the fail-closed issuance error says exactly that).
     if bytes.len() < STAMP_STORE_HEADER_LEN
         || &bytes[0..4] != STAMP_STORE_MAGIC
         || &bytes[6..38] != batch_id.as_slice()
     {
-        return if removed_cleanly(path) {
-            LoadedSidecar::empty()
-        } else {
-            LoadedSidecar::broken(map, "corrupt/foreign sidecar header could not be removed")
-        };
+        return LoadedSidecar::broken(map, "corrupt or foreign sidecar header");
     }
     let version = u16::from_le_bytes([bytes[4], bytes[5]]);
     let (record_len, has_checksum) = match version {
         STAMP_STORE_VERSION => (STAMP_RECORD_LEN, true),
         STAMP_STORE_VERSION_V1 => (STAMP_RECORD_LEN_V1, false),
-        _ => {
-            // Unknown future/foreign version: drop it rather than guess —
-            // same appendable-only-if-removed rule as a bad header.
-            return if removed_cleanly(path) {
-                LoadedSidecar::empty()
-            } else {
-                LoadedSidecar::broken(map, "unknown sidecar version could not be removed")
-            };
-        }
+        // Unknown future/foreign version: same fail-closed rule — don't
+        // guess at framing and don't destroy what a newer build wrote.
+        _ => return LoadedSidecar::broken(map, "unknown sidecar version"),
     };
 
     // Newest-timestamp-wins per address, keeping only checksum-valid
@@ -1165,48 +1160,85 @@ fn rewrite_sidecar(
         .map_err(|e| PostageError::Persist(format!("{}: {e}", path.display())))
 }
 
+/// How an [`append_stamp_record`] failure left the file.
+#[derive(Debug)]
+struct AppendError {
+    /// The file was truncated back to its pre-append length — framing
+    /// is intact and future appends stay safe.
+    rolled_back: bool,
+    msg: String,
+}
+
 /// Append one checksummed `(addr, stamp)` record to the sidecar,
 /// creating it with a header first if absent, and fsync before
 /// returning so a restart recovers it. Append-only: a crash can only
 /// damage the trailing record, which the loader truncates or (if a full
 /// but torn record) rejects by checksum, leaving the address's earlier
 /// record intact.
+///
+/// **Runtime torn writes are rolled back**, not just crash-time ones:
+/// the loader's trailing-partial recovery only runs at startup, so a
+/// partial `write_all` here (ENOSPC, I/O error) followed by a later
+/// successful append would misalign framing mid-file and silently
+/// checksum-kill every record after the tear on the next load. On any
+/// write failure the file is truncated back to its pre-append length;
+/// if that truncation itself fails, the error says so
+/// (`rolled_back = false`) and the caller must poison the issuer.
 fn append_stamp_record(
     path: &Path,
     batch_id: &[u8; 32],
     addr: &[u8; 32],
     stamp: &[u8; STAMP_SIZE],
-) -> Result<(), PostageError> {
+) -> Result<(), AppendError> {
     use std::io::Write as _;
 
+    let fail = |msg: String| AppendError {
+        rolled_back: true, // nothing written yet
+        msg,
+    };
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
-                .map_err(|e| PostageError::Persist(format!("{}: {e}", path.display())))?;
+                .map_err(|e| fail(format!("{}: {e}", path.display())))?;
         }
     }
-    let need_header = !path.exists();
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-        .map_err(|e| PostageError::Persist(format!("{}: {e}", path.display())))?;
-    if need_header {
-        let mut header = Vec::with_capacity(STAMP_STORE_HEADER_LEN);
-        header.extend_from_slice(STAMP_STORE_MAGIC);
-        header.extend_from_slice(&STAMP_STORE_VERSION.to_le_bytes());
-        header.extend_from_slice(batch_id);
-        f.write_all(&header)
-            .map_err(|e| PostageError::Persist(format!("{}: {e}", path.display())))?;
+        .map_err(|e| fail(format!("{}: {e}", path.display())))?;
+    let pre_len = f
+        .metadata()
+        .map_err(|e| fail(format!("{}: {e}", path.display())))?
+        .len();
+
+    let mut buf = Vec::with_capacity(STAMP_STORE_HEADER_LEN + STAMP_RECORD_LEN);
+    if pre_len == 0 {
+        buf.extend_from_slice(STAMP_STORE_MAGIC);
+        buf.extend_from_slice(&STAMP_STORE_VERSION.to_le_bytes());
+        buf.extend_from_slice(batch_id);
     }
-    let mut rec = Vec::with_capacity(STAMP_RECORD_LEN);
-    rec.extend_from_slice(addr);
-    rec.extend_from_slice(stamp);
-    rec.extend_from_slice(&stamp_record_checksum(addr, stamp));
-    f.write_all(&rec)
-        .map_err(|e| PostageError::Persist(format!("{}: {e}", path.display())))?;
-    f.sync_all()
-        .map_err(|e| PostageError::Persist(format!("{}: {e}", path.display())))?;
+    buf.extend_from_slice(addr);
+    buf.extend_from_slice(stamp);
+    buf.extend_from_slice(&stamp_record_checksum(addr, stamp));
+
+    let write_result = f.write_all(&buf).and_then(|()| f.sync_all());
+    if let Err(e) = write_result {
+        // Truncate the (possibly partial) frame back off so the next
+        // append can't land after a tear and shift framing.
+        let rolled_back = f.set_len(pre_len).and_then(|()| f.sync_all()).is_ok();
+        return Err(AppendError {
+            rolled_back,
+            msg: if rolled_back {
+                format!("{}: append failed (rolled back): {e}", path.display())
+            } else {
+                format!(
+                    "{}: append failed AND rollback truncate failed: {e}",
+                    path.display()
+                )
+            },
+        });
+    }
     Ok(())
 }
 
@@ -1822,37 +1854,104 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A foreign/corrupt-header sidecar is only appendable if it can be
-    /// cleared first. If removal fails (e.g. a read-only parent directory
-    /// keeps the file but leaves it writable), it must fail closed —
-    /// appending v2 records under the bad header would be rejected on
-    /// restart and lose the mapping.
-    #[cfg(unix)]
+    /// A corrupt/foreign-header sidecar fails closed and is NEVER
+    /// deleted: one flipped header bit is indistinguishable from a
+    /// foreign file, and deleting would silently discard every recorded
+    /// slot mapping (the loader used to unlink here — blocker-4
+    /// regression).
     #[test]
-    fn unremovable_foreign_sidecar_fails_closed() {
-        use std::os::unix::fs::PermissionsExt;
+    fn corrupt_header_fails_closed_and_survives() {
         let dir = tmpdir();
-        let sub = dir.join("sub");
-        std::fs::create_dir(&sub).unwrap();
-        let sidecar = sub.join("x.stamps");
+        let sidecar = dir.join("x.stamps");
         // Bad magic, long enough to pass the length check.
         std::fs::write(&sidecar, [0xEEu8; 64]).unwrap();
-        // Read-only parent: the file can be read but not unlinked.
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-        // Under root, permissions don't bind — the sabotage is
-        // ineffective, so only assert when removal genuinely fails.
-        let sabotage_effective = std::fs::remove_file(&sidecar).is_err();
-        if sabotage_effective {
-            let loaded = load_stamp_store(&sidecar, &[0x11; 32]);
-            assert!(
-                !loaded.appendable(),
-                "an un-removable foreign sidecar must fail closed"
-            );
+        let loaded = load_stamp_store(&sidecar, &[0x11; 32]);
+        assert!(
+            !loaded.appendable(),
+            "a corrupt-header sidecar must fail closed"
+        );
+        assert!(
+            sidecar.exists(),
+            "the loader must never delete a sidecar it can't parse"
+        );
+
+        // Same rule for a well-formed header with an unknown version.
+        let mut future = Vec::new();
+        future.extend_from_slice(STAMP_STORE_MAGIC);
+        future.extend_from_slice(&99u16.to_le_bytes());
+        future.extend_from_slice(&[0x11; 32]);
+        std::fs::write(&sidecar, &future).unwrap();
+        let loaded = load_stamp_store(&sidecar, &[0x11; 32]);
+        assert!(!loaded.appendable(), "unknown version must fail closed");
+        assert!(sidecar.exists(), "unknown version must not be deleted");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Blocker-3 regression: a runtime append failure must not leave a
+    /// torn frame mid-file. The rollback truncates back to the
+    /// pre-append length so the next append can't shift framing and
+    /// checksum-kill everything after the tear on the next load.
+    #[test]
+    fn failed_append_rolls_back_to_a_clean_boundary() {
+        let dir = tmpdir();
+        let sidecar = dir.join("x.stamps");
+        let batch_id = [0x22u8; 32];
+
+        // One good record.
+        append_stamp_record(&sidecar, &batch_id, &[0xA1; 32], &[0x01; STAMP_SIZE]).unwrap();
+        let clean_len = std::fs::metadata(&sidecar).unwrap().len();
+
+        // Simulate the tear a partial write_all leaves behind, then the
+        // rollback the fixed append performs.
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&sidecar)
+                .unwrap();
+            f.write_all(&[0xB2; 40]).unwrap(); // 40 of 149 bytes: torn
+            f.set_len(clean_len).unwrap(); // the rollback path
         }
 
-        // Restore perms so cleanup can run.
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).ok();
+        // Frame boundary intact: the next append lands cleanly and BOTH
+        // records survive a reload.
+        append_stamp_record(&sidecar, &batch_id, &[0xC3; 32], &[0x02; STAMP_SIZE]).unwrap();
+        let loaded = load_stamp_store(&sidecar, &batch_id);
+        assert!(loaded.unusable_reason.is_none());
+        assert_eq!(
+            loaded.map.len(),
+            2,
+            "no record may be lost after a rollback"
+        );
+        assert_eq!(loaded.map[&[0xA1; 32]], [0x01; STAMP_SIZE]);
+        assert_eq!(loaded.map[&[0xC3; 32]], [0x02; STAMP_SIZE]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The un-rollback-able variant must poison the issuer: with a torn
+    /// frame stuck at EOF, any further append would bury the tear
+    /// mid-file, so `sign_stamp_bytes` has to refuse until a restart
+    /// lets the loader truncate it.
+    #[test]
+    fn unrolled_torn_append_poisons_the_issuer() {
+        let dir = tmpdir();
+        let path = dir.join("c.bin");
+        let secret = [0x33u8; 32];
+        let batch_id = [0x44u8; 32];
+        let mut issuer = StampIssuer::open_or_new(path.clone(), batch_id, 17, 16, false).unwrap();
+        let a1 = [0xD4u8; 32];
+        sign_stamp_bytes(&secret, &mut issuer, &a1).unwrap();
+
+        // Simulate append_stamp_record's worst case having happened.
+        issuer.stamp_persistence_failed = Some("torn sidecar append could not be rolled back");
+        let a2 = [0xE5u8; 32];
+        let err = sign_stamp_bytes(&secret, &mut issuer, &a2).unwrap_err();
+        assert!(
+            matches!(err, PostageError::Persist(_)),
+            "poisoned issuer must fail closed as Persist, got: {err:?}"
+        );
+        assert!(err.to_string().contains("torn sidecar append"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -2477,7 +2477,15 @@ fn handle_control_command(
                 pss_secret: None,
             };
             if watch.is_empty() {
-                // Nothing to watch — close the stream immediately.
+                // Nothing to watch — tell the subscriber why before the
+                // stream closes (a bare drop looks like a node failure
+                // and invites a blind retry loop).
+                send_terminal_ack(
+                    &ack,
+                    ControlAck::Error {
+                        message: "lurker subscription rejected: nothing to watch".to_string(),
+                    },
+                );
                 return;
             }
             // All-zeros target → the node's own neighborhood (where PSS
@@ -2516,6 +2524,17 @@ fn handle_control_command(
                     target: "ant_p2p::lurker",
                     limit = crate::lurker_registry::MAX_LURKER_NEIGHBORHOODS,
                     "lurker subscription rejected: neighborhood limit reached",
+                );
+                // Surface the rejection so the gateway can close the
+                // WebSocket with a reason instead of a bare drop.
+                send_terminal_ack(
+                    &ack,
+                    ControlAck::Error {
+                        message: format!(
+                            "lurker subscription rejected: neighborhood limit reached ({})",
+                            crate::lurker_registry::MAX_LURKER_NEIGHBORHOODS
+                        ),
+                    },
                 );
                 return;
             };

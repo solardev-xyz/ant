@@ -146,12 +146,24 @@ impl Seen {
         }
     }
 
-    /// Record `(address, content)`; `false` if this exact version was
-    /// already seen (another covering peer usually delivers it too).
-    fn insert(&mut self, address: &[u8; 32], data: &[u8]) -> bool {
+    /// Dedup key for one content version.
+    fn key_for(address: &[u8; 32], data: &[u8]) -> [u8; 64] {
         let mut key = [0u8; 64];
         key[..32].copy_from_slice(address);
         key[32..].copy_from_slice(&keccak256(data));
+        key
+    }
+
+    /// Record `(address, content)`; `false` if this exact version was
+    /// already seen (another covering peer usually delivers it too).
+    /// Production goes through [`Self::key_for`] + [`Self::insert_key`]
+    /// so the delivery path can roll a reservation back on cancel.
+    #[cfg(test)]
+    fn insert(&mut self, address: &[u8; 32], data: &[u8]) -> bool {
+        self.insert_key(Self::key_for(address, data))
+    }
+
+    fn insert_key(&mut self, key: [u8; 64]) -> bool {
         if !self.set.insert(key) {
             return false;
         }
@@ -163,6 +175,91 @@ impl Seen {
         }
         true
     }
+
+    /// Roll back a reservation made by [`Seen::insert_key`]. Only called
+    /// on the rare cancel/error path, so the O(n) order scan is fine.
+    fn remove(&mut self, key: &[u8; 64]) {
+        if self.set.remove(key) {
+            if let Some(pos) = self.order.iter().position(|k| k == key) {
+                self.order.remove(pos);
+            }
+        }
+    }
+}
+
+/// Rolls a [`Seen`] reservation back on drop unless committed.
+///
+/// The delivery send (`out.send(...).await`) is a **cancellation point**:
+/// the driver's handover aborts obsolete pullers, and an abort landing
+/// while the channel is full would otherwise leave the chunk marked seen
+/// but never delivered — every other covering peer's copy of it then
+/// dedups against the phantom entry and the message is lost for good,
+/// defeating the very redundancy the covering set exists for. Reserving
+/// first (keeping the cross-puller mutual exclusion) and rolling back on
+/// an uncommitted drop restores at-least-once.
+struct SeenReservation {
+    seen: Arc<Mutex<Seen>>,
+    key: [u8; 64],
+    committed: bool,
+}
+
+impl SeenReservation {
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for SeenReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&self.key);
+        }
+    }
+}
+
+/// Dedup, classify, and forward one delivered chunk (cancel-safely — see
+/// [`SeenReservation`]). Returns `false` when the subscriber is gone and
+/// the puller should exit.
+async fn deliver_chunk(
+    seen: &Arc<Mutex<Seen>>,
+    watch: &SharedWatch,
+    out: &mpsc::Sender<DecodedMessage>,
+    address: &[u8; 32],
+    data: &[u8],
+) -> bool {
+    // Dedup one *content version* — the same chunk arrives from several
+    // covering peers, but a GSOC update reuses its address with new
+    // content and must still go through.
+    let key = Seen::key_for(address, data);
+    if !seen
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert_key(key)
+    {
+        return true;
+    }
+    let decoded = classify(
+        address,
+        data,
+        &watch.read().unwrap_or_else(PoisonError::into_inner),
+    );
+    if let Some(msg) = decoded {
+        tracing::info!(target: "ant_p2p::lurker", "lurker decoded a message");
+        let reservation = SeenReservation {
+            seen: Arc::clone(seen),
+            key,
+            committed: false,
+        };
+        if out.send(msg).await.is_err() {
+            // Subscriber gone: the rollback is moot but harmless.
+            return false;
+        }
+        reservation.commit();
+    }
+    true
 }
 
 /// Run the lurker until `out` is closed (subscriber gone) or the peer
@@ -487,29 +584,8 @@ async fn pull_bin(
             "pull round",
         );
         for chunk in &page.chunks {
-            // Dedup one *content version* — the same chunk arrives from
-            // several covering peers, but a GSOC update reuses its
-            // address with new content and must still go through.
-            if !seen
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(&chunk.address, &chunk.data)
-            {
-                continue;
-            }
-            let decoded = classify(
-                &chunk.address,
-                &chunk.data,
-                &watch.read().unwrap_or_else(PoisonError::into_inner),
-            );
-            if let Some(msg) = decoded {
-                tracing::info!(
-                    target: "ant_p2p::lurker",
-                    peer = %peer_id, bin, "lurker decoded a message",
-                );
-                if out.send(msg).await.is_err() {
-                    return;
-                }
+            if !deliver_chunk(&seen, &watch, &out, &chunk.address, &chunk.data).await {
+                return;
             }
         }
         start = page.topmost.saturating_add(1);
@@ -554,11 +630,76 @@ fn want(offered: &OfferedChunk, watch: &WatchState) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::RwLock;
 
     fn overlay(first: u8) -> Overlay {
         let mut o = [0u8; 32];
         o[0] = first;
         o
+    }
+
+    /// A watched GSOC chunk plus the watch that matches it.
+    fn watched_gsoc(payload: &[u8]) -> ([u8; 32], Vec<u8>, SharedWatch) {
+        let identifier = ant_crypto::gsoc::identifier_from_string("lurker-test");
+        let secret = ant_crypto::gsoc::gsoc_mine(&[0u8; 32], &identifier, 1).unwrap();
+        let chunk = ant_crypto::gsoc::build_gsoc_chunk(&secret, &identifier, payload).unwrap();
+        let watch: SharedWatch = Arc::new(RwLock::new(WatchState {
+            gsoc_addresses: std::collections::HashSet::from([chunk.address]),
+            ..WatchState::default()
+        }));
+        (chunk.address, chunk.wire, watch)
+    }
+
+    /// Blocker-1 regression: a puller aborted while `out.send` is parked
+    /// on a full channel must NOT leave the chunk marked seen — the next
+    /// covering peer's copy has to go through, or the message is lost
+    /// for good (at-least-once).
+    #[tokio::test]
+    async fn aborted_delivery_rolls_back_the_seen_reservation() {
+        let (address, data, watch) = watched_gsoc(b"must-not-vanish");
+        let seen: Arc<Mutex<Seen>> = Arc::new(Mutex::new(Seen::new()));
+        let (out, mut rx) = mpsc::channel::<DecodedMessage>(1);
+        // Fill the channel so the delivery send parks.
+        out.try_send(DecodedMessage::Pss {
+            topic: [0u8; 32],
+            message: vec![],
+        })
+        .unwrap();
+
+        let task = {
+            let (seen, watch, out) = (Arc::clone(&seen), Arc::clone(&watch), out.clone());
+            let (address, data) = (address, data.clone());
+            tokio::spawn(async move { deliver_chunk(&seen, &watch, &out, &address, &data).await })
+        };
+        // Let the task reach the parked send, then abort it (the
+        // handover path).
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+
+        // The reservation must have rolled back: a second covering
+        // peer's identical delivery still goes through.
+        assert!(rx.try_recv().is_ok()); // drain the filler
+        assert!(deliver_chunk(&seen, &watch, &out, &address, &data).await);
+        match rx.try_recv() {
+            Ok(DecodedMessage::Gsoc { payload, .. }) => {
+                assert_eq!(payload, b"must-not-vanish");
+            }
+            other => panic!("expected the re-delivered GSOC message, got {other:?}"),
+        }
+    }
+
+    /// A committed delivery stays seen: re-deliveries dedup as before.
+    #[tokio::test]
+    async fn committed_delivery_stays_deduped() {
+        let (address, data, watch) = watched_gsoc(b"once-only");
+        let seen: Arc<Mutex<Seen>> = Arc::new(Mutex::new(Seen::new()));
+        let (out, mut rx) = mpsc::channel::<DecodedMessage>(4);
+        assert!(deliver_chunk(&seen, &watch, &out, &address, &data).await);
+        assert!(rx.try_recv().is_ok());
+        // Second covering peer delivers the same version: deduped.
+        assert!(deliver_chunk(&seen, &watch, &out, &address, &data).await);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

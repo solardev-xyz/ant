@@ -17,19 +17,29 @@
 //!   receives topic-broadcast messages.
 
 use ant_control::{ControlAck, ControlCommand};
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
 use axum::response::Response;
 use serde::Deserialize;
 use tokio::sync::mpsc;
+use tokio::time::{Instant, MissedTickBehavior};
 use tracing::debug;
 
-use crate::error::json_error;
+use crate::error::{params_error, parse_hex_param, ParamKind};
 use crate::handle::GatewayHandle;
 
 /// Depth of the node→gateway message buffer for one subscription.
 const SUB_CHANNEL_CAP: usize = 64;
+
+/// Server → client Ping cadence. A subscription holds a lurker slot
+/// (`MAX_LURKER_NEIGHBORHOODS` node-wide), so a dead client must not pin
+/// one until the kernel notices: we ping like bee's API does and drop
+/// the socket when the client stops answering.
+const WS_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a client may go without any inbound frame (Pong, data,
+/// Close) before the subscription is torn down. Three missed pings.
+const WS_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// Optional query for `/pss/subscribe`.
 #[derive(Debug, Deserialize)]
@@ -49,8 +59,9 @@ pub async fn gsoc_subscribe(
     Path(address_hex): Path<String>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let Some(address) = parse_hex32(&address_hex) else {
-        return json_error(StatusCode::BAD_REQUEST, "invalid gsoc address");
+    let mut reasons = Vec::new();
+    let Some(address) = parse_hex_param::<32>("address", &address_hex, &mut reasons) else {
+        return params_error(ParamKind::Path, reasons);
     };
     // Watch exactly this SOC address; reside in its neighborhood.
     let cmd_target = address;
@@ -70,10 +81,13 @@ pub async fn pss_subscribe(
     // With `?neighborhood=`, lurk that rendezvous neighborhood; otherwise
     // all-zeros → the node's own neighborhood (directed PSS to this node).
     let target = match &query.neighborhood {
-        Some(hex) => match parse_hex32(hex) {
-            Some(t) => t,
-            None => return json_error(StatusCode::BAD_REQUEST, "invalid neighborhood overlay"),
-        },
+        Some(hex) => {
+            let mut reasons = Vec::new();
+            match parse_hex_param::<32>("neighborhood", hex, &mut reasons) {
+                Some(t) => t,
+                None => return params_error(ParamKind::Query, reasons),
+            }
+        }
         None => [0u8; 32],
     };
     ws.on_upgrade(move |socket| run_subscription(handle, socket, target, Vec::new(), vec![topic]))
@@ -97,9 +111,20 @@ async fn run_subscription(
         ack: ack_tx,
     };
     if handle.commands.send(cmd).await.is_err() {
-        let _ = socket.send(Message::Close(None)).await;
+        let _ = socket
+            .send(close_frame(close_code::ERROR, "node unavailable"))
+            .await;
         return;
     }
+
+    // Keep-alive: ping on a fixed cadence and require *some* inbound
+    // frame (Pong, data, Close) within WS_IDLE_TIMEOUT. Without this a
+    // dead/abandoned client pins its lurker slot until the kernel gives
+    // up on the connection — and the slots are a small node-wide pool.
+    let mut ping = tokio::time::interval(WS_PING_INTERVAL);
+    ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    ping.tick().await; // immediate first tick — consume it
+    let mut last_inbound = Instant::now();
 
     loop {
         tokio::select! {
@@ -110,27 +135,52 @@ async fn run_subscription(
                         break;
                     }
                 }
+                // Rejection (neighborhood cap, nothing to watch): tell
+                // the client why so it doesn't blind-retry into the
+                // same refusal.
+                Some(ControlAck::Error { message }) => {
+                    let _ = socket
+                        .send(close_frame(close_code::AGAIN, &message))
+                        .await;
+                    break;
+                }
                 Some(_) => {} // no other ack kinds on this stream
-                None => break, // node closed the subscription
+                None => {
+                    // Node closed the subscription.
+                    let _ = socket
+                        .send(close_frame(close_code::AWAY, "subscription closed by node"))
+                        .await;
+                    break;
+                }
             },
             // Client activity: a Close (or a socket error) ends the sub.
-            // Dropping `ack_rx` stops the node-side lurker.
+            // Dropping `ack_rx` stops the node-side lurker. Any inbound
+            // frame — Pong included (axum answers client Pings itself) —
+            // counts as liveness.
             client = socket.recv() => match client {
                 Some(Ok(Message::Close(_)) | Err(_)) | None => break,
-                Some(Ok(_)) => {} // ignore inbound data/ping frames
+                Some(Ok(_)) => last_inbound = Instant::now(),
             },
+            _ = ping.tick() => {
+                if last_inbound.elapsed() > WS_IDLE_TIMEOUT {
+                    debug!(target: "ant_gateway", "subscription client unresponsive; dropping");
+                    break;
+                }
+                if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
+            }
         }
     }
     debug!(target: "ant_gateway", "subscription closed");
 }
 
-/// Parse a 32-byte hex string (optional `0x`).
-fn parse_hex32(s: &str) -> Option<[u8; 32]> {
-    let s = s
-        .strip_prefix("0x")
-        .or_else(|| s.strip_prefix("0X"))
-        .unwrap_or(s);
-    let mut out = [0u8; 32];
-    hex::decode_to_slice(s, &mut out).ok()?;
-    Some(out)
+/// Build a Close frame carrying a machine-actionable code and a human
+/// reason (bee likewise closes subscription sockets with a reason).
+fn close_frame(code: u16, reason: &str) -> Message {
+    Message::Close(Some(CloseFrame {
+        code,
+        // Close reasons are capped at 123 bytes by RFC 6455.
+        reason: reason.chars().take(120).collect::<String>().into(),
+    }))
 }
