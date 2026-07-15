@@ -94,8 +94,10 @@ pub enum ControlCommand {
         /// Bin to pull. `None` = the closest peer's proximity-order bin
         /// to `target` (the neighborhood bin a lurker cares about).
         bin: Option<u8>,
-        /// Start binID (inclusive). `None` = the peer's cursor for the
-        /// bin (only newer chunks).
+        /// Start binID (inclusive). `None` = a historical page just
+        /// below the peer's cursor (answered immediately — see
+        /// `PROBE_BACKLOG`); an explicit start past the cursor
+        /// live-blocks until the next chunk arrives.
         start: Option<u64>,
         /// Cap on chunks whose delivery to actually request this page.
         max_deliver: usize,
