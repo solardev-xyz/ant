@@ -899,10 +899,11 @@ struct SwarmState {
     /// attested phantom batches). Fed by the push paths on
     /// `StampRejected`; consulted by `PostageStatus`/`PostageList` so
     /// `/stamps` stops reporting a dead batch as usable after the
-    /// first failed push. Process-lifetime only — a batch that later
-    /// syncs on-chain recovers on restart (or next successful push
-    /// clears it).
-    rejected_batches: Arc<std::sync::Mutex<HashSet<[u8; 32]>>>,
+    /// first failed push. Each entry carries a **self-probe schedule**
+    /// (issue #52): clients filter on `usable`, so nothing external
+    /// ever pushes with a rejected batch again — the node re-validates
+    /// it itself with backoff and clears the mark when peers accept.
+    rejected_batches: RejectedBatches,
     /// Last successfully-resolved sequence-feed index per
     /// `(owner, topic)` (perf-lab Experiment 6b). Sequence feeds are
     /// append-only, so a previously-resolved index is always a valid
@@ -988,7 +989,7 @@ impl SwarmState {
             credit_ledger: None,
             push_skip: ant_retrieval::PushSkipCache::new(),
             push_load: ant_retrieval::PushLoadTracker::from_env().map(Arc::new),
-            rejected_batches: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            rejected_batches: Arc::new(std::sync::Mutex::new(HashMap::new())),
             feed_hints: Arc::new(std::sync::Mutex::new(HashMap::new())),
             hot_hint: None,
             known_dialable: HashMap::new(),
@@ -1575,6 +1576,11 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
     let mut status_pulse = tokio::time::interval(Duration::from_millis(250));
     status_pulse.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     status_pulse.tick().await;
+    // Self-probe scan for peer-rejected batches (issue #52): a cheap
+    // no-op while nothing is rejected.
+    let mut batch_probe_pulse = tokio::time::interval(BATCH_PROBE_TICK);
+    batch_probe_pulse.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    batch_probe_pulse.tick().await;
     // Upload runtime slot: starts as the constructor-provided value and
     // may be filled once by a `LateChainInit` (see the select arm
     // below). Loop-local rather than read from `cfg` so the late init
@@ -1676,6 +1682,9 @@ pub async fn run(mut cfg: RunConfig) -> Result<(), RunError> {
                 // does the actual work. We just need *some* event to
                 // wake the select up regularly so the snapshot stays
                 // live during gateway-only / fully-idle periods.
+            }
+            _ = batch_probe_pulse.tick() => {
+                spawn_due_batch_probes(&state, &control, upload_rt.as_ref(), cfg.network_id);
             }
             Some(cmd) = recv_command(commands.as_mut()) => {
                 match cmd {
@@ -2978,7 +2987,7 @@ fn handle_control_command(
                             let rejected = state
                                 .rejected_batches
                                 .lock()
-                                .is_ok_and(|s| s.contains(iss.batch_id()));
+                                .is_ok_and(|s| s.contains_key(iss.batch_id()));
                             postage_status_view(&iss.stats(), !rejected)
                         })
                 }
@@ -3001,7 +3010,7 @@ fn handle_control_command(
                             let rejected = state
                                 .rejected_batches
                                 .lock()
-                                .is_ok_and(|s| s.contains(iss.batch_id()));
+                                .is_ok_and(|s| s.contains_key(iss.batch_id()));
                             postage_status_view(&iss.stats(), !rejected)
                         })
                         .collect()
@@ -3743,12 +3752,62 @@ fn gateway_push_patience() -> Duration {
     }))
 }
 
+/// First self-probe delay after a batch is peer-rejected. Rejections
+/// with "batchstore … not found" are usually a propagation race — the
+/// on-chain creation event hasn't reached the storers' batchstores yet
+/// — and peers typically sync within seconds to a couple of minutes.
+const BATCH_PROBE_BACKOFF_INITIAL: Duration = Duration::from_secs(15);
+/// Backoff ceiling for repeated probe rejections. A batch still
+/// rejected at this cadence is plausibly a genuine phantom (creation tx
+/// reorged away / wrong chain), but "not found" is never a *durable*
+/// verdict, so we keep probing cheaply rather than give up.
+const BATCH_PROBE_BACKOFF_MAX: Duration = Duration::from_mins(10);
+/// How often the node loop scans for due batch probes. Cheap no-op
+/// when nothing is marked rejected.
+const BATCH_PROBE_TICK: Duration = Duration::from_secs(5);
+/// Flight lease on an in-flight probe: while a probe is running, no
+/// second probe fires for the same batch — a pushsync walk can outlast
+/// the early backoffs (per-peer timeouts × error budget), and without
+/// the guard two overlapping rejections would double the backoff twice
+/// per schedule. If the outcome never lands within the lease (a lost
+/// task), the flight is considered dead and probing resumes — a stuck
+/// `in_flight` must not quietly reinstate the very deadlock this
+/// machinery exists to break.
+const BATCH_PROBE_FLIGHT_LEASE: Duration = Duration::from_mins(2);
+
+/// Self-probe schedule for one peer-rejected batch (issue #52).
+///
+/// "Unusable until a push succeeds" used to be the whole recovery
+/// story — but every well-behaved client filters on `usable`, so the
+/// rejected batch was never selected, never pushed with, and never
+/// recovered. The node now re-validates rejected batches *itself*: a
+/// tiny deterministic probe chunk is re-pushed with backoff until
+/// peers accept it, at which point the mark clears and `/stamps`
+/// reports the batch usable again with no client action.
+struct RejectedBatch {
+    /// Delay before the probe after next; doubles on each probe the
+    /// peers still reject, capped at [`BATCH_PROBE_BACKOFF_MAX`].
+    backoff: Duration,
+    /// When the next probe becomes due.
+    next_probe: Instant,
+    /// Probes attempted so far (diagnostics only).
+    probes: u32,
+    /// A probe is currently running (strict one-in-flight per batch).
+    /// Set when the probe is popped, cleared by
+    /// [`record_batch_probe_outcome`]; bounded by
+    /// [`BATCH_PROBE_FLIGHT_LEASE`] so a lost task can't wedge probing.
+    in_flight: bool,
+}
+
+/// Peer-rejected batches keyed by batch id, with their probe schedules.
+type RejectedBatches = Arc<std::sync::Mutex<HashMap<[u8; 32], RejectedBatch>>>;
+
 /// Maintain the peer-attested phantom-batch set: a `StampRejected`
 /// outcome marks the stamp's batch rejected (so `/stamps` turns
-/// `usable:false` after the first failed push); any successful push
-/// with the batch clears it (a batch that synced late recovers).
+/// `usable:false` after the first failed push) and schedules the
+/// self-probe; any successful push with the batch clears it.
 fn note_stamp_outcome(
-    rejected: &Arc<std::sync::Mutex<HashSet<[u8; 32]>>>,
+    rejected: &RejectedBatches,
     stamp: &[u8; ant_postage::STAMP_SIZE],
     err: Option<&ant_retrieval::pushsync::PushSyncError>,
 ) {
@@ -3759,18 +3818,236 @@ fn note_stamp_outcome(
     };
     match err {
         Some(ant_retrieval::pushsync::PushSyncError::StampRejected { .. }) => {
-            if set.insert(batch_id) {
+            // Repeated organic rejections don't reset an existing probe
+            // schedule — the prober owns the backoff.
+            set.entry(batch_id).or_insert_with(|| {
                 warn!(
                     target: "ant_p2p",
                     batch = %hex::encode(batch_id),
-                    "batch marked peer-rejected — /stamps will report it unusable until a push succeeds",
+                    "batch marked peer-rejected — /stamps reports it unusable; \
+                     self-probing with backoff until peers accept it",
                 );
-            }
+                RejectedBatch {
+                    backoff: BATCH_PROBE_BACKOFF_INITIAL,
+                    next_probe: Instant::now() + BATCH_PROBE_BACKOFF_INITIAL,
+                    probes: 0,
+                    in_flight: false,
+                }
+            });
         }
         Some(_) => {}
         None => {
-            set.remove(&batch_id);
+            if set.remove(&batch_id).is_some() {
+                info!(
+                    target: "ant_p2p",
+                    batch = %hex::encode(batch_id),
+                    "peer-rejected batch recovered — a push succeeded; /stamps reports it usable again",
+                );
+            }
         }
+    }
+}
+
+/// Pop the batches whose probe is due. Popping marks the batch
+/// `in_flight` and leases the slot for [`BATCH_PROBE_FLIGHT_LEASE`]:
+/// exactly one probe runs per batch at a time, however long the walk
+/// takes relative to the backoff. A batch still `in_flight` past its
+/// lease is a lost task — probing resumes (with a warning) rather than
+/// staying wedged forever.
+fn due_batch_probes(rejected: &RejectedBatches, now: Instant) -> Vec<[u8; 32]> {
+    let Ok(mut set) = rejected.lock() else {
+        return Vec::new();
+    };
+    let mut due = Vec::new();
+    for (batch_id, entry) in set.iter_mut() {
+        if entry.next_probe > now {
+            continue;
+        }
+        if entry.in_flight {
+            warn!(
+                target: "ant_p2p",
+                batch = %hex::encode(batch_id),
+                "batch probe outlived its flight lease (lost task?); re-probing",
+            );
+        }
+        entry.in_flight = true;
+        entry.next_probe = now + BATCH_PROBE_FLIGHT_LEASE;
+        entry.probes += 1;
+        due.push(*batch_id);
+    }
+    due
+}
+
+/// Record one probe's outcome. Success clears the mark (via
+/// [`note_stamp_outcome`]'s semantics); a fresh `StampRejected` doubles
+/// the backoff toward the cap; any other failure (no peers, timeouts)
+/// keeps the current cadence — it isn't a verdict about the batch.
+fn record_batch_probe_outcome(
+    rejected: &RejectedBatches,
+    batch_id: [u8; 32],
+    err: Option<&ant_retrieval::pushsync::PushSyncError>,
+) {
+    let Ok(mut set) = rejected.lock() else {
+        return;
+    };
+    match err {
+        None => {
+            if let Some(e) = set.remove(&batch_id) {
+                info!(
+                    target: "ant_p2p",
+                    batch = %hex::encode(batch_id),
+                    probes = e.probes,
+                    "peer-rejected batch recovered by self-probe — /stamps reports it usable again",
+                );
+            }
+        }
+        Some(ant_retrieval::pushsync::PushSyncError::StampRejected { .. }) => {
+            if let Some(e) = set.get_mut(&batch_id) {
+                e.in_flight = false;
+                e.backoff = (e.backoff * 2).min(BATCH_PROBE_BACKOFF_MAX);
+                e.next_probe = Instant::now() + e.backoff;
+                debug!(
+                    target: "ant_p2p",
+                    batch = %hex::encode(batch_id),
+                    probes = e.probes,
+                    next_backoff_secs = e.backoff.as_secs(),
+                    "batch self-probe still peer-rejected; backing off",
+                );
+            }
+        }
+        // Transient (no peers / timeout): release the flight and keep
+        // the cadence — this outcome says nothing about the batch.
+        Some(_) => {
+            if let Some(e) = set.get_mut(&batch_id) {
+                e.in_flight = false;
+                e.next_probe = Instant::now() + e.backoff;
+            }
+        }
+    }
+}
+
+/// The deterministic probe chunk for a batch: a tiny CAC whose address
+/// is a pure function of the batch id. Re-probing therefore re-stamps
+/// the *same* address every time, and the issuer's per-chunk stamp
+/// cache reuses the original bucket slot (with a fresh timestamp) — so
+/// self-probing a batch costs exactly ONE `(bucket, index)` slot total,
+/// no matter how many probes it takes.
+fn batch_probe_chunk(batch_id: &[u8; 32]) -> ([u8; 32], Vec<u8>) {
+    let payload = format!("ant postage batch probe 0x{}", hex::encode(batch_id));
+    ant_crypto::cac_new(payload.as_bytes()).expect("probe payload is far below the chunk cap")
+}
+
+/// Build the routing fetcher every push path shares, with the full
+/// wiring: push-skip cache, network id, load tracker, neighborhood
+/// dialer, and SWAP (or env-gated pseudosettle) settlement. ONE place —
+/// `push_with_stamp`, `push_soc_with_stamp`, and the batch self-probe
+/// all call this, so a future settlement change cannot silently miss a
+/// path (the probe being the one nobody would remember to update).
+/// Callers layer path-specific options (`with_require_deep`) on top.
+fn build_push_fetcher(
+    state: &SwarmState,
+    control: Control,
+    network_id: u64,
+) -> ant_retrieval::RoutingFetcher {
+    let mut fetcher = ant_retrieval::RoutingFetcher::new(control, state.peers_watch.subscribe())
+        .with_push_skip(state.push_skip.clone())
+        .with_network_id(network_id);
+    if let Some(load) = state.push_load.clone() {
+        fetcher = fetcher.with_push_load(load);
+    }
+    if let Some(tx) = state.neighborhood_dial_tx.clone() {
+        fetcher = fetcher.with_neighborhood_dialer(tx);
+    }
+    if let Some(svc) = state.pushsync_swap.clone() {
+        let s: Arc<dyn ant_retrieval::PushsyncSettlement> = svc;
+        fetcher = fetcher.with_pushsync_settlement(s);
+    } else if let Some(acc) = state
+        .accounting
+        .clone()
+        .filter(|_| crate::push_pseudosettle::PushPseudosettle::enabled_by_env())
+    {
+        // Experiment 1: cheque-less push settlement — mirror push
+        // debits into the shared Accounting so the pseudosettle
+        // driver time-settles upload peers (bee-light behaviour).
+        let s: Arc<dyn ant_retrieval::PushsyncSettlement> =
+            Arc::new(crate::push_pseudosettle::PushPseudosettle::new(acc));
+        fetcher = fetcher.with_pushsync_settlement(s);
+    }
+    fetcher
+}
+
+/// Fire one self-probe push per due rejected batch (issue #52). Called
+/// from the node loop on [`BATCH_PROBE_TICK`]; a fast no-op while
+/// nothing is marked rejected. Each probe is a real single-walk
+/// pushsync of the batch's deterministic probe chunk: success clears
+/// the rejection (and `/stamps` flips back to `usable:true`), a fresh
+/// peer rejection doubles the backoff, and transient failures keep the
+/// cadence.
+fn spawn_due_batch_probes(
+    state: &SwarmState,
+    control: &Control,
+    upload: Option<&Arc<UploadRuntime>>,
+    network_id: u64,
+) {
+    // Cheap emptiness gate before any other work.
+    if state.rejected_batches.lock().map_or(true, |s| s.is_empty()) {
+        return;
+    }
+    let Some(upload) = upload else { return };
+    for batch_id in due_batch_probes(&state.rejected_batches, Instant::now()) {
+        let (addr, wire) = batch_probe_chunk(&batch_id);
+        // Stamp under the issuer mutex like every push. The probe
+        // address is fixed per batch, so this reuses the same bucket
+        // slot on every probe (fresh timestamp) — one slot total.
+        let stamp = {
+            let mut issuers = match upload.issuers.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let Some(issuer) = issuers.get_mut(&batch_id) else {
+                // Batch was deregistered since the rejection: nothing
+                // left to recover — drop the mark.
+                if let Ok(mut set) = state.rejected_batches.lock() {
+                    set.remove(&batch_id);
+                }
+                continue;
+            };
+            match ant_postage::sign_stamp_bytes(&upload.stamp_key, issuer, &addr) {
+                Ok(s) => s,
+                Err(e) => {
+                    // Issuer can't stamp (e.g. sidecar poisoned):
+                    // probing is pointless until that's resolved. Keep
+                    // the mark, release the flight, retry at the
+                    // current cadence.
+                    debug!(
+                        target: "ant_p2p",
+                        batch = %hex::encode(batch_id),
+                        "batch self-probe could not stamp: {e}",
+                    );
+                    if let Ok(mut set) = state.rejected_batches.lock() {
+                        if let Some(entry) = set.get_mut(&batch_id) {
+                            entry.in_flight = false;
+                            entry.next_probe = Instant::now() + entry.backoff;
+                        }
+                    }
+                    continue;
+                }
+            }
+        };
+        let fetcher = build_push_fetcher(state, control.clone(), network_id);
+        let rejected = state.rejected_batches.clone();
+        tokio::spawn(async move {
+            debug!(
+                target: "ant_p2p",
+                batch = %hex::encode(batch_id),
+                probe_chunk = %hex::encode(addr),
+                "self-probing peer-rejected batch",
+            );
+            match fetcher.push_stamped_chunk(addr, wire, stamp).await {
+                Ok(()) => record_batch_probe_outcome(&rejected, batch_id, None),
+                Err(e) => record_batch_probe_outcome(&rejected, batch_id, Some(&e)),
+            }
+        });
     }
 }
 
@@ -3788,23 +4065,18 @@ fn push_with_stamp(
     require_deep: bool,
     ack: oneshot::Sender<ControlAck>,
 ) {
-    let peers_rx = state.peers_watch.subscribe();
     let rejected_batches = state.rejected_batches.clone();
     let patience_peers = state.peers_watch.subscribe();
-    if peers_rx.borrow().is_empty() {
+    if state.peers_watch.subscribe().borrow().is_empty() {
         let _ = ack.send(ControlAck::Error {
             message: "no peers available; wait for handshakes to complete".into(),
         });
         return;
     }
-    let control = control.clone();
-    let pushsync_swap = state.pushsync_swap.clone();
-    let accounting = state.accounting.clone();
-    let push_skip = state.push_skip.clone();
-    let push_load = state.push_load.clone();
+    let fetcher =
+        build_push_fetcher(state, control.clone(), network_id).with_require_deep(require_deep);
     let disk_cache = state.disk_cache.clone();
     let mem_cache = state.chunk_cache.clone();
-    let neighborhood_dial = state.neighborhood_dial_tx.clone();
     tokio::spawn(async move {
         // Land the chunk in our own local store *before* pushsync,
         // mirroring bee's store-then-push upload model. Without
@@ -3827,29 +4099,6 @@ fn push_with_stamp(
                     "failed to cache uploaded chunk locally: {e}",
                 );
             }
-        }
-        let mut fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx)
-            .with_push_skip(push_skip)
-            .with_network_id(network_id)
-            .with_require_deep(require_deep);
-        if let Some(load) = push_load {
-            fetcher = fetcher.with_push_load(load);
-        }
-        if let Some(tx) = neighborhood_dial {
-            fetcher = fetcher.with_neighborhood_dialer(tx);
-        }
-        if let Some(svc) = pushsync_swap {
-            let s: Arc<dyn ant_retrieval::PushsyncSettlement> = svc;
-            fetcher = fetcher.with_pushsync_settlement(s);
-        } else if let Some(acc) =
-            accounting.filter(|_| crate::push_pseudosettle::PushPseudosettle::enabled_by_env())
-        {
-            // Experiment 1: cheque-less push settlement — mirror push
-            // debits into the shared Accounting so the pseudosettle
-            // driver time-settles upload peers (bee-light behaviour).
-            let s: Arc<dyn ant_retrieval::PushsyncSettlement> =
-                Arc::new(crate::push_pseudosettle::PushPseudosettle::new(acc));
-            fetcher = fetcher.with_pushsync_settlement(s);
         }
         let reply =
             match push_with_patience(&fetcher, patience_peers, addr, wire, stamp, false).await {
@@ -3883,23 +4132,17 @@ fn push_soc_with_stamp(
     ack: oneshot::Sender<ControlAck>,
 ) {
     const SOC_HEADER: usize = 32 + 65;
-    let peers_rx = state.peers_watch.subscribe();
     let rejected_batches = state.rejected_batches.clone();
     let patience_peers = state.peers_watch.subscribe();
-    if peers_rx.borrow().is_empty() {
+    if state.peers_watch.subscribe().borrow().is_empty() {
         let _ = ack.send(ControlAck::NotReady {
             message: "no peers available; wait for handshakes to complete".into(),
         });
         return;
     }
-    let control = control.clone();
-    let pushsync_swap = state.pushsync_swap.clone();
-    let accounting = state.accounting.clone();
-    let push_skip = state.push_skip.clone();
-    let push_load = state.push_load.clone();
+    let fetcher = build_push_fetcher(state, control.clone(), network_id);
     let disk_cache = state.disk_cache.clone();
     let mem_cache = state.chunk_cache.clone();
-    let neighborhood_dial = state.neighborhood_dial_tx.clone();
     tokio::spawn(async move {
         // Keep a local copy of our own upload before pushsync, so
         // the node can serve the SOC it just stamped without
@@ -3946,28 +4189,6 @@ fn push_soc_with_stamp(
                     }
                 }
             }
-        }
-        let mut fetcher = ant_retrieval::RoutingFetcher::new(control, peers_rx)
-            .with_push_skip(push_skip)
-            .with_network_id(network_id);
-        if let Some(load) = push_load {
-            fetcher = fetcher.with_push_load(load);
-        }
-        if let Some(tx) = neighborhood_dial {
-            fetcher = fetcher.with_neighborhood_dialer(tx);
-        }
-        if let Some(svc) = pushsync_swap {
-            let s: Arc<dyn ant_retrieval::PushsyncSettlement> = svc;
-            fetcher = fetcher.with_pushsync_settlement(s);
-        } else if let Some(acc) =
-            accounting.filter(|_| crate::push_pseudosettle::PushPseudosettle::enabled_by_env())
-        {
-            // Experiment 1: cheque-less push settlement — mirror push
-            // debits into the shared Accounting so the pseudosettle
-            // driver time-settles upload peers (bee-light behaviour).
-            let s: Arc<dyn ant_retrieval::PushsyncSettlement> =
-                Arc::new(crate::push_pseudosettle::PushPseudosettle::new(acc));
-            fetcher = fetcher.with_pushsync_settlement(s);
         }
         // Fix B: SOCs run strict-receipt during the patience budget —
         // the walk hunts a DEEP placement (re-walking after deepening)
@@ -7222,6 +7443,140 @@ mod tests {
 
     fn pid() -> PeerId {
         Keypair::generate_ed25519().public().to_peer_id()
+    }
+
+    fn stamp_for(batch_id: [u8; 32]) -> [u8; ant_postage::STAMP_SIZE] {
+        let mut s = [0u8; ant_postage::STAMP_SIZE];
+        s[..32].copy_from_slice(&batch_id);
+        s
+    }
+
+    fn rejected_err() -> ant_retrieval::pushsync::PushSyncError {
+        ant_retrieval::pushsync::PushSyncError::StampRejected {
+            batch_id: [0u8; 32],
+            rejections: 1,
+            sample: "batchstore get: not found".into(),
+        }
+    }
+
+    /// Issue #52 regression: a peer-rejected batch must carry a probe
+    /// schedule that becomes due — not sit in the set waiting for an
+    /// external push that usable-filtering clients will never make.
+    #[test]
+    fn rejected_batch_schedules_a_probe_and_recovers_on_success() {
+        let rejected: RejectedBatches = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let batch = [0xAB; 32];
+        note_stamp_outcome(&rejected, &stamp_for(batch), Some(&rejected_err()));
+
+        // Marked unusable, probe scheduled but not yet due.
+        assert!(rejected.lock().unwrap().contains_key(&batch));
+        assert!(due_batch_probes(&rejected, Instant::now()).is_empty());
+
+        // After the initial backoff the probe is due — and popping it
+        // marks the flight so the next tick can't double-fire it.
+        let later = Instant::now() + BATCH_PROBE_BACKOFF_INITIAL + Duration::from_millis(10);
+        assert_eq!(due_batch_probes(&rejected, later), vec![batch]);
+        assert!(due_batch_probes(&rejected, later).is_empty());
+
+        // A successful probe clears the mark → /stamps flips usable.
+        record_batch_probe_outcome(&rejected, batch, None);
+        assert!(!rejected.lock().unwrap().contains_key(&batch));
+    }
+
+    /// Reviewer change-request regression: a walk that outlasts the
+    /// early backoffs must NOT overlap a second probe for the same
+    /// batch — strictly one in flight, released by the outcome. And a
+    /// flight that never reports (lost task) expires with the lease so
+    /// probing can't wedge.
+    #[test]
+    fn only_one_probe_in_flight_per_batch() {
+        let rejected: RejectedBatches = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let batch = [0x77; 32];
+        note_stamp_outcome(&rejected, &stamp_for(batch), Some(&rejected_err()));
+
+        let t0 = Instant::now() + BATCH_PROBE_BACKOFF_INITIAL + Duration::from_millis(10);
+        assert_eq!(due_batch_probes(&rejected, t0), vec![batch]);
+
+        // The walk runs long: several backoff periods pass, still
+        // within the flight lease → NO second probe fires.
+        let mid_flight = t0 + 4 * BATCH_PROBE_BACKOFF_INITIAL;
+        assert!(mid_flight < t0 + BATCH_PROBE_FLIGHT_LEASE);
+        assert!(due_batch_probes(&rejected, mid_flight).is_empty());
+
+        // The outcome lands (still rejected): flight released, backoff
+        // doubled exactly ONCE, and the next probe fires on the new
+        // schedule.
+        record_batch_probe_outcome(&rejected, batch, Some(&rejected_err()));
+        {
+            let set = rejected.lock().unwrap();
+            assert!(!set[&batch].in_flight);
+            assert_eq!(set[&batch].backoff, 2 * BATCH_PROBE_BACKOFF_INITIAL);
+        }
+        let next = Instant::now() + 2 * BATCH_PROBE_BACKOFF_INITIAL + Duration::from_millis(10);
+        assert_eq!(due_batch_probes(&rejected, next), vec![batch]);
+
+        // Lost-task backstop: no outcome ever lands; once the lease
+        // expires the flight is considered dead and probing resumes.
+        let past_lease = next + BATCH_PROBE_FLIGHT_LEASE + Duration::from_millis(10);
+        assert_eq!(due_batch_probes(&rejected, past_lease), vec![batch]);
+    }
+
+    /// Still-rejected probes back off exponentially toward the cap;
+    /// transient failures (no peers, timeouts) keep the cadence — they
+    /// are not verdicts about the batch.
+    #[test]
+    fn probe_backoff_doubles_on_rejection_and_caps() {
+        let rejected: RejectedBatches = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let batch = [0xCD; 32];
+        note_stamp_outcome(&rejected, &stamp_for(batch), Some(&rejected_err()));
+
+        for _ in 0..12 {
+            record_batch_probe_outcome(&rejected, batch, Some(&rejected_err()));
+        }
+        let backoff = rejected.lock().unwrap()[&batch].backoff;
+        assert_eq!(backoff, BATCH_PROBE_BACKOFF_MAX, "backoff must cap");
+
+        // A transient error must not grow the backoff further… or
+        // remove the mark.
+        let transient = ant_retrieval::pushsync::PushSyncError::ReceiptMismatch;
+        record_batch_probe_outcome(&rejected, batch, Some(&transient));
+        let set = rejected.lock().unwrap();
+        assert_eq!(set[&batch].backoff, BATCH_PROBE_BACKOFF_MAX);
+        assert!(set.contains_key(&batch));
+    }
+
+    /// Repeated organic rejections must not reset the probe schedule
+    /// (the prober owns the backoff), and an organic success clears the
+    /// mark exactly like a probe success.
+    #[test]
+    fn organic_pushes_interact_correctly_with_the_probe_schedule() {
+        let rejected: RejectedBatches = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let batch = [0xEF; 32];
+        note_stamp_outcome(&rejected, &stamp_for(batch), Some(&rejected_err()));
+        record_batch_probe_outcome(&rejected, batch, Some(&rejected_err()));
+        let backoff_before = rejected.lock().unwrap()[&batch].backoff;
+
+        // Another organic rejection arrives: schedule untouched.
+        note_stamp_outcome(&rejected, &stamp_for(batch), Some(&rejected_err()));
+        assert_eq!(rejected.lock().unwrap()[&batch].backoff, backoff_before);
+
+        // An organic success (e.g. a manual pinned-batch upload, or
+        // any client that doesn't filter) clears the mark.
+        note_stamp_outcome(&rejected, &stamp_for(batch), None);
+        assert!(!rejected.lock().unwrap().contains_key(&batch));
+    }
+
+    /// The probe chunk is a pure function of the batch id: same address
+    /// every probe (so the stamp cache reuses one bucket slot), distinct
+    /// across batches, and a well-formed CAC.
+    #[test]
+    fn probe_chunk_is_deterministic_per_batch() {
+        let (a1, w1) = batch_probe_chunk(&[0x11; 32]);
+        let (a2, _) = batch_probe_chunk(&[0x11; 32]);
+        let (b1, _) = batch_probe_chunk(&[0x22; 32]);
+        assert_eq!(a1, a2);
+        assert_ne!(a1, b1);
+        assert!(ant_crypto::cac_valid(&a1, &w1));
     }
 
     /// Regression for the quiet-subscription leak: closing the
