@@ -2502,6 +2502,7 @@ fn handle_control_command(
             target,
             gsoc_addresses,
             pss_topics,
+            history,
             ack,
         } => {
             use crate::lurker::{self, LurkerConfig};
@@ -2514,6 +2515,7 @@ fn handle_control_command(
                 // only (the topic-derived key handles it). Directed PSS to
                 // the node's key lands when a pss.key is persisted.
                 pss_secret: None,
+                history,
             };
             if watch.is_empty() {
                 // Nothing to watch — tell the subscriber why before the

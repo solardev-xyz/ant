@@ -37,6 +37,17 @@ pub struct WatchState {
     /// node's key. `None` still receives **topic-broadcast** PSS (messages
     /// with no explicit recipient, decryptable via the topic-derived key).
     pub pss_secret: Option<[u8; 32]>,
+    /// **Mailbox mode**: sweep a bounded trojan-bin backlog on subscribe
+    /// rather than only tailing live traffic. When set, fresh PSS pullers
+    /// start a bounded window behind the cursor (see
+    /// `lurker::HISTORY_BACKLOG`) instead of just behind it, so messages
+    /// sent while the receiver was offline are recovered — a recent-history
+    /// window (its reach depends on how busy the swept bin is). Union-OR
+    /// across subscribers: if any asks for history, the shared lurker
+    /// sweeps. Intended for discrete PSS messages; a GSOC watcher wants
+    /// the latest SOC value, not every historical version, so GSOC-only
+    /// subscribers leave this unset.
+    pub history: bool,
 }
 
 impl WatchState {
@@ -62,6 +73,9 @@ impl WatchState {
         if self.pss_secret.is_none() {
             self.pss_secret = other.pss_secret;
         }
+        // Any subscriber asking for history makes the shared lurker
+        // sweep the backlog.
+        self.history |= other.history;
     }
 }
 
@@ -229,6 +243,39 @@ mod tests {
             ..Default::default()
         };
         assert!(classify(&address, &data, &other).is_none());
+    }
+
+    #[test]
+    fn merge_from_unions_topics_secret_and_history() {
+        let mut base = WatchState {
+            pss_topics: vec![[1u8; 32]],
+            ..Default::default()
+        };
+        // A history-wanting subscriber attaches: the shared lurker must
+        // now sweep (history OR), and the union grows.
+        base.merge_from(&WatchState {
+            pss_topics: vec![[2u8; 32]],
+            pss_secret: Some([9u8; 32]),
+            history: true,
+            ..Default::default()
+        });
+        assert!(
+            base.history,
+            "any history subscriber makes the lurker sweep"
+        );
+        assert_eq!(base.pss_topics, vec![[1u8; 32], [2u8; 32]]);
+        assert_eq!(base.pss_secret, Some([9u8; 32]));
+
+        // A later non-history subscriber must NOT turn the sweep back off.
+        base.merge_from(&WatchState {
+            gsoc_addresses: HashSet::from([[3u8; 32]]),
+            ..Default::default()
+        });
+        assert!(
+            base.history,
+            "history stays set once any subscriber wanted it"
+        );
+        assert!(base.gsoc_addresses.contains(&[3u8; 32]));
     }
 
     #[test]

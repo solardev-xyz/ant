@@ -69,6 +69,30 @@ const HANDOVER_MAX_OVERLAP: Duration = Duration::from_mins(1);
 /// peers, so delivery is at-least-once, not N-times. Replaced pullers
 /// don't use this: they resume exactly where their predecessor stopped.
 const PULL_BACKLOG: u64 = 8;
+/// Earliest binID (reserves are 1-indexed; binID 0 is never used).
+const HISTORY_FLOOR: u64 = 1;
+/// Mailbox lookback, in binIDs, per (peer, bin). Mailbox mode starts a
+/// fresh puller this far behind the peer's cursor instead of at
+/// [`PULL_BACKLOG`], recovering messages sent while offline.
+///
+/// It is a **bounded** window on purpose. binIDs count chunks that
+/// landed in one bin on one peer, and a light node pulls a shallow
+/// covering peer's bin (`b_p ≈ 9-14`), which is busy — so an unbounded
+/// `start = 1` sweep would drag the whole history of a hot bin. This
+/// window caps the sweep at a few thousand recent chunks per bin, which
+/// on a busy bin is a recent-history mailbox (minutes-to-hours,
+/// depending on the bin's fill rate) rather than the complete backlog.
+///
+/// A *complete* backlog sweep would need the trojan concentrated into a
+/// sparse deep bin (a deeper mining prefix pulled by a deeply-resident
+/// receiver) — see [`PSS_MINED_PREFIX_BITS`] for why that trade doesn't
+/// pay at light-node residency. So today the mailbox is "recent", and a
+/// larger [`HISTORY_BACKLOG`] simply extends how far back it reaches at
+/// linear cost.
+///
+/// A sweep may exceed [`SEEN_CAP`] and re-deliver its oldest chunks;
+/// that is within the documented at-least-once/may-duplicate contract.
+const HISTORY_BACKLOG: u64 = 4096;
 /// Number of closest connected peers to pull from concurrently. A
 /// freshly-pushed chunk lands on the storer(s) nearest its address and
 /// replicates outward; pulling several covering peers catches it
@@ -432,9 +456,13 @@ pub async fn run(
         // may have added or removed GSOC addresses / PSS topics since
         // the last one, and the desired-set handover below then grows
         // or retires pullers to match.
-        let (want_gsoc, want_pss) = {
+        let (want_gsoc, want_pss, history) = {
             let w = watch.read().unwrap_or_else(PoisonError::into_inner);
-            (!w.gsoc_addresses.is_empty(), !w.pss_topics.is_empty())
+            (
+                !w.gsoc_addresses.is_empty(),
+                !w.pss_topics.is_empty(),
+                w.history,
+            )
         };
 
         // Which covering (peer, bin)s do we want, and which peers still
@@ -487,13 +515,16 @@ pub async fn run(
                     .copied()
                     .filter(|(epoch, _)| *epoch == cursors.epoch)
                     .map(|(_, start)| start);
-                let start = resume.unwrap_or_else(|| {
-                    cursor.saturating_add(1).saturating_sub(PULL_BACKLOG).max(1)
-                });
+                // A replaced puller resumes exactly where it stopped.
+                // Otherwise: mailbox mode sweeps the whole bin backlog
+                // (offline delivery); the default just tails live with a
+                // small backlog to cover the reside/cursor-read window.
+                let start = start_bin_id(resume, cursor, history);
                 tracing::info!(
                     target: "ant_p2p::lurker",
                     peer = %peer_id, bin, start, epoch = cursors.epoch,
-                    resumed = resume.is_some(), "lurker pulling neighborhood bin",
+                    resumed = resume.is_some(), history,
+                    "lurker pulling neighborhood bin",
                 );
                 next_generation += 1;
                 let handle = tokio::spawn(pull_bin(
@@ -741,6 +772,32 @@ fn covering_bins(b_p: u8, want_gsoc: bool, want_pss: bool) -> Vec<u8> {
     bins
 }
 
+/// The binID a fresh or resumed puller starts at.
+///
+/// - **Resume** (epoch-matched replacement puller): exactly where the
+///   predecessor stopped — never re-pull, never gap.
+/// - **Mailbox** (`history`, fresh puller): [`HISTORY_BACKLOG`] behind
+///   the cursor — sweep the recent bin backlog so messages sent while
+///   offline are recovered. The seen-set dedups the sweep against live
+///   traffic.
+/// - **Default** (fresh puller): a short [`PULL_BACKLOG`] behind the
+///   cursor — covers the window between a storer accepting a chunk and
+///   us reading its cursor, without pulling history.
+fn start_bin_id(resume: Option<u64>, cursor: u64, history: bool) -> u64 {
+    if let Some(start) = resume {
+        return start;
+    }
+    let backlog = if history {
+        HISTORY_BACKLOG
+    } else {
+        PULL_BACKLOG
+    };
+    cursor
+        .saturating_add(1)
+        .saturating_sub(backlog)
+        .max(HISTORY_FLOOR)
+}
+
 /// The `n` connected peers whose overlays are closest to `target`,
 /// deepest first. Marks the snapshot seen (`borrow_and_update`) so the
 /// driver's `changed()` wait really waits for the *next* change.
@@ -912,6 +969,34 @@ mod tests {
     #[test]
     fn no_watch_no_bins() {
         assert!(covering_bins(12, false, false).is_empty());
+    }
+
+    /// Mailbox mode: a FRESH puller sweeps a bounded backlog behind the
+    /// cursor (`HISTORY_BACKLOG`), recovering offline messages; the
+    /// default only tails a short `PULL_BACKLOG`.
+    #[test]
+    fn start_bin_id_mailbox_sweeps_the_backlog_window() {
+        // Deep cursor: history reaches HISTORY_BACKLOG back, default only PULL_BACKLOG.
+        assert_eq!(
+            start_bin_id(None, 50_000, true),
+            50_000 + 1 - HISTORY_BACKLOG
+        );
+        assert_eq!(start_bin_id(None, 50_000, false), 50_000 + 1 - PULL_BACKLOG);
+        // Sparse bin (fewer chunks than the window): backlog underflows
+        // to the floor → the mailbox recovers the ENTIRE bin history.
+        assert_eq!(start_bin_id(None, 500, true), HISTORY_FLOOR);
+        // A near-empty bin can't go below the floor either way.
+        assert_eq!(start_bin_id(None, 2, false), HISTORY_FLOOR);
+    }
+
+    /// A resumed (epoch-matched replacement) puller ALWAYS continues
+    /// exactly where its predecessor stopped — mailbox mode must not
+    /// rewind it to the floor and re-pull the whole backlog every
+    /// handover.
+    #[test]
+    fn start_bin_id_resume_overrides_mailbox() {
+        assert_eq!(start_bin_id(Some(12_345), 50_000, true), 12_345);
+        assert_eq!(start_bin_id(Some(12_345), 50_000, false), 12_345);
     }
 
     #[test]
