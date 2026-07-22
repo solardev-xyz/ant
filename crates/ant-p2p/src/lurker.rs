@@ -94,12 +94,27 @@ const COVERING_PEERS: usize = 5;
 ///   it; the correct base is `L`, with a small deeper window for the
 ///   geometric tail (each +1 bin halves the missed mass).
 ///
-/// The convention also bounds cost: on a depth-`d` storer the bins
-/// `>= L` hold only `~2^(22-(L-d))` of its ~2^22-chunk reserve
-/// (`d≈12, L=16` → 1/16 of ingest; `L=24` → ~1-2K chunks total), so
-/// candidate try-unwrap traffic stays small. `L` must also exceed the
-/// storage depth or no storer keeps the trojan at all — another reason
-/// this is a convention, not a per-sender free choice.
+/// `L` must exceed the storage depth `d` or no storer keeps the trojan
+/// at all — one reason this is a network convention (sender and receiver
+/// MUST agree), not a per-sender free choice.
+///
+/// **Why 16 and not 24.** A deeper prefix concentrates a trojan into a
+/// smaller slice of the reserve (`~2^(reserve-(L-d))`), which in
+/// principle cuts a *deeply-resident* receiver's candidate traffic and
+/// shrinks the mailbox backlog. But that benefit needs covering peers at
+/// `b_p >= L`: a light node's covering peers sit at `b_p ≈ 9-14`, so for
+/// them `covering_bins` pulls bin `b_p` **regardless of `L`** (the
+/// `b_p < L` regime). Measured on mainnet: at both `L=16` and `L=24` the
+/// receiver pulls the same bins and downloads the same candidates — the
+/// deeper prefix buys a light-node receiver nothing. It only *costs*: `L`
+/// bits is `~2^L` mine hashes, so `L=24` is ~256× the sender work
+/// (seconds on a phone, and it trips the send timeout), and PSS already
+/// carries an economic spam gate via the postage stamp every send burns.
+/// So we keep `L=16`: cheap to mine (mobile-friendly), identical receive
+/// at light-node residency. (A deeper prefix as a network-wide anti-spam
+/// proof-of-work is a protocol-incentive question, not a
+/// receiver-efficiency one; tracked in the SWIP messaging extension's
+/// "PSS mining depth" section.)
 const PSS_MINED_PREFIX_BITS: u8 = 16;
 /// Deeper bins pulled past bin [`PSS_MINED_PREFIX_BITS`] in the
 /// `b_p >= L` regime, covering the geometric tail of `PO(c, p) =
