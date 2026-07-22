@@ -67,6 +67,21 @@ async fn pss_subscribe_delivers_the_topic_message() {
     );
 }
 
+/// Mailbox mode: `?history=true` parses and upgrades cleanly (guards the
+/// query wiring end to end; the sweep behaviour itself is unit-tested in
+/// `ant_p2p::lurker::start_bin_id`).
+#[tokio::test]
+async fn pss_subscribe_accepts_history_query() {
+    let base = serve().await;
+    let url = format!("{base}/pss/subscribe/test?history=true");
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(&url).await.expect("ws");
+    let frame = ws.next().await.expect("frame").expect("ok");
+    assert_eq!(
+        frame,
+        Message::Binary(b"fixture-lurker-payload".to_vec().into())
+    );
+}
+
 #[tokio::test]
 async fn capped_subscription_is_rejected_with_a_close_reason() {
     let base = serve().await;
