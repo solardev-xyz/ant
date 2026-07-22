@@ -75,10 +75,37 @@ const PULL_BACKLOG: u64 = 8;
 /// regardless of which one got (or replicated) it first — the difference
 /// between reliable and flaky reception on a light node.
 const COVERING_PEERS: usize = 5;
-/// Extra deeper bins to pull past the base neighborhood bin. GSOC's watch
-/// target *is* the chunk address, so its base bin is exact; PSS mines a
-/// short overlay prefix, so the chunk can sit a few bins deeper on a given
-/// peer — this window covers that without pulling the whole reserve.
+/// The PSS mined-prefix convention, in bits: receivers assume trojan
+/// chunks are mined to share at least this many leading bits with the
+/// target overlay (= 2-byte targets on bee's `/pss/send`, the de-facto
+/// practice and what ant's own gateway demos use).
+///
+/// Correction due to Viktor Trón: which bin a trojan `c` occupies on a
+/// covering peer `p` depends on how `b_p = PO(p, target)` compares to
+/// the mined prefix length `L` — the trie geometry gives two regimes:
+///
+/// - **`b_p < L`**: `p` diverges from the target at bit `b_p` while `c`
+///   still agrees there, so `PO(c, p) = b_p` **exactly**. One
+///   deterministic bin; any window is dead weight.
+/// - **`b_p >= L`**: `c` agrees with `p` through bit `L` and is mined
+///   noise beyond, so `PO(c, p) = L + Geom(1/2)` — *independent of
+///   `b_p`*, i.e. the trojan sits around bin `L`, **shallower** than
+///   `b_p`. Pulling `b_p` and deeper (the previous behaviour) misses
+///   it; the correct base is `L`, with a small deeper window for the
+///   geometric tail (each +1 bin halves the missed mass).
+///
+/// The convention also bounds cost: on a depth-`d` storer the bins
+/// `>= L` hold only `~2^(22-(L-d))` of its ~2^22-chunk reserve
+/// (`d≈12, L=16` → 1/16 of ingest; `L=24` → ~1-2K chunks total), so
+/// candidate try-unwrap traffic stays small. `L` must also exceed the
+/// storage depth or no storer keeps the trojan at all — another reason
+/// this is a convention, not a per-sender free choice.
+const PSS_MINED_PREFIX_BITS: u8 = 16;
+/// Deeper bins pulled past bin [`PSS_MINED_PREFIX_BITS`] in the
+/// `b_p >= L` regime, covering the geometric tail of `PO(c, p) =
+/// L + Geom(1/2)`: a window of 3 captures 15/16 of the mass per peer,
+/// and the [`COVERING_PEERS`]-way redundancy covers the rest. Unused in
+/// the `b_p < L` regime, where the bin is exact.
 const PSS_BIN_WINDOW: u8 = 3;
 /// Highest proximity-order bin.
 const MAX_BIN: u8 = 31;
@@ -385,19 +412,14 @@ pub async fn run(
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|k, _| active.contains_key(k));
 
-        // Deeper bins only matter for PSS (unknown address); GSOC's base
-        // bin is exact. Re-read each pass: the registry may have added
-        // or removed PSS topics since the last one, and the desired-set
-        // handover below then grows or retires the deeper-bin pullers.
-        let window = if watch
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .pss_topics
-            .is_empty()
-        {
-            0
-        } else {
-            PSS_BIN_WINDOW
+        // Which bins each covering peer needs depends on the watch
+        // kinds (see `covering_bins`). Re-read each pass: the registry
+        // may have added or removed GSOC addresses / PSS topics since
+        // the last one, and the desired-set handover below then grows
+        // or retires pullers to match.
+        let (want_gsoc, want_pss) = {
+            let w = watch.read().unwrap_or_else(PoisonError::into_inner);
+            (!w.gsoc_addresses.is_empty(), !w.pss_topics.is_empty())
         };
 
         // Which covering (peer, bin)s do we want, and which peers still
@@ -405,37 +427,34 @@ pub async fn run(
         // cursors concurrently (bounded) so one silent peer can't stall
         // every other peer's coverage.
         let mut desired: HashSet<(PeerId, u8)> = HashSet::new();
-        let mut need_cursors: Vec<(PeerId, u8, u8)> = Vec::new();
+        let mut need_cursors: Vec<(PeerId, Vec<u8>)> = Vec::new();
         for (peer_id, peer_overlay) in closest_n(&mut peers, &target, COVERING_PEERS) {
-            let base_bin = proximity(&peer_overlay, &target);
-            let top_bin = base_bin.saturating_add(window).min(MAX_BIN);
-            for bin in base_bin..=top_bin {
+            let bins = covering_bins(proximity(&peer_overlay, &target), want_gsoc, want_pss);
+            for &bin in &bins {
                 desired.insert((peer_id, bin));
             }
-            if (base_bin..=top_bin).any(|b| !active.contains_key(&(peer_id, b))) {
-                need_cursors.push((peer_id, base_bin, top_bin));
+            if bins.iter().any(|b| !active.contains_key(&(peer_id, *b))) {
+                need_cursors.push((peer_id, bins));
             }
         }
-        let fetches = need_cursors
-            .into_iter()
-            .map(|(peer_id, base_bin, top_bin)| {
-                let mut ctl = control.clone();
-                async move {
-                    let cursors = tokio::time::timeout(
-                        CURSOR_FETCH_TIMEOUT,
-                        pullsync::get_cursors(&mut ctl, peer_id),
-                    )
-                    .await;
-                    (peer_id, base_bin, top_bin, cursors)
-                }
-            });
+        let fetches = need_cursors.into_iter().map(|(peer_id, bins)| {
+            let mut ctl = control.clone();
+            async move {
+                let cursors = tokio::time::timeout(
+                    CURSOR_FETCH_TIMEOUT,
+                    pullsync::get_cursors(&mut ctl, peer_id),
+                )
+                .await;
+                (peer_id, bins, cursors)
+            }
+        });
         let results = futures::future::join_all(fetches).await;
 
-        for (peer_id, base_bin, top_bin, cursors) in results {
+        for (peer_id, bins, cursors) in results {
             let Ok(Ok(cursors)) = cursors else {
                 continue; // timed out or errored → try again next pass
             };
-            for bin in base_bin..=top_bin {
+            for bin in bins {
                 if active.contains_key(&(peer_id, bin)) {
                     continue;
                 }
@@ -668,6 +687,45 @@ async fn pull_bin(
     }
 }
 
+/// The bins to pull from one covering peer at proximity `b_p` to the
+/// target, per watch kind. Small (≤ 1 + window+1 entries), duplicates
+/// removed, order irrelevant (each bin becomes its own puller).
+///
+/// - **GSOC**: the watch target *is* the chunk address, so
+///   `PO(chunk, peer) = b_p` exactly — one bin.
+/// - **PSS**: two regimes by the trie geometry (see
+///   [`PSS_MINED_PREFIX_BITS`]): a peer shallower than the mined
+///   prefix holds the trojan at exactly `b_p`; a peer at or deeper
+///   than the prefix holds it around bin `L` (geometric tail), which
+///   can be *shallower* than `b_p` — the bug the old
+///   `b_p..=b_p+window` selection had.
+fn covering_bins(b_p: u8, want_gsoc: bool, want_pss: bool) -> Vec<u8> {
+    let mut bins: Vec<u8> = Vec::new();
+    if want_gsoc {
+        bins.push(b_p);
+    }
+    if want_pss {
+        if b_p < PSS_MINED_PREFIX_BITS {
+            // Deterministic regime: PO(c, p) = b_p exactly.
+            if !bins.contains(&b_p) {
+                bins.push(b_p);
+            }
+        } else {
+            // Geometric regime: PO(c, p) = L + Geom(1/2), independent
+            // of b_p.
+            let top = PSS_MINED_PREFIX_BITS
+                .saturating_add(PSS_BIN_WINDOW)
+                .min(MAX_BIN);
+            for bin in PSS_MINED_PREFIX_BITS..=top {
+                if !bins.contains(&bin) {
+                    bins.push(bin);
+                }
+            }
+        }
+    }
+    bins
+}
+
 /// The `n` connected peers whose overlays are closest to `target`,
 /// deepest first. Marks the snapshot seen (`borrow_and_update`) so the
 /// driver's `changed()` wait really waits for the *next* change.
@@ -768,6 +826,77 @@ mod tests {
         // Second covering peer delivers the same version: deduped.
         assert!(deliver_chunk(&seen, &watch, &out, &address, &data).await);
         assert!(rx.try_recv().is_err());
+    }
+
+    /// Viktor Trón's correction, deterministic regime: a covering peer
+    /// SHALLOWER than the mined prefix (`b_p < L`) holds the trojan at
+    /// exactly bin `b_p` — the old `b_p..=b_p+3` window pulled three
+    /// bins that cannot contain it.
+    #[test]
+    fn pss_bins_shallow_peer_is_exact() {
+        assert_eq!(covering_bins(11, false, true), vec![11]);
+        assert_eq!(covering_bins(0, false, true), vec![0]);
+        assert_eq!(
+            covering_bins(PSS_MINED_PREFIX_BITS - 1, false, true),
+            vec![PSS_MINED_PREFIX_BITS - 1]
+        );
+    }
+
+    /// Viktor Trón's correction, geometric regime: a covering peer AT
+    /// or DEEPER than the mined prefix (`b_p >= L`) holds the trojan at
+    /// `L + Geom(1/2)` — *independent of `b_p`*, i.e. possibly
+    /// SHALLOWER than `b_p`. The old selection pulled `b_p..=b_p+3` and
+    /// missed the trojan entirely once `b_p > L + 3`.
+    #[test]
+    fn pss_bins_deep_peer_pulls_the_mined_prefix_window() {
+        let l = PSS_MINED_PREFIX_BITS;
+        let expect: Vec<u8> = (l..=l + PSS_BIN_WINDOW).collect();
+        // b_p == L: same bins either way, but for the right reason.
+        assert_eq!(covering_bins(l, false, true), expect);
+        // b_p = 20 > L+3: the old code pulled 20..=23 — zero overlap
+        // with where the trojan actually sits.
+        assert_eq!(covering_bins(20, false, true), expect);
+        // Very deep peer (co-resident rendezvous node): same.
+        assert_eq!(covering_bins(30, false, true), expect);
+    }
+
+    /// GSOC is unaffected by the correction: the watch target IS the
+    /// chunk address, so `PO(chunk, peer) = b_p` exactly — one bin,
+    /// window never applies.
+    #[test]
+    fn gsoc_bins_are_always_exact() {
+        assert_eq!(covering_bins(5, true, false), vec![5]);
+        assert_eq!(covering_bins(20, true, false), vec![20]);
+    }
+
+    /// A mixed watch (GSOC + PSS on one shared lurker) takes the UNION:
+    /// the exact GSOC bin plus the PSS regime bins, deduplicated —
+    /// which for a deep peer means the GSOC bin sits deeper than the
+    /// whole PSS window.
+    #[test]
+    fn mixed_watch_takes_the_union_of_both_kinds() {
+        let l = PSS_MINED_PREFIX_BITS;
+        // Deep peer: exact GSOC bin 20 + PSS window 16..=19.
+        let bins = covering_bins(20, true, true);
+        assert!(bins.contains(&20));
+        for bin in l..=l + PSS_BIN_WINDOW {
+            assert!(bins.contains(&bin), "missing PSS bin {bin}");
+        }
+        assert_eq!(bins.len(), 1 + usize::from(PSS_BIN_WINDOW) + 1);
+
+        // Shallow peer: both kinds want exactly b_p — deduplicated.
+        assert_eq!(covering_bins(9, true, true), vec![9]);
+
+        // Peer inside the PSS window: GSOC bin dedups into it.
+        let bins = covering_bins(l + 1, true, true);
+        assert_eq!(bins.len(), usize::from(PSS_BIN_WINDOW) + 1);
+    }
+
+    /// Nothing watched → no bins (the driver skips idle watches
+    /// upstream, but the function must not invent coverage).
+    #[test]
+    fn no_watch_no_bins() {
+        assert!(covering_bins(12, false, false).is_empty());
     }
 
     #[test]
