@@ -63,6 +63,20 @@ final class AntNode: ObservableObject {
     private var handle: OpaquePointer?
     private var peerPollTask: Task<Void, Never>?
     private var pathMonitor: NWPathMonitor?
+    /// Serialises the node's lifecycle transitions (`start`, `shutdown`,
+    /// `restoreAccount`), so exactly one is ever in flight.
+    ///
+    /// `status` cannot do that job on its own: `restoreAccount` has to
+    /// force it back to `.idle` — a `.failed` node is exactly the case
+    /// Restore exists for — which would let a second `start()` slip past
+    /// the idle guard while the first is still inside
+    /// `ant_init_with_identity`. Two inits over one data dir race in
+    /// `bind_account_state` (each parking the other's postage /
+    /// chequebook / SWAP state, worst case hitting its "refusing to
+    /// start: both exist" abort), leave whichever node lost the `handle`
+    /// assignment running unshut-down over state now scoped to the other
+    /// account, and fight over the gateway's fixed port.
+    private var lifecycle: Task<Void, Never>?
     /// Gnosis RPC handed to the gateway so its `/wallet` and `/stamps`
     /// surfaces read real on-chain state (the `chain` build feature).
     private var gnosisRpc: String = AntNode.defaultRpc
@@ -71,8 +85,26 @@ final class AntNode: ObservableObject {
 
     // MARK: - Lifecycle
 
+    /// Run `body` once every lifecycle transition queued ahead of it has
+    /// finished. Code already running *inside* a transition must call the
+    /// `perform…` variants directly — coming back through here would make
+    /// it wait on the queue entry it is.
+    private func serialized(_ body: @escaping @MainActor () async -> Void) async {
+        let previous = lifecycle
+        let task = Task { @MainActor in
+            await previous?.value
+            await body()
+        }
+        lifecycle = task
+        await task.value
+    }
+
     func start(rpc: String? = nil) async {
-        guard case .idle = status else { return }
+        await serialized { await self.performStart(rpc: rpc) }
+    }
+
+    private func performStart(rpc: String?) async {
+        guard case .idle = status, handle == nil else { return }
         status = .starting
         if let rpc, !rpc.trimmingCharacters(in: .whitespaces).isEmpty {
             gnosisRpc = rpc
@@ -86,7 +118,15 @@ final class AntNode: ObservableObject {
 
         let identity: String
         do {
-            identity = try AccountKeystore.loadOrCreateIdentity()
+            // Minting is only ever right on a genuine first launch. An
+            // empty Keychain on a data dir that already ran an account
+            // means the key was lost, not that there never was one — most
+            // sharply when another device in the iCloud circle turned the
+            // sync toggle off and the deletion propagated here. Creating
+            // a fresh account there would bury the funded one under a
+            // stranger's marker; failing sends the user to Restore.
+            identity = try AccountKeystore.loadOrCreateIdentity(
+                allowCreate: !Self.hasPriorAccount(in: dataDir))
         } catch {
             // An unreadable stored key (e.g. the enclave wrapping key is
             // gone) must not be a dead end: the Storage tab's Restore
@@ -122,6 +162,10 @@ final class AntNode: ObservableObject {
     }
 
     func shutdown() async {
+        await serialized { await self.performShutdown() }
+    }
+
+    private func performShutdown() async {
         guard let h = handle else { return }
         handle = nil
         peerPollTask?.cancel()
@@ -303,7 +347,9 @@ final class AntNode: ObservableObject {
 
     /// Move the stored account key between iCloud-backed and device-bound
     /// protection. Takes effect at rest immediately; the running node is
-    /// unaffected (it already holds the key in memory).
+    /// unaffected (it already holds the key in memory). Turning it off
+    /// also removes the key from the user's *other* devices, so callers
+    /// confirm first — see `AccountKeystore.setICloudBackup`.
     func setICloudBackup(_ enabled: Bool) throws {
         try AccountKeystore.setICloudBackup(enabled)
         keyProtection = AccountKeystore.currentProtection()
@@ -320,15 +366,34 @@ final class AntNode: ObservableObject {
     /// `ant-ffi`). Without that the checklist would keep reporting the
     /// old account's plan as active while every stamp the restored key
     /// signs over it is rejected by peers.
+    ///
+    /// Restoring is one transition, run on the lifecycle queue: a Restore
+    /// tapped while the launch `start()` is still inside
+    /// `ant_init_with_identity` has to wait for it rather than race a
+    /// second init over the same data dir.
     func restoreAccount(fromKey key: String) async throws {
-        _ = try AccountKeystore.restore(fromAccountKey: key)
-        await shutdown()
-        // `shutdown()` is a no-op for a node that never came up, so reset
-        // the status by hand — otherwise `start()`'s idle guard would
-        // strand a `.failed` node (exactly the case Restore exists for).
-        status = .idle
-        await start()
-        if case .failed(let m) = status { throw AntError.op(m) }
+        // Validate before queueing so a typo comes back straight away
+        // instead of behind an in-flight start. Nothing is written yet.
+        _ = try AccountKeystore.identity(fromAccountKey: key)
+        var failure: Error?
+        await serialized {
+            do {
+                _ = try AccountKeystore.restore(fromAccountKey: key)
+            } catch {
+                failure = error
+                return
+            }
+            await self.performShutdown()
+            // `performShutdown()` is a no-op for a node that never came
+            // up, so reset the status by hand — otherwise the idle guard
+            // would strand a `.failed` node (exactly the case Restore
+            // exists for). Safe only because the queue guarantees no
+            // other start is in flight.
+            self.status = .idle
+            await self.performStart(rpc: nil)
+            if case .failed(let m) = self.status { failure = AntError.op(m) }
+        }
+        if let failure { throw failure }
     }
 
     // MARK: - Refresh
@@ -431,6 +496,16 @@ final class AntNode: ObservableObject {
         let dir = base.appendingPathComponent("antstream", isDirectory: true)
         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
+    }
+
+    /// Has an account already run against this data dir? `ant-ffi` writes
+    /// `account.json` (the public address only) on every start, so its
+    /// presence means an earlier account's postage / chequebook / SWAP
+    /// state is sitting at the canonical paths. A reinstall takes the
+    /// container with it, so this is `false` on a real first launch.
+    private static func hasPriorAccount(in dataDir: URL) -> Bool {
+        FileManager.default.fileExists(
+            atPath: dataDir.appendingPathComponent("account.json").path)
     }
 
     private static func seedPeerstoreIfNeeded(in dataDir: URL) {

@@ -39,6 +39,13 @@ Bundle id: `at.vibing.ant.stream`. Data dir:
    publish / feed / SOC writes; ultra-light is read-only. This is the
    surface the publisher (#67) and viewer (#66) will use.
 
+`start()`, `shutdown()` and the Restore flow's restart all run on one
+lifecycle queue, so only one of them is ever in flight: a Restore tapped
+while the launch `start()` is still inside `ant_init_with_identity` waits
+for it rather than racing a second init over the same data dir (two
+concurrent `bind_account_state` calls would park each other's postage /
+chequebook state, and both gateways would want port 1633).
+
 Backgrounding spends the grace window inside `beginBackgroundTask` while
 `ant_suspend` checkpoints; foregrounding calls `ant_resume` (re-dials the
 peer set the OS reaped) then `ant_wake`, and rebinds the gateway — a
@@ -92,6 +99,16 @@ leaves the Keychain empty even for an instant — the new item is written
 (add, or update when one is already there) before the old variant is
 removed — so a failed write leaves the previous key in place instead of
 letting the next launch mint a brand-new account over it.
+
+Turning the **iCloud Keychain** toggle *off* is the one change that reaches
+past this device: a `kSecAttrSynchronizable` item is deleted across the
+whole iCloud circle, so the user's other iPhone/iPad loses the key too. It
+goes through a confirmation alert that says exactly that, with a "Back up
+key first" way out. As a backstop, a device on the receiving end of such a
+deletion — empty Keychain, but a data dir that has already run an account
+(`account.json` is there) — refuses to mint a replacement and reports
+"This device's account key is gone", pointing at Restore, instead of
+silently starting a new account over the funded one's state.
 
 Restoring a *different* account also re-scopes what the node keeps on
 disk: `ant_init_with_identity` parks the previous account's postage

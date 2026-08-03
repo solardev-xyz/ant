@@ -19,6 +19,11 @@ struct StorageView: View {
     @State private var showRestore = false
     @State private var exportedKey: String?
     @State private var busy = false
+    /// The iCloud switch's own state. Mirrors ``AntNode/keyProtection``,
+    /// but is separate from it because turning the switch *off* only asks
+    /// a question — the key is not moved until the alert is confirmed.
+    @State private var iCloudOn = false
+    @State private var confirmICloudOff = false
 
     var body: some View {
         ZStack {
@@ -62,6 +67,19 @@ struct StorageView: View {
         .sheet(isPresented: $showRestore) {
             RestoreAccountSheet { message in banner.flash(message) }
         }
+        // Switching sync off is destructive beyond this device: an iCloud
+        // Keychain deletion propagates to every device in the circle, so
+        // the user's other iPhone/iPad loses the key too — and the next
+        // launch there finds an empty Keychain. Never on a stray tap.
+        .alert("Turn off iCloud recovery?", isPresented: $confirmICloudOff) {
+            Button("Back up key first") { iCloudOn = true; revealKey() }
+            Button("Turn off", role: .destructive) { applyICloudBackup(false) }
+            Button("Cancel", role: .cancel) { iCloudOn = true }
+        } message: {
+            Text("This removes the account key from iCloud Keychain on all your devices, not just this one. Afterwards only this device has it — anywhere else the account can be recovered only from your backed-up key.")
+        }
+        .onAppear { syncICloudSwitch() }
+        .onChange(of: node.keyProtection) { _, _ in syncICloudSwitch() }
         .task {
             await node.refreshAll()
             await node.refreshValidity(rpc: rpc)
@@ -251,12 +269,17 @@ struct StorageView: View {
                     .font(.caption)
                     .foregroundStyle(.white.opacity(0.65))
 
-                Toggle(isOn: iCloudBinding) {
+                Toggle(isOn: $iCloudOn) {
                     Text("Recover with iCloud Keychain")
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.white)
                 }
                 .tint(.green)
+                .onChange(of: iCloudOn) { _, on in
+                    // Ignore the echo of `syncICloudSwitch()`.
+                    guard on != storedSyncsToICloud else { return }
+                    if on { applyICloudBackup(true) } else { confirmICloudOff = true }
+                }
 
                 Text("Your account key keeps your broadcasts yours. Back it up somewhere safe — anyone with it controls this account.")
                     .font(.subheadline)
@@ -287,22 +310,27 @@ struct StorageView: View {
         }
     }
 
-    /// Toggling this re-stores the key under the other protection — read
-    /// through the old one first, so the account survives either way.
-    private var iCloudBinding: Binding<Bool> {
-        Binding(
-            get: { node.keyProtection?.syncsToICloud == true },
-            set: { enabled in
-                do {
-                    try node.setICloudBackup(enabled)
-                    banner.flash(enabled
-                                 ? "Account key will recover from iCloud Keychain"
-                                 : "Account key is now device-only")
-                } catch {
-                    banner.flash(error.localizedDescription)
-                }
-            }
-        )
+    private var storedSyncsToICloud: Bool { node.keyProtection?.syncsToICloud == true }
+
+    /// Put the switch back in step with what is actually stored — after a
+    /// cancelled or failed change, and whenever the protection moves.
+    private func syncICloudSwitch() {
+        if iCloudOn != storedSyncsToICloud { iCloudOn = storedSyncsToICloud }
+    }
+
+    /// Re-store the key under the other protection — read through the old
+    /// one first, so the account survives either way. `false` also deletes
+    /// the synced item, which is why it is only reached from the alert.
+    private func applyICloudBackup(_ enabled: Bool) {
+        do {
+            try node.setICloudBackup(enabled)
+            banner.flash(enabled
+                         ? "Account key will recover from iCloud Keychain"
+                         : "Account key removed from iCloud — this device only")
+        } catch {
+            banner.flash(error.localizedDescription)
+        }
+        syncICloudSwitch()
     }
 
     private var advancedCard: some View {

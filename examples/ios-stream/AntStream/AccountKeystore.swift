@@ -65,9 +65,13 @@ enum AccountKeystore {
         case enclave(String)
         case ffi(String)
         case corrupt(String)
+        /// Nothing stored, on a device that has run an account before.
+        case missing
 
         var errorDescription: String? {
             switch self {
+            case .missing:
+                return "This device's account key is gone. Paste your backed-up key under Restore to get the account back."
             case .keychain(let status):
                 let detail = SecCopyErrorMessageString(status, nil) as String?
                 return "Keychain error \(status)\(detail.map { ": \($0)" } ?? "")"
@@ -103,8 +107,18 @@ enum AccountKeystore {
 
     /// The identity document to hand `ant_init_with_identity`, creating
     /// (and storing) one on first launch. Never writes the key to disk.
-    static func loadOrCreateIdentity() throws -> String {
+    ///
+    /// `allowCreate` is the caller's answer to "is this *really* a first
+    /// launch?" (see `AntNode.hasPriorAccount`). An empty Keychain on an
+    /// install that has already run an account is a lost key, not a new
+    /// user — most sharply when the key was synced and another device in
+    /// the iCloud circle turned sync off, which deletes the item on every
+    /// device. Minting there would silently strand a funded account, so
+    /// the caller gets ``KeystoreError/missing`` and sends the user to
+    /// Restore instead.
+    static func loadOrCreateIdentity(allowCreate: Bool = true) throws -> String {
         if let existing = try loadIdentity() { return existing }
+        guard allowCreate else { throw KeystoreError.missing }
         let json = try generateIdentity()
         try store(identity: json, protection: preferredProtection())
         return json
@@ -136,7 +150,15 @@ enum AccountKeystore {
 
     /// Move the stored identity between iCloud-backed and device-bound
     /// protection. Reads the identity through the *old* protection first,
-    /// so the key survives the switch either way.
+    /// so the key survives the switch **on this device** either way.
+    ///
+    /// Turning sync *off* is destructive on the user's *other* devices:
+    /// removing a `kSecAttrSynchronizable` item deletes it right across
+    /// the iCloud circle, so every other device that recovered this
+    /// account loses its only copy of the key. Callers must confirm that
+    /// with the user first (`StorageView`'s alert) — and a device on the
+    /// receiving end of such a deletion refuses to mint a replacement
+    /// account (see ``loadOrCreateIdentity(allowCreate:)``).
     static func setICloudBackup(_ enabled: Bool) throws {
         guard let identity = try loadIdentity() else { return }
         let target: Protection = enabled ? .iCloudKeychain : preferredProtection()
