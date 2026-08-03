@@ -89,6 +89,50 @@ AntHandle *ant_init_with_options(const char *data_dir,
                                  char **out_err);
 
 /*
+ * Like ant_init_with_options, but the *host* owns the account key.
+ * `identity_json` carries the identity document (the shape
+ * ant_identity_generate returns) and the library neither reads nor
+ * writes `identity.json` in the data dir — so on iOS the key can live
+ * in the Keychain (optionally Secure-Enclave-wrapped) instead of the
+ * app container. This is the `KeyProvider` backend PLAN.md §5.10 plans
+ * for mobile. `source_root` behaves exactly as above (pass NULL to
+ * disable the rebase).
+ *
+ * On success returns a non-NULL handle. On failure returns NULL and
+ * writes an allocated error string to *out_err (free with
+ * ant_free_string).
+ */
+AntHandle *ant_init_with_identity(const char *data_dir,
+                                  const char *source_root,
+                                  const char *identity_json,
+                                  char **out_err);
+
+/*
+ * Mint a fresh node identity without starting a node, so a host that
+ * keeps the key itself can create one on first run and hand it back to
+ * ant_init_with_identity.
+ *
+ * Returns an allocated JSON document
+ *   {"signing_key","overlay_nonce","libp2p_keypair"}
+ * — all hex, and all secret: `signing_key` *is* the account. Free with
+ * ant_free_string. On failure returns NULL and writes an allocated
+ * message into *out_err.
+ */
+char *ant_identity_generate(char **out_err);
+
+/*
+ * Rebuild a node identity from a backed-up account key (64 hex chars, a
+ * leading `0x` and surrounding whitespace are tolerated) — the "restore
+ * my account" path when the host's copy is gone but the user still has
+ * the key from ant_account_export_key. Returns the same JSON document
+ * as ant_identity_generate, with the overlay nonce derived from the
+ * account address so the restore is reproducible across devices.
+ * Malformed or out-of-range keys are rejected with an error rather than
+ * failing later at node startup.
+ */
+char *ant_identity_from_key(const char *signing_key_hex, char **out_err);
+
+/*
  * Download a Swarm reference. Accepted forms:
  *
  *   64-hex          single-chunk or multi-chunk /bytes tree

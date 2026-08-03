@@ -38,8 +38,8 @@ use ant_control::{
     ControlAck, ControlCommand, GetProgress, IdentityInfo, PeerInfo, RetrievalInfo, StatusSnapshot,
 };
 use ant_crypto::{
-    ethereum_address_from_public_key, overlay_from_ethereum_address, random_overlay_nonce,
-    random_secp256k1_secret, OVERLAY_NONCE_LEN, SECP256K1_SECRET_LEN,
+    ethereum_address_from_public_key, keccak256, overlay_from_ethereum_address,
+    random_overlay_nonce, random_secp256k1_secret, OVERLAY_NONCE_LEN, SECP256K1_SECRET_LEN,
 };
 use ant_node::{run_node, NodeConfig, UploadManager};
 use ant_p2p::UploadRuntime;
@@ -224,6 +224,25 @@ struct IdentityFile {
     libp2p_keypair: Option<String>,
 }
 
+/// Domain separator for the overlay nonce we derive when an identity is
+/// rebuilt from a bare account key ([`ant_identity_from_key`]). Deriving
+/// it from the *public* Ethereum address (never the secret) keeps a
+/// key-only restore reproducible — the same key always yields the same
+/// overlay — without publishing any function of the private key.
+const OVERLAY_NONCE_DOMAIN: &[u8] = b"ant-ffi/overlay-nonce/v1";
+
+/// Where the node's identity (account key) comes from.
+enum IdentitySource<'a> {
+    /// Legacy/desktop behaviour: `identity.json` inside the data dir,
+    /// created on first run. The library owns the key material on disk.
+    DataDir,
+    /// Host-provided identity JSON (same shape as `identity.json`). The
+    /// library never reads or writes the key on disk — this is the
+    /// `KeyProvider` backend PLAN.md § 5.10 plans for mobile, where the
+    /// host keeps the key in the iOS Keychain / Android Keystore.
+    Provided(&'a str),
+}
+
 #[derive(Debug, thiserror::Error)]
 enum FfiError {
     #[error("null pointer")]
@@ -299,7 +318,7 @@ pub unsafe extern "C" fn ant_init_with_options(
             } else {
                 Some(cstr_to_path(source_root)?)
             };
-            init_inner(&path, source_root.as_deref())
+            init_inner(&path, source_root.as_deref(), IdentitySource::DataDir)
         }));
         match result {
             Ok(Ok(handle)) => Box::into_raw(Box::new(handle)),
@@ -315,14 +334,122 @@ pub unsafe extern "C" fn ant_init_with_options(
     }
 }
 
-fn init_inner(data_dir: &Path, source_root: Option<&Path>) -> Result<AntHandle, FfiError> {
+/// Like [`ant_init_with_options`], but the *host* owns the account key:
+/// `identity_json` carries the identity document (the same shape
+/// [`ant_identity_generate`] returns) and the library neither reads nor
+/// writes `identity.json` in the data dir. This is the `KeyProvider`
+/// backend PLAN.md § 5.10 plans for mobile — on iOS the document lives in
+/// the Keychain (optionally Secure-Enclave-wrapped), so an attacker with
+/// the app container never gets the key.
+///
+/// Everything else behaves exactly like [`ant_init_with_options`].
+///
+/// # Safety
+///
+/// * `data_dir` and `identity_json` must be valid NUL-terminated UTF-8
+///   strings.
+/// * `source_root` must be a valid NUL-terminated UTF-8 string, or null.
+/// * `out_err` must point at a writable `*mut c_char` slot, or be null
+///   to opt out of error reporting.
+#[no_mangle]
+pub unsafe extern "C" fn ant_init_with_identity(
+    data_dir: *const c_char,
+    source_root: *const c_char,
+    identity_json: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut AntHandle {
+    unsafe {
+        clear_out_err(out_err);
+        let result = catch_unwind(AssertUnwindSafe(|| -> Result<AntHandle, FfiError> {
+            let path = cstr_to_path(data_dir)?;
+            let source_root = if source_root.is_null() {
+                None
+            } else {
+                Some(cstr_to_path(source_root)?)
+            };
+            let identity = cstr_to_str(identity_json)?;
+            init_inner(
+                &path,
+                source_root.as_deref(),
+                IdentitySource::Provided(identity),
+            )
+        }));
+        match result {
+            Ok(Ok(handle)) => Box::into_raw(Box::new(handle)),
+            Ok(Err(e)) => {
+                write_out_err(out_err, &e.to_string());
+                std::ptr::null_mut()
+            }
+            Err(_) => {
+                write_out_err(out_err, "panic in ant_init_with_identity");
+                std::ptr::null_mut()
+            }
+        }
+    }
+}
+
+/// Mint a fresh node identity without starting a node, so a host that
+/// keeps the key itself (iOS Keychain / Android Keystore) can create one
+/// on first run and feed it back to [`ant_init_with_identity`].
+///
+/// Returns an allocated JSON document
+/// `{"signing_key","overlay_nonce","libp2p_keypair"}` — all hex, and all
+/// secret: `signing_key` *is* the account. Free with
+/// [`ant_free_string`]. On failure returns null and writes an allocated
+/// message into `*out_err`.
+///
+/// # Safety
+///
+/// * `out_err` must point at a writable `*mut c_char` slot, or be null.
+#[no_mangle]
+pub unsafe extern "C" fn ant_identity_generate(out_err: *mut *mut c_char) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_identity_generate", || {
+            let id = new_identity().map_err(|e| e.to_string())?;
+            serde_json::to_string(&id).map_err(|e| format!("serialize identity: {e}"))
+        })
+    }
+}
+
+/// Rebuild a node identity from a backed-up account key (64 hex chars,
+/// `0x` prefix tolerated) — the "restore my account" path when the
+/// Keychain copy is gone but the user still has their key. Returns the
+/// same JSON document as [`ant_identity_generate`], with the overlay
+/// nonce derived from the account address so the restore is
+/// reproducible. Rejects malformed or out-of-range keys.
+///
+/// # Safety
+///
+/// * `signing_key_hex` must be a valid NUL-terminated UTF-8 string.
+/// * `out_err` must point at a writable `*mut c_char` slot, or be null.
+#[no_mangle]
+pub unsafe extern "C" fn ant_identity_from_key(
+    signing_key_hex: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_identity_from_key", || {
+            let hex_str = cstr_to_str(signing_key_hex).map_err(|e| e.to_string())?;
+            let id = identity_from_signing_key(hex_str).map_err(|e| e.to_string())?;
+            serde_json::to_string(&id).map_err(|e| format!("serialize identity: {e}"))
+        })
+    }
+}
+
+fn init_inner(
+    data_dir: &Path,
+    source_root: Option<&Path>,
+    identity: IdentitySource<'_>,
+) -> Result<AntHandle, FfiError> {
     install_log_subscriber();
 
     std::fs::create_dir_all(data_dir)
         .map_err(|e| FfiError::Io(format!("create data dir {}: {e}", data_dir.display())))?;
 
-    let id_path = data_dir.join("identity.json");
-    let (signing_secret, overlay_nonce, libp2p_keypair) = load_or_create_identity(&id_path)?;
+    let (signing_secret, overlay_nonce, libp2p_keypair) = match identity {
+        IdentitySource::DataDir => load_or_create_identity(&data_dir.join("identity.json"))?,
+        IdentitySource::Provided(json) => decode_identity_json(json)?,
+    };
 
     let vk = *SigningKey::from_bytes((&signing_secret).into())
         .map_err(|e| FfiError::Crypto(format!("invalid signing key: {e}")))?
@@ -2418,42 +2545,98 @@ fn load_or_create_identity(
     if id_path.exists() {
         let raw = std::fs::read_to_string(id_path)
             .map_err(|e| FfiError::Io(format!("read {}: {e}", id_path.display())))?;
-        let id: IdentityFile = serde_json::from_str(&raw)
-            .map_err(|e| FfiError::Io(format!("parse identity.json: {e}")))?;
-        let mut signing_secret = [0u8; SECP256K1_SECRET_LEN];
-        hex::decode_to_slice(&id.signing_key, &mut signing_secret)
-            .map_err(|e| FfiError::Io(format!("decode signing_key: {e}")))?;
-        let mut overlay_nonce = [0u8; OVERLAY_NONCE_LEN];
-        hex::decode_to_slice(&id.overlay_nonce, &mut overlay_nonce)
-            .map_err(|e| FfiError::Io(format!("decode overlay_nonce: {e}")))?;
-        let kp = if let Some(ref enc) = id.libp2p_keypair {
-            let bytes = hex::decode(enc)
-                .map_err(|e| FfiError::Io(format!("decode libp2p_keypair: {e}")))?;
-            Keypair::from_protobuf_encoding(&bytes)
-                .map_err(|e| FfiError::Io(format!("libp2p keypair protobuf: {e}")))?
-        } else {
-            secp256k1_keypair_from_signing_secret(&signing_secret)?
-        };
-        return Ok((signing_secret, overlay_nonce, kp));
+        return decode_identity_json(&raw);
     }
 
-    let signing_secret = random_secp256k1_secret();
-    let overlay_nonce = random_overlay_nonce();
-    let kp = secp256k1_keypair_from_signing_secret(&signing_secret)?;
+    let id = new_identity()?;
+    let decoded = decode_identity(&id)?;
+    let pretty = serde_json::to_string_pretty(&id)
+        .map_err(|e| FfiError::Io(format!("serialize identity: {e}")))?;
+    std::fs::write(id_path, pretty)
+        .map_err(|e| FfiError::Io(format!("write {}: {e}", id_path.display())))?;
+    Ok(decoded)
+}
 
-    let id = IdentityFile {
+/// Parse an identity JSON document (`identity.json`'s shape) into the
+/// three pieces the node loop needs. Shared by the on-disk path and the
+/// host-provided (`ant_init_with_identity`) path.
+fn decode_identity_json(
+    raw: &str,
+) -> Result<([u8; SECP256K1_SECRET_LEN], [u8; OVERLAY_NONCE_LEN], Keypair), FfiError> {
+    let id: IdentityFile =
+        serde_json::from_str(raw).map_err(|e| FfiError::Io(format!("parse identity json: {e}")))?;
+    decode_identity(&id)
+}
+
+fn decode_identity(
+    id: &IdentityFile,
+) -> Result<([u8; SECP256K1_SECRET_LEN], [u8; OVERLAY_NONCE_LEN], Keypair), FfiError> {
+    let signing_secret = decode_signing_key(&id.signing_key)?;
+    let mut overlay_nonce = [0u8; OVERLAY_NONCE_LEN];
+    hex::decode_to_slice(&id.overlay_nonce, &mut overlay_nonce)
+        .map_err(|e| FfiError::Io(format!("decode overlay_nonce: {e}")))?;
+    let kp = if let Some(ref enc) = id.libp2p_keypair {
+        let bytes =
+            hex::decode(enc).map_err(|e| FfiError::Io(format!("decode libp2p_keypair: {e}")))?;
+        Keypair::from_protobuf_encoding(&bytes)
+            .map_err(|e| FfiError::Io(format!("libp2p keypair protobuf: {e}")))?
+    } else {
+        secp256k1_keypair_from_signing_secret(&signing_secret)?
+    };
+    Ok((signing_secret, overlay_nonce, kp))
+}
+
+/// Decode a 64-hex account key (an optional `0x` prefix is tolerated,
+/// since that's how wallets hand keys to users) and reject anything the
+/// secp256k1 group won't accept — zero, or ≥ the curve order. Doing this
+/// here means a mistyped restore fails with a clear message instead of
+/// surfacing as an opaque node-startup error.
+fn decode_signing_key(hex_str: &str) -> Result<[u8; SECP256K1_SECRET_LEN], FfiError> {
+    let trimmed = hex_str.trim();
+    let body = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+    let mut secret = [0u8; SECP256K1_SECRET_LEN];
+    hex::decode_to_slice(body, &mut secret)
+        .map_err(|e| FfiError::Crypto(format!("decode signing_key: {e}")))?;
+    SigningKey::from_bytes((&secret).into())
+        .map_err(|e| FfiError::Crypto(format!("invalid signing key: {e}")))?;
+    Ok(secret)
+}
+
+/// A brand-new identity: random account key, random overlay nonce, and
+/// the libp2p keypair derived from the key.
+fn new_identity() -> Result<IdentityFile, FfiError> {
+    identity_file(random_secp256k1_secret(), random_overlay_nonce())
+}
+
+/// Rebuild an identity from a bare account key — the "I still have my
+/// backed-up key" restore path. The overlay nonce is derived from the
+/// account's Ethereum address so the same key always produces the same
+/// overlay, making the restore reproducible across devices.
+fn identity_from_signing_key(hex_str: &str) -> Result<IdentityFile, FfiError> {
+    let secret = decode_signing_key(hex_str)?;
+    let vk = *SigningKey::from_bytes((&secret).into())
+        .map_err(|e| FfiError::Crypto(format!("invalid signing key: {e}")))?
+        .verifying_key();
+    let eth = ethereum_address_from_public_key(&vk);
+    let mut preimage = Vec::with_capacity(OVERLAY_NONCE_DOMAIN.len() + eth.len());
+    preimage.extend_from_slice(OVERLAY_NONCE_DOMAIN);
+    preimage.extend_from_slice(&eth);
+    identity_file(secret, keccak256(&preimage))
+}
+
+fn identity_file(
+    signing_secret: [u8; SECP256K1_SECRET_LEN],
+    overlay_nonce: [u8; OVERLAY_NONCE_LEN],
+) -> Result<IdentityFile, FfiError> {
+    let kp = secp256k1_keypair_from_signing_secret(&signing_secret)?;
+    Ok(IdentityFile {
         signing_key: hex::encode(signing_secret),
         overlay_nonce: hex::encode(overlay_nonce),
         libp2p_keypair: Some(hex::encode(
             kp.to_protobuf_encoding()
                 .map_err(|e| FfiError::Io(format!("encode libp2p keypair: {e}")))?,
         )),
-    };
-    let pretty = serde_json::to_string_pretty(&id)
-        .map_err(|e| FfiError::Io(format!("serialize identity: {e}")))?;
-    std::fs::write(id_path, pretty)
-        .map_err(|e| FfiError::Io(format!("write {}: {e}", id_path.display())))?;
-    Ok((signing_secret, overlay_nonce, kp))
+    })
 }
 
 fn secp256k1_keypair_from_signing_secret(
@@ -2651,6 +2834,127 @@ mod tests {
     fn parse_reference_rejects_bad_length() {
         let err = parse_reference("abc").unwrap_err();
         assert!(matches!(err, FfiError::Reference(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn generated_identity_round_trips_through_json() {
+        let id = new_identity().expect("generate identity");
+        let json = serde_json::to_string(&id).expect("serialize");
+        let (secret, nonce, kp) = decode_identity_json(&json).expect("decode");
+        assert_eq!(hex::encode(secret), id.signing_key);
+        assert_eq!(hex::encode(nonce), id.overlay_nonce);
+        // The embedded libp2p keypair must be the one derived from the
+        // account key, or the node would announce a peer id that doesn't
+        // match the overlay it signs handshakes for.
+        let derived = secp256k1_keypair_from_signing_secret(&secret).expect("derive keypair");
+        assert_eq!(kp.public().to_peer_id(), derived.public().to_peer_id());
+    }
+
+    #[test]
+    fn generated_identities_are_distinct() {
+        let a = new_identity().expect("generate a");
+        let b = new_identity().expect("generate b");
+        assert_ne!(a.signing_key, b.signing_key);
+        assert_ne!(a.overlay_nonce, b.overlay_nonce);
+    }
+
+    #[test]
+    fn identity_from_key_is_reproducible() {
+        let key = "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+        let a = identity_from_signing_key(key).expect("from key");
+        let b = identity_from_signing_key(key).expect("from key again");
+        assert_eq!(a.signing_key, key);
+        // Same key ⇒ same overlay nonce ⇒ same overlay, so restoring on a
+        // second device lands the node in the same neighbourhood.
+        assert_eq!(a.overlay_nonce, b.overlay_nonce);
+        assert_eq!(a.libp2p_keypair, b.libp2p_keypair);
+    }
+
+    #[test]
+    fn identity_from_key_accepts_0x_prefix_and_whitespace() {
+        let key = "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+        let bare = identity_from_signing_key(key).expect("bare");
+        let prefixed = identity_from_signing_key(&format!("  0x{key}\n")).expect("prefixed");
+        assert_eq!(bare.signing_key, prefixed.signing_key);
+        assert_eq!(bare.overlay_nonce, prefixed.overlay_nonce);
+    }
+
+    #[test]
+    fn identity_from_key_rejects_bad_keys() {
+        // Too short, not hex, zero, and ≥ the secp256k1 group order.
+        for bad in [
+            "abcd",
+            "zz0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
+            &"0".repeat(64),
+            "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
+        ] {
+            assert!(
+                identity_from_signing_key(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_identity_json_rejects_malformed_documents() {
+        assert!(decode_identity_json("not json").is_err());
+        // Valid JSON, but the nonce isn't 32 bytes of hex.
+        let id = new_identity().expect("generate identity");
+        let bad = format!(
+            r#"{{"signing_key":"{}","overlay_nonce":"beef","libp2p_keypair":null}}"#,
+            id.signing_key
+        );
+        assert!(decode_identity_json(&bad).is_err());
+    }
+
+    #[test]
+    fn data_dir_identity_is_written_once_and_reused() {
+        let dir = std::env::temp_dir().join(format!(
+            "ant-ffi-identity-datadir-{}-{:p}",
+            std::process::id(),
+            &0u8
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let id_path = dir.join("identity.json");
+
+        let (first, nonce, _) = load_or_create_identity(&id_path).expect("create");
+        assert!(id_path.exists(), "first call must persist identity.json");
+        let (second, nonce2, _) = load_or_create_identity(&id_path).expect("reload");
+        assert_eq!(first, second, "reload must return the same account key");
+        assert_eq!(nonce, nonce2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn provided_identity_leaves_no_key_on_disk() {
+        // The whole point of the host-held path: nothing key-shaped may
+        // land in the data dir when the embedder supplies the identity.
+        let dir = std::env::temp_dir().join(format!(
+            "ant-ffi-identity-provided-{}-{:p}",
+            std::process::id(),
+            &0u8
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        let id = new_identity().expect("generate identity");
+        let json = serde_json::to_string(&id).expect("serialize");
+        let (secret, ..) = decode_identity_json(&json).expect("decode provided identity");
+        assert_eq!(hex::encode(secret), id.signing_key);
+
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "expected an empty data dir, got {entries:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ParsedRef doesn't derive Debug because [u8; 32] wouldn't print
