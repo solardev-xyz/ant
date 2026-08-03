@@ -104,7 +104,7 @@ struct BenchView: View {
                 Text("Publisher throughput")
                     .font(.headline)
                     .foregroundStyle(.white)
-                Text(publishToSwarm
+                Text(willPublish
                      ? "Publishes synthetic video segments to Swarm exactly the way a broadcast will — one POST per segment through this device's node — and measures what it sustains."
                      : "Measures only the on-device work (splitting each segment into chunks and stamping them). No network, no storage plan needed — this is the CPU ceiling, not the broadcast number.")
                     .font(.subheadline)
@@ -140,7 +140,12 @@ struct BenchView: View {
                     .font(.caption)
                     .foregroundStyle(.white.opacity(0.6))
 
-                Toggle(isOn: $publishToSwarm) {
+                // Bound to `willPublish`, not to the raw preference: a
+                // device with no plan cannot publish, and a switch left
+                // reading "on" there would contradict both the sentence
+                // under it and what the run actually does.
+                Toggle(isOn: Binding(get: { willPublish },
+                                     set: { publishToSwarm = $0 })) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Publish to Swarm")
                             .font(.subheadline.weight(.semibold))
@@ -265,6 +270,12 @@ struct BenchView: View {
     /// batch id to stamp with.
     private var canPublish: Bool { node.isReadyToBroadcast && batchId != nil }
 
+    /// What this run will *actually* do. Every surface that describes
+    /// the run — the blurb, the switch, the mode the node is started in
+    /// — reads this one expression, so none of them can promise a
+    /// network measurement the device can't take.
+    private var willPublish: Bool { publishToSwarm && canPublish }
+
     private var batchId: String? {
         guard let plan = node.plan, plan.enabled, !plan.batchId.isEmpty else { return nil }
         return plan.batchId
@@ -281,7 +292,15 @@ struct BenchView: View {
     /// e.g. `iPhone16,1`. `UIDevice.model` only ever says "iPhone", which
     /// cannot distinguish the two device generations the issue asks to
     /// compare.
+    ///
+    /// On a simulator `uname` reports the *host* architecture, which
+    /// would file a simulator row as if it came off a phone — so the
+    /// simulated model is used instead, and marked as simulated.
     private static var deviceModel: String {
+        if let simulated = ProcessInfo.processInfo
+            .environment["SIMULATOR_MODEL_IDENTIFIER"], !simulated.isEmpty {
+            return "Simulator \(simulated)"
+        }
         var info = utsname()
         uname(&info)
         let identifier = withUnsafeBytes(of: &info.machine) { raw in
@@ -308,7 +327,7 @@ struct BenchView: View {
         // 30-minute run would end up measuring the sleep timer.
         UIApplication.shared.isIdleTimerDisabled = true
 
-        let batch = publishToSwarm ? batchId : nil
+        let batch = willPublish ? batchId : nil
         Task {
             do {
                 try await node.startBench(
