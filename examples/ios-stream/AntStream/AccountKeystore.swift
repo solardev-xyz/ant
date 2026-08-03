@@ -159,8 +159,13 @@ enum AccountKeystore {
     /// with the user first (`StorageView`'s alert) — and a device on the
     /// receiving end of such a deletion refuses to mint a replacement
     /// account (see ``loadOrCreateIdentity(allowCreate:)``).
+    ///
+    /// Throws ``KeystoreError/missing`` when nothing is stored: there is
+    /// no key to protect (or un-protect), and a silent no-op here would
+    /// let the lost-key state flash a "will recover from iCloud" banner
+    /// over an empty Keychain. The error's message points at Restore.
     static func setICloudBackup(_ enabled: Bool) throws {
-        guard let identity = try loadIdentity() else { return }
+        guard let identity = try loadIdentity() else { throw KeystoreError.missing }
         let target: Protection = enabled ? .iCloudKeychain : preferredProtection()
         try store(identity: identity, protection: target)
     }

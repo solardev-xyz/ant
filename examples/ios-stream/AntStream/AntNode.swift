@@ -241,6 +241,17 @@ final class AntNode: ObservableObject {
         // wait for the ones already inside the node to come back before
         // `ant_shutdown` frees the memory they are running on.
         await drainBorrows()
+        // Everything account-scoped goes too: after a restore the
+        // Keychain holds the *new* account, and if the subsequent start
+        // fails these would keep rendering the old account's plan,
+        // chequebook and address as live — nothing refreshes them while
+        // `handle == nil`. Cleared after the drain, because an in-flight
+        // refresh publishes its (now stale) result before the drain
+        // resumes us; a successful start repopulates via `refreshAll()`.
+        plan = nil
+        account = nil
+        settlement = nil
+        validity = nil
         await Task.detached(priority: .userInitiated) {
             _ = ant_stop_gateway(h)
             ant_shutdown(h)

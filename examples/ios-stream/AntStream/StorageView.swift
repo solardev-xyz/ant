@@ -374,7 +374,7 @@ struct StorageView: View {
                     } label: {
                         if busy { ProgressView() } else { Text("Find my storage automatically") }
                     }
-                    .disabled(busy || rpc.isEmpty)
+                    .disabled(busy)
                 } footer: {
                     Text("Searches the chain for any storage plan this account owns, and finishes the one-time settlement setup. May take a moment.")
                 }
@@ -440,11 +440,21 @@ struct StorageView: View {
 
     // MARK: helpers
 
+    /// The RPC to actually use: the field's placeholder shows the default,
+    /// so an empty field means "use the default" — same fallback as every
+    /// other flow (Get Started, Extend). Matters most on the
+    /// restore-onto-a-new-device path, which reaches this sheet before
+    /// Get Started ever filled the field in.
+    private var activeRpc: String {
+        let r = rpc.trimmingCharacters(in: .whitespaces)
+        return r.isEmpty ? AntNode.defaultRpc : r
+    }
+
     private func discover() async {
         busy = true
         defer { busy = false }
         do {
-            try await node.discoverStorage(rpc: rpc)
+            try await node.discoverStorage(rpc: activeRpc)
             showConnect = false
             if node.plan?.enabled == true {
                 banner.flash("Storage connected")
