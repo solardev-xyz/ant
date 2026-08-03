@@ -62,8 +62,7 @@ jobs:
           xcodebuild -project AntStream.xcodeproj -scheme AntStream \
             -configuration Debug \
             -destination "platform=iOS Simulator,name=${{ steps.sim.outputs.device }}" \
-            -derivedDataPath build \
-            CODE_SIGNING_ALLOWED=NO build
+            -derivedDataPath build build
 
       - name: Launch and capture screenshots
         working-directory: examples/ios-stream
