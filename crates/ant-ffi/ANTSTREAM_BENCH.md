@@ -50,11 +50,14 @@ further behind is not a pass, even with zero errors.
 | Linux x86_64 8 vCPU / no network | pipeline | 60000 kbit/s | 60.00 Mbit/s | 1846.5 | 985 / 1188 / 1271 | 992 | yes |
 | Linux x86_64 8 vCPU / no network | pipeline | 120000 kbit/s | 120.00 Mbit/s | 3691.9 | 1927 / 2217 / 2533 | 1959 | yes |
 | Linux x86_64 / local `antd` 0.5.43, no usable batch | publish | 3400 kbit/s | 0.00 Mbit/s | 0.0 | — | — | **no** (`400 … batch … not usable`) |
+| iOS simulator (iPhone18,1, macOS CI runner) | pipeline | 3400 kbit/s | 3.34 Mbit/s | 103.5 | 1391 / 2036 / — | 1243 | yes |
 
 Environment: Intel Haswell 8 vCPU, Linux 6.14, `ant-ffi` 0.5.43 release
 build, embedded node running alongside (100–114 BZZ peers), 2 s
 segments, 4-deep publish window. Pipeline rows: 180 s (3400) / 80 s
-(others), 20 s warm-up excluded.
+(others), 20 s warm-up excluded. Simulator row: 60 s run, 5 s warm-up,
+captured by the `antstream-visual` workflow (issue #70) driving the
+app's own bench sheet.
 
 **`pipeline` is not a broadcast number.** It measures only the
 on-device half of publishing — splitting each segment into its Swarm
@@ -76,8 +79,20 @@ What the measured rows do establish:
   issue's 3.4 Mbit/s target are the same number in different units —
   a desktop node with 400 peers sits exactly at 720p.
 * The publish path is wired correctly end-to-end against a real
-  `ant-gateway`: the last row is a real `POST /bzz` reaching the real
-  batch check, failing only for want of a funded batch.
+  `ant-gateway`: the `publish` row is a real `POST /bzz` reaching the
+  real batch check, failing only for want of a funded batch.
+* **The simulator row is the interesting one.** Same 850 KB segments,
+  but 1391 ms per segment against the Linux box's 80 ms — ≈ 4.9 Mbit/s
+  per publish path, only ~1.4× the 720p target. It still keeps up
+  (four segments publish concurrently), but on Apple silicon the
+  on-device pipeline is *not* free at 720p the way it is on desktop.
+  Treat it as a floor — a CI runner's simulator is virtualised and
+  shares a host — and take a real device pipeline row before reading
+  anything into it. It is, however, the reason the phone's CPU ceiling
+  is worth measuring rather than assumed, and it is measured from the
+  app itself: the run below came out of the AntStream UI on a macOS
+  runner via `antstream-visual`, i.e. through the whole
+  `ant_bench_start` → `_progress` → `_stop` FFI round trip.
 
 ### Owed
 
