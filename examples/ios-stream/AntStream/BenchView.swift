@@ -102,6 +102,12 @@ struct BenchView: View {
         .task {
             let seconds = UserDefaults.standard.integer(forKey: "antstreamBenchSeconds")
             guard seconds > 0, !running, report == nil else { return }
+            // A cold launch reaches this sheet before `ant_init` has
+            // returned; wait for the node the same way the button does.
+            for _ in 0..<60 where !nodeReady {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+            guard nodeReady else { return }
             durationSeconds = UInt64(seconds)
             start()
         }
@@ -171,8 +177,15 @@ struct BenchView: View {
                 .disabled(!canPublish)
                 .tint(.red.opacity(0.7))
 
-                GlassPillButton(title: "Start bench", icon: "gauge.with.needle",
-                                tint: .red.opacity(0.35)) { start() }
+                // The bench runs *on* the node, so there is nothing to
+                // start until `ant_init` has returned a handle. Without
+                // this the button is live for the first seconds after
+                // launch and answers with "AntStream is still starting
+                // up".
+                GlassPillButton(title: nodeReady ? "Start bench" : "Waiting for the node…",
+                                icon: nodeReady ? "gauge.with.needle" : "hourglass",
+                                tint: .red.opacity(nodeReady ? 0.35 : 0.15)) { start() }
+                    .disabled(!nodeReady)
             }
         }
     }
@@ -286,6 +299,10 @@ struct BenchView: View {
     /// — reads this one expression, so none of them can promise a
     /// network measurement the device can't take.
     private var willPublish: Bool { publishToSwarm && canPublish }
+
+    /// The node has a live handle. Every mode needs one — even the
+    /// no-network pipeline run drives the node's runtime.
+    private var nodeReady: Bool { node.status.isReady }
 
     private var batchId: String? {
         guard let plan = node.plan, plan.enabled, !plan.batchId.isEmpty else { return nil }

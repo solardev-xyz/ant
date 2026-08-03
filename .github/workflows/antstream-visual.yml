@@ -101,9 +101,12 @@ jobs:
           xcrun simctl terminate booted at.vibing.ant.stream || true
           xcrun simctl launch booted at.vibing.ant.stream \
             -antstreamShowBench YES -antstreamBenchSeconds 60
-          sleep 40
-          xcrun simctl io booted screenshot shots/04-bench-running.png
+          # The sheet waits for `ant_init` before starting (~20 s on a
+          # cold launch), so the first shot is ~25 s into the run and
+          # the second is after it has finished and reported.
           sleep 45
+          xcrun simctl io booted screenshot shots/04-bench-running.png
+          sleep 60
           xcrun simctl io booted screenshot shots/05-bench-report.png
           xcrun simctl spawn booted log show --last 5m \
             --predicate 'processImagePath contains "AntStream"' \
