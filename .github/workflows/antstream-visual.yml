@@ -74,9 +74,10 @@ jobs:
           xcrun simctl install booted "$APP"
           xcrun simctl launch booted at.vibing.ant.stream
           mkdir -p shots
-          # Cold start, before the node has any peers: the readiness
-          # checklist and the Go live gate must both read "not connected"
-          # here, however far the rest of the setup got.
+          # The app's first frame, before the node has settled: the Go
+          # live gate and the readiness checklist must agree here too,
+          # however far the setup got. (Peers land fast on a runner —
+          # airplane mode / zero peers stays a manual device check.)
           sleep 3
           xcrun simctl io booted screenshot shots/00-cold-start.png
           sleep 17
