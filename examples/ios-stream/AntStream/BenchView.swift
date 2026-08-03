@@ -94,6 +94,17 @@ struct BenchView: View {
             }
         }
         .onDisappear { pollTask?.cancel() }
+        // `-antstreamBenchSeconds <n>` starts a run of that length as
+        // soon as the sheet appears. Same UserDefaults launch-argument
+        // channel as `-antstreamShowBench`, and for the same reason:
+        // it is how `antstream-visual` captures the bench *running*
+        // rather than only the form that starts it.
+        .task {
+            let seconds = UserDefaults.standard.integer(forKey: "antstreamBenchSeconds")
+            guard seconds > 0, !running, report == nil else { return }
+            durationSeconds = UInt64(seconds)
+            start()
+        }
     }
 
     // MARK: cards
