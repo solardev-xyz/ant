@@ -383,10 +383,16 @@ struct StorageView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { showConnect = false }
+                    // Dismissing mid-search doesn't stop the search — the
+                    // node keeps scanning the chain, and a Restore tapped
+                    // meanwhile has to wait for it before the node can be
+                    // torn down. Keep the sheet (and its spinner) up so
+                    // that wait is visible rather than mysterious.
+                    Button("Cancel") { showConnect = false }.disabled(busy)
                 }
             }
         }
+        .interactiveDismissDisabled(busy)
         .presentationDetents([.medium])
     }
 

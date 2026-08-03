@@ -46,6 +46,16 @@ for it rather than racing a second init over the same data dir (two
 concurrent `bind_account_state` calls would park each other's postage /
 chequebook state, and both gateways would want port 1633).
 
+Ordinary FFI calls are not transitions, so the queue does not order them:
+each one hands the handle to a detached task and outlives the read that
+produced it (a chain-scanning `ant_storage_discover` can still be inside
+the node long after its sheet is gone). `AntNode.withHandle` counts those
+borrows, and `shutdown()` — including the one inside Restore — clears the
+handle and then waits for the count to reach zero before `ant_shutdown`
+frees it, so no call is ever left running on freed memory or writing the
+old account's state into a data dir `bind_account_state` has just
+re-scoped.
+
 Backgrounding spends the grace window inside `beginBackgroundTask` while
 `ant_suspend` checkpoints; foregrounding calls `ant_resume` (re-dials the
 peer set the OS reaped) then `ant_wake`, and rebinds the gateway — a

@@ -77,6 +77,12 @@ final class AntNode: ObservableObject {
     /// assignment running unshut-down over state now scoped to the other
     /// account, and fight over the gateway's fixed port.
     private var lifecycle: Task<Void, Never>?
+    /// How many FFI calls are currently *borrowing* ``handle`` — see
+    /// ``withHandle(_:)``.
+    private var borrowCount = 0
+    /// Parked ``performShutdown()`` calls waiting for `borrowCount` to
+    /// reach zero.
+    private var drainWaiters: [CheckedContinuation<Void, Never>] = []
     /// Gnosis RPC handed to the gateway so its `/wallet` and `/stamps`
     /// surfaces read real on-chain state (the `chain` build feature).
     private var gnosisRpc: String = AntNode.defaultRpc
@@ -97,6 +103,64 @@ final class AntNode: ObservableObject {
         }
         lifecycle = task
         await task.value
+    }
+
+    /// Run `body` with the live handle, holding it open for the call's
+    /// whole duration. Returns `nil` — without calling `body` — when
+    /// there is no node.
+    ///
+    /// Every ordinary FFI call hands its pointer to a detached task and
+    /// then suspends, so it outlives the `handle` read that produced it:
+    /// a chain-scanning `ant_storage_discover`, a `refreshValidity` RPC
+    /// or a backgrounding `ant_suspend` can still be inside the node
+    /// seconds later. `ant_shutdown` deallocates that handle, so freeing
+    /// it under one of them is a use-after-free — worst case the
+    /// still-running call writing the old account's state into a data dir
+    /// `bind_account_state` has already re-scoped to the restored one.
+    ///
+    /// The lifecycle queue cannot prevent that: it orders transitions
+    /// against each other, not against ordinary borrows. So borrows are
+    /// counted here instead, and ``performShutdown()`` waits for the
+    /// count to fall to zero before it frees anything.
+    private func withHandle<T>(_ body: (OpaquePointer) async throws -> T) async rethrows -> T? {
+        guard let h = handle else { return nil }
+        borrowCount += 1
+        defer { endBorrow() }
+        return try await body(h)
+    }
+
+    private func endBorrow() {
+        borrowCount -= 1
+        guard borrowCount == 0, !drainWaiters.isEmpty else { return }
+        let waiters = drainWaiters
+        drainWaiters = []
+        for waiter in waiters { waiter.resume() }
+    }
+
+    /// Wait until no FFI call is inside the node any more. Callers must
+    /// have cleared `handle` first, so no *new* borrow can start.
+    private func drainBorrows() async {
+        while borrowCount > 0 {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                drainWaiters.append(continuation)
+            }
+        }
+    }
+
+    /// Borrow the handle for one FFI call that returns an owned C string
+    /// (see ``withHandle(_:)`` and ``string(name:_:)``). Throws
+    /// ``AntError/notReady`` when there is no node.
+    private func ffiString(
+        name: String,
+        _ body: @escaping (OpaquePointer, UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?)
+            -> UnsafeMutablePointer<CChar>?
+    ) async throws -> String {
+        guard let value = try await withHandle({ h in
+            try await Self.string(name: name) { errPtr in body(h, errPtr) }
+        }) else {
+            throw AntError.notReady
+        }
+        return value
     }
 
     func start(rpc: String? = nil) async {
@@ -173,6 +237,10 @@ final class AntNode: ObservableObject {
         pathMonitor = nil
         peerCount = 0
         gatewayUp = false
+        // `handle` is nil from here, so no further call can borrow it —
+        // wait for the ones already inside the node to come back before
+        // `ant_shutdown` frees the memory they are running on.
+        await drainBorrows()
         await Task.detached(priority: .userInitiated) {
             _ = ant_stop_gateway(h)
             ant_shutdown(h)
@@ -185,19 +253,20 @@ final class AntNode: ObservableObject {
     /// needs; ultra-light is read-only). Idempotent node-side.
     @discardableResult
     func startGateway() async -> Bool {
-        guard let h = handle else { return false }
         let addr = Self.gatewayAddress
         let rpc = gnosisRpc
-        let ok = await Task.detached(priority: .userInitiated) { () -> Bool in
-            var errPtr: UnsafeMutablePointer<CChar>? = nil
-            let ok = addr.withCString { caddr in
-                rpc.withCString { crpc in
-                    ant_start_gateway(h, caddr, true, crpc, &errPtr)
+        guard let ok = await withHandle({ h in
+            await Task.detached(priority: .userInitiated) { () -> Bool in
+                var errPtr: UnsafeMutablePointer<CChar>? = nil
+                let ok = addr.withCString { caddr in
+                    rpc.withCString { crpc in
+                        ant_start_gateway(h, caddr, true, crpc, &errPtr)
+                    }
                 }
-            }
-            if !ok, let errPtr { ant_free_string(errPtr) }
-            return ok
-        }.value
+                if !ok, let errPtr { ant_free_string(errPtr) }
+                return ok
+            }.value
+        }) else { return false }
         gatewayUp = ok
         return ok
     }
@@ -207,11 +276,12 @@ final class AntNode: ObservableObject {
     /// (bounded node-side at ~5 s), so run it inside a
     /// `beginBackgroundTask` window.
     func suspend() async {
-        guard let h = handle else { return }
-        await Task.detached(priority: .userInitiated) {
-            var errPtr: UnsafeMutablePointer<CChar>? = nil
-            if ant_suspend(h, &errPtr) != 0, let errPtr { ant_free_string(errPtr) }
-        }.value
+        _ = await withHandle { h in
+            await Task.detached(priority: .userInitiated) {
+                var errPtr: UnsafeMutablePointer<CChar>? = nil
+                if ant_suspend(h, &errPtr) != 0, let errPtr { ant_free_string(errPtr) }
+            }.value
+        }
     }
 
     /// Undo `suspend()` on foreground / network-restored transitions.
@@ -219,13 +289,15 @@ final class AntNode: ObservableObject {
     /// suspension the sockets are half-open) and `ant_wake` restarts the
     /// work the suspension paused.
     func wake() async {
-        guard let h = handle else { return }
-        await Task.detached(priority: .userInitiated) {
-            var errPtr: UnsafeMutablePointer<CChar>? = nil
-            if ant_resume(h, &errPtr) != 0, let errPtr { ant_free_string(errPtr) }
-            var wakeErr: UnsafeMutablePointer<CChar>? = nil
-            if ant_wake(h, &wakeErr) != 0, let wakeErr { ant_free_string(wakeErr) }
-        }.value
+        guard handle != nil else { return }
+        _ = await withHandle { h in
+            await Task.detached(priority: .userInitiated) {
+                var errPtr: UnsafeMutablePointer<CChar>? = nil
+                if ant_resume(h, &errPtr) != 0, let errPtr { ant_free_string(errPtr) }
+                var wakeErr: UnsafeMutablePointer<CChar>? = nil
+                if ant_wake(h, &wakeErr) != 0, let wakeErr { ant_free_string(wakeErr) }
+            }.value
+        }
         // `ant_resume` recovers the swarm only: if the OS also tore down
         // the gateway's localhost listener it has to be rebound
         // separately (see ant.h). Re-binding a live gateway is a no-op
@@ -234,8 +306,10 @@ final class AntNode: ObservableObject {
     }
 
     private func restartGateway() async {
-        guard let h = handle else { return }
-        await Task.detached(priority: .userInitiated) { _ = ant_stop_gateway(h) }.value
+        guard handle != nil else { return }
+        _ = await withHandle { h in
+            await Task.detached(priority: .userInitiated) { _ = ant_stop_gateway(h) }.value
+        }
         await startGateway()
     }
 
@@ -273,8 +347,7 @@ final class AntNode: ObservableObject {
 
     /// Price a plan (no transaction). Returns the payment information.
     func quoteStorage(rpc: String, depth: UInt8, days: UInt64) async throws -> StorageQuote {
-        guard let h = handle else { throw AntError.notReady }
-        let json = try await Self.string(name: "price plan") { errPtr in
+        let json = try await ffiString(name: "price plan") { h, errPtr in
             rpc.withCString { ant_storage_quote(h, $0, depth, days, errPtr) }
         }
         guard let q = StreamDecoder.quote(from: json) else {
@@ -286,8 +359,7 @@ final class AntNode: ObservableObject {
     /// Buy + activate a plan funding only with xDAI: the node swaps the
     /// xBZZ shortfall on-chain itself, then buys the plan. Spends real funds.
     func buyStorage(rpc: String, depth: UInt8, amountPerChunk: String, immutable: Bool) async throws {
-        guard let h = handle else { throw AntError.notReady }
-        let json = try await Self.string(name: "activate storage") { errPtr in
+        let json = try await ffiString(name: "activate storage") { h, errPtr in
             rpc.withCString { crpc in
                 amountPerChunk.withCString { camt in
                     ant_storage_buy_xdai(h, crpc, depth, camt, immutable ? 1 : 0, errPtr)
@@ -300,8 +372,7 @@ final class AntNode: ObservableObject {
 
     /// Price extending the connected plan's lifetime by `days`.
     func quoteTopUp(rpc: String, days: UInt64) async throws -> StorageQuote {
-        guard let h = handle else { throw AntError.notReady }
-        let json = try await Self.string(name: "price extension") { errPtr in
+        let json = try await ffiString(name: "price extension") { h, errPtr in
             rpc.withCString { ant_storage_topup_quote(h, $0, days, errPtr) }
         }
         guard let q = StreamDecoder.quote(from: json) else {
@@ -313,8 +384,7 @@ final class AntNode: ObservableObject {
     /// Extend the connected plan's lifetime, funding only with xDAI.
     /// Spends real funds. Publishes the refreshed validity.
     func topUpStorage(rpc: String, amountPerChunk: String) async throws {
-        guard let h = handle else { throw AntError.notReady }
-        let json = try await Self.string(name: "extend storage") { errPtr in
+        let json = try await ffiString(name: "extend storage") { h, errPtr in
             rpc.withCString { crpc in
                 amountPerChunk.withCString { camt in
                     ant_storage_topup_xdai(h, crpc, camt, errPtr)
@@ -329,8 +399,7 @@ final class AntNode: ObservableObject {
     /// the retry path for the one-time chequebook deploy, so a plan that
     /// activated without settlement can be repaired without `antctl`.
     func discoverStorage(rpc: String) async throws {
-        guard let h = handle else { throw AntError.notReady }
-        _ = try await Self.string(name: "find storage") { errPtr in
+        _ = try await ffiString(name: "find storage") { h, errPtr in
             rpc.withCString { ant_storage_discover(h, $0, errPtr) }
         }
         await refreshAll()
@@ -339,8 +408,7 @@ final class AntNode: ObservableObject {
     // MARK: - Account
 
     func exportKey() async throws -> String {
-        guard let h = handle else { throw AntError.notReady }
-        return try await Self.string(name: "export key") { errPtr in
+        try await ffiString(name: "export key") { h, errPtr in
             ant_account_export_key(h, errPtr)
         }
     }
@@ -370,7 +438,11 @@ final class AntNode: ObservableObject {
     /// Restoring is one transition, run on the lifecycle queue: a Restore
     /// tapped while the launch `start()` is still inside
     /// `ant_init_with_identity` has to wait for it rather than race a
-    /// second init over the same data dir.
+    /// second init over the same data dir. The teardown additionally
+    /// waits for any ordinary FFI call still inside the old node (see
+    /// ``withHandle(_:)``), which the queue does not cover: an on-chain
+    /// discover left running by a dismissed Connect sheet must not be
+    /// executing on a handle `ant_shutdown` has freed.
     func restoreAccount(fromKey key: String) async throws {
         // Validate before queueing so a typo comes back straight away
         // instead of behind an in-flight start. Nothing is written yet.
@@ -405,8 +477,7 @@ final class AntNode: ObservableObject {
     }
 
     func refreshPlan() async {
-        guard let h = handle else { return }
-        if let json = try? await Self.string(name: "storage status", { errPtr in
+        if let json = try? await ffiString(name: "storage status", { h, errPtr in
             ant_storage_status(h, errPtr)
         }) {
             let decoded = StreamDecoder.plan(from: json)
@@ -415,8 +486,7 @@ final class AntNode: ObservableObject {
     }
 
     func refreshAccount() async {
-        guard let h = handle else { return }
-        if let json = try? await Self.string(name: "account info", { errPtr in
+        if let json = try? await ffiString(name: "account info", { h, errPtr in
             ant_account_info(h, errPtr)
         }) {
             let decoded = StreamDecoder.account(from: json)
@@ -427,8 +497,8 @@ final class AntNode: ObservableObject {
     /// Fetch the connected plan's remaining lifetime from chain. Needs a
     /// Gnosis RPC URL; a no-op when none is set or no plan is connected.
     func refreshValidity(rpc: String) async {
-        guard let h = handle, !rpc.isEmpty, hasStorage else { return }
-        if let json = try? await Self.string(name: "storage validity", { errPtr in
+        guard !rpc.isEmpty, hasStorage else { return }
+        if let json = try? await ffiString(name: "storage validity", { h, errPtr in
             rpc.withCString { ant_storage_validity(h, $0, errPtr) }
         }), let v = StreamDecoder.validity(from: json) {
             validity = v
@@ -436,8 +506,7 @@ final class AntNode: ObservableObject {
     }
 
     func refreshSettlement() async {
-        guard let h = handle else { return }
-        if let json = try? await Self.string(name: "settlement status", { errPtr in
+        if let json = try? await ffiString(name: "settlement status", { h, errPtr in
             ant_storage_settlement_status(h, errPtr)
         }) {
             let decoded = StreamDecoder.settlement(from: json)
@@ -449,18 +518,20 @@ final class AntNode: ObservableObject {
 
     private func startPollingPeers() {
         peerPollTask?.cancel()
-        guard let h = handle else { return }
-        peerPollTask = Task { [weak self] in
+        guard handle != nil else { return }
+        peerPollTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
-                let count = Int(ant_peer_count(h))
-                await MainActor.run {
-                    guard let self, self.handle == h else { return }
-                    // Publish only real changes: an unconditional
-                    // re-assign fires objectWillChange every second and
-                    // re-renders every observing view.
-                    let clamped = max(0, count)
-                    if self.peerCount != clamped { self.peerCount = clamped }
-                }
+                // Re-read the handle every tick rather than capturing it
+                // once: a shutdown clears it, and `ant_peer_count` is a
+                // cheap non-blocking read, so doing it inline on the main
+                // actor keeps it in the same atomic step as that check —
+                // no suspension in between for a shutdown to slip into.
+                guard let self, let h = self.handle else { return }
+                // Publish only real changes: an unconditional re-assign
+                // fires objectWillChange every second and re-renders
+                // every observing view.
+                let count = max(0, Int(ant_peer_count(h)))
+                if self.peerCount != count { self.peerCount = count }
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
         }
