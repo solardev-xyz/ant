@@ -358,7 +358,9 @@ final class AntNode: ObservableObject {
         pathMonitor = monitor
     }
 
-    private static func interfaceLabel(for path: NWPath) -> String {
+    /// `nonisolated`: this runs on `NWPathMonitor`'s queue, inside the
+    /// path handler, before the hop back onto the main actor.
+    private nonisolated static func interfaceLabel(for path: NWPath) -> String {
         guard path.status == .satisfied else { return "Offline" }
         if path.usesInterfaceType(.wifi) { return "Wi-Fi" }
         if path.usesInterfaceType(.cellular) { return "Cellular" }
@@ -546,8 +548,10 @@ final class AntNode: ObservableObject {
               let json = String(data: data, encoding: .utf8) else {
             throw AntError.op("could not encode the bench configuration")
         }
-        let started = try await withHandle { h in
-            await Task.detached(priority: .userInitiated) { () -> Result<Bool, String> in
+        // `nil` from `withHandle` means there is no node; a non-nil
+        // inner value is the failure detail (`nil` inside = started).
+        let failure: String?? = await withHandle { h in
+            await Task.detached(priority: .userInitiated) { () -> String? in
                 var errPtr: UnsafeMutablePointer<CChar>? = nil
                 let ok = json.withCString { ant_bench_start(h, $0, &errPtr) }
                 // Keep the node's message: "a benchmark is already
@@ -555,14 +559,11 @@ final class AntNode: ObservableObject {
                 // are all things the operator has to act on.
                 let detail = ok ? nil : errPtr.map { String(cString: $0) }
                 if let errPtr { ant_free_string(errPtr) }
-                return ok ? .success(true) : .failure(detail ?? "could not start the benchmark")
+                return ok ? nil : (detail ?? "could not start the benchmark")
             }.value
         }
-        switch started {
-        case .none: throw AntError.notReady
-        case .some(.failure(let message)): throw AntError.op(message)
-        case .some(.success): break
-        }
+        guard let started = failure else { throw AntError.notReady }
+        if let message = started { throw AntError.op(message) }
     }
 
     /// Live progress of the running benchmark, or `nil` when there is

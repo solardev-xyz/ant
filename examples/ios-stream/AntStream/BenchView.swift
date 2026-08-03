@@ -24,17 +24,29 @@ struct BenchView: View {
     /// Renditions the decision is between — the issue asks which
     /// rendition(s) phone-direct broadcast targets, so the picker is
     /// the shortlist, not a free-form number.
-    private static let renditions: [(label: String, kbps: UInt32)] = [
-        ("360p · 900 kbit/s", 900),
-        ("540p · 1.8 Mbit/s", 1800),
-        ("720p · 3.4 Mbit/s", 3400),
-        ("1080p · 6 Mbit/s", 6000),
+    private struct Rendition: Identifiable {
+        let name: String
+        let kbps: UInt32
+        var id: UInt32 { kbps }
+    }
+
+    private struct RunLength: Identifiable {
+        let name: String
+        let seconds: UInt64
+        var id: UInt64 { seconds }
+    }
+
+    private static let renditions: [Rendition] = [
+        Rendition(name: "360p", kbps: 900),
+        Rendition(name: "540p", kbps: 1800),
+        Rendition(name: "720p", kbps: 3400),
+        Rendition(name: "1080p", kbps: 6000),
     ]
 
-    private static let durations: [(label: String, seconds: UInt64)] = [
-        ("2 min (smoke)", 120),
-        ("10 min", 600),
-        ("30 min (quotable)", 1800),
+    private static let runLengths: [RunLength] = [
+        RunLength(name: "2 min", seconds: 120),
+        RunLength(name: "10 min", seconds: 600),
+        RunLength(name: "30 min", seconds: 1800),
     ]
 
     @State private var bitrateKbps: UInt32 = 3400
@@ -112,7 +124,7 @@ struct BenchView: View {
                     .tracking(2)
                     .foregroundStyle(.white.opacity(0.6))
                 Picker("Rendition", selection: $bitrateKbps) {
-                    ForEach(Self.renditions, id: \.kbps) { Text($0.label).tag($0.kbps) }
+                    ForEach(Self.renditions) { Text($0.name).tag($0.kbps) }
                 }
                 .pickerStyle(.segmented)
 
@@ -121,9 +133,12 @@ struct BenchView: View {
                     .tracking(2)
                     .foregroundStyle(.white.opacity(0.6))
                 Picker("Run length", selection: $durationSeconds) {
-                    ForEach(Self.durations, id: \.seconds) { Text($0.label).tag($0.seconds) }
+                    ForEach(Self.runLengths) { Text($0.name).tag($0.seconds) }
                 }
                 .pickerStyle(.segmented)
+                Text("\(bitrateKbps) kbit/s · \(Int(durationSeconds) / 60) min · 2 s segments")
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.6))
 
                 Toggle(isOn: $publishToSwarm) {
                     VStack(alignment: .leading, spacing: 2) {
@@ -188,7 +203,7 @@ struct BenchView: View {
                 Label(report.sustained ? "Sustained the rendition" : "Did not keep up",
                       systemImage: report.sustained ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
                     .font(.headline)
-                    .foregroundStyle(report.sustained ? .green : .orange)
+                    .foregroundStyle(report.sustained ? Color.green : Color.orange)
                 statRow("Sustained", String(format: "%.2f Mbit/s", report.sustainedMbitS))
                 statRow("Chunks/s", String(format: "%.1f", report.sustainedChunksS))
                 statRow("Publish p50/p95",
@@ -273,7 +288,7 @@ struct BenchView: View {
             raw.prefix { $0 != 0 }.map { Character(UnicodeScalar(UInt8($0))) }
         }
         let model = String(identifier)
-        return model.isEmpty ? UIDevice.current.model : model
+        return model.isEmpty ? "unknown-device" : model
     }
 
     // MARK: actions
