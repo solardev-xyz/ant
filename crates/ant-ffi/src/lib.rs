@@ -74,6 +74,13 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(10);
 /// side to poll.
 const NO_PEERS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How long [`ant_shutdown`] waits for the runtime's tasks to stop
+/// before giving up on them. Long enough for an in-flight checkpoint
+/// write to finish (that is the point — see [`ant_shutdown`]), short
+/// enough that a wedged dial can't hold an app teardown or a restore
+/// hostage. Matches the node's own suspend checkpoint bound (~5 s).
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
 /// On-disk `SQLite` chunk cache cap for the embedded node. The whole
 /// point of running a Swarm node on-device is to amortise fetches
 /// across app launches; without a persistent cache every cold start
@@ -509,7 +516,7 @@ struct AccountMarker {
 fn bind_account_state(data_dir: &Path, eth: &[u8; 20]) -> Result<(), FfiError> {
     let current = format!("0x{}", hex::encode(eth));
     let marker = data_dir.join(ACCOUNT_MARKER_FILE);
-    match read_account_marker(&marker) {
+    match read_account_marker(&marker)? {
         // Same account as last launch: the canonical paths are its own.
         Some(previous) if previous.eq_ignore_ascii_case(&current) => {}
         // Someone else's (or unattributable) state sitting where this
@@ -578,26 +585,41 @@ fn move_account_entries(from: &Path, to: &Path) -> Result<(), FfiError> {
     Ok(())
 }
 
-/// The account the data dir's state belongs to: `None` when there is no
-/// marker at all, [`UNKNOWN_ACCOUNT`] when one exists but can't be read
-/// (fail closed — unattributable state is treated as another account's).
-fn read_account_marker(path: &Path) -> Option<String> {
-    if !path.exists() {
-        return None;
-    }
-    let account = std::fs::read_to_string(path)
+/// The account the data dir's state belongs to: `Ok(None)` when there is
+/// no marker at all, `Ok(Some(`[`UNKNOWN_ACCOUNT`]`))` when one exists but
+/// its *contents* aren't a valid marker (fail closed — state we can't
+/// attribute is treated as another account's).
+///
+/// A marker we can't *read* (I/O error, not a missing file) is an error,
+/// not an unknown account: reporting it as unattributable would park this
+/// account's own postage / chequebook state under `accounts/unknown`,
+/// where the adopt step — which only ever looks at
+/// `accounts/<own address>` — never brings it back. A transient read
+/// failure has to fail the start it happened on, so the next one (which
+/// can read the marker) comes up with the account intact.
+fn read_account_marker(path: &Path) -> Result<Option<String>, FfiError> {
+    let raw = match std::fs::read(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(FfiError::Io(format!(
+                "refusing to start: cannot read the account marker {}: {e}",
+                path.display(),
+            )))
+        }
+    };
+    let account = serde_json::from_slice::<AccountMarker>(&raw)
         .ok()
-        .and_then(|raw| serde_json::from_str::<AccountMarker>(&raw).ok())
         .map(|m| m.account)
         .filter(|a| is_eth_address(a));
     if account.is_none() {
         tracing::warn!(
             target: "ant-ffi",
             path = %path.display(),
-            "unreadable account marker; treating the data dir's state as another account's",
+            "corrupt account marker; treating the data dir's state as another account's",
         );
     }
-    Some(account.unwrap_or_else(|| UNKNOWN_ACCOUNT.to_string()))
+    Ok(Some(account.unwrap_or_else(|| UNKNOWN_ACCOUNT.to_string())))
 }
 
 fn write_account_marker(path: &Path, account: &str) -> Result<(), FfiError> {
@@ -2668,8 +2690,18 @@ pub unsafe extern "C" fn ant_free_string(ptr: *mut c_char) {
     }
 }
 
-/// Shut the embedded node down. Aborts the Tokio runtime and frees the
+/// Shut the embedded node down. Stops the Tokio runtime and frees the
 /// handle. After this returns, `handle` must not be used again.
+///
+/// Blocks until the node's tasks have stopped (bounded by
+/// [`SHUTDOWN_GRACE`]), so call it off the host's main thread. It has to
+/// block: a restore does `ant_shutdown(A)` then `ant_init(B)` over the
+/// same data dir, and a task of A's still running after this returns
+/// (an upload checkpoint or postage persist is a `create_dir_all`, a
+/// write and a rename) would recreate A's canonical files *after*
+/// `ant_init(B)` parked them — attributing A's state to B, or leaving
+/// both copies for the next switch to abort on in
+/// `move_account_entries`.
 ///
 /// # Safety
 ///
@@ -2681,11 +2713,12 @@ pub unsafe extern "C" fn ant_shutdown(handle: *mut AntHandle) {
             return;
         }
         let handle = Box::from_raw(handle);
-        // Dropping the runtime aborts every spawned task (including the
-        // node loop) and joins blocking threads. We ship it off to a
-        // `shutdown_background` call so this FFI entry point never blocks
-        // if the node loop is mid-dial and holding a socket open.
-        handle.runtime.shutdown_background();
+        // Cancels every spawned task (including the node loop) at its
+        // next await point and joins the worker / blocking threads. The
+        // timeout keeps a task wedged in a syscall (a dial holding a
+        // socket open) from hanging the host for good; it leaks the
+        // thread rather than the wait.
+        handle.runtime.shutdown_timeout(SHUTDOWN_GRACE);
     }
 }
 
@@ -3276,7 +3309,7 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_marker_parks_state_as_unattributable() {
+    fn corrupt_marker_parks_state_as_unattributable() {
         let dir = scratch_dir("account-corrupt");
         seed_account_state(&dir);
         std::fs::write(dir.join(ACCOUNT_MARKER_FILE), b"{ truncated").expect("corrupt marker");
@@ -3290,6 +3323,93 @@ mod tests {
             .join(UNKNOWN_ACCOUNT)
             .join("chequebook.json")
             .exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_marker_that_cannot_be_read_fails_the_start_instead_of_parking() {
+        // A read *failure* (as opposed to a marker whose contents are
+        // corrupt) says nothing about who the state belongs to. Parking
+        // it as unattributable would be one-way: adopt only ever looks
+        // at `accounts/<own address>`, so the account's own plan and
+        // chequebook would never come back, and the next buy would
+        // deploy a second chequebook. Fail the start; the next one can
+        // read the marker and comes up intact.
+        let dir = scratch_dir("account-unreadable");
+        seed_account_state(&dir);
+        // A directory where the marker belongs: `read` fails with
+        // EISDIR, not NotFound, on every platform we ship.
+        std::fs::create_dir(dir.join(ACCOUNT_MARKER_FILE)).expect("marker as a dir");
+
+        let err = bind_account_state(&dir, &[0x77u8; 20]).expect_err("must not succeed");
+        assert!(
+            err.to_string().contains("account marker"),
+            "unhelpful error: {err}",
+        );
+        assert!(
+            dir.join("chequebook.json").exists() && dir.join("postage").join("batch.bin").exists(),
+            "the account's own state must stay where it is",
+        );
+        assert!(
+            !dir.join(ACCOUNT_PARK_DIR).exists(),
+            "nothing may be parked on an unreadable marker",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A handle over `runtime` with everything else inert — enough for
+    /// the [`ant_shutdown`] contract, which only touches the runtime.
+    fn test_handle(runtime: Runtime, data_dir: &Path) -> AntHandle {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+        let (_status_tx, status_rx) = watch::channel(StatusSnapshot::default());
+        AntHandle {
+            runtime,
+            cmd_tx,
+            status_rx,
+            progress: Mutex::new(DownloadProgressState::default()),
+            cancel_flag: AtomicBool::new(false),
+            cancel_notify: Notify::new(),
+            verify_cancel: Arc::new(AtomicBool::new(false)),
+            signing_secret: [0u8; SECP256K1_SECRET_LEN],
+            eth: [0u8; 20],
+            data_dir: data_dir.to_path_buf(),
+            gateway_task: Mutex::new(None),
+        }
+    }
+
+    #[test]
+    fn shutdown_does_not_return_while_a_task_is_still_persisting() {
+        // Restore is `ant_shutdown(A)` then `ant_init(B)` over one data
+        // dir. If a task of A's is still inside its checkpoint persist
+        // (`create_dir_all` + write + rename) when shutdown returns, it
+        // recreates A's canonical files *after* B's `bind_account_state`
+        // parked them: A's state is then attributed to B, and the next
+        // switch back to A aborts in `move_account_entries`.
+        let dir = scratch_dir("shutdown-drain");
+        let checkpoint = dir.join("postage").join("late.bin");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let target = checkpoint.clone();
+        runtime.spawn(async move {
+            // Sync from here on, exactly like the real persist: nothing
+            // for a cancel to land on until it has finished.
+            std::thread::sleep(Duration::from_millis(300));
+            std::fs::create_dir_all(target.parent().expect("parent")).expect("create dir");
+            std::fs::write(&target, b"late").expect("write checkpoint");
+        });
+        // Let the task reach the worker before we tear the runtime down.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let handle = Box::into_raw(Box::new(test_handle(runtime, &dir)));
+        unsafe { ant_shutdown(handle) };
+
+        assert!(
+            checkpoint.exists(),
+            "ant_shutdown returned while a task was still writing to the data dir",
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

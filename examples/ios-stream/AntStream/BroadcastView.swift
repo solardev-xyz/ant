@@ -109,10 +109,12 @@ struct BroadcastView: View {
                     .foregroundStyle(.white.opacity(0.6))
 
                 checkRow(
-                    done: node.status.isReady && node.peerCount > 0,
+                    done: node.isOnNetwork,
                     title: "Connected to the network",
-                    detail: node.status.isReady
-                        ? "\(node.peerCount) peers" : node.status.label
+                    detail: node.isOffline
+                        ? "Waiting for network…"
+                        : (node.status.isReady
+                            ? "\(node.peerCount) peers" : node.status.label)
                 )
                 checkRow(
                     done: node.keyProtection != nil,

@@ -138,7 +138,7 @@ struct AccountInfo: Codable, Equatable {
 /// video rather than gigabytes. Depths are the smallest whose Swarm
 /// "effective volume" (the volume storable at a ≤0.1% failure rate)
 /// covers the advertised limit — d21 ≈ 2.60 GB, d22 ≈ 7.73 GB,
-/// d23 ≈ 21.4 GB — so a plan never promises more than it can durably
+/// d23 ≈ 19.94 GB — so a plan never promises more than it can durably
 /// hold.
 struct StoragePlanTier: Identifiable, Equatable {
     let id: String
@@ -178,10 +178,13 @@ struct StoragePlanTier: Identifiable, Equatable {
         StoragePlanTier(id: "creator", title: "Creator",
                         depth: 22, days: 180,
                         safeLimitBytes: 5 * 1_000_000_000),
-        // depth 23 → effective ≈ 21.4 GB (covers 20 GB).
+        // depth 23 → effective ≈ 19.94 GB (covers 15 GB). 20 GB would
+        // sit *above* the effective volume: a broadcaster who filled the
+        // advertised hours would saturate a bucket and evict the start
+        // of their own stream.
         StoragePlanTier(id: "studio", title: "Studio",
                         depth: 23, days: 365,
-                        safeLimitBytes: 20 * 1_000_000_000),
+                        safeLimitBytes: 15 * 1_000_000_000),
     ]
 }
 

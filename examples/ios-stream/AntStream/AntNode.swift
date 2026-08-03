@@ -355,10 +355,21 @@ final class AntNode: ObservableObject {
     /// True once a storage plan is connected — gates broadcasting.
     var hasStorage: Bool { plan?.enabled == true }
 
+    /// The checklist's first step: the node is up *and* actually talking
+    /// to the network. `status.isReady` only says `ant_init` returned —
+    /// it is true one line after launch, offline included — so a
+    /// broadcast gate has to look at the live path and the peer count
+    /// too, or a device in airplane mode reads as ready.
+    var isOnNetwork: Bool { !isOffline && status.isReady && peerCount > 0 }
+
     /// Everything a first launch has to get through before the device can
-    /// go live. Drives the Broadcast tab's readiness checklist.
+    /// go live — the conjunction of the Broadcast tab's readiness
+    /// checklist, row for row. Keep the two in step: this is the same
+    /// gate capture + publish attach to, so anything the user sees
+    /// unchecked must hold `isReadyToBroadcast` false.
     var isReadyToBroadcast: Bool {
-        status.isReady && hasStorage && settlement?.enabled == true && gatewayUp
+        isOnNetwork && keyProtection != nil && hasStorage
+            && settlement?.enabled == true && gatewayUp
     }
 
     /// Price a plan (no transaction). Returns the payment information.
