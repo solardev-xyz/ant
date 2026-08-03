@@ -78,7 +78,20 @@ struct StorageView: View {
         } message: {
             Text("This removes the account key from iCloud Keychain on all your devices, not just this one. Afterwards only this device has it — anywhere else the account can be recovered only from your backed-up key.")
         }
-        .onAppear { syncICloudSwitch() }
+        .onAppear {
+            syncICloudSwitch()
+            let args = RootView.shotArgs
+            if args.contains("-antstream-shot-icloud") {
+                Task {
+                    try? await Task.sleep(nanoseconds: 12_000_000_000)
+                    applyICloudBackup(true)
+                    if args.contains("-antstream-shot-restore") {
+                        try? await Task.sleep(nanoseconds: 2_000_000_000)
+                        showRestore = true
+                    }
+                }
+            }
+        }
         .onChange(of: node.keyProtection) { _, _ in syncICloudSwitch() }
         .task {
             await node.refreshAll()

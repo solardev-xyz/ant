@@ -78,6 +78,18 @@ jobs:
           xcrun simctl io booted screenshot shots/01-first-screen.png
           sleep 25
           xcrun simctl io booted screenshot shots/02-after-node-start.png
+          # Verification-only captures (R1-F1): Storage tab with iCloud
+          # recovery on, and the Restore sheet over it.
+          xcrun simctl terminate booted at.vibing.ant.stream || true
+          xcrun simctl launch booted at.vibing.ant.stream \
+            -antstream-shot-storage -antstream-shot-icloud
+          sleep 22
+          xcrun simctl io booted screenshot shots/03-storage-icloud-on.png
+          xcrun simctl terminate booted at.vibing.ant.stream || true
+          xcrun simctl launch booted at.vibing.ant.stream \
+            -antstream-shot-storage -antstream-shot-icloud -antstream-shot-restore
+          sleep 28
+          xcrun simctl io booted screenshot shots/04-restore-sheet.png
           xcrun simctl spawn booted log show --last 3m \
             --predicate 'processImagePath contains "AntStream"' \
             > shots/app-log.txt || true
