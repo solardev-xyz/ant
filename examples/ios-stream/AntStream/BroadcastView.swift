@@ -14,7 +14,13 @@ struct BroadcastView: View {
     @StateObject private var banner = BannerState()
 
     @State private var showGetStarted = false
-    @State private var showBench = false
+    /// Opened by the **Run bench** button — and, on launch, by
+    /// `-antstreamShowBench YES`, which iOS folds into `UserDefaults`.
+    /// That is how `antstream-visual` (issue #70) gets a screenshot of
+    /// the bench sheet: the simulator run has no tap driver, and a
+    /// screenshot of the button alone is not evidence that the sheet
+    /// behind it renders.
+    @State private var showBench = UserDefaults.standard.bool(forKey: "antstreamShowBench")
 
     var body: some View {
         ZStack {

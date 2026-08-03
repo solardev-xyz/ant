@@ -84,7 +84,16 @@ jobs:
           xcrun simctl io booted screenshot shots/01-first-screen.png
           sleep 25
           xcrun simctl io booted screenshot shots/02-after-node-start.png
-          xcrun simctl spawn booted log show --last 3m \
+          # Relaunch straight into the throughput-bench sheet (#67
+          # stage 1). iOS parses `-key value` launch arguments into
+          # UserDefaults, which is the only way to reach a sheet here:
+          # the runner has no tap driver, and a screenshot of the
+          # button alone doesn't show that the sheet renders.
+          xcrun simctl terminate booted at.vibing.ant.stream || true
+          xcrun simctl launch booted at.vibing.ant.stream -antstreamShowBench YES
+          sleep 12
+          xcrun simctl io booted screenshot shots/03-bench-sheet.png
+          xcrun simctl spawn booted log show --last 5m \
             --predicate 'processImagePath contains "AntStream"' \
             > shots/app-log.txt || true
 
