@@ -110,14 +110,17 @@ leaves the Keychain empty even for an instant — the new item is written
 removed — so a failed write leaves the previous key in place instead of
 letting the next launch mint a brand-new account over it.
 
-Turning the **iCloud Keychain** toggle *off* is the one change that reaches
-past this device: a `kSecAttrSynchronizable` item is deleted across the
-whole iCloud circle, so the user's other iPhone/iPad loses the key too. It
-goes through a confirmation alert that says exactly that, with a "Back up
-key first" way out. As a backstop, a device on the receiving end of such a
-deletion — empty Keychain, but a data dir that has already run an account
-(`account.json` is there) — refuses to mint a replacement and reports
-"This device's account key is gone", pointing at Restore, instead of
+Two changes reach past this device, and both go through a confirmation
+alert stating their real blast radius. Turning the **iCloud Keychain**
+toggle *off* deletes the `kSecAttrSynchronizable` item across the whole
+iCloud circle, so the user's other iPhone/iPad loses the key too; the
+alert offers a "Back up key first" way out. Restoring *while the stored
+key syncs* overwrites that same synced item: the restored account takes
+over on every device in the circle, and the current key's only synced
+copy is gone for good. As a backstop, a device on the receiving end of a
+toggle-off deletion — empty Keychain, but a data dir that has already run
+an account (`account.json` is there) — refuses to mint a replacement and
+reports "This device's account key is gone", pointing at Restore, instead of
 silently starting a new account over the funded one's state.
 
 Restoring a *different* account also re-scopes what the node keeps on

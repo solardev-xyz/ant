@@ -202,19 +202,24 @@ final class AntNode: ObservableObject {
         keyProtection = AccountKeystore.currentProtection()
 
         let path = dataDir.path
-        let raw: OpaquePointer? = await Task.detached(priority: .userInitiated) {
+        let (raw, initError): (OpaquePointer?, String?) = await Task.detached(priority: .userInitiated) {
             var errPtr: UnsafeMutablePointer<CChar>? = nil
             let h = path.withCString { cpath in
                 identity.withCString { cid in
                     ant_init_with_identity(cpath, nil, cid, &errPtr)
                 }
             }
-            if h == nil, let errPtr { ant_free_string(errPtr) }
-            return h
+            // Keep the failure detail: `bind_account_state`'s deliberate
+            // "refusing to start: … move one aside by hand" abort is an
+            // instruction to the user, and `restoreAccount` rethrows this
+            // status straight into the Restore sheet.
+            let detail = h == nil ? errPtr.map { String(cString: $0) } : nil
+            if let errPtr { ant_free_string(errPtr) }
+            return (h, detail)
         }.value
 
         guard let raw else {
-            status = .failed("could not start")
+            status = .failed(initError ?? "could not start")
             return
         }
         handle = raw

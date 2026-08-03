@@ -35,9 +35,9 @@ import Security
 ///   for enclave key creation).
 ///
 /// Every mode uses `kSecAttrAccessibleAfterFirstUnlock` so the node can
-/// start from a `BGProcessingTask` after a reboot the user hasn't unlocked
-/// past yet; the two device-bound modes add `…ThisDeviceOnly` so the item
-/// is excluded from unencrypted backups.
+/// start after a reboot the user hasn't unlocked past; the two
+/// device-bound modes add `…ThisDeviceOnly` so the item is excluded from
+/// unencrypted backups.
 enum AccountKeystore {
     /// How the stored identity is protected at rest.
     enum Protection: String, Codable, CaseIterable {
@@ -174,10 +174,20 @@ enum AccountKeystore {
     /// `0x` tolerated) and make it the stored identity. Returns the
     /// rebuilt identity document. Throws before touching the Keychain if
     /// the key is malformed, so a typo can't wipe a working account.
+    ///
+    /// The stored protection is preserved — including `.iCloudKeychain`,
+    /// where the overwrite syncs to every device in the circle, so
+    /// callers confirm with the user first (`StorageView`'s Restore
+    /// alert). A *throwing* protection read is propagated rather than
+    /// treated as "nothing stored": falling back to
+    /// `preferredProtection()` there would silently move an iCloud-synced
+    /// account to device-bound protection on a transient Keychain error,
+    /// taking its automatic-recovery safety net with it.
     @discardableResult
     static func restore(fromAccountKey key: String) throws -> String {
         let json = try identity(fromAccountKey: key)
-        try store(identity: json, protection: currentProtection() ?? preferredProtection())
+        let stored = try readEnvelope()?.protection
+        try store(identity: json, protection: stored ?? preferredProtection())
         return json
     }
 
@@ -214,16 +224,6 @@ enum AccountKeystore {
         }
         try? fm.removeItem(at: url)
         return true
-    }
-
-    /// Forget the stored identity (both the Keychain item and the enclave
-    /// wrapping key). Used by "Remove account from this device"; the
-    /// account itself is only recoverable from the exported key
-    /// afterwards.
-    static func destroy() throws {
-        try deleteItem(synchronizable: true)
-        try deleteItem(synchronizable: false)
-        deleteEnclaveKey()
     }
 
     // MARK: - FFI helpers
@@ -386,7 +386,8 @@ enum AccountKeystore {
 
     /// The P-256 wrapping key held in the Secure Enclave, created on
     /// first use. Private-key usage only — no biometry gate, because the
-    /// node has to start from a background task with no one watching.
+    /// key is unwrapped on every launch and a Face ID prompt there would
+    /// stand between the user and the node starting.
     private static func enclaveKey(createIfMissing: Bool) throws -> SecKey {
         let query: [String: Any] = [
             kSecClass as String: kSecClassKey,

@@ -484,6 +484,13 @@ struct StorageView: View {
 /// the node on the restored account. The key is validated by
 /// `ant_identity_from_key` *before* anything is written, so a typo can't
 /// destroy a working account.
+///
+/// "Same protection" cuts the other way when the stored key syncs: the
+/// restore then *overwrites the synced item*, which replaces the account
+/// on every device in the iCloud circle and destroys the current key's
+/// only synced copy. That configuration gets the same treatment as the
+/// sync-off toggle — an explicit alert, never a bare tap — and the
+/// footer stops claiming the change is device-local.
 private struct RestoreAccountSheet: View {
     @EnvironmentObject var node: AntNode
     @Environment(\.dismiss) private var dismiss
@@ -494,6 +501,11 @@ private struct RestoreAccountSheet: View {
     @State private var key = ""
     @State private var error: String?
     @State private var busy = false
+    /// Whether the *stored* key syncs through iCloud Keychain — read
+    /// straight from the keystore (on appear, and again on tap), because
+    /// the blast radius of the overwrite depends on what is stored now.
+    @State private var storedKeySyncs = false
+    @State private var confirmSyncedReplace = false
 
     var body: some View {
         NavigationStack {
@@ -507,7 +519,9 @@ private struct RestoreAccountSheet: View {
                 } header: {
                     Text("Account key")
                 } footer: {
-                    Text("Paste the key you backed up. This device's current account is replaced — back it up first if you still need it.")
+                    Text(storedKeySyncs
+                         ? "Paste the key you backed up. The current account is replaced on every device that uses iCloud Keychain, and its key's synced copy is overwritten — back it up first if you still need it."
+                         : "Paste the key you backed up. This device's current account is replaced — back it up first if you still need it.")
                 }
 
                 if let error {
@@ -516,7 +530,15 @@ private struct RestoreAccountSheet: View {
 
                 Section {
                     Button {
-                        Task { await restore() }
+                        // Re-read at the moment of truth, not just on
+                        // appear: this decision is what stands between a
+                        // tap and a circle-wide overwrite.
+                        storedKeySyncs = AccountKeystore.currentProtection() == .iCloudKeychain
+                        if storedKeySyncs {
+                            confirmSyncedReplace = true
+                        } else {
+                            Task { await restore() }
+                        }
                     } label: {
                         if busy { ProgressView() } else { Text("Restore account") }
                     }
@@ -531,6 +553,16 @@ private struct RestoreAccountSheet: View {
                 }
             }
         }
+        // Mirrors the sync-off toggle's alert: an iCloud Keychain
+        // overwrite propagates to the whole circle, so it is confirmed
+        // with its real blast radius spelled out, never done on a tap.
+        .alert("Replace the account on all your devices?", isPresented: $confirmSyncedReplace) {
+            Button("Restore on all devices", role: .destructive) { Task { await restore() } }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Your current account key syncs through iCloud Keychain, so this replaces the account on all your devices that use it — not just this one — and permanently overwrites the current key's synced copy. Back up the current key first if you might still need this account.")
+        }
+        .onAppear { storedKeySyncs = AccountKeystore.currentProtection() == .iCloudKeychain }
         .interactiveDismissDisabled(busy)
         .presentationDetents([.medium])
     }
