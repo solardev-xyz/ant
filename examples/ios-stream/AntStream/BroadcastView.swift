@@ -14,6 +14,7 @@ struct BroadcastView: View {
     @StateObject private var banner = BannerState()
 
     @State private var showGetStarted = false
+    @State private var showBench = false
 
     var body: some View {
         ZStack {
@@ -24,6 +25,7 @@ struct BroadcastView: View {
                     header
                     liveCard
                     checklistCard
+                    benchCard
                     if !node.hasStorage { setUpCard }
                 }
                 .padding(.horizontal, 16)
@@ -36,6 +38,7 @@ struct BroadcastView: View {
         .preferredColorScheme(.dark)
         .overlay(alignment: .top) { BannerView(message: banner.message) }
         .sheet(isPresented: $showGetStarted) { GetStartedView() }
+        .sheet(isPresented: $showBench) { BenchView() }
         .task { await node.refreshAll() }
     }
 
@@ -160,6 +163,31 @@ struct BroadcastView: View {
                     .truncationMode(.middle)
             }
             Spacer()
+        }
+    }
+
+    // MARK: throughput bench (#67 stage 1)
+
+    /// The go/no-go instrument. It answers "which rendition can this
+    /// phone, on this network, actually broadcast?" — the question that
+    /// gates the whole publisher track — so it lives on the Broadcast
+    /// tab next to the checklist it depends on, not behind a debug menu.
+    private var benchCard: some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Throughput bench")
+                    .font(.headline)
+                    .foregroundStyle(.white)
+                Text(node.isReadyToBroadcast
+                     ? "Publishes synthetic segments through this device's node to measure what it can sustain on \(node.networkLabel)."
+                     : "Measures the on-device part of publishing. Finish the checklist above to measure the network too.")
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.7))
+                GlassPillButton(title: "Run bench", icon: "gauge.with.needle",
+                                tint: .white.opacity(0.18)) {
+                    showBench = true
+                }
+            }
         }
     }
 

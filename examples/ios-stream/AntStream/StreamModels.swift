@@ -219,7 +219,134 @@ struct StorageQuote: Codable, Equatable {
     }
 }
 
+/// Live progress of a publisher throughput benchmark, as returned by
+/// `ant_bench_progress` (issue #67 stage 1).
+struct BenchSnapshot: Codable, Equatable {
+    let running: Bool
+    let elapsedS: Double
+    let configuredDurationS: UInt64
+    let segmentsTotal: UInt64
+    let segmentsOk: UInt64
+    let segmentsFailed: UInt64
+    let sustainedMbitS: Double
+    let sustainedChunksS: Double
+    let lagMsLast: UInt64
+    let peers: UInt32
+
+    enum CodingKeys: String, CodingKey {
+        case running
+        case elapsedS = "elapsed_s"
+        case configuredDurationS = "configured_duration_s"
+        case segmentsTotal = "segments_total"
+        case segmentsOk = "segments_ok"
+        case segmentsFailed = "segments_failed"
+        case sustainedMbitS = "sustained_mbit_s"
+        case sustainedChunksS = "sustained_chunks_s"
+        case lagMsLast = "lag_ms_last"
+        case peers
+    }
+
+    var progressFraction: Double {
+        guard configuredDurationS > 0 else { return 0 }
+        return min(1.0, elapsedS / Double(configuredDurationS))
+    }
+}
+
+/// Final result of a benchmark run, as returned by `ant_bench_stop`.
+/// Field-for-field the Rust `BenchReport`; `markdownRow` mirrors the
+/// Rust renderer so a row copied off the phone drops straight into
+/// `crates/ant-ffi/ANTSTREAM_BENCH.md` next to the CI rows.
+struct BenchReport: Codable, Equatable {
+    let label: String
+    let mode: String
+    let notes: String
+    let targetBitrateKbps: UInt32
+    let segmentMs: UInt32
+    let segmentBytes: UInt64
+    let maxInFlight: Int
+    let configuredDurationS: UInt64
+    let warmupS: UInt64
+    let measuredS: Double
+    let segmentsTotal: UInt64
+    let segmentsOk: UInt64
+    let segmentsFailed: UInt64
+    let sustainedMbitS: Double
+    let sustainedChunksS: Double
+    let publishMsP50: UInt64
+    let publishMsP95: UInt64
+    let publishMsMax: UInt64
+    let lagMsP50: UInt64
+    let lagMsP95: UInt64
+    let lagMsMax: UInt64
+    let lagMsFinal: UInt64
+    let sustained: Bool
+    let peersMin: UInt32
+    let peersMax: UInt32
+    let errors: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case label, mode, notes, sustained, errors
+        case targetBitrateKbps = "target_bitrate_kbps"
+        case segmentMs = "segment_ms"
+        case segmentBytes = "segment_bytes"
+        case maxInFlight = "max_in_flight"
+        case configuredDurationS = "configured_duration_s"
+        case warmupS = "warmup_s"
+        case measuredS = "measured_s"
+        case segmentsTotal = "segments_total"
+        case segmentsOk = "segments_ok"
+        case segmentsFailed = "segments_failed"
+        case sustainedMbitS = "sustained_mbit_s"
+        case sustainedChunksS = "sustained_chunks_s"
+        case publishMsP50 = "publish_ms_p50"
+        case publishMsP95 = "publish_ms_p95"
+        case publishMsMax = "publish_ms_max"
+        case lagMsP50 = "lag_ms_p50"
+        case lagMsP95 = "lag_ms_p95"
+        case lagMsMax = "lag_ms_max"
+        case lagMsFinal = "lag_ms_final"
+        case peersMin = "peers_min"
+        case peersMax = "peers_max"
+    }
+
+    static let markdownHeader = """
+        | environment | mode | target | sustained | chunks/s | publish p50/p95/max ms | final lag ms | kept up |
+        |---|---|---|---|---|---|---|---|
+        """
+
+    var markdownRow: String {
+        let sustainedMbit = String(format: "%.2f", sustainedMbitS)
+        let chunks = String(format: "%.1f", sustainedChunksS)
+        return "| \(label) | \(mode) | \(targetBitrateKbps) kbit/s | \(sustainedMbit) Mbit/s "
+            + "| \(chunks) | \(publishMsP50) / \(publishMsP95) / \(publishMsMax) "
+            + "| \(lagMsFinal) | \(sustained ? "yes" : "**no**") |"
+    }
+
+    /// The whole run, ready to paste into the issue: the table row plus
+    /// the context a reader needs to trust it.
+    var markdownBlock: String {
+        var out = "\(Self.markdownHeader)\n\(markdownRow)\n"
+        out += "\nRun: \(segmentsOk)/\(segmentsTotal) segments over "
+        out += "\(Int(measuredS)) s measured (\(warmupS) s warm-up excluded), "
+        out += "\(segmentBytes) B segments every \(segmentMs) ms, "
+        out += "window \(maxInFlight), peers \(peersMin)–\(peersMax).\n"
+        if !notes.isEmpty { out += "Notes: \(notes)\n" }
+        if !errors.isEmpty { out += "Errors: \(errors.joined(separator: "; "))\n" }
+        return out
+    }
+}
+
 enum StreamDecoder {
+    static func benchSnapshot(from json: String) -> BenchSnapshot? {
+        guard let data = json.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(BenchSnapshot.self, from: data)
+    }
+
+    static func benchReport(from json: String) -> BenchReport? {
+        guard let data = json.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(BenchReport.self, from: data)
+    }
+
     static func plan(from json: String) -> StoragePlan? {
         guard let data = json.data(using: .utf8) else { return nil }
         return try? JSONDecoder().decode(StoragePlan.self, from: data)

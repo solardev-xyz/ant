@@ -184,3 +184,15 @@ does not forward to the unified log, so relaunch with `--console-pty`).
    deploys the chequebook.
 4. The checklist goes all-green: connected, key secured, plan active,
    settlement ready, gateway up. No `antctl` at any point.
+
+## Throughput bench (issue #67 stage 1)
+
+**Broadcast → Run bench** runs the publisher loop with synthetic
+segments instead of camera output and reports what this device
+sustains: Mbit/s, chunks/s, publish latency and how far behind the live
+edge it falls. The measurement core is shared with the native CI
+harness (`cargo run -p ant-ffi --example publish_bench`), so device and
+desktop numbers are directly comparable.
+
+Criteria, results so far and the exact steps for a quotable 30-minute
+device run: [`crates/ant-ffi/ANTSTREAM_BENCH.md`](../../crates/ant-ffi/ANTSTREAM_BENCH.md).
