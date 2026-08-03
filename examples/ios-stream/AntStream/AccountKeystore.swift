@@ -248,34 +248,58 @@ enum AccountKeystore {
         let envelope = Envelope(version: 1, protection: protection, payload: payload)
         let data = try JSONEncoder().encode(envelope)
 
-        // Replace both the synced and the device-only variant: a
-        // synchronizable item and a non-synchronizable one with the same
-        // service/account are *different* Keychain items, and leaving the
-        // old one behind would let a stale identity resurface after a
-        // protection change.
-        try deleteItem(synchronizable: true)
-        try deleteItem(synchronizable: false)
+        // Write the new item *first*. Deleting both variants up front
+        // would open a window in which the Keychain holds no copy of the
+        // account key at all, and a failed write (keychain unavailable,
+        // no disk) would make that permanent: `loadOrCreateIdentity`
+        // finds nothing on the next launch and mints a *new* account
+        // over the funded one, recoverable only from an exported key.
+        // Store-then-delete keeps a durable copy at every instant, so a
+        // failure here leaves the previous protection intact.
+        try upsertItem(data, synchronizable: protection.syncsToICloud)
 
-        var attrs: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecValueData as String: data,
-        ]
-        if protection.syncsToICloud {
-            attrs[kSecAttrSynchronizable as String] = kCFBooleanTrue
-            // Synchronizable items cannot use a …ThisDeviceOnly class.
-            attrs[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-        } else {
-            attrs[kSecAttrSynchronizable as String] = kCFBooleanFalse
-            attrs[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        }
-        let status = SecItemAdd(attrs as CFDictionary, nil)
-        guard status == errSecSuccess else { throw KeystoreError.keychain(status) }
+        // Only now drop the other variant: a synchronizable item and a
+        // non-synchronizable one with the same service/account are
+        // *different* Keychain items, and leaving the old one behind
+        // would let a stale identity resurface after a protection change.
+        try deleteItem(synchronizable: !protection.syncsToICloud)
 
         // The enclave wrapping key is dead weight once we've moved to a
         // plaintext (syncing) item; drop it so it can't linger.
         if protection != .secureEnclave { deleteEnclaveKey() }
+    }
+
+    /// Add the identity item, or overwrite the value of the one already
+    /// there. `SecItemAdd` on an existing (service, account,
+    /// synchronizable) triple fails with `errSecDuplicateItem` rather
+    /// than replacing it — that triple is the item's primary key — so
+    /// the update leg is not optional once we stopped deleting first.
+    private static func upsertItem(_ data: Data, synchronizable: Bool) throws {
+        // Synchronizable items cannot use a …ThisDeviceOnly class.
+        let accessible = synchronizable
+            ? kSecAttrAccessibleAfterFirstUnlock
+            : kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        let identifiers: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecAttrSynchronizable as String: synchronizable ? kCFBooleanTrue as Any
+                : kCFBooleanFalse as Any,
+        ]
+
+        var attrs = identifiers
+        attrs[kSecAttrAccessible as String] = accessible
+        attrs[kSecValueData as String] = data
+        let added = SecItemAdd(attrs as CFDictionary, nil)
+        if added == errSecSuccess { return }
+        guard added == errSecDuplicateItem else { throw KeystoreError.keychain(added) }
+
+        let changes: [String: Any] = [
+            kSecAttrAccessible as String: accessible,
+            kSecValueData as String: data,
+        ]
+        let updated = SecItemUpdate(identifiers as CFDictionary, changes as CFDictionary)
+        guard updated == errSecSuccess else { throw KeystoreError.keychain(updated) }
     }
 
     private static func readEnvelope() throws -> Envelope? {
@@ -288,16 +312,30 @@ enum AccountKeystore {
             // account entirely.
             kSecAttrSynchronizable as String: kSecAttrSynchronizableAny,
             kSecReturnData as String: kCFBooleanTrue as Any,
-            kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecReturnAttributes as String: kCFBooleanTrue as Any,
+            // Both variants exist for an instant while `store` moves the
+            // identity between them — and permanently if the app is
+            // killed in that instant — and `kSecMatchLimitOne` picks
+            // between them in an unspecified order, which could hand back
+            // the identity that was just replaced (a restored account
+            // silently reverting to the old one). Take every match and
+            // use the most recently written.
+            kSecMatchLimit as String: kSecMatchLimitAll,
         ]
         var out: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &out)
         if status == errSecItemNotFound { return nil }
-        guard status == errSecSuccess, let data = out as? Data else {
+        guard status == errSecSuccess, let items = out as? [[String: Any]] else {
             throw KeystoreError.keychain(status)
         }
+        let newest = items.compactMap { item -> (Date, Data)? in
+            guard let data = item[kSecValueData as String] as? Data else { return nil }
+            let written = item[kSecAttrModificationDate as String] as? Date ?? .distantPast
+            return (written, data)
+        }.max { $0.0 < $1.0 }?.1
+        guard let newest else { return nil }
         do {
-            return try JSONDecoder().decode(Envelope.self, from: data)
+            return try JSONDecoder().decode(Envelope.self, from: newest)
         } catch {
             throw KeystoreError.corrupt("\(error)")
         }

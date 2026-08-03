@@ -311,6 +311,15 @@ final class AntNode: ObservableObject {
 
     /// Replace the stored account key with a backed-up one. The node has
     /// to restart to adopt it, so we tear it down and start again.
+    ///
+    /// The restart is also what re-scopes the node's on-disk state to the
+    /// restored account: `ant_init_with_identity` parks the previous
+    /// account's postage batches, chequebook association and SWAP ledgers
+    /// under `<data dir>/accounts/<its address>/` and swaps in whatever
+    /// the restored account left behind (see `bind_account_state` in
+    /// `ant-ffi`). Without that the checklist would keep reporting the
+    /// old account's plan as active while every stamp the restored key
+    /// signs over it is rejected by peers.
     func restoreAccount(fromKey key: String) async throws {
         _ = try AccountKeystore.restore(fromAccountKey: key)
         await shutdown()

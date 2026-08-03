@@ -436,6 +436,187 @@ pub unsafe extern "C" fn ant_identity_from_key(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Account-scoped on-disk state
+// ---------------------------------------------------------------------------
+
+/// Data-dir entries that belong to one specific *account* (the node EOA)
+/// rather than to the device.
+///
+/// None of these transfer between accounts. A postage store issues
+/// stamps over a batch whose owner is recorded on-chain; a chequebook is
+/// bound on-chain to its issuer; both SWAP ledgers are denominated in
+/// cheques signed by (or payable to) one account; an upload job stamps
+/// against a specific batch. Signing any of them with a different key
+/// produces state that looks healthy locally and is rejected by every
+/// peer, so they travel with the account instead of staying put (see
+/// [`bind_account_state`]).
+///
+/// Everything else in the data dir is account-independent and stays:
+/// `peers.json` (a network peer list), `chunks.sqlite` (a content cache
+/// keyed by chunk address), and `identity.json` — which *is* the
+/// account, and only exists in [`IdentitySource::DataDir`] mode, where
+/// the account can't change behind our back in the first place.
+const ACCOUNT_SCOPED_ENTRIES: &[&str] = &[
+    "postage",
+    "uploads",
+    "chequebook.json",
+    "swap_credits.json",
+    "pushsync_outbound.json",
+];
+
+/// Records which account the [`ACCOUNT_SCOPED_ENTRIES`] currently at
+/// their canonical paths belong to. Holds the *public* Ethereum address
+/// only — no function of the key — so the host-held-identity guarantee
+/// ("the library never writes key material to disk") is unaffected.
+const ACCOUNT_MARKER_FILE: &str = "account.json";
+
+/// Parent of the per-account parking dirs: `<data_dir>/accounts/<0xeth>/`.
+const ACCOUNT_PARK_DIR: &str = "accounts";
+
+/// Parking name for state whose marker exists but is unreadable. We know
+/// it isn't ours (a marker we wrote is well-formed), but not whose it is.
+const UNKNOWN_ACCOUNT: &str = "unknown";
+
+/// The `account.json` marker.
+#[derive(Serialize, Deserialize)]
+struct AccountMarker {
+    /// `0x` + 40 hex: the node EOA that owns the account-scoped state.
+    account: String,
+}
+
+/// Make the data dir's account-scoped state belong to `eth` before
+/// anything reads it.
+///
+/// Without this, a key swap silently mixes two accounts: the postage
+/// reload (`drive::reload_persisted_issuers`) and the chequebook
+/// association are keyed by path, not by owner, so the new key would
+/// sign stamps over the *old* account's batch and cheques against the
+/// *old* account's chequebook. Nothing local notices — the plan reads as
+/// active and settlement as ready — while every peer drops both, which
+/// is precisely the failure mode that has to be caught before startup
+/// rather than at first use.
+///
+/// The previous account's state is *parked* under
+/// `<data_dir>/accounts/<its address>/` rather than deleted, and this
+/// account's parked state (from an earlier switch) is swapped back in,
+/// so switching keys back and forth loses nothing.
+///
+/// Ordering is crash-safe: parking runs before the marker is rewritten
+/// (a crash in between just re-runs a now-empty park), and the adopt
+/// step runs on every start (a crash mid-adopt is finished by the next
+/// one).
+fn bind_account_state(data_dir: &Path, eth: &[u8; 20]) -> Result<(), FfiError> {
+    let current = format!("0x{}", hex::encode(eth));
+    let marker = data_dir.join(ACCOUNT_MARKER_FILE);
+    match read_account_marker(&marker) {
+        // Same account as last launch: the canonical paths are its own.
+        Some(previous) if previous.eq_ignore_ascii_case(&current) => {}
+        // Someone else's (or unattributable) state sitting where this
+        // account's belongs — park it before anything opens it.
+        Some(previous) => {
+            tracing::warn!(
+                target: "ant-ffi",
+                previous = %previous,
+                current = %current,
+                "data dir belongs to a different account; parking its postage / chequebook / settlement state",
+            );
+            move_account_entries(data_dir, &account_park_dir(data_dir, &previous))?;
+            write_account_marker(&marker, &current)?;
+        }
+        // No marker: either a fresh data dir, or the first start under a
+        // build that keeps one. Whatever is here was written by the
+        // account starting now — before host-held identities the key
+        // came from this very directory and could not change.
+        None => write_account_marker(&marker, &current)?,
+    }
+
+    // Swap this account's own parked state (if any) back in. Runs on
+    // every start so an interrupted adopt is completed on the next one.
+    let parked = account_park_dir(data_dir, &current);
+    if parked.is_dir() {
+        move_account_entries(&parked, data_dir)?;
+        // Empty now; a leftover (something else was put in there) is
+        // left alone rather than removed.
+        let _ = std::fs::remove_dir(&parked);
+    }
+    Ok(())
+}
+
+/// `<data_dir>/accounts/<owner>` — `owner` is always either a validated
+/// `0x` + 40-hex address or [`UNKNOWN_ACCOUNT`], so it can never escape
+/// the data dir.
+fn account_park_dir(data_dir: &Path, owner: &str) -> PathBuf {
+    data_dir.join(ACCOUNT_PARK_DIR).join(owner)
+}
+
+/// Move every [`ACCOUNT_SCOPED_ENTRIES`] entry present in `from` into
+/// `to`. Refuses (rather than clobbering) when the destination already
+/// holds an entry of the same name: two accounts' copies of one name
+/// means we can no longer tell which is whose, and guessing is how the
+/// wrong batch gets stamped.
+fn move_account_entries(from: &Path, to: &Path) -> Result<(), FfiError> {
+    for name in ACCOUNT_SCOPED_ENTRIES {
+        let src = from.join(name);
+        if !src.exists() {
+            continue;
+        }
+        std::fs::create_dir_all(to)
+            .map_err(|e| FfiError::Io(format!("create {}: {e}", to.display())))?;
+        let dst = to.join(name);
+        if dst.exists() {
+            return Err(FfiError::Io(format!(
+                "refusing to start: {} and {} both exist; move one aside by hand",
+                src.display(),
+                dst.display(),
+            )));
+        }
+        std::fs::rename(&src, &dst).map_err(|e| {
+            FfiError::Io(format!("move {} to {}: {e}", src.display(), dst.display()))
+        })?;
+    }
+    Ok(())
+}
+
+/// The account the data dir's state belongs to: `None` when there is no
+/// marker at all, [`UNKNOWN_ACCOUNT`] when one exists but can't be read
+/// (fail closed — unattributable state is treated as another account's).
+fn read_account_marker(path: &Path) -> Option<String> {
+    if !path.exists() {
+        return None;
+    }
+    let account = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<AccountMarker>(&raw).ok())
+        .map(|m| m.account)
+        .filter(|a| is_eth_address(a));
+    if account.is_none() {
+        tracing::warn!(
+            target: "ant-ffi",
+            path = %path.display(),
+            "unreadable account marker; treating the data dir's state as another account's",
+        );
+    }
+    Some(account.unwrap_or_else(|| UNKNOWN_ACCOUNT.to_string()))
+}
+
+fn write_account_marker(path: &Path, account: &str) -> Result<(), FfiError> {
+    let json = serde_json::to_string(&AccountMarker {
+        account: account.to_string(),
+    })
+    .map_err(|e| FfiError::Io(format!("serialize account marker: {e}")))?;
+    // Write-tmp + rename: a torn marker would make the next start park
+    // this account's own state as a stranger's.
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json)
+        .map_err(|e| FfiError::Io(format!("write {}: {e}", tmp.display())))?;
+    std::fs::rename(&tmp, path).map_err(|e| FfiError::Io(format!("write {}: {e}", path.display())))
+}
+
+fn is_eth_address(s: &str) -> bool {
+    s.len() == 42 && s.starts_with("0x") && s[2..].bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 fn init_inner(
     data_dir: &Path,
     source_root: Option<&Path>,
@@ -457,6 +638,12 @@ fn init_inner(
     let eth = ethereum_address_from_public_key(&vk);
     let overlay = overlay_from_ethereum_address(&eth, 1, &overlay_nonce);
     let peer_id = libp2p_keypair.public().to_peer_id();
+
+    // The host can hand us a *different* account than it did last launch
+    // (`ant_identity_from_key` + a Restore flow), so make the data dir's
+    // account-scoped state belong to this account before anything below
+    // opens it.
+    bind_account_state(data_dir, &eth)?;
 
     let started_at_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -595,8 +782,9 @@ fn init_inner(
     // no-RPC manual path. Gated on `chain`: a download-only build never
     // uploads, so it never needs (or can deploy) a chequebook.
     #[cfg(feature = "chain")]
-    let pushsync_cfg = match ant_chain::chequebook_store::load_persisted_chequebook(
+    let pushsync_cfg = match ant_chain::chequebook_store::load_persisted_chequebook_for(
         &data_dir.join("chequebook.json"),
+        &eth,
     ) {
         Ok(Some(chequebook)) => {
             tracing::info!(
@@ -2954,6 +3142,154 @@ mod tests {
             "expected an empty data dir, got {entries:?}"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A data dir seeded with one batch store, a chequebook association
+    /// and both SWAP ledgers — the state a working account leaves behind.
+    fn seed_account_state(dir: &Path) {
+        std::fs::create_dir_all(dir.join("postage")).expect("create postage dir");
+        std::fs::write(dir.join("postage").join("batch.bin"), b"batch").expect("write batch");
+        std::fs::create_dir_all(dir.join("uploads")).expect("create uploads dir");
+        std::fs::write(dir.join("chequebook.json"), b"{}").expect("write chequebook");
+        std::fs::write(dir.join("swap_credits.json"), b"{}").expect("write credits");
+        std::fs::write(dir.join("pushsync_outbound.json"), b"{}").expect("write outbound");
+    }
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("ant-ffi-{tag}-{}-{:p}", std::process::id(), &0u8));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn account_switch_parks_the_previous_accounts_state() {
+        let dir = scratch_dir("account-switch");
+        let a = [0xaau8; 20];
+        let b = [0xbbu8; 20];
+
+        // Account A runs once and leaves a plan + chequebook behind.
+        bind_account_state(&dir, &a).expect("bind A");
+        seed_account_state(&dir);
+
+        // Account B is restored onto the same device. None of A's state
+        // may still be at the canonical paths B's node reads.
+        bind_account_state(&dir, &b).expect("bind B");
+        for name in ACCOUNT_SCOPED_ENTRIES {
+            assert!(
+                !dir.join(name).exists(),
+                "{name} must not be visible to the new account",
+            );
+        }
+        // Parked, not destroyed: A can still be restored.
+        let parked = dir
+            .join(ACCOUNT_PARK_DIR)
+            .join(format!("0x{}", hex::encode(a)));
+        assert!(parked.join("postage").join("batch.bin").exists());
+        assert!(parked.join("chequebook.json").exists());
+
+        // Switching back hands A its own state again, and parks B's.
+        seed_account_state(&dir);
+        bind_account_state(&dir, &a).expect("bind A again");
+        assert!(dir.join("postage").join("batch.bin").exists());
+        assert!(dir.join("chequebook.json").exists());
+        assert!(!parked.exists(), "A's park dir is emptied on adopt");
+        assert!(dir
+            .join(ACCOUNT_PARK_DIR)
+            .join(format!("0x{}", hex::encode(b)))
+            .join("chequebook.json")
+            .exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restored_account_does_not_inherit_the_previous_plan() {
+        // The path the node actually takes at startup, with a real
+        // postage store: account A's batch must not be reloaded into
+        // account B's issuer registry (B's key would sign stamps over a
+        // batch A owns, and every peer would drop them), and must come
+        // back intact when A is restored.
+        let dir = scratch_dir("account-issuers");
+        let (a, b) = ([0x44u8; 20], [0x55u8; 20]);
+        let batch = [0x66u8; 32];
+
+        bind_account_state(&dir, &a).expect("bind A");
+        let postage = dir.join("postage");
+        std::fs::create_dir_all(&postage).expect("create postage dir");
+        drop(
+            ant_postage::StampIssuer::open_or_new(
+                postage.join(format!("{}.bin", hex::encode(batch))),
+                batch,
+                20,
+                16,
+                false,
+            )
+            .expect("create batch store"),
+        );
+        assert!(drive::reload_persisted_issuers(&postage).contains_key(&batch));
+
+        bind_account_state(&dir, &b).expect("bind B");
+        assert!(
+            drive::reload_persisted_issuers(&postage).is_empty(),
+            "the restored account must not stamp against the previous account's batch",
+        );
+
+        bind_account_state(&dir, &a).expect("bind A again");
+        assert!(
+            drive::reload_persisted_issuers(&postage).contains_key(&batch),
+            "restoring the original account must return its plan",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_account_restart_leaves_state_in_place() {
+        let dir = scratch_dir("account-restart");
+        let a = [0x11u8; 20];
+        bind_account_state(&dir, &a).expect("first start");
+        seed_account_state(&dir);
+        bind_account_state(&dir, &a).expect("restart");
+        assert!(dir.join("postage").join("batch.bin").exists());
+        assert!(dir.join("chequebook.json").exists());
+        assert!(
+            !dir.join(ACCOUNT_PARK_DIR).exists(),
+            "a plain restart must not move anything",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_data_dir_without_a_marker_keeps_its_state() {
+        // Upgrade path: state written before the marker existed belongs
+        // to the account starting now (that build had no way to change
+        // the key under a fixed data dir).
+        let dir = scratch_dir("account-legacy");
+        seed_account_state(&dir);
+        bind_account_state(&dir, &[0x22u8; 20]).expect("adopt legacy state");
+        assert!(dir.join("postage").join("batch.bin").exists());
+        assert!(dir.join(ACCOUNT_MARKER_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreadable_marker_parks_state_as_unattributable() {
+        let dir = scratch_dir("account-corrupt");
+        seed_account_state(&dir);
+        std::fs::write(dir.join(ACCOUNT_MARKER_FILE), b"{ truncated").expect("corrupt marker");
+        bind_account_state(&dir, &[0x33u8; 20]).expect("bind over corrupt marker");
+        assert!(
+            !dir.join("chequebook.json").exists(),
+            "state we can't attribute must not be adopted",
+        );
+        assert!(dir
+            .join(ACCOUNT_PARK_DIR)
+            .join(UNKNOWN_ACCOUNT)
+            .join("chequebook.json")
+            .exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

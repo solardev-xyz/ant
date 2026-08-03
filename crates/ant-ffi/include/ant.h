@@ -98,6 +98,16 @@ AntHandle *ant_init_with_options(const char *data_dir,
  * for mobile. `source_root` behaves exactly as above (pass NULL to
  * disable the rebase).
  *
+ * Because the host can hand over a *different* account than last time
+ * (a restore-from-backup-key flow), every init re-scopes the data dir's
+ * account-owned state — postage batches, the chequebook association and
+ * both SWAP ledgers — to the account in `identity_json`: another
+ * account's copy is parked under `<data_dir>/accounts/<its address>/`
+ * (never deleted) and this account's parked copy, if any, is swapped
+ * back in. Stamps signed over someone else's batch and cheques drawn on
+ * someone else's chequebook are rejected by every peer, so the swap has
+ * to happen before the node loop starts rather than at first use.
+ *
  * On success returns a non-NULL handle. On failure returns NULL and
  * writes an allocated error string to *out_err (free with
  * ant_free_string).

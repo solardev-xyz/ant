@@ -60,6 +60,14 @@ pub(crate) enum DriveError {
 /// app restart without re-reading the chain. Mirrors `antd`'s startup
 /// reload. Unreadable stores are skipped with a warning rather than
 /// failing the whole node bring-up.
+///
+/// A store records the batch but not its owner, so this cannot tell a
+/// batch *this* account paid for from one the previous account did —
+/// stamping the latter with the current key produces stamps every peer
+/// rejects. Ownership is enforced one level up instead:
+/// [`crate::bind_account_state`] parks the whole `postage` directory
+/// with the account that wrote it, so by the time this runs the
+/// directory only holds the running account's batches.
 pub(crate) fn reload_persisted_issuers(
     postage_dir: &std::path::Path,
 ) -> HashMap<[u8; 32], StampIssuer> {
@@ -1244,11 +1252,11 @@ async fn ensure_settlement_best_effort(
 #[cfg(feature = "chain")]
 pub(crate) fn settlement_status(h: &AntHandle) -> Result<String, DriveError> {
     let path = h.data_dir.join("chequebook.json");
-    let (enabled, chequebook) = match ant_chain::chequebook_store::load_persisted_chequebook(&path)
-    {
-        Ok(Some(cb)) => (true, Some(format!("0x{}", hex::encode(cb)))),
-        _ => (false, None),
-    };
+    let (enabled, chequebook) =
+        match ant_chain::chequebook_store::load_persisted_chequebook_for(&path, &h.eth) {
+            Ok(Some(cb)) => (true, Some(format!("0x{}", hex::encode(cb)))),
+            _ => (false, None),
+        };
     to_json(&SettlementStatus {
         enabled,
         chequebook,
@@ -1313,9 +1321,12 @@ async fn resolve_or_deploy_chequebook(
 
     let persist_path = data_dir.join("chequebook.json");
 
-    // 1. Already known (persisted from a prior run / this session).
-    if let Some(cb) =
-        chequebook_store::load_persisted_chequebook(&persist_path).map_err(map_cb_err)?
+    // 1. Already known (persisted from a prior run / this session), and
+    //    issued by *this* account — a record left behind by a different
+    //    account is skipped, so we rediscover / deploy our own below
+    //    instead of signing cheques nobody will honour.
+    if let Some(cb) = chequebook_store::load_persisted_chequebook_for(&persist_path, &node_eth)
+        .map_err(map_cb_err)?
     {
         return Ok(Some(cb));
     }

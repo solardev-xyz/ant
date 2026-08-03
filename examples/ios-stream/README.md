@@ -87,7 +87,20 @@ expiring, device-local pasteboard rather than the plain clipboard);
 "Restore" accepts one back. The key is validated by `ant_identity_from_key`
 *before* anything is written, so a typo can't destroy a working account.
 The overlay nonce is derived from the account address, so restoring the
-same key twice always lands on the same overlay.
+same key twice always lands on the same overlay. Storing a key never
+leaves the Keychain empty even for an instant — the new item is written
+(add, or update when one is already there) before the old variant is
+removed — so a failed write leaves the previous key in place instead of
+letting the next launch mint a brand-new account over it.
+
+Restoring a *different* account also re-scopes what the node keeps on
+disk: `ant_init_with_identity` parks the previous account's postage
+batches, chequebook association and SWAP ledgers under
+`<data dir>/accounts/<its address>/` and swaps in whatever the restored
+account left behind. Those are owned on-chain by one account, so reusing
+them under another key would stamp and sign cheques that look valid on
+the device and are rejected by every peer. Nothing is deleted, so
+switching back restores the original account's plan intact.
 
 **Scope.** This moves the key *at rest* out of the library, which is the
 mobile half of PLAN.md § 5.10. It is not yet the full callback-based
