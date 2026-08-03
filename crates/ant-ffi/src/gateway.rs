@@ -179,8 +179,9 @@ pub unsafe extern "C" fn ant_start_gateway(
             // Read-only + fast: this NEVER deploys here (that's
             // `ant_deploy_chequebook`, which spends gas) and a load error
             // degrades to `None` rather than failing gateway start.
-            let chequebook = match ant_chain::chequebook_store::load_persisted_chequebook(
+            let chequebook = match ant_chain::chequebook_store::load_persisted_chequebook_for(
                 &handle.data_dir.join("chequebook.json"),
+                &handle.eth,
             ) {
                 Ok(cb) => cb,
                 Err(e) => {

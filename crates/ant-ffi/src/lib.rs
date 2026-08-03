@@ -38,8 +38,8 @@ use ant_control::{
     ControlAck, ControlCommand, GetProgress, IdentityInfo, PeerInfo, RetrievalInfo, StatusSnapshot,
 };
 use ant_crypto::{
-    ethereum_address_from_public_key, overlay_from_ethereum_address, random_overlay_nonce,
-    random_secp256k1_secret, OVERLAY_NONCE_LEN, SECP256K1_SECRET_LEN,
+    ethereum_address_from_public_key, keccak256, overlay_from_ethereum_address,
+    random_overlay_nonce, random_secp256k1_secret, OVERLAY_NONCE_LEN, SECP256K1_SECRET_LEN,
 };
 use ant_node::{run_node, NodeConfig, UploadManager};
 use ant_p2p::UploadRuntime;
@@ -73,6 +73,13 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(10);
 /// the whole warmup window is friendlier than forcing the Swift
 /// side to poll.
 const NO_PEERS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How long [`ant_shutdown`] waits for the runtime's tasks to stop
+/// before giving up on them. Long enough for an in-flight checkpoint
+/// write to finish (that is the point — see [`ant_shutdown`]), short
+/// enough that a wedged dial can't hold an app teardown or a restore
+/// hostage. Matches the node's own suspend checkpoint bound (~5 s).
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// On-disk `SQLite` chunk cache cap for the embedded node. The whole
 /// point of running a Swarm node on-device is to amortise fetches
@@ -224,6 +231,25 @@ struct IdentityFile {
     libp2p_keypair: Option<String>,
 }
 
+/// Domain separator for the overlay nonce we derive when an identity is
+/// rebuilt from a bare account key ([`ant_identity_from_key`]). Deriving
+/// it from the *public* Ethereum address (never the secret) keeps a
+/// key-only restore reproducible — the same key always yields the same
+/// overlay — without publishing any function of the private key.
+const OVERLAY_NONCE_DOMAIN: &[u8] = b"ant-ffi/overlay-nonce/v1";
+
+/// Where the node's identity (account key) comes from.
+enum IdentitySource<'a> {
+    /// Legacy/desktop behaviour: `identity.json` inside the data dir,
+    /// created on first run. The library owns the key material on disk.
+    DataDir,
+    /// Host-provided identity JSON (same shape as `identity.json`). The
+    /// library never reads or writes the key on disk — this is the
+    /// `KeyProvider` backend PLAN.md § 5.10 plans for mobile, where the
+    /// host keeps the key in the iOS Keychain / Android Keystore.
+    Provided(&'a str),
+}
+
 #[derive(Debug, thiserror::Error)]
 enum FfiError {
     #[error("null pointer")]
@@ -299,7 +325,7 @@ pub unsafe extern "C" fn ant_init_with_options(
             } else {
                 Some(cstr_to_path(source_root)?)
             };
-            init_inner(&path, source_root.as_deref())
+            init_inner(&path, source_root.as_deref(), IdentitySource::DataDir)
         }));
         match result {
             Ok(Ok(handle)) => Box::into_raw(Box::new(handle)),
@@ -315,14 +341,318 @@ pub unsafe extern "C" fn ant_init_with_options(
     }
 }
 
-fn init_inner(data_dir: &Path, source_root: Option<&Path>) -> Result<AntHandle, FfiError> {
+/// Like [`ant_init_with_options`], but the *host* owns the account key:
+/// `identity_json` carries the identity document (the same shape
+/// [`ant_identity_generate`] returns) and the library neither reads nor
+/// writes `identity.json` in the data dir. This is the `KeyProvider`
+/// backend PLAN.md § 5.10 plans for mobile — on iOS the document lives in
+/// the Keychain (optionally Secure-Enclave-wrapped), so an attacker with
+/// the app container never gets the key.
+///
+/// Everything else behaves exactly like [`ant_init_with_options`].
+///
+/// # Safety
+///
+/// * `data_dir` and `identity_json` must be valid NUL-terminated UTF-8
+///   strings.
+/// * `source_root` must be a valid NUL-terminated UTF-8 string, or null.
+/// * `out_err` must point at a writable `*mut c_char` slot, or be null
+///   to opt out of error reporting.
+#[no_mangle]
+pub unsafe extern "C" fn ant_init_with_identity(
+    data_dir: *const c_char,
+    source_root: *const c_char,
+    identity_json: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut AntHandle {
+    unsafe {
+        clear_out_err(out_err);
+        let result = catch_unwind(AssertUnwindSafe(|| -> Result<AntHandle, FfiError> {
+            let path = cstr_to_path(data_dir)?;
+            let source_root = if source_root.is_null() {
+                None
+            } else {
+                Some(cstr_to_path(source_root)?)
+            };
+            let identity = cstr_to_str(identity_json)?;
+            init_inner(
+                &path,
+                source_root.as_deref(),
+                IdentitySource::Provided(identity),
+            )
+        }));
+        match result {
+            Ok(Ok(handle)) => Box::into_raw(Box::new(handle)),
+            Ok(Err(e)) => {
+                write_out_err(out_err, &e.to_string());
+                std::ptr::null_mut()
+            }
+            Err(_) => {
+                write_out_err(out_err, "panic in ant_init_with_identity");
+                std::ptr::null_mut()
+            }
+        }
+    }
+}
+
+/// Mint a fresh node identity without starting a node, so a host that
+/// keeps the key itself (iOS Keychain / Android Keystore) can create one
+/// on first run and feed it back to [`ant_init_with_identity`].
+///
+/// Returns an allocated JSON document
+/// `{"signing_key","overlay_nonce","libp2p_keypair"}` — all hex, and all
+/// secret: `signing_key` *is* the account. Free with
+/// [`ant_free_string`]. On failure returns null and writes an allocated
+/// message into `*out_err`.
+///
+/// # Safety
+///
+/// * `out_err` must point at a writable `*mut c_char` slot, or be null.
+#[no_mangle]
+pub unsafe extern "C" fn ant_identity_generate(out_err: *mut *mut c_char) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_identity_generate", || {
+            let id = new_identity().map_err(|e| e.to_string())?;
+            serde_json::to_string(&id).map_err(|e| format!("serialize identity: {e}"))
+        })
+    }
+}
+
+/// Rebuild a node identity from a backed-up account key (64 hex chars,
+/// `0x` prefix tolerated) — the "restore my account" path when the
+/// Keychain copy is gone but the user still has their key. Returns the
+/// same JSON document as [`ant_identity_generate`], with the overlay
+/// nonce derived from the account address so the restore is
+/// reproducible. Rejects malformed or out-of-range keys.
+///
+/// # Safety
+///
+/// * `signing_key_hex` must be a valid NUL-terminated UTF-8 string.
+/// * `out_err` must point at a writable `*mut c_char` slot, or be null.
+#[no_mangle]
+pub unsafe extern "C" fn ant_identity_from_key(
+    signing_key_hex: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_identity_from_key", || {
+            let hex_str = cstr_to_str(signing_key_hex).map_err(|e| e.to_string())?;
+            let id = identity_from_signing_key(hex_str).map_err(|e| e.to_string())?;
+            serde_json::to_string(&id).map_err(|e| format!("serialize identity: {e}"))
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Account-scoped on-disk state
+// ---------------------------------------------------------------------------
+
+/// Data-dir entries that belong to one specific *account* (the node EOA)
+/// rather than to the device.
+///
+/// None of these transfer between accounts. A postage store issues
+/// stamps over a batch whose owner is recorded on-chain; a chequebook is
+/// bound on-chain to its issuer; both SWAP ledgers are denominated in
+/// cheques signed by (or payable to) one account; an upload job stamps
+/// against a specific batch. Signing any of them with a different key
+/// produces state that looks healthy locally and is rejected by every
+/// peer, so they travel with the account instead of staying put (see
+/// [`bind_account_state`]).
+///
+/// Everything else in the data dir is account-independent and stays:
+/// `peers.json` (a network peer list), `chunks.sqlite` (a content cache
+/// keyed by chunk address), and `identity.json` — which *is* the
+/// account, and only exists in [`IdentitySource::DataDir`] mode, where
+/// the account can't change behind our back in the first place.
+const ACCOUNT_SCOPED_ENTRIES: &[&str] = &[
+    "postage",
+    "uploads",
+    "chequebook.json",
+    "swap_credits.json",
+    "pushsync_outbound.json",
+];
+
+/// Records which account the [`ACCOUNT_SCOPED_ENTRIES`] currently at
+/// their canonical paths belong to. Holds the *public* Ethereum address
+/// only — no function of the key — so the host-held-identity guarantee
+/// ("the library never writes key material to disk") is unaffected.
+const ACCOUNT_MARKER_FILE: &str = "account.json";
+
+/// Parent of the per-account parking dirs: `<data_dir>/accounts/<0xeth>/`.
+const ACCOUNT_PARK_DIR: &str = "accounts";
+
+/// Parking name for state whose marker exists but is unreadable. We know
+/// it isn't ours (a marker we wrote is well-formed), but not whose it is.
+const UNKNOWN_ACCOUNT: &str = "unknown";
+
+/// The `account.json` marker.
+#[derive(Serialize, Deserialize)]
+struct AccountMarker {
+    /// `0x` + 40 hex: the node EOA that owns the account-scoped state.
+    account: String,
+}
+
+/// Make the data dir's account-scoped state belong to `eth` before
+/// anything reads it.
+///
+/// Without this, a key swap silently mixes two accounts: the postage
+/// reload (`drive::reload_persisted_issuers`) and the chequebook
+/// association are keyed by path, not by owner, so the new key would
+/// sign stamps over the *old* account's batch and cheques against the
+/// *old* account's chequebook. Nothing local notices — the plan reads as
+/// active and settlement as ready — while every peer drops both, which
+/// is precisely the failure mode that has to be caught before startup
+/// rather than at first use.
+///
+/// The previous account's state is *parked* under
+/// `<data_dir>/accounts/<its address>/` rather than deleted, and this
+/// account's parked state (from an earlier switch) is swapped back in,
+/// so switching keys back and forth loses nothing.
+///
+/// Ordering is crash-safe: parking runs before the marker is rewritten
+/// (a crash in between just re-runs a now-empty park), and the adopt
+/// step runs on every start (a crash mid-adopt is finished by the next
+/// one).
+fn bind_account_state(data_dir: &Path, eth: &[u8; 20]) -> Result<(), FfiError> {
+    let current = format!("0x{}", hex::encode(eth));
+    let marker = data_dir.join(ACCOUNT_MARKER_FILE);
+    match read_account_marker(&marker)? {
+        // Same account as last launch: the canonical paths are its own.
+        Some(previous) if previous.eq_ignore_ascii_case(&current) => {}
+        // Someone else's (or unattributable) state sitting where this
+        // account's belongs — park it before anything opens it.
+        Some(previous) => {
+            tracing::warn!(
+                target: "ant-ffi",
+                previous = %previous,
+                current = %current,
+                "data dir belongs to a different account; parking its postage / chequebook / settlement state",
+            );
+            move_account_entries(data_dir, &account_park_dir(data_dir, &previous))?;
+            write_account_marker(&marker, &current)?;
+        }
+        // No marker: either a fresh data dir, or the first start under a
+        // build that keeps one. Whatever is here was written by the
+        // account starting now — before host-held identities the key
+        // came from this very directory and could not change.
+        None => write_account_marker(&marker, &current)?,
+    }
+
+    // Swap this account's own parked state (if any) back in. Runs on
+    // every start so an interrupted adopt is completed on the next one.
+    let parked = account_park_dir(data_dir, &current);
+    if parked.is_dir() {
+        move_account_entries(&parked, data_dir)?;
+        // Empty now; a leftover (something else was put in there) is
+        // left alone rather than removed.
+        let _ = std::fs::remove_dir(&parked);
+    }
+    Ok(())
+}
+
+/// `<data_dir>/accounts/<owner>` — `owner` is always either a validated
+/// `0x` + 40-hex address or [`UNKNOWN_ACCOUNT`], so it can never escape
+/// the data dir.
+fn account_park_dir(data_dir: &Path, owner: &str) -> PathBuf {
+    data_dir.join(ACCOUNT_PARK_DIR).join(owner)
+}
+
+/// Move every [`ACCOUNT_SCOPED_ENTRIES`] entry present in `from` into
+/// `to`. Refuses (rather than clobbering) when the destination already
+/// holds an entry of the same name: two accounts' copies of one name
+/// means we can no longer tell which is whose, and guessing is how the
+/// wrong batch gets stamped.
+fn move_account_entries(from: &Path, to: &Path) -> Result<(), FfiError> {
+    for name in ACCOUNT_SCOPED_ENTRIES {
+        let src = from.join(name);
+        if !src.exists() {
+            continue;
+        }
+        std::fs::create_dir_all(to)
+            .map_err(|e| FfiError::Io(format!("create {}: {e}", to.display())))?;
+        let dst = to.join(name);
+        if dst.exists() {
+            return Err(FfiError::Io(format!(
+                "refusing to start: {} and {} both exist; move one aside by hand",
+                src.display(),
+                dst.display(),
+            )));
+        }
+        std::fs::rename(&src, &dst).map_err(|e| {
+            FfiError::Io(format!("move {} to {}: {e}", src.display(), dst.display()))
+        })?;
+    }
+    Ok(())
+}
+
+/// The account the data dir's state belongs to: `Ok(None)` when there is
+/// no marker at all, `Ok(Some(`[`UNKNOWN_ACCOUNT`]`))` when one exists but
+/// its *contents* aren't a valid marker (fail closed — state we can't
+/// attribute is treated as another account's).
+///
+/// A marker we can't *read* (I/O error, not a missing file) is an error,
+/// not an unknown account: reporting it as unattributable would park this
+/// account's own postage / chequebook state under `accounts/unknown`,
+/// where the adopt step — which only ever looks at
+/// `accounts/<own address>` — never brings it back. A transient read
+/// failure has to fail the start it happened on, so the next one (which
+/// can read the marker) comes up with the account intact.
+fn read_account_marker(path: &Path) -> Result<Option<String>, FfiError> {
+    let raw = match std::fs::read(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(FfiError::Io(format!(
+                "refusing to start: cannot read the account marker {}: {e}",
+                path.display(),
+            )))
+        }
+    };
+    let account = serde_json::from_slice::<AccountMarker>(&raw)
+        .ok()
+        .map(|m| m.account)
+        .filter(|a| is_eth_address(a));
+    if account.is_none() {
+        tracing::warn!(
+            target: "ant-ffi",
+            path = %path.display(),
+            "corrupt account marker; treating the data dir's state as another account's",
+        );
+    }
+    Ok(Some(account.unwrap_or_else(|| UNKNOWN_ACCOUNT.to_string())))
+}
+
+fn write_account_marker(path: &Path, account: &str) -> Result<(), FfiError> {
+    let json = serde_json::to_string(&AccountMarker {
+        account: account.to_string(),
+    })
+    .map_err(|e| FfiError::Io(format!("serialize account marker: {e}")))?;
+    // Write-tmp + rename: a torn marker would make the next start park
+    // this account's own state as a stranger's.
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json)
+        .map_err(|e| FfiError::Io(format!("write {}: {e}", tmp.display())))?;
+    std::fs::rename(&tmp, path).map_err(|e| FfiError::Io(format!("write {}: {e}", path.display())))
+}
+
+fn is_eth_address(s: &str) -> bool {
+    s.len() == 42 && s.starts_with("0x") && s[2..].bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn init_inner(
+    data_dir: &Path,
+    source_root: Option<&Path>,
+    identity: IdentitySource<'_>,
+) -> Result<AntHandle, FfiError> {
     install_log_subscriber();
 
     std::fs::create_dir_all(data_dir)
         .map_err(|e| FfiError::Io(format!("create data dir {}: {e}", data_dir.display())))?;
 
-    let id_path = data_dir.join("identity.json");
-    let (signing_secret, overlay_nonce, libp2p_keypair) = load_or_create_identity(&id_path)?;
+    let (signing_secret, overlay_nonce, libp2p_keypair) = match identity {
+        IdentitySource::DataDir => load_or_create_identity(&data_dir.join("identity.json"))?,
+        IdentitySource::Provided(json) => decode_identity_json(json)?,
+    };
 
     let vk = *SigningKey::from_bytes((&signing_secret).into())
         .map_err(|e| FfiError::Crypto(format!("invalid signing key: {e}")))?
@@ -330,6 +660,12 @@ fn init_inner(data_dir: &Path, source_root: Option<&Path>) -> Result<AntHandle, 
     let eth = ethereum_address_from_public_key(&vk);
     let overlay = overlay_from_ethereum_address(&eth, 1, &overlay_nonce);
     let peer_id = libp2p_keypair.public().to_peer_id();
+
+    // The host can hand us a *different* account than it did last launch
+    // (`ant_identity_from_key` + a Restore flow), so make the data dir's
+    // account-scoped state belong to this account before anything below
+    // opens it.
+    bind_account_state(data_dir, &eth)?;
 
     let started_at_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -468,8 +804,9 @@ fn init_inner(data_dir: &Path, source_root: Option<&Path>) -> Result<AntHandle, 
     // no-RPC manual path. Gated on `chain`: a download-only build never
     // uploads, so it never needs (or can deploy) a chequebook.
     #[cfg(feature = "chain")]
-    let pushsync_cfg = match ant_chain::chequebook_store::load_persisted_chequebook(
+    let pushsync_cfg = match ant_chain::chequebook_store::load_persisted_chequebook_for(
         &data_dir.join("chequebook.json"),
+        &eth,
     ) {
         Ok(Some(chequebook)) => {
             tracing::info!(
@@ -2353,8 +2690,18 @@ pub unsafe extern "C" fn ant_free_string(ptr: *mut c_char) {
     }
 }
 
-/// Shut the embedded node down. Aborts the Tokio runtime and frees the
+/// Shut the embedded node down. Stops the Tokio runtime and frees the
 /// handle. After this returns, `handle` must not be used again.
+///
+/// Blocks until the node's tasks have stopped (bounded by
+/// [`SHUTDOWN_GRACE`]), so call it off the host's main thread. It has to
+/// block: a restore does `ant_shutdown(A)` then `ant_init(B)` over the
+/// same data dir, and a task of A's still running after this returns
+/// (an upload checkpoint or postage persist is a `create_dir_all`, a
+/// write and a rename) would recreate A's canonical files *after*
+/// `ant_init(B)` parked them — attributing A's state to B, or leaving
+/// both copies for the next switch to abort on in
+/// `move_account_entries`.
 ///
 /// # Safety
 ///
@@ -2366,11 +2713,12 @@ pub unsafe extern "C" fn ant_shutdown(handle: *mut AntHandle) {
             return;
         }
         let handle = Box::from_raw(handle);
-        // Dropping the runtime aborts every spawned task (including the
-        // node loop) and joins blocking threads. We ship it off to a
-        // `shutdown_background` call so this FFI entry point never blocks
-        // if the node loop is mid-dial and holding a socket open.
-        handle.runtime.shutdown_background();
+        // Cancels every spawned task (including the node loop) at its
+        // next await point and joins the worker / blocking threads. The
+        // timeout keeps a task wedged in a syscall (a dial holding a
+        // socket open) from hanging the host for good; it leaks the
+        // thread rather than the wait.
+        handle.runtime.shutdown_timeout(SHUTDOWN_GRACE);
     }
 }
 
@@ -2418,42 +2766,98 @@ fn load_or_create_identity(
     if id_path.exists() {
         let raw = std::fs::read_to_string(id_path)
             .map_err(|e| FfiError::Io(format!("read {}: {e}", id_path.display())))?;
-        let id: IdentityFile = serde_json::from_str(&raw)
-            .map_err(|e| FfiError::Io(format!("parse identity.json: {e}")))?;
-        let mut signing_secret = [0u8; SECP256K1_SECRET_LEN];
-        hex::decode_to_slice(&id.signing_key, &mut signing_secret)
-            .map_err(|e| FfiError::Io(format!("decode signing_key: {e}")))?;
-        let mut overlay_nonce = [0u8; OVERLAY_NONCE_LEN];
-        hex::decode_to_slice(&id.overlay_nonce, &mut overlay_nonce)
-            .map_err(|e| FfiError::Io(format!("decode overlay_nonce: {e}")))?;
-        let kp = if let Some(ref enc) = id.libp2p_keypair {
-            let bytes = hex::decode(enc)
-                .map_err(|e| FfiError::Io(format!("decode libp2p_keypair: {e}")))?;
-            Keypair::from_protobuf_encoding(&bytes)
-                .map_err(|e| FfiError::Io(format!("libp2p keypair protobuf: {e}")))?
-        } else {
-            secp256k1_keypair_from_signing_secret(&signing_secret)?
-        };
-        return Ok((signing_secret, overlay_nonce, kp));
+        return decode_identity_json(&raw);
     }
 
-    let signing_secret = random_secp256k1_secret();
-    let overlay_nonce = random_overlay_nonce();
-    let kp = secp256k1_keypair_from_signing_secret(&signing_secret)?;
+    let id = new_identity()?;
+    let decoded = decode_identity(&id)?;
+    let pretty = serde_json::to_string_pretty(&id)
+        .map_err(|e| FfiError::Io(format!("serialize identity: {e}")))?;
+    std::fs::write(id_path, pretty)
+        .map_err(|e| FfiError::Io(format!("write {}: {e}", id_path.display())))?;
+    Ok(decoded)
+}
 
-    let id = IdentityFile {
+/// Parse an identity JSON document (`identity.json`'s shape) into the
+/// three pieces the node loop needs. Shared by the on-disk path and the
+/// host-provided (`ant_init_with_identity`) path.
+fn decode_identity_json(
+    raw: &str,
+) -> Result<([u8; SECP256K1_SECRET_LEN], [u8; OVERLAY_NONCE_LEN], Keypair), FfiError> {
+    let id: IdentityFile =
+        serde_json::from_str(raw).map_err(|e| FfiError::Io(format!("parse identity json: {e}")))?;
+    decode_identity(&id)
+}
+
+fn decode_identity(
+    id: &IdentityFile,
+) -> Result<([u8; SECP256K1_SECRET_LEN], [u8; OVERLAY_NONCE_LEN], Keypair), FfiError> {
+    let signing_secret = decode_signing_key(&id.signing_key)?;
+    let mut overlay_nonce = [0u8; OVERLAY_NONCE_LEN];
+    hex::decode_to_slice(&id.overlay_nonce, &mut overlay_nonce)
+        .map_err(|e| FfiError::Io(format!("decode overlay_nonce: {e}")))?;
+    let kp = if let Some(ref enc) = id.libp2p_keypair {
+        let bytes =
+            hex::decode(enc).map_err(|e| FfiError::Io(format!("decode libp2p_keypair: {e}")))?;
+        Keypair::from_protobuf_encoding(&bytes)
+            .map_err(|e| FfiError::Io(format!("libp2p keypair protobuf: {e}")))?
+    } else {
+        secp256k1_keypair_from_signing_secret(&signing_secret)?
+    };
+    Ok((signing_secret, overlay_nonce, kp))
+}
+
+/// Decode a 64-hex account key (an optional `0x` prefix is tolerated,
+/// since that's how wallets hand keys to users) and reject anything the
+/// secp256k1 group won't accept — zero, or ≥ the curve order. Doing this
+/// here means a mistyped restore fails with a clear message instead of
+/// surfacing as an opaque node-startup error.
+fn decode_signing_key(hex_str: &str) -> Result<[u8; SECP256K1_SECRET_LEN], FfiError> {
+    let trimmed = hex_str.trim();
+    let body = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+    let mut secret = [0u8; SECP256K1_SECRET_LEN];
+    hex::decode_to_slice(body, &mut secret)
+        .map_err(|e| FfiError::Crypto(format!("decode signing_key: {e}")))?;
+    SigningKey::from_bytes((&secret).into())
+        .map_err(|e| FfiError::Crypto(format!("invalid signing key: {e}")))?;
+    Ok(secret)
+}
+
+/// A brand-new identity: random account key, random overlay nonce, and
+/// the libp2p keypair derived from the key.
+fn new_identity() -> Result<IdentityFile, FfiError> {
+    identity_file(random_secp256k1_secret(), random_overlay_nonce())
+}
+
+/// Rebuild an identity from a bare account key — the "I still have my
+/// backed-up key" restore path. The overlay nonce is derived from the
+/// account's Ethereum address so the same key always produces the same
+/// overlay, making the restore reproducible across devices.
+fn identity_from_signing_key(hex_str: &str) -> Result<IdentityFile, FfiError> {
+    let secret = decode_signing_key(hex_str)?;
+    let vk = *SigningKey::from_bytes((&secret).into())
+        .map_err(|e| FfiError::Crypto(format!("invalid signing key: {e}")))?
+        .verifying_key();
+    let eth = ethereum_address_from_public_key(&vk);
+    let mut preimage = Vec::with_capacity(OVERLAY_NONCE_DOMAIN.len() + eth.len());
+    preimage.extend_from_slice(OVERLAY_NONCE_DOMAIN);
+    preimage.extend_from_slice(&eth);
+    identity_file(secret, keccak256(&preimage))
+}
+
+fn identity_file(
+    signing_secret: [u8; SECP256K1_SECRET_LEN],
+    overlay_nonce: [u8; OVERLAY_NONCE_LEN],
+) -> Result<IdentityFile, FfiError> {
+    let kp = secp256k1_keypair_from_signing_secret(&signing_secret)?;
+    Ok(IdentityFile {
         signing_key: hex::encode(signing_secret),
         overlay_nonce: hex::encode(overlay_nonce),
         libp2p_keypair: Some(hex::encode(
             kp.to_protobuf_encoding()
                 .map_err(|e| FfiError::Io(format!("encode libp2p keypair: {e}")))?,
         )),
-    };
-    let pretty = serde_json::to_string_pretty(&id)
-        .map_err(|e| FfiError::Io(format!("serialize identity: {e}")))?;
-    std::fs::write(id_path, pretty)
-        .map_err(|e| FfiError::Io(format!("write {}: {e}", id_path.display())))?;
-    Ok((signing_secret, overlay_nonce, kp))
+    })
 }
 
 fn secp256k1_keypair_from_signing_secret(
@@ -2651,6 +3055,362 @@ mod tests {
     fn parse_reference_rejects_bad_length() {
         let err = parse_reference("abc").unwrap_err();
         assert!(matches!(err, FfiError::Reference(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn generated_identity_round_trips_through_json() {
+        let id = new_identity().expect("generate identity");
+        let json = serde_json::to_string(&id).expect("serialize");
+        let (secret, nonce, kp) = decode_identity_json(&json).expect("decode");
+        assert_eq!(hex::encode(secret), id.signing_key);
+        assert_eq!(hex::encode(nonce), id.overlay_nonce);
+        // The embedded libp2p keypair must be the one derived from the
+        // account key, or the node would announce a peer id that doesn't
+        // match the overlay it signs handshakes for.
+        let derived = secp256k1_keypair_from_signing_secret(&secret).expect("derive keypair");
+        assert_eq!(kp.public().to_peer_id(), derived.public().to_peer_id());
+    }
+
+    #[test]
+    fn generated_identities_are_distinct() {
+        let a = new_identity().expect("generate a");
+        let b = new_identity().expect("generate b");
+        assert_ne!(a.signing_key, b.signing_key);
+        assert_ne!(a.overlay_nonce, b.overlay_nonce);
+    }
+
+    #[test]
+    fn identity_from_key_is_reproducible() {
+        let key = "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+        let a = identity_from_signing_key(key).expect("from key");
+        let b = identity_from_signing_key(key).expect("from key again");
+        assert_eq!(a.signing_key, key);
+        // Same key ⇒ same overlay nonce ⇒ same overlay, so restoring on a
+        // second device lands the node in the same neighbourhood.
+        assert_eq!(a.overlay_nonce, b.overlay_nonce);
+        assert_eq!(a.libp2p_keypair, b.libp2p_keypair);
+    }
+
+    #[test]
+    fn identity_from_key_accepts_0x_prefix_and_whitespace() {
+        let key = "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+        let bare = identity_from_signing_key(key).expect("bare");
+        let prefixed = identity_from_signing_key(&format!("  0x{key}\n")).expect("prefixed");
+        assert_eq!(bare.signing_key, prefixed.signing_key);
+        assert_eq!(bare.overlay_nonce, prefixed.overlay_nonce);
+    }
+
+    #[test]
+    fn identity_from_key_rejects_bad_keys() {
+        // Too short, not hex, zero, and ≥ the secp256k1 group order.
+        for bad in [
+            "abcd",
+            "zz0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
+            &"0".repeat(64),
+            "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
+        ] {
+            assert!(
+                identity_from_signing_key(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_identity_json_rejects_malformed_documents() {
+        assert!(decode_identity_json("not json").is_err());
+        // Valid JSON, but the nonce isn't 32 bytes of hex.
+        let id = new_identity().expect("generate identity");
+        let bad = format!(
+            r#"{{"signing_key":"{}","overlay_nonce":"beef","libp2p_keypair":null}}"#,
+            id.signing_key
+        );
+        assert!(decode_identity_json(&bad).is_err());
+    }
+
+    #[test]
+    fn data_dir_identity_is_written_once_and_reused() {
+        let dir = std::env::temp_dir().join(format!(
+            "ant-ffi-identity-datadir-{}-{:p}",
+            std::process::id(),
+            &0u8
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let id_path = dir.join("identity.json");
+
+        let (first, nonce, _) = load_or_create_identity(&id_path).expect("create");
+        assert!(id_path.exists(), "first call must persist identity.json");
+        let (second, nonce2, _) = load_or_create_identity(&id_path).expect("reload");
+        assert_eq!(first, second, "reload must return the same account key");
+        assert_eq!(nonce, nonce2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn provided_identity_leaves_no_key_on_disk() {
+        // The whole point of the host-held path: nothing key-shaped may
+        // land in the data dir when the embedder supplies the identity.
+        let dir = std::env::temp_dir().join(format!(
+            "ant-ffi-identity-provided-{}-{:p}",
+            std::process::id(),
+            &0u8
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        let id = new_identity().expect("generate identity");
+        let json = serde_json::to_string(&id).expect("serialize");
+        let (secret, ..) = decode_identity_json(&json).expect("decode provided identity");
+        assert_eq!(hex::encode(secret), id.signing_key);
+
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "expected an empty data dir, got {entries:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A data dir seeded with one batch store, a chequebook association
+    /// and both SWAP ledgers — the state a working account leaves behind.
+    fn seed_account_state(dir: &Path) {
+        std::fs::create_dir_all(dir.join("postage")).expect("create postage dir");
+        std::fs::write(dir.join("postage").join("batch.bin"), b"batch").expect("write batch");
+        std::fs::create_dir_all(dir.join("uploads")).expect("create uploads dir");
+        std::fs::write(dir.join("chequebook.json"), b"{}").expect("write chequebook");
+        std::fs::write(dir.join("swap_credits.json"), b"{}").expect("write credits");
+        std::fs::write(dir.join("pushsync_outbound.json"), b"{}").expect("write outbound");
+    }
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("ant-ffi-{tag}-{}-{:p}", std::process::id(), &0u8));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn account_switch_parks_the_previous_accounts_state() {
+        let dir = scratch_dir("account-switch");
+        let a = [0xaau8; 20];
+        let b = [0xbbu8; 20];
+
+        // Account A runs once and leaves a plan + chequebook behind.
+        bind_account_state(&dir, &a).expect("bind A");
+        seed_account_state(&dir);
+
+        // Account B is restored onto the same device. None of A's state
+        // may still be at the canonical paths B's node reads.
+        bind_account_state(&dir, &b).expect("bind B");
+        for name in ACCOUNT_SCOPED_ENTRIES {
+            assert!(
+                !dir.join(name).exists(),
+                "{name} must not be visible to the new account",
+            );
+        }
+        // Parked, not destroyed: A can still be restored.
+        let parked = dir
+            .join(ACCOUNT_PARK_DIR)
+            .join(format!("0x{}", hex::encode(a)));
+        assert!(parked.join("postage").join("batch.bin").exists());
+        assert!(parked.join("chequebook.json").exists());
+
+        // Switching back hands A its own state again, and parks B's.
+        seed_account_state(&dir);
+        bind_account_state(&dir, &a).expect("bind A again");
+        assert!(dir.join("postage").join("batch.bin").exists());
+        assert!(dir.join("chequebook.json").exists());
+        assert!(!parked.exists(), "A's park dir is emptied on adopt");
+        assert!(dir
+            .join(ACCOUNT_PARK_DIR)
+            .join(format!("0x{}", hex::encode(b)))
+            .join("chequebook.json")
+            .exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restored_account_does_not_inherit_the_previous_plan() {
+        // The path the node actually takes at startup, with a real
+        // postage store: account A's batch must not be reloaded into
+        // account B's issuer registry (B's key would sign stamps over a
+        // batch A owns, and every peer would drop them), and must come
+        // back intact when A is restored.
+        let dir = scratch_dir("account-issuers");
+        let (a, b) = ([0x44u8; 20], [0x55u8; 20]);
+        let batch = [0x66u8; 32];
+
+        bind_account_state(&dir, &a).expect("bind A");
+        let postage = dir.join("postage");
+        std::fs::create_dir_all(&postage).expect("create postage dir");
+        drop(
+            ant_postage::StampIssuer::open_or_new(
+                postage.join(format!("{}.bin", hex::encode(batch))),
+                batch,
+                20,
+                16,
+                false,
+            )
+            .expect("create batch store"),
+        );
+        assert!(drive::reload_persisted_issuers(&postage).contains_key(&batch));
+
+        bind_account_state(&dir, &b).expect("bind B");
+        assert!(
+            drive::reload_persisted_issuers(&postage).is_empty(),
+            "the restored account must not stamp against the previous account's batch",
+        );
+
+        bind_account_state(&dir, &a).expect("bind A again");
+        assert!(
+            drive::reload_persisted_issuers(&postage).contains_key(&batch),
+            "restoring the original account must return its plan",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_account_restart_leaves_state_in_place() {
+        let dir = scratch_dir("account-restart");
+        let a = [0x11u8; 20];
+        bind_account_state(&dir, &a).expect("first start");
+        seed_account_state(&dir);
+        bind_account_state(&dir, &a).expect("restart");
+        assert!(dir.join("postage").join("batch.bin").exists());
+        assert!(dir.join("chequebook.json").exists());
+        assert!(
+            !dir.join(ACCOUNT_PARK_DIR).exists(),
+            "a plain restart must not move anything",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_data_dir_without_a_marker_keeps_its_state() {
+        // Upgrade path: state written before the marker existed belongs
+        // to the account starting now (that build had no way to change
+        // the key under a fixed data dir).
+        let dir = scratch_dir("account-legacy");
+        seed_account_state(&dir);
+        bind_account_state(&dir, &[0x22u8; 20]).expect("adopt legacy state");
+        assert!(dir.join("postage").join("batch.bin").exists());
+        assert!(dir.join(ACCOUNT_MARKER_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_marker_parks_state_as_unattributable() {
+        let dir = scratch_dir("account-corrupt");
+        seed_account_state(&dir);
+        std::fs::write(dir.join(ACCOUNT_MARKER_FILE), b"{ truncated").expect("corrupt marker");
+        bind_account_state(&dir, &[0x33u8; 20]).expect("bind over corrupt marker");
+        assert!(
+            !dir.join("chequebook.json").exists(),
+            "state we can't attribute must not be adopted",
+        );
+        assert!(dir
+            .join(ACCOUNT_PARK_DIR)
+            .join(UNKNOWN_ACCOUNT)
+            .join("chequebook.json")
+            .exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_marker_that_cannot_be_read_fails_the_start_instead_of_parking() {
+        // A read *failure* (as opposed to a marker whose contents are
+        // corrupt) says nothing about who the state belongs to. Parking
+        // it as unattributable would be one-way: adopt only ever looks
+        // at `accounts/<own address>`, so the account's own plan and
+        // chequebook would never come back, and the next buy would
+        // deploy a second chequebook. Fail the start; the next one can
+        // read the marker and comes up intact.
+        let dir = scratch_dir("account-unreadable");
+        seed_account_state(&dir);
+        // A directory where the marker belongs: `read` fails with
+        // EISDIR, not NotFound, on every platform we ship.
+        std::fs::create_dir(dir.join(ACCOUNT_MARKER_FILE)).expect("marker as a dir");
+
+        let err = bind_account_state(&dir, &[0x77u8; 20]).expect_err("must not succeed");
+        assert!(
+            err.to_string().contains("account marker"),
+            "unhelpful error: {err}",
+        );
+        assert!(
+            dir.join("chequebook.json").exists() && dir.join("postage").join("batch.bin").exists(),
+            "the account's own state must stay where it is",
+        );
+        assert!(
+            !dir.join(ACCOUNT_PARK_DIR).exists(),
+            "nothing may be parked on an unreadable marker",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A handle over `runtime` with everything else inert — enough for
+    /// the [`ant_shutdown`] contract, which only touches the runtime.
+    fn test_handle(runtime: Runtime, data_dir: &Path) -> AntHandle {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+        let (_status_tx, status_rx) = watch::channel(StatusSnapshot::default());
+        AntHandle {
+            runtime,
+            cmd_tx,
+            status_rx,
+            progress: Mutex::new(DownloadProgressState::default()),
+            cancel_flag: AtomicBool::new(false),
+            cancel_notify: Notify::new(),
+            verify_cancel: Arc::new(AtomicBool::new(false)),
+            signing_secret: [0u8; SECP256K1_SECRET_LEN],
+            eth: [0u8; 20],
+            data_dir: data_dir.to_path_buf(),
+            gateway_task: Mutex::new(None),
+        }
+    }
+
+    #[test]
+    fn shutdown_does_not_return_while_a_task_is_still_persisting() {
+        // Restore is `ant_shutdown(A)` then `ant_init(B)` over one data
+        // dir. If a task of A's is still inside its checkpoint persist
+        // (`create_dir_all` + write + rename) when shutdown returns, it
+        // recreates A's canonical files *after* B's `bind_account_state`
+        // parked them: A's state is then attributed to B, and the next
+        // switch back to A aborts in `move_account_entries`.
+        let dir = scratch_dir("shutdown-drain");
+        let checkpoint = dir.join("postage").join("late.bin");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let target = checkpoint.clone();
+        runtime.spawn(async move {
+            // Sync from here on, exactly like the real persist: nothing
+            // for a cancel to land on until it has finished.
+            std::thread::sleep(Duration::from_millis(300));
+            std::fs::create_dir_all(target.parent().expect("parent")).expect("create dir");
+            std::fs::write(&target, b"late").expect("write checkpoint");
+        });
+        // Let the task reach the worker before we tear the runtime down.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let handle = Box::into_raw(Box::new(test_handle(runtime, &dir)));
+        unsafe { ant_shutdown(handle) };
+
+        assert!(
+            checkpoint.exists(),
+            "ant_shutdown returned while a task was still writing to the data dir",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ParsedRef doesn't derive Debug because [u8; 32] wouldn't print
