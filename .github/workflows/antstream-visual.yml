@@ -1,0 +1,90 @@
+# AntStream simulator evidence (issue #70).
+#
+# Builds the iOS example app for the simulator on a macOS runner, boots a
+# simulator, launches the app, and uploads screenshots + app log as
+# artifacts — so PRs touching examples/ios-stream get build verification
+# and visual evidence despite the orchestrator running on Linux.
+#
+# Device-only paths (camera/broadcast) and real iCloud Keychain sync are
+# out of scope — those stay manual.
+
+name: antstream-visual
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "examples/ios-stream/**"
+      - ".github/workflows/antstream-visual.yml"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  simulator-evidence:
+    name: build AntStream + simulator screenshots
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: antstream-visual
+
+      - name: Select newest Xcode
+        run: |
+          sudo xcode-select -s "$(ls -d /Applications/Xcode*.app | sort -V | tail -1)/Contents/Developer"
+          xcodebuild -version
+
+      - name: Pick a simulator
+        id: sim
+        run: |
+          DEVICE=$(xcrun simctl list devices available | grep -E '^\s+iPhone' | head -1 | sed -E 's/^ +//; s/ \([-A-F0-9]+\).*$//')
+          if [ -z "$DEVICE" ]; then
+            echo "no iPhone simulator available"; xcrun simctl list devices; exit 1
+          fi
+          echo "device=$DEVICE" >> "$GITHUB_OUTPUT"
+          echo "picked: $DEVICE"
+
+      - name: Build for simulator
+        working-directory: examples/ios-stream
+        run: |
+          xcodebuild -project AntStream.xcodeproj -scheme AntStream \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,name=${{ steps.sim.outputs.device }}" \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO build
+
+      - name: Launch and capture screenshots
+        working-directory: examples/ios-stream
+        run: |
+          APP=$(find build/Build/Products -maxdepth 3 -name "AntStream.app" | head -1)
+          [ -n "$APP" ] || { echo "app not found"; exit 1; }
+          xcrun simctl boot "${{ steps.sim.outputs.device }}" || true
+          xcrun simctl bootstatus "${{ steps.sim.outputs.device }}" -b
+          xcrun simctl install booted "$APP"
+          xcrun simctl launch booted at.vibing.ant.stream
+          mkdir -p shots
+          sleep 20
+          xcrun simctl io booted screenshot shots/01-first-screen.png
+          sleep 25
+          xcrun simctl io booted screenshot shots/02-after-node-start.png
+          xcrun simctl spawn booted log show --last 3m \
+            --predicate 'processImagePath contains "AntStream"' \
+            > shots/app-log.txt || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: antstream-simulator-evidence
+          path: examples/ios-stream/shots/
+          if-no-files-found: error
