@@ -730,9 +730,16 @@ char *ant_bench_progress(const AntHandle *handle, char **out_err);
  * Stop the run and return its final report as an allocated JSON object
  * (free with ant_free_string): the config it ran with plus
  * sustained_mbit_s / sustained_chunks_s, publish_ms_p50|p95|max,
- * lag_ms_p50|p95|max|final, peers_min|max, segments_ok|failed, the
- * first few error strings, and a "sustained" verdict (every segment
+ * lag_ms_p50|p95|max|final, peers_min|max, segments_ok|failed,
+ * measured_segments_total|ok, the first few error strings, and a
+ * "sustained" verdict (at least one segment measured AND every segment
  * published AND the final lag still inside 3 x segment_ms).
+ *
+ * A run stopped before warmup_s has elapsed measures nothing:
+ * measured_segments_total is 0, every figure is 0, and "sustained" is
+ * false because there is no window to judge — not because the run fell
+ * behind. Hosts rendering a verdict should say so rather than showing
+ * such a run as a pass or a failure.
  *
  * BLOCKING: the cancel is cooperative, so this waits for the in-flight
  * segments to land (bounded at ~65 s by the bench's own per-segment

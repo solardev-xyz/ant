@@ -33,11 +33,19 @@ lives in `crates/ant-ffi/src/bench.rs` and not in a throwaway script.
    optimum is 400 peers at ~105 chunks/s ≈ 3.4 Mbit/s — find the phone
    optimum) and **battery/thermal** over the run.
 
-A run "keeps up" when every segment published *and* the final segment
-was still within three segment durations of the live edge. That single
-predicate (`BenchReport::keeps_up`) backs both the `sustained` field and
-the **kept up** column below — a run that quietly falls further and
-further behind is not a pass, even with zero errors.
+A run "keeps up" when it measured something at all, every segment
+published, *and* the final measured segment was still within three
+segment durations of the live edge. That single predicate
+(`BenchReport::keeps_up`) backs both the `sustained` field and the
+**kept up** column below — a run that quietly falls further and further
+behind is not a pass, even with zero errors.
+
+The first clause is the one that bites in practice: stop a run before
+`warmup_s` has elapsed and *nothing* is in the measured window, so every
+figure folds to zero — including `lag_ms_final`, which would otherwise
+sit comfortably inside the budget and pass a 0.00 Mbit/s run. Such a run
+has no verdict rather than a false one: `measured_segments_total` is 0
+and the **kept up** cell reads `n/a (no measured window)`.
 
 ## Results
 
@@ -190,7 +198,8 @@ read as a *floor*, not the phone's ceiling.
 | `lag_ms_p50/p95/max/final` | how far behind live each segment landed (capture → published). Flat = keeping up; climbing = the uplink can't take the bitrate |
 | `segments_failed` + `errors` | first few verbatim gateway errors — an unusable batch or a settlement stall shows up here, not as a slow number |
 | `peers_min/max` | BZZ peer set during the run; a run that started cold is visible here |
-| `sustained` | `segments_failed == 0 && lag_ms_final ≤ 3 × segment_ms` |
+| `measured_segments_total/ok` | the post-warm-up sample everything above is computed from; `0` = the run was stopped inside the warm-up and measured nothing |
+| `sustained` | `measured_segments_ok > 0 && segments_failed == 0 && lag_ms_final ≤ 3 × segment_ms` |
 
 `warmup_s` (default 30 s) is excluded from the sustained figures: the
 first segments pay peer-set warm-up and pushsync skip-cache misses.

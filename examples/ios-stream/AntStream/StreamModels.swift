@@ -270,6 +270,11 @@ struct BenchReport: Codable, Equatable {
     let segmentsTotal: UInt64
     let segmentsOk: UInt64
     let segmentsFailed: UInt64
+    /// Segments captured inside the measured (post-warm-up) window —
+    /// the sample every figure below is computed from. Zero means the
+    /// run was stopped before it left warm-up, so there is no verdict.
+    let measuredSegmentsTotal: UInt64
+    let measuredSegmentsOk: UInt64
     let sustainedMbitS: Double
     let sustainedChunksS: Double
     let publishMsP50: UInt64
@@ -296,6 +301,8 @@ struct BenchReport: Codable, Equatable {
         case segmentsTotal = "segments_total"
         case segmentsOk = "segments_ok"
         case segmentsFailed = "segments_failed"
+        case measuredSegmentsTotal = "measured_segments_total"
+        case measuredSegmentsOk = "measured_segments_ok"
         case sustainedMbitS = "sustained_mbit_s"
         case sustainedChunksS = "sustained_chunks_s"
         case publishMsP50 = "publish_ms_p50"
@@ -314,22 +321,41 @@ struct BenchReport: Codable, Equatable {
         |---|---|---|---|---|---|---|---|
         """
 
+    /// Whether the run produced a measured (post-warm-up) sample at
+    /// all. Stopping inside `warmup_s` leaves none — every figure is
+    /// then the zero an empty window folds to, and the run has no
+    /// verdict to report either way. Mirrors Rust's `has_measurement`.
+    var hasMeasurement: Bool { measuredSegmentsTotal > 0 }
+
+    /// The **kept up** cell — three-state, matching Rust's `verdict()`:
+    /// a run that measured nothing must not enter the go/no-go table as
+    /// a pass *or* a failure.
+    var verdict: String {
+        guard hasMeasurement else { return "n/a (no measured window)" }
+        return sustained ? "yes" : "**no**"
+    }
+
     var markdownRow: String {
         let sustainedMbit = String(format: "%.2f", sustainedMbitS)
         let chunks = String(format: "%.1f", sustainedChunksS)
         return "| \(label) | \(mode) | \(targetBitrateKbps) kbit/s | \(sustainedMbit) Mbit/s "
             + "| \(chunks) | \(publishMsP50) / \(publishMsP95) / \(publishMsMax) "
-            + "| \(lagMsFinal) | \(sustained ? "yes" : "**no**") |"
+            + "| \(lagMsFinal) | \(verdict) |"
     }
 
     /// The whole run, ready to paste into the issue: the table row plus
     /// the context a reader needs to trust it.
     var markdownBlock: String {
         var out = "\(Self.markdownHeader)\n\(markdownRow)\n"
-        out += "\nRun: \(segmentsOk)/\(segmentsTotal) segments over "
-        out += "\(Int(measuredS)) s measured (\(warmupS) s warm-up excluded), "
+        out += "\nRun: \(segmentsOk)/\(segmentsTotal) segments published, "
+        out += "\(measuredSegmentsOk) inside the \(Int(measuredS)) s measured window "
+        out += "(\(warmupS) s warm-up excluded), "
         out += "\(segmentBytes) B segments every \(segmentMs) ms, "
         out += "window \(maxInFlight), peers \(peersMin)–\(peersMax).\n"
+        if !hasMeasurement {
+            out += "Stopped before the warm-up ended: nothing was measured, "
+            out += "so this run has no throughput number and no verdict.\n"
+        }
         if !notes.isEmpty { out += "Notes: \(notes)\n" }
         if !errors.isEmpty { out += "Errors: \(errors.joined(separator: "; "))\n" }
         return out

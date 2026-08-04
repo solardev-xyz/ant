@@ -110,6 +110,15 @@ struct BenchView: View {
             guard nodeReady else { return }
             durationSeconds = UInt64(seconds)
             start()
+            // `-antstreamBenchStopAfter <n>` then taps "Stop and
+            // report" n seconds in. Stopping *inside* `warmup_s` is the
+            // one report state a runner can't otherwise reach (no tap
+            // driver) and the one the card must not render as a pass:
+            // nothing was measured, so there is no verdict.
+            let stopAfter = UserDefaults.standard.integer(forKey: "antstreamBenchStopAfter")
+            guard stopAfter > 0 else { return }
+            try? await Task.sleep(nanoseconds: UInt64(stopAfter) * 1_000_000_000)
+            if running { stop() }
         }
     }
 
@@ -229,10 +238,20 @@ struct BenchView: View {
     private func resultCard(_ report: BenchReport) -> some View {
         GlassCard {
             VStack(alignment: .leading, spacing: 14) {
-                Label(report.sustained ? "Sustained the rendition" : "Did not keep up",
-                      systemImage: report.sustained ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
+                // Three states, not two: a run stopped inside the
+                // warm-up measured nothing, and claiming it sustained
+                // the rendition (or that it failed to) would both be
+                // verdicts on an empty window.
+                Label(verdictTitle(report), systemImage: verdictIcon(report))
                     .font(.headline)
-                    .foregroundStyle(report.sustained ? Color.green : Color.orange)
+                    .foregroundStyle(verdictTint(report))
+                if !report.hasMeasurement {
+                    Text("Stopped before the \(report.warmupS) s warm-up ended, so nothing "
+                         + "went into the measured window. Let a run pass the warm-up to "
+                         + "get a number.")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.7))
+                }
                 statRow("Sustained", String(format: "%.2f Mbit/s", report.sustainedMbitS))
                 statRow("Chunks/s", String(format: "%.1f", report.sustainedChunksS))
                 statRow("Publish p50/p95",
@@ -241,6 +260,7 @@ struct BenchView: View {
                         "\(report.lagMsP95) / \(report.lagMsFinal) ms")
                 statRow("Segments",
                         "\(report.segmentsOk) ok · \(report.segmentsFailed) failed")
+                statRow("Measured", "\(report.measuredSegmentsOk) segments")
                 if let first = report.errors.first {
                     Text(first)
                         .font(.caption)
@@ -273,6 +293,24 @@ struct BenchView: View {
                     .textSelection(.enabled)
             }
         }
+    }
+
+    // The result card's headline reads the same three-state verdict the
+    // copied table row does (`BenchReport.verdict`), so the card and the
+    // row a reader pastes into #67 can never disagree.
+    private func verdictTitle(_ report: BenchReport) -> String {
+        guard report.hasMeasurement else { return "Nothing measured yet" }
+        return report.sustained ? "Sustained the rendition" : "Did not keep up"
+    }
+
+    private func verdictIcon(_ report: BenchReport) -> String {
+        guard report.hasMeasurement else { return "clock.badge.questionmark" }
+        return report.sustained ? "checkmark.seal.fill" : "exclamationmark.triangle.fill"
+    }
+
+    private func verdictTint(_ report: BenchReport) -> Color {
+        guard report.hasMeasurement else { return .white.opacity(0.75) }
+        return report.sustained ? .green : .orange
     }
 
     private func statRow(_ title: String, _ value: String) -> some View {

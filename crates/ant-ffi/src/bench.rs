@@ -357,6 +357,14 @@ pub struct BenchReport {
     pub segments_total: u64,
     pub segments_ok: u64,
     pub segments_failed: u64,
+    /// Segments captured *inside* the measured window, failures
+    /// included — i.e. the sample every figure below is computed from.
+    /// Zero means the run never left warm-up, so there is nothing to
+    /// judge; see [`BenchReport::has_measurement`].
+    pub measured_segments_total: u64,
+    /// Of those, the ones that published. The verdict keys off this
+    /// rather than `segments_ok`, which also counts warm-up.
+    pub measured_segments_ok: u64,
     /// Sustained *published* throughput over the measured window. This
     /// is the go/no-go number.
     pub sustained_mbit_s: f64,
@@ -388,13 +396,44 @@ impl BenchReport {
         u64::from(segment_ms) * 3
     }
 
-    /// "Did this configuration keep up?" — every segment published, and
-    /// the last segment still inside the lag budget.
+    /// Whether the run produced a measured (post-warm-up) sample at
+    /// all. A run stopped inside `warmup_s` has none: every figure in
+    /// the report is then the zero an empty window folds to, and
+    /// neither "kept up" nor "did not keep up" is a statement about
+    /// anything that was measured.
+    #[must_use]
+    pub const fn has_measurement(&self) -> bool {
+        self.measured_segments_total > 0
+    }
+
+    /// "Did this configuration keep up?" — the run measured something,
+    /// every segment published, and the last measured segment was
+    /// still inside the lag budget.
+    ///
+    /// The first clause is load-bearing: `lag_ms_final` (like the
+    /// sustained figures) defaults to 0 on an empty measured window, so
+    /// without it a run stopped during warm-up would report a
+    /// 0.00 Mbit/s *pass*.
     #[must_use]
     pub fn keeps_up(&self) -> bool {
-        self.segments_failed == 0
-            && self.segments_ok > 0
+        self.measured_segments_ok > 0
+            && self.segments_failed == 0
             && self.lag_ms_final <= Self::lag_budget_ms(self.segment_ms)
+    }
+
+    /// The **kept up** cell. Three-state on purpose: a run with no
+    /// measured window has no verdict to give, and printing either
+    /// "yes" or "no" for it would put a claim nobody measured into the
+    /// go/no-go table.
+    #[must_use]
+    pub const fn verdict(&self) -> &'static str {
+        if !self.has_measurement() {
+            "n/a (no measured window)"
+        } else if self.sustained {
+            "yes"
+        } else {
+            "**no**"
+        }
     }
 
     /// One Markdown table row, matching [`markdown_header`].
@@ -411,7 +450,7 @@ impl BenchReport {
             self.publish_ms_p95,
             self.publish_ms_max,
             self.lag_ms_final,
-            if self.sustained { "yes" } else { "**no**" },
+            self.verdict(),
         )
     }
 }
@@ -573,6 +612,8 @@ fn build_report(config: &BenchConfig, stats: &BenchStats, elapsed: Duration) -> 
         segments_total: stats.segments.len() as u64,
         segments_ok: stats.segments.iter().filter(|s| s.ok).count() as u64,
         segments_failed: stats.segments.iter().filter(|s| !s.ok).count() as u64,
+        measured_segments_total: measured.len() as u64,
+        measured_segments_ok: measured.iter().filter(|s| s.ok).count() as u64,
         sustained_mbit_s: window.mbit_s,
         sustained_chunks_s: window.chunks_s,
         publish_ms_p50: percentile(&publish_ms, 50),
@@ -1134,6 +1175,47 @@ mod tests {
         assert!(report.sustained);
         assert_eq!(report.lag_ms_final, 1000);
         assert!(report.markdown_row().contains("| yes |"));
+    }
+
+    #[test]
+    fn a_run_stopped_inside_the_warmup_has_no_verdict() {
+        // "Stop and report" tapped 6 s into a run with a 10 s warm-up:
+        // both segments published, but none of them was measured. The
+        // report must not claim the rendition was sustained on the
+        // strength of an empty window (whose lag_ms_final folds to 0).
+        let mut stats = BenchStats::default();
+        for (captured, finished) in [(2, 3), (4, 5)] {
+            stats.record(outcome(captured, finished, true), None);
+        }
+        let report = build_report(&config(), &stats, Duration::from_secs(6));
+        assert_eq!(report.segments_ok, 2);
+        assert_eq!(report.measured_segments_total, 0);
+        assert!(!report.has_measurement());
+        assert!(!report.sustained, "{report:?}");
+        assert!(report.sustained_mbit_s.abs() < f64::EPSILON);
+        // And the row says so, rather than passing *or* failing a run
+        // that measured nothing.
+        assert!(
+            report
+                .markdown_row()
+                .contains("| n/a (no measured window) |"),
+            "row: {}",
+            report.markdown_row(),
+        );
+    }
+
+    #[test]
+    fn a_failure_inside_the_measured_window_still_reads_as_a_failure() {
+        // The other empty-`measured_segments_ok` shape: segments were
+        // measured, they just all failed. That is a real "**no**", not
+        // an absent verdict.
+        let mut stats = BenchStats::default();
+        stats.record(outcome(12, 13, false), Some("boom".into()));
+        let report = build_report(&config(), &stats, Duration::from_secs(20));
+        assert!(report.has_measurement());
+        assert_eq!(report.measured_segments_ok, 0);
+        assert!(!report.sustained);
+        assert!(report.markdown_row().contains("**no**"));
     }
 
     #[test]

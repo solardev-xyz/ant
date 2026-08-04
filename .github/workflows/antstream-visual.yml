@@ -108,6 +108,16 @@ jobs:
           xcrun simctl io booted screenshot shots/04-bench-running.png
           sleep 60
           xcrun simctl io booted screenshot shots/05-bench-report.png
+          # And the report state a stopped-too-early run reaches: the
+          # run is cut 3 s in, inside the 5 s warm-up, so the measured
+          # window is empty. The card has to say so instead of showing
+          # a 0.00 Mbit/s run as having sustained the rendition.
+          xcrun simctl terminate booted at.vibing.ant.stream || true
+          xcrun simctl launch booted at.vibing.ant.stream \
+            -antstreamShowBench YES -antstreamBenchSeconds 60 \
+            -antstreamBenchStopAfter 3
+          sleep 45
+          xcrun simctl io booted screenshot shots/06-bench-stopped-in-warmup.png
           xcrun simctl spawn booted log show --last 5m \
             --predicate 'processImagePath contains "AntStream"' \
             > shots/app-log.txt || true
