@@ -436,6 +436,13 @@ struct BenchView: View {
         Task {
             defer {
                 running = false
+                // A user-tapped stop leaves the last progress sample
+                // saying `running: true` — the live card keys off it,
+                // so without this the sheet keeps a spinner and a
+                // "Stop and report" button on screen next to the final
+                // report. (The self-finishing path is unaffected: its
+                // last sample already said false.)
+                snapshot = nil
                 UIApplication.shared.isIdleTimerDisabled = false
             }
             do {
