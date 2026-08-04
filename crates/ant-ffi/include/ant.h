@@ -732,8 +732,12 @@ char *ant_bench_progress(const AntHandle *handle, char **out_err);
  * sustained_mbit_s / sustained_chunks_s, publish_ms_p50|p95|max,
  * lag_ms_p50|p95|max|final, peers_min|max, segments_ok|failed,
  * measured_segments_total|ok, the first few error strings, and a
- * "sustained" verdict (at least one segment measured AND every segment
- * published AND the final lag still inside 3 x segment_ms).
+ * "sustained" verdict (at least one segment measured AND every
+ * measured segment published AND the final lag still inside
+ * 3 x segment_ms). The verdict is scoped to the post-warm-up window:
+ * a segment that failed inside warmup_s is counted in segments_failed
+ * but does not fail the run, since excluding cold-start effects is
+ * what warmup_s is for.
  *
  * A run stopped before warmup_s has elapsed measures nothing:
  * measured_segments_total is 0, every figure is 0, and "sustained" is

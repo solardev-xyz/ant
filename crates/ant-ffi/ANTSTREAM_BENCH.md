@@ -199,10 +199,13 @@ read as a *floor*, not the phone's ceiling.
 | `segments_failed` + `errors` | first few verbatim gateway errors — an unusable batch or a settlement stall shows up here, not as a slow number |
 | `peers_min/max` | BZZ peer set during the run; a run that started cold is visible here |
 | `measured_segments_total/ok` | the post-warm-up sample everything above is computed from; `0` = the run was stopped inside the warm-up and measured nothing |
-| `sustained` | `measured_segments_ok > 0 && segments_failed == 0 && lag_ms_final ≤ 3 × segment_ms` |
+| `sustained` | `measured_segments_ok > 0 && measured_segments_ok == measured_segments_total && lag_ms_final ≤ 3 × segment_ms` |
 
-`warmup_s` (default 30 s) is excluded from the sustained figures: the
-first segments pay peer-set warm-up and pushsync skip-cache misses.
+`warmup_s` (default 30 s) is excluded from the sustained figures *and
+from the verdict*: the first segments pay peer-set warm-up and pushsync
+skip-cache misses, so a segment that failed in there is reported (in
+`segments_failed` / `errors`) but does not fail the run. Only failures
+inside the measured window do.
 
 ## Scope
 

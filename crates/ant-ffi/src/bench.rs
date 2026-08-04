@@ -407,8 +407,17 @@ impl BenchReport {
     }
 
     /// "Did this configuration keep up?" — the run measured something,
-    /// every segment published, and the last measured segment was
-    /// still inside the lag budget.
+    /// every *measured* segment published, and the last measured segment
+    /// was still inside the lag budget.
+    ///
+    /// Every clause is scoped to the post-warm-up window on purpose. The
+    /// whole-run `segments_failed` must not appear here: a cold-start
+    /// failure inside `warmup_s` (peer-set warm-up, a pushsync
+    /// skip-cache miss — precisely what `warmup_s` exists to exclude)
+    /// would otherwise sink the verdict of an otherwise clean measured
+    /// run and put a spurious `**no**` in the go/no-go table. Warm-up
+    /// failures stay visible in `segments_failed` and `errors`; they
+    /// just don't get a vote.
     ///
     /// The first clause is load-bearing: `lag_ms_final` (like the
     /// sustained figures) defaults to 0 on an empty measured window, so
@@ -417,7 +426,7 @@ impl BenchReport {
     #[must_use]
     pub fn keeps_up(&self) -> bool {
         self.measured_segments_ok > 0
-            && self.segments_failed == 0
+            && self.measured_segments_ok == self.measured_segments_total
             && self.lag_ms_final <= Self::lag_budget_ms(self.segment_ms)
     }
 
@@ -1163,6 +1172,28 @@ mod tests {
         assert_eq!(report.segments_failed, 0);
         assert!(report.lag_ms_final > 6000, "lag {}", report.lag_ms_final);
         assert!(!report.sustained);
+    }
+
+    #[test]
+    fn a_failure_inside_the_warmup_does_not_sink_a_clean_measured_run() {
+        // The cold-start shape `warmup_s` exists to exclude: the first
+        // segment misses (peer set still warming, pushsync skip-cache
+        // cold), then every measured segment publishes inside the lag
+        // budget. The verdict is about the measured window, so this is
+        // a pass — the warm-up failure is still reported, it just
+        // doesn't get a vote.
+        let mut stats = BenchStats::default();
+        stats.record(outcome(2, 3, false), Some("cold pushsync".into()));
+        for i in 0..10u64 {
+            stats.record(outcome(12 + i * 2, 13 + i * 2, true), None);
+        }
+        let report = build_report(&config(), &stats, Duration::from_secs(40));
+        assert_eq!(report.segments_failed, 1, "the miss is still reported");
+        assert_eq!(report.measured_segments_total, 10);
+        assert_eq!(report.measured_segments_ok, 10);
+        assert_eq!(report.lag_ms_final, 1000);
+        assert!(report.sustained, "{report:?}");
+        assert!(report.markdown_row().contains("| yes |"));
     }
 
     #[test]
