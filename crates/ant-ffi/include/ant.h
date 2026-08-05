@@ -410,6 +410,42 @@ char *ant_storage_status(const AntHandle *handle, char **out_err);
 char *ant_storage_settlement_status(const AntHandle *handle, char **out_err);
 
 /*
+ * Settlement-deposit status as a JSON object:
+ *   {"enabled":bool,"chequebook":"0x…"|null,"deposit_plur","deposit_bzz",
+ *    "target_plur","target_bzz","shortfall_plur","shortfall_bzz",
+ *    "needs_top_up":bool,"xdai_required","xdai_required_display",
+ *    "xdai_to_send","xdai_to_send_display","sufficient_funds":bool}
+ * ant_storage_settlement_status says whether a chequebook is deployed;
+ * this says whether it actually backs the cheques it signs. A chequebook
+ * at deposit 0 publishes fine until the peers' payment tolerance runs
+ * out, then collapses into pushsync timeouts — so the Storage tab reads
+ * this to detect that and offer ant_storage_settlement_topup.
+ * `enabled=false` (zeroed, needs_top_up=false) when this account has no
+ * chequebook yet; buying/connecting a plan deploys one, funded. Reads
+ * chain (a few light eth_calls) — for an explicit refresh, not every
+ * status poll. Requires the `chain` cargo feature.
+ */
+char *ant_storage_settlement_deposit(const AntHandle *handle,
+                                     const char *gnosis_rpc,
+                                     char **out_err);
+
+/*
+ * Fund this account's chequebook up to the settlement deposit target
+ * (0.001 xBZZ), funding ONLY with xDAI: the node swaps the xBZZ
+ * shortfall on-chain if it doesn't already hold it, then transfers the
+ * deposit to the chequebook. The explicit top-up path — a chequebook's
+ * deposit is only read at deploy time, so an already-deployed one can be
+ * funded no other way. Idempotent (a chequebook at the target is a
+ * no-op); errors when this account has no chequebook yet. Returns the
+ * refreshed ant_storage_settlement_deposit JSON. SUBMITS REAL
+ * TRANSACTIONS AND SPENDS REAL FUNDS, and BLOCKS until they confirm.
+ * Requires the `chain` cargo feature.
+ */
+char *ant_storage_settlement_topup(const AntHandle *handle,
+                                   const char *gnosis_rpc,
+                                   char **out_err);
+
+/*
  * Deep read-back propagation check for an uploaded reference. Resolves
  * the manifest to its data root, enumerates the file's chunk tree
  * (fetching every interior node network-only, which proves the skeleton
@@ -525,12 +561,13 @@ char *ant_storage_discover(const AntHandle *handle,
  * Deploy (or return the already-persisted) node-owned chequebook so the
  * publish-setup checklist's "chequebook deployed" step can complete.
  * Idempotent: if this device already deployed a chequebook it's returned
- * as-is (no redeploy); otherwise this signs an on-chain
- * factory.deploySimpleSwap (issuer = node EOA) deployed UNFUNDED, persists
- * the association, and returns the new address. SUBMITS A REAL ON-CHAIN
- * TRANSACTION: spends gas (xDAI) only — zero xBZZ deposit, so the user's
- * xBZZ stays in their wallet (bee still accepts the cheques) — and BLOCKS
- * until the tx confirms. Light-mode only (requires the `chain` cargo feature;
+ * as-is (no redeploy — though one still short of its settlement deposit
+ * is topped up from spare xBZZ); otherwise this signs an on-chain
+ * factory.deploySimpleSwap (issuer = node EOA), funds it with the
+ * 0.001 xBZZ settlement deposit so its cheques are actually backed,
+ * persists the association, and returns the new address. SUBMITS REAL
+ * ON-CHAIN TRANSACTIONS: spends gas (xDAI) plus the deposit (xBZZ, capped
+ * to the wallet's balance) and BLOCKS until they confirm. Light-mode only (requires the `chain` cargo feature;
  * otherwise returns NULL + an error). Returns
  *   {"chequebookAddress":"0x<40hex>"}
  * (free with ant_free_string), or NULL with an error in *out_err. The
@@ -546,13 +583,19 @@ char *ant_deploy_chequebook(const AntHandle *handle,
  * (2^depth chunks × 4 KiB); `days` sets how long it should last.
  * Returns a JSON object:
  *   {"depth","days","amount_per_chunk","total_cost_plur",
- *    "total_cost_bzz","capacity_bytes","account_bzz",
+ *    "total_cost_bzz","settlement_deposit_plur","settlement_deposit_bzz",
+ *    "capacity_bytes","account_bzz",
  *    "account_bzz_display","account_xdai","account_xdai_display",
  *    "needed_bzz","needed_bzz_display","xdai_required",
  *    "xdai_required_display","xdai_to_send","xdai_to_send_display",
  *    "sufficient_funds"}
  * For the xDAI-only flow, `xdai_to_send_display` is exactly how much more
  * xDAI to send; the node swaps it to xBZZ and buys the plan itself.
+ * `settlement_deposit_*` is the one-time xBZZ deposit this purchase also
+ * puts behind the node's chequebook so its cheques are backed (0 once it
+ * is funded). It is part of the all-in figures (`needed_bzz`,
+ * `xdai_required`, `xdai_to_send`, `sufficient_funds`), not of
+ * `total_cost_*`, which stays the plan's own price.
  * Requires the `chain` cargo feature.
  */
 char *ant_storage_quote(const AntHandle *handle,

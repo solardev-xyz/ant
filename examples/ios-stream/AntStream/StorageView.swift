@@ -36,6 +36,8 @@ struct StorageView: View {
                     if node.plan?.enabled == true {
                         if node.settlement?.enabled == false {
                             settlementWarningCard
+                        } else if node.settlementDeposit?.needsTopUp == true {
+                            settlementDepositCard
                         }
                     } else {
                         connectCard
@@ -52,6 +54,7 @@ struct StorageView: View {
             .refreshable {
                 await node.refreshAll()
                 await node.refreshValidity(rpc: rpc)
+                await node.refreshSettlementDeposit(rpc: activeRpc)
             }
         }
         .preferredColorScheme(.dark)
@@ -83,6 +86,10 @@ struct StorageView: View {
         .task {
             await node.refreshAll()
             await node.refreshValidity(rpc: rpc)
+            // Unlike the validity read, this one falls back to the public
+            // RPC: an unfunded chequebook is the state a user has no way
+            // of guessing at, and most installs never type an RPC in.
+            await node.refreshSettlementDeposit(rpc: activeRpc)
         }
     }
 
@@ -190,6 +197,51 @@ struct StorageView: View {
                     }
                     GlassPillButton(title: "Run setup", icon: "arrow.clockwise") {
                         showConnect = true
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: settlement deposit (top-up)
+
+    /// Shown when the chequebook is deployed but holds no (or too little)
+    /// xBZZ. Paying peers is what keeps a broadcast moving: an empty
+    /// chequebook signs cheques nobody can cash, so publishing runs clean
+    /// for a while and then collapses into timeouts and growing lag.
+    /// Plans set up before this app funded the chequebook are all in that
+    /// state, hence the one-tap top-up.
+    private var settlementDepositCard: some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 12) {
+                Label("Broadcasts will stall without a deposit",
+                      systemImage: "bolt.badge.clock")
+                    .font(.headline)
+                    .foregroundStyle(.orange)
+                Text("Your account pays the network as it publishes, and the account it pays from is empty. A one-time \(node.settlementDeposit?.targetBzz ?? "0.0010") xBZZ deposit keeps segments flowing — it stays yours until it's spent.")
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.75))
+                if node.settlementDeposit?.sufficientFunds == false,
+                   let send = node.settlementDeposit?.xdaiToSendDisplay {
+                    Text("Add about \(send) xDAI to your account first.")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.6))
+                }
+                HStack(spacing: 12) {
+                    if busy {
+                        ProgressView().tint(.white)
+                    } else {
+                        GlassPillButton(title: "Add deposit", icon: "arrow.up.circle") {
+                            topUpDeposit()
+                        }
+                    }
+                    if node.settlementDeposit?.sufficientFunds == false {
+                        GlassPillButton(title: "Add xDAI", icon: "plus") {
+                            if let addr = node.account?.ethAddress {
+                                UIPasteboard.general.string = addr
+                            }
+                            banner.flash("Send a little xDAI to your account (copied)")
+                        }
                     }
                 }
             }
@@ -448,6 +500,21 @@ struct StorageView: View {
     private var activeRpc: String {
         let r = rpc.trimmingCharacters(in: .whitespaces)
         return r.isEmpty ? AntNode.defaultRpc : r
+    }
+
+    /// Put the settlement deposit behind the chequebook. Spends real
+    /// funds, so it only ever runs from the card's explicit tap.
+    private func topUpDeposit() {
+        Task {
+            busy = true
+            defer { busy = false }
+            do {
+                try await node.topUpSettlementDeposit(rpc: activeRpc)
+                banner.flash("Deposit added — broadcasts are paid for")
+            } catch {
+                banner.flash(error.localizedDescription)
+            }
+        }
     }
 
     private func discover() async {

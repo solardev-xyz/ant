@@ -7,9 +7,10 @@ import SwiftUI
 ///
 /// Deliberately consumer-flavoured: "plans", not "postage batches";
 /// "activate", not "createBatch". The Rust side does the heavy lifting —
-/// `ant_storage_quote` prices a plan against the live chain, and
+/// `ant_storage_quote` prices a plan against the live chain — including
+/// the one-time deposit that backs the node's cheques — and
 /// `ant_storage_buy_xdai` swaps the xBZZ shortfall, buys the batch, and
-/// deploys the chequebook (`ensure_settlement`) in one call.
+/// deploys *and funds* the chequebook (`ensure_settlement`) in one call.
 struct GetStartedView: View {
     @EnvironmentObject var node: AntNode
     @Environment(\.dismiss) private var dismiss
@@ -220,8 +221,26 @@ struct GetStartedView: View {
                     }
                     .buttonStyle(.plain)
                 }
+                if includesSettlementDeposit(quote) {
+                    // Say what the extra buys. The price also covers a
+                    // one-time deposit the node puts behind the account it
+                    // pays the network from — without it publishing stalls
+                    // once peers stop extending credit.
+                    Text("Includes a one-time \(quote.settlementDepositBzz) xBZZ network deposit that keeps your broadcast flowing.")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.6))
+                        .multilineTextAlignment(.center)
+                }
             }
         }
+    }
+
+    /// Whether this price carries the one-time settlement deposit — i.e.
+    /// the chequebook it deploys still needs funding. Zero once it is
+    /// funded, and the note is then left off rather than claiming a
+    /// charge that isn't there.
+    private func includesSettlementDeposit(_ quote: StorageQuote) -> Bool {
+        (UInt64(quote.settlementDepositPlur) ?? 0) > 0
     }
 
     // MARK: Step 3 — activating
