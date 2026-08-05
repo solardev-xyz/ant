@@ -51,6 +51,11 @@ final class AntNode: ObservableObject {
     /// `true` while the device has no usable network path
     /// (`NWPathMonitor`). The node is suspended for the duration.
     @Published private(set) var isOffline: Bool = false
+    /// Which interface the node is currently reaching the network over
+    /// — "Wi-Fi", "Cellular", "Wired" or "Offline". The #67 throughput
+    /// table is *per network type*, and asking the operator to type
+    /// that in is how a cellular row ends up labelled Wi-Fi.
+    @Published private(set) var networkLabel: String = "Unknown"
     /// How the account key is protected at rest, for the Storage tab.
     @Published private(set) var keyProtection: AccountKeystore.Protection?
 
@@ -336,8 +341,11 @@ final class AntNode: ObservableObject {
         let monitor = NWPathMonitor()
         monitor.pathUpdateHandler = { [weak self] netPath in
             let offline = netPath.status != .satisfied
+            let label = Self.interfaceLabel(for: netPath)
             Task { @MainActor [weak self] in
-                guard let self, self.isOffline != offline else { return }
+                guard let self else { return }
+                if self.networkLabel != label { self.networkLabel = label }
+                guard self.isOffline != offline else { return }
                 self.isOffline = offline
                 if offline {
                     await self.suspend()
@@ -348,6 +356,16 @@ final class AntNode: ObservableObject {
         }
         monitor.start(queue: DispatchQueue(label: "antstream.netpath"))
         pathMonitor = monitor
+    }
+
+    /// `nonisolated`: this runs on `NWPathMonitor`'s queue, inside the
+    /// path handler, before the hop back onto the main actor.
+    private nonisolated static func interfaceLabel(for path: NWPath) -> String {
+        guard path.status == .satisfied else { return "Offline" }
+        if path.usesInterfaceType(.wifi) { return "Wi-Fi" }
+        if path.usesInterfaceType(.cellular) { return "Cellular" }
+        if path.usesInterfaceType(.wiredEthernet) { return "Wired" }
+        return "Unknown"
     }
 
     // MARK: - Storage
@@ -493,6 +511,84 @@ final class AntNode: ObservableObject {
             if case .failed(let m) = self.status { failure = AntError.op(m) }
         }
         if let failure { throw failure }
+    }
+
+    // MARK: - Publisher throughput bench (#67 stage 1)
+
+    /// Start a synthetic-segment publisher benchmark on the node.
+    ///
+    /// `batchId` selects the mode: the connected plan's batch publishes
+    /// real segments through `POST /bzz` on the in-process gateway (the
+    /// go/no-go measurement), `nil` measures only the local chunk +
+    /// stamp pipeline, which needs neither network nor plan.
+    ///
+    /// The label carries the device and network the numbers describe —
+    /// a row in the results table is meaningless without it.
+    func startBench(
+        label: String,
+        bitrateKbps: UInt32,
+        durationSeconds: UInt64,
+        batchId: String?,
+        notes: String
+    ) async throws {
+        let config: [String: Any] = [
+            "label": label,
+            "bitrate_kbps": bitrateKbps,
+            "segment_ms": 2000,
+            "duration_s": durationSeconds,
+            // Long runs average over 30 s of peer-set warm-up; short
+            // ones would have nothing left to measure.
+            "warmup_s": durationSeconds > 120 ? 30 : 5,
+            "max_in_flight": 4,
+            "gateway": "http://\(Self.gatewayAddress)",
+            "batch_id": batchId ?? "",
+            "notes": notes,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: config),
+              let json = String(data: data, encoding: .utf8) else {
+            throw AntError.op("could not encode the bench configuration")
+        }
+        // `nil` from `withHandle` means there is no node; a non-nil
+        // inner value is the failure detail (`nil` inside = started).
+        let failure: String?? = await withHandle { h in
+            await Task.detached(priority: .userInitiated) { () -> String? in
+                var errPtr: UnsafeMutablePointer<CChar>? = nil
+                let ok = json.withCString { ant_bench_start(h, $0, &errPtr) }
+                // Keep the node's message: "a benchmark is already
+                // running", "batch_id is not hex" and "invalid config"
+                // are all things the operator has to act on.
+                let detail = ok ? nil : errPtr.map { String(cString: $0) }
+                if let errPtr { ant_free_string(errPtr) }
+                return ok ? nil : (detail ?? "could not start the benchmark")
+            }.value
+        }
+        guard let started = failure else { throw AntError.notReady }
+        if let message = started { throw AntError.op(message) }
+    }
+
+    /// Live progress of the running benchmark, or `nil` when there is
+    /// none (or the node went away underneath it).
+    func benchProgress() async -> BenchSnapshot? {
+        guard let json = try? await ffiString(name: "bench progress", { h, errPtr in
+            ant_bench_progress(h, errPtr)
+        }) else { return nil }
+        return StreamDecoder.benchSnapshot(from: json)
+    }
+
+    /// Stop the benchmark and take its final report.
+    ///
+    /// `ant_bench_stop` blocks until the in-flight segments land (up to
+    /// ~65 s), so this must not run on the main actor's thread —
+    /// ``ffiString`` already hops onto a detached task for exactly that
+    /// reason.
+    func stopBench() async throws -> BenchReport {
+        let json = try await ffiString(name: "stop benchmark") { h, errPtr in
+            ant_bench_stop(h, errPtr)
+        }
+        guard let report = StreamDecoder.benchReport(from: json) else {
+            throw AntError.op("could not read the benchmark report")
+        }
+        return report
     }
 
     // MARK: - Refresh

@@ -21,6 +21,7 @@
 //! `ant_download` calls are allowed and share the node's cache /
 //! retrieval pipeline; the mpsc command channel serialises dispatch.
 
+pub mod bench;
 mod drive;
 mod gateway;
 #[cfg(feature = "jni")]
@@ -171,6 +172,12 @@ pub struct AntHandle {
     /// the iOS app serve `http://127.0.0.1:<port>` in-process instead of
     /// spawning the `antd` daemon. See [`gateway`].
     gateway_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The `AntStream` publisher throughput benchmark currently running
+    /// on this handle, if any (issue #67 stage 1). `None` until
+    /// [`ant_bench_start`]; cleared by [`ant_bench_stop`]. Exactly one
+    /// run at a time — two concurrent runs would each measure the
+    /// other's upload contention rather than the network's.
+    bench: Mutex<Option<Arc<bench::BenchRun>>>,
 }
 
 /// Live snapshot of the in-flight download, maintained by the
@@ -872,6 +879,7 @@ fn init_inner(
         eth,
         data_dir: data_dir.to_path_buf(),
         gateway_task: Mutex::new(None),
+        bench: Mutex::new(None),
     })
 }
 
@@ -2723,6 +2731,184 @@ pub unsafe extern "C" fn ant_shutdown(handle: *mut AntHandle) {
 }
 
 // ---------------------------------------------------------------------------
+// AntStream publisher throughput benchmark (issue #67 stage 1)
+// ---------------------------------------------------------------------------
+
+/// How long [`ant_bench_stop`] waits for a cancelled run to settle
+/// before returning the report anyway. An in-flight `POST /bzz` is
+/// bounded by the bench's own 60 s publish deadline, so a run that
+/// hasn't finished by then is not going to.
+const BENCH_STOP_GRACE: Duration = Duration::from_secs(65);
+
+/// Poll interval while waiting for a cancelled run to settle.
+const BENCH_STOP_POLL: Duration = Duration::from_millis(50);
+
+/// Start an `AntStream` publisher throughput benchmark on this node.
+///
+/// `config_json` is a [`bench::BenchConfig`] document; only `label` is
+/// required. With a `batch_id` the run publishes real segments through
+/// `POST /bzz` on `gateway` (start it first with
+/// [`ant_start_gateway`]); without one it measures the local
+/// chunk + stamp pipeline only, which needs no network and no batch.
+///
+/// Returns immediately — the run drives itself on the node's runtime.
+/// Poll it with [`ant_bench_progress`] and finish it with
+/// [`ant_bench_stop`]. Only one run at a time per handle: a second
+/// start while one is live fails rather than silently measuring two
+/// publishers competing for the same uplink.
+///
+/// Returns `true` on success, `false` with an allocated message in
+/// `out_err` (free with [`ant_free_string`]) otherwise.
+///
+/// # Safety
+///
+/// `handle` must come from [`ant_init`] and must not have been passed
+/// to [`ant_shutdown`]. `config_json` must be a NUL-terminated UTF-8
+/// string. `out_err`, if non-null, must point at a writable
+/// `*mut c_char` slot.
+#[no_mangle]
+pub unsafe extern "C" fn ant_bench_start(
+    handle: *const AntHandle,
+    config_json: *const c_char,
+    out_err: *mut *mut c_char,
+) -> bool {
+    unsafe {
+        clear_out_err(out_err);
+        let Some(handle) = handle.as_ref() else {
+            write_out_err(out_err, "ant_bench_start: null handle");
+            return false;
+        };
+        let config = match cstr_to_str(config_json)
+            .map_err(|e| e.to_string())
+            .and_then(|raw| {
+                serde_json::from_str::<bench::BenchConfig>(raw)
+                    .map_err(|e| format!("ant_bench_start: invalid config: {e}"))
+            }) {
+            Ok(c) => c,
+            Err(msg) => {
+                write_out_err(out_err, &msg);
+                return false;
+            }
+        };
+
+        // Hold the slot across check → start → store, so two concurrent
+        // starts can't both pass the "already running" check.
+        let mut slot = handle
+            .bench
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.as_ref().is_some_and(|run| !run.is_finished()) {
+            write_out_err(
+                out_err,
+                "ant_bench_start: a benchmark is already running on this node",
+            );
+            return false;
+        }
+        match bench::start(
+            handle.runtime.handle(),
+            config,
+            handle.signing_secret,
+            Some(handle.status_rx.clone()),
+        ) {
+            Ok(run) => {
+                *slot = Some(run);
+                true
+            }
+            Err(e) => {
+                write_out_err(out_err, &format!("ant_bench_start: {e}"));
+                false
+            }
+        }
+    }
+}
+
+/// Live progress of the run started by [`ant_bench_start`], as an
+/// allocated [`bench::BenchSnapshot`] JSON string (free with
+/// [`ant_free_string`]). Non-blocking. Returns null with an error when
+/// no run has been started on this handle.
+///
+/// # Safety
+///
+/// `handle` must come from [`ant_init`] and must not have been passed
+/// to [`ant_shutdown`]. `out_err`, if non-null, must point at a
+/// writable `*mut c_char` slot.
+#[no_mangle]
+pub unsafe extern "C" fn ant_bench_progress(
+    handle: *const AntHandle,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_bench_progress", || {
+            let handle = handle.as_ref().ok_or_else(null_handle)?;
+            let run = handle
+                .bench
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .ok_or_else(|| "no benchmark has been started on this node".to_string())?;
+            serde_json::to_string(&run.snapshot()).map_err(|e| format!("serialize snapshot: {e}"))
+        })
+    }
+}
+
+/// Stop the run and return its final [`bench::BenchReport`] as an
+/// allocated JSON string (free with [`ant_free_string`]).
+///
+/// **Blocking**: the cancel is cooperative, so this waits (up to ~65 s,
+/// the bench's own per-segment publish deadline) for the in-flight
+/// segments to land — a truncated tail would understate the sustained
+/// figure the report exists to state. Call it off the UI thread.
+///
+/// Safe to call on an already-finished run: it returns the same report.
+///
+/// # Safety
+///
+/// `handle` must come from [`ant_init`] and must not have been passed
+/// to [`ant_shutdown`]. `out_err`, if non-null, must point at a
+/// writable `*mut c_char` slot.
+#[no_mangle]
+pub unsafe extern "C" fn ant_bench_stop(
+    handle: *const AntHandle,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_bench_stop", || {
+            let handle = handle.as_ref().ok_or_else(null_handle)?;
+            let run = handle
+                .bench
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .ok_or_else(|| "no benchmark has been started on this node".to_string())?;
+            run.cancel();
+            let deadline = Instant::now() + BENCH_STOP_GRACE;
+            while !run.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(BENCH_STOP_POLL);
+            }
+            let report = run.report();
+            // Only release the slot once the loop is actually done —
+            // otherwise the next `ant_bench_start` would run against a
+            // node that is still uploading the previous run's tail. And
+            // only if the slot still holds *this* run: while we waited,
+            // the run could have settled and a concurrent
+            // `ant_bench_start` legitimately installed a new one, which
+            // clearing the slot would orphan (and let a third start run
+            // two publishers on one uplink).
+            if run.is_finished() {
+                let mut slot = handle
+                    .bench
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if slot.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, &run)) {
+                    *slot = None;
+                }
+            }
+            serde_json::to_string(&report).map_err(|e| format!("serialize report: {e}"))
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -3374,6 +3560,7 @@ mod tests {
             eth: [0u8; 20],
             data_dir: data_dir.to_path_buf(),
             gateway_task: Mutex::new(None),
+            bench: Mutex::new(None),
         }
     }
 
@@ -3410,6 +3597,100 @@ mod tests {
             checkpoint.exists(),
             "ant_shutdown returned while a task was still writing to the data dir",
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Local pipeline mode (no `batch_id`): no gateway, no batch, no
+    /// network — the loop runs entirely on the runtime.
+    fn bench_config(label: &str, duration_s: u64) -> CString {
+        CString::new(format!(
+            r#"{{"label":"{label}","duration_s":{duration_s},"warmup_s":0,"segment_ms":200,"bitrate_kbps":64,"max_in_flight":2}}"#
+        ))
+        .expect("config json")
+    }
+
+    fn bench_slot(handle: *const AntHandle) -> Option<Arc<bench::BenchRun>> {
+        unsafe { &*handle }
+            .bench
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    #[test]
+    fn bench_stop_does_not_clear_a_run_it_did_not_stop() {
+        // `ant_bench_stop` waits for the cancelled run to settle and then
+        // frees the slot. If it frees whatever is *in* the slot rather
+        // than the run it stopped, a start that legitimately lands inside
+        // that wait (run 1 has settled, so the "already running" check
+        // passes) is orphaned: run 2 keeps publishing for its whole
+        // duration with nobody holding its handle, and the next start
+        // sees an empty slot and adds a second publisher on one uplink.
+        let dir = scratch_dir("bench-stop-race");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let handle = Box::into_raw(Box::new(test_handle(runtime, &dir)));
+
+        let first = bench_config("race-first", 30);
+        assert!(
+            unsafe { ant_bench_start(handle, first.as_ptr(), std::ptr::null_mut()) },
+            "first start",
+        );
+        let run1 = bench_slot(handle).expect("run 1 in the slot");
+
+        // The stopper cancels run 1 and then sits in its settle poll.
+        let stopper = {
+            let addr = handle as usize;
+            std::thread::spawn(move || {
+                let report =
+                    unsafe { ant_bench_stop(addr as *const AntHandle, std::ptr::null_mut()) };
+                assert!(!report.is_null(), "stop must return run 1's report");
+                unsafe { ant_free_string(report) };
+            })
+        };
+        // Give it time to take its clone of run 1 and cancel it. Run 1
+        // only settles at its next 200 ms segment boundary, so we are
+        // polling below well before it does.
+        std::thread::sleep(Duration::from_millis(100));
+
+        // The moment run 1 has settled, a second start is legitimate —
+        // and it lands inside the stopper's poll window.
+        while !run1.is_finished() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let second = bench_config("race-second", 30);
+        assert!(
+            unsafe { ant_bench_start(handle, second.as_ptr(), std::ptr::null_mut()) },
+            "second start once run 1 settled",
+        );
+        let run2 = bench_slot(handle).expect("run 2 in the slot");
+        assert!(!Arc::ptr_eq(&run1, &run2), "run 2 must be a fresh run");
+
+        stopper.join().expect("stopper thread");
+
+        assert!(
+            bench_slot(handle).is_some_and(|cur| Arc::ptr_eq(&cur, &run2)),
+            "stop released the slot of a run it never stopped: run 2 is orphaned",
+        );
+        let third = bench_config("race-third", 30);
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let admitted = unsafe { ant_bench_start(handle, third.as_ptr(), &raw mut err) };
+        if !err.is_null() {
+            unsafe { ant_free_string(err) };
+        }
+        assert!(
+            !admitted,
+            "a third start was admitted while run 2 is still publishing",
+        );
+
+        run2.cancel();
+        while !run2.is_finished() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        unsafe { ant_shutdown(handle) };
         let _ = std::fs::remove_dir_all(&dir);
     }
 

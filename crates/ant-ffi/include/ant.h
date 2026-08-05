@@ -681,6 +681,78 @@ bool ant_start_gateway(const AntHandle *handle,
 bool ant_stop_gateway(const AntHandle *handle);
 
 /*
+ * Start the AntStream publisher throughput benchmark (issue #67 stage 1)
+ * on this node: a synthetic-segment publisher loop that measures
+ * sustained Mbit/s, chunks/s, per-segment publish latency, and how far
+ * behind the live edge the uploader falls.
+ *
+ * `config_json` is a BenchConfig document; only "label" is required:
+ *   {
+ *     "label":          "iPhone 15 Pro / LTE",   // required, the table row key
+ *     "bitrate_kbps":   3400,                    // target video bitrate
+ *     "segment_ms":     2000,                    // HLS segment cadence
+ *     "duration_s":     1800,                    // >= 1800 for a quotable number
+ *     "warmup_s":       30,                      // excluded from the average
+ *     "max_in_flight":  4,                       // bounded publish window
+ *     "gateway":        "http://127.0.0.1:1633", // ant_start_gateway's address
+ *     "batch_id":       "0x<64 hex>",            // omit -> no-network mode
+ *     "seed":           123,
+ *     "notes":          "iOS 26.0, battery 87%->81%, thermal nominal"
+ *   }
+ *
+ * With a batch_id, every segment is published with a real POST /bzz
+ * against `gateway` (start it first with ant_start_gateway) — that is
+ * the number the go/no-go gate is about. Without one, the run measures
+ * only the local chunk-split + postage-stamp pipeline, which needs no
+ * network and no batch (useful as a device CPU ceiling, and the only
+ * mode available before a storage plan is connected).
+ *
+ * Returns immediately; the run drives itself on the node's runtime.
+ * Only one run at a time per handle. Returns true on success, false
+ * with an allocated message in *out_err (free with ant_free_string).
+ */
+bool ant_bench_start(const AntHandle *handle,
+                     const char *config_json,
+                     char **out_err);
+
+/*
+ * Live progress of the run started by ant_bench_start, as an allocated
+ * JSON object (free with ant_free_string):
+ *   {"running":true,"elapsed_s":42.0,"configured_duration_s":1800,
+ *    "segments_total":21,"segments_ok":21,"segments_failed":0,
+ *    "sustained_mbit_s":3.4,"sustained_chunks_s":105.5,
+ *    "lag_ms_last":180,"peers":114}
+ * Non-blocking. Returns NULL + an error when no run has been started.
+ */
+char *ant_bench_progress(const AntHandle *handle, char **out_err);
+
+/*
+ * Stop the run and return its final report as an allocated JSON object
+ * (free with ant_free_string): the config it ran with plus
+ * sustained_mbit_s / sustained_chunks_s, publish_ms_p50|p95|max,
+ * lag_ms_p50|p95|max|final, peers_min|max, segments_ok|failed,
+ * measured_segments_total|ok, the first few error strings, and a
+ * "sustained" verdict (at least one segment measured AND every
+ * measured segment published AND the final lag still inside
+ * 3 x segment_ms). The verdict is scoped to the post-warm-up window:
+ * a segment that failed inside warmup_s is counted in segments_failed
+ * but does not fail the run, since excluding cold-start effects is
+ * what warmup_s is for.
+ *
+ * A run stopped before warmup_s has elapsed measures nothing:
+ * measured_segments_total is 0, every figure is 0, and "sustained" is
+ * false because there is no window to judge — not because the run fell
+ * behind. Hosts rendering a verdict should say so rather than showing
+ * such a run as a pass or a failure.
+ *
+ * BLOCKING: the cancel is cooperative, so this waits for the in-flight
+ * segments to land (bounded at ~65 s by the bench's own per-segment
+ * publish deadline) rather than truncating the measurement. Call it off
+ * the main thread. Safe to call on an already-finished run.
+ */
+char *ant_bench_stop(const AntHandle *handle, char **out_err);
+
+/*
  * Shut the embedded node down and free the handle. After this
  * returns, `handle` must not be used again.
  */
