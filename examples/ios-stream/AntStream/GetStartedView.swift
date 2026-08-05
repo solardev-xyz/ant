@@ -50,8 +50,44 @@ struct GetStartedView: View {
         }
         .preferredColorScheme(.dark)
         .interactiveDismissDisabled(step == .activating)
-        .task { await loadPlans() }
+        .task {
+            // antstream-visual: `-antstream-shot-getstarted-pay` opens the
+            // flow straight on the payment step with a representative
+            // quote, so CI can capture the buy-flow cost breakdown — the
+            // "Send xDAI" card and the new one-time settlement-deposit
+            // line — without the live quote a fresh runner may not be able
+            // to fetch. Live pricing (`loadPlans`) otherwise.
+            if RootView.shotArgs.contains("-antstream-shot-getstarted-pay") {
+                selected = StoragePlanTier.all.first
+                quote = Self.screenshotSampleQuote
+                step = .payment
+            } else {
+                await loadPlans()
+            }
+        }
     }
+
+    /// A representative Starter-plan quote for the payment-step screenshot
+    /// (`-antstream-shot-getstarted-pay`). Its deposit fields are non-zero,
+    /// so `includesSettlementDeposit` is true and the deposit line renders
+    /// — the whole point of the capture. Sample only; the real flow always
+    /// prices against the live chain.
+    private static let screenshotSampleQuote = StorageQuote(
+        depth: 21,
+        days: 30,
+        amountPerChunk: "0",
+        totalCostBzz: "0.0500",
+        settlementDepositPlur: "10000000000000",
+        settlementDepositBzz: "0.0010",
+        capacityBytes: 2_000_000_000,
+        accountBzzDisplay: "0.0000",
+        accountXdai: "0",
+        accountXdaiDisplay: "0.0000",
+        neededBzzDisplay: "0.0510",
+        xdaiRequiredDisplay: "0.60",
+        xdaiToSendDisplay: "0.60",
+        sufficientFunds: false
+    )
 
     @ViewBuilder private var content: some View {
         switch step {

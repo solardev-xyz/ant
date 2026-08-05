@@ -664,6 +664,56 @@ final class AntNode: ObservableObject {
         await refreshAll()
     }
 
+    // MARK: - Screenshot hooks (antstream-visual CI)
+
+    /// Drive the Storage tab to the deposit-0 top-up state for a CI
+    /// screenshot.
+    ///
+    /// The settlement-deposit card is the migration surface for every
+    /// pre-funding install: a chequebook that is deployed but holds no
+    /// xBZZ. It renders only when a plan is connected *and* the on-chain
+    /// deposit read comes back under target — and a fresh simulator
+    /// account has neither a plan nor a chequebook, so that state can't be
+    /// reached from real state on the runner. This publishes representative
+    /// sample values so `antstream-visual` can capture the card.
+    ///
+    /// Sample only, and only ever called behind `-antstream-shot-deposit`:
+    /// it moves no funds and is never reached in normal use. The account
+    /// address the card copies is left as the node's real one (set by
+    /// `refreshAccount`), so only the settlement figures are synthetic.
+    func installDepositTopUpSample() {
+        // A modest connected plan so `plan.enabled` gates the card in, and
+        // the storage meter shows a populated bar rather than "no plan".
+        plan = StoragePlan(
+            enabled: true,
+            batchId: "0x0000000000000000000000000000000000000000000000000000000000000000",
+            batchDepth: 22,
+            immutable: false,
+            totalCapacityChunks: 1_250_000,   // ~5 GB at 4 KiB/chunk
+            issuedChunks: 40_000,             // ~160 MB used
+            worstCaseRemainingChunks: 1_210_000
+        )
+        // A deployed chequebook (settlement enabled) …
+        settlement = SettlementInfo(
+            enabled: true,
+            chequebook: "0x370e6965000000000000000000000000000000e1"
+        )
+        // … that is empty: the exact deposit-0 branch #73 fixes, and the
+        // figures the read returns for it (target 0.0010 xBZZ, all of it
+        // missing, ~0.0150 xDAI to fund it — matching the PR's verified
+        // on-chain probe of a real unfunded chequebook).
+        settlementDeposit = SettlementDeposit(
+            enabled: true,
+            chequebook: "0x370e6965000000000000000000000000000000e1",
+            depositBzz: "0.0000",
+            targetBzz: "0.0010",
+            shortfallBzz: "0.0010",
+            needsTopUp: true,
+            xdaiToSendDisplay: "0.0150",
+            sufficientFunds: false
+        )
+    }
+
     // MARK: - Polling
 
     private func startPollingPeers() {

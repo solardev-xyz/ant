@@ -118,6 +118,47 @@ jobs:
             -antstreamBenchStopAfter 3
           sleep 45
           xcrun simctl io booted screenshot shots/06-bench-stopped-in-warmup.png
+          # --- Storage / settlement surfaces (PR #75) ---
+          # A screenshot captures only whatever the app opens *to*, and the
+          # runner has no tap driver, so each Storage surface is reached by
+          # its own launch argument (parsed once into RootView.shotArgs)
+          # rather than by driving the tab bar. See RootView.swift.
+          #
+          # 07 — Storage tab on a fresh account: the storage meter's
+          # no-plan state and the "Set up storage" card — whatever #75
+          # renders for settlement when the account has no plan yet.
+          xcrun simctl terminate booted at.vibing.ant.stream || true
+          xcrun simctl launch booted at.vibing.ant.stream -antstream-shot-storage
+          sleep 22
+          xcrun simctl io booted screenshot shots/07-storage-overview.png
+          # 08 — the buy flow (Get Started) plan picker: the storage plans
+          # and their prices. Pricing needs the network; the layout renders
+          # regardless, so this honestly shows whatever the runner quotes
+          # from the public Gnosis RPC (a spinner/chevron if it can't).
+          xcrun simctl terminate booted at.vibing.ant.stream || true
+          xcrun simctl launch booted at.vibing.ant.stream -antstream-shot-getstarted
+          sleep 20
+          xcrun simctl io booted screenshot shots/08-storage-getstarted-plans.png
+          # 09 — the buy flow's payment step: the "Send xDAI" cost card and
+          # the new one-time settlement-deposit line #75 adds ("Includes a
+          # one-time … xBZZ network deposit …"). A live quote needs funds
+          # and a reachable chain, so this is driven with a representative
+          # quote to capture the deposit line the PR is about.
+          xcrun simctl terminate booted at.vibing.ant.stream || true
+          xcrun simctl launch booted at.vibing.ant.stream \
+            -antstream-shot-getstarted -antstream-shot-getstarted-pay
+          sleep 20
+          xcrun simctl io booted screenshot shots/09-storage-getstarted-deposit.png
+          # 10 — the Storage tab's deposit-0 top-up card: #75's migration
+          # surface for installs whose chequebook was deployed unfunded
+          # ("Broadcasts will stall without a deposit" → Add deposit). A
+          # fresh simulator account has no chequebook to be under-funded,
+          # so representative sample state is published to reach the card.
+          xcrun simctl terminate booted at.vibing.ant.stream || true
+          xcrun simctl launch booted at.vibing.ant.stream \
+            -antstream-shot-storage -antstream-shot-deposit
+          sleep 22
+          xcrun simctl io booted screenshot shots/10-storage-deposit-topup.png
           xcrun simctl spawn booted log show --last 5m \
             --predicate 'processImagePath contains "AntStream"' \
             > shots/app-log.txt || true
