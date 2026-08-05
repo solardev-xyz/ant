@@ -84,21 +84,23 @@ struct StorageView: View {
         .onAppear { syncICloudSwitch() }
         .onChange(of: node.keyProtection) { _, _ in syncICloudSwitch() }
         .task {
-            await node.refreshAll()
-            await node.refreshValidity(rpc: rpc)
             // antstream-visual: a fresh simulator account has no plan or
             // chequebook, so the deposit-0 top-up card can't be reached
             // from real state. Publish representative sample state instead
-            // so CI can screenshot that surface. Real state otherwise.
+            // so CI can screenshot that surface — installing it *first*
+            // (it latches, so later refreshes leave it in place), then only
+            // refreshing the account for the real address the card copies.
             if RootView.shotArgs.contains("-antstream-shot-deposit") {
                 node.installDepositTopUpSample()
-            } else {
-                // Unlike the validity read, this one falls back to the
-                // public RPC: an unfunded chequebook is the state a user
-                // has no way of guessing at, and most installs never type
-                // an RPC in.
-                await node.refreshSettlementDeposit(rpc: activeRpc)
+                await node.refreshAccount()
+                return
             }
+            await node.refreshAll()
+            await node.refreshValidity(rpc: rpc)
+            // Unlike the validity read, this one falls back to the public
+            // RPC: an unfunded chequebook is the state a user has no way
+            // of guessing at, and most installs never type an RPC in.
+            await node.refreshSettlementDeposit(rpc: activeRpc)
         }
     }
 

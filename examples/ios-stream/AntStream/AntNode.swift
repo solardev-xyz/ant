@@ -604,11 +604,16 @@ final class AntNode: ObservableObject {
     }
 
     func refreshPlan() async {
+        // Keep an installed screenshot sample from being clobbered by a
+        // real read (which on a fresh runner account returns "no plan").
+        if screenshotSampleActive { return }
         if let json = try? await ffiString(name: "storage status", { h, errPtr in
             ant_storage_status(h, errPtr)
         }) {
             let decoded = StreamDecoder.plan(from: json)
-            if decoded != plan { plan = decoded }
+            // Re-check after the await: a sample may have been installed
+            // while this read was in flight.
+            if !screenshotSampleActive, decoded != plan { plan = decoded }
         }
     }
 
@@ -633,11 +638,12 @@ final class AntNode: ObservableObject {
     }
 
     func refreshSettlement() async {
+        if screenshotSampleActive { return }
         if let json = try? await ffiString(name: "settlement status", { h, errPtr in
             ant_storage_settlement_status(h, errPtr)
         }) {
             let decoded = StreamDecoder.settlement(from: json)
-            if decoded != settlement { settlement = decoded }
+            if !screenshotSampleActive, decoded != settlement { settlement = decoded }
         }
     }
 
@@ -645,6 +651,7 @@ final class AntNode: ObservableObject {
     /// Gnosis RPC URL and a deployed chequebook; best-effort, so a flaky
     /// RPC leaves the previous value rather than clearing the card.
     func refreshSettlementDeposit(rpc: String) async {
+        if screenshotSampleActive { return }
         guard !rpc.isEmpty, settlement?.enabled == true else { return }
         if let json = try? await ffiString(name: "settlement deposit", { h, errPtr in
             rpc.withCString { ant_storage_settlement_deposit(h, $0, errPtr) }
@@ -666,6 +673,12 @@ final class AntNode: ObservableObject {
 
     // MARK: - Screenshot hooks (antstream-visual CI)
 
+    /// Set once a screenshot sample has been installed, so the periodic /
+    /// scene-phase refreshes that would otherwise reset `plan` and the
+    /// settlement fields to their real (empty) runner state leave the
+    /// sample in place for the capture. Never set outside the shot path.
+    private var screenshotSampleActive = false
+
     /// Drive the Storage tab to the deposit-0 top-up state for a CI
     /// screenshot.
     ///
@@ -682,6 +695,7 @@ final class AntNode: ObservableObject {
     /// address the card copies is left as the node's real one (set by
     /// `refreshAccount`), so only the settlement figures are synthetic.
     func installDepositTopUpSample() {
+        screenshotSampleActive = true
         // A modest connected plan so `plan.enabled` gates the card in, and
         // the storage meter shows a populated bar rather than "no plan".
         plan = StoragePlan(
