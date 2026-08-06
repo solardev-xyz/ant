@@ -597,8 +597,64 @@ use crate::GNOSIS_CHAIN_ID;
 const POSTAGE_BUCKET_DEPTH: u8 = 16;
 
 /// xBZZ has 16 decimals; one whole xBZZ is `10^16` PLUR.
-#[cfg(feature = "chain")]
 const PLUR_PER_BZZ: u128 = 10_000_000_000_000_000;
+
+/// Deposit sizing for the chequebook the storage flows deploy.
+///
+/// A chequebook with **deposit 0** — what `ensure_settlement` used to
+/// leave behind — is a chequebook that backs no cheque: swap is enabled
+/// and peers accept the cheques, so publishing runs clean right up until
+/// the peers' payment tolerance is exhausted, then collapses into 60 s
+/// pushsync timeouts (issue #73; the #67 soak measured 0.57 Mbit/s with
+/// 25 failures and a 10-minute live-edge lag). The same soak with a
+/// funded chequebook ran 899/899 segments at 0.89 Mbit/s flat.
+///
+/// Compiled unconditionally: the on-chain callers are `chain`-only, but
+/// this sizing math is the part the default `cargo test --workspace
+/// --lib` gate can cover.
+#[cfg_attr(not(feature = "chain"), allow(dead_code))]
+pub(crate) mod deposit {
+    /// Target xBZZ deposit behind the node's chequebook, in PLUR:
+    /// **0.001 xBZZ**. Grounded in the #67 benchmark, where that deposit
+    /// backed 65 K+ cheques with huge margin (~300× one soak's measured
+    /// settlement demand). Small enough not to compete with the postage
+    /// batch the user came to buy, and not spent money either — an
+    /// unspent deposit stays withdrawable by the issuer.
+    pub(crate) const TARGET_PLUR: u128 = super::PLUR_PER_BZZ / 1_000;
+
+    /// xBZZ (PLUR) a chequebook already holding `deposited_plur` still
+    /// needs to reach [`TARGET_PLUR`]. Zero once it is at (or above) the
+    /// target, so a funded account is never charged twice.
+    pub(crate) fn shortfall(deposited_plur: u128) -> u128 {
+        TARGET_PLUR.saturating_sub(deposited_plur)
+    }
+
+    /// Whether a deployed chequebook still needs funding. The single
+    /// predicate the quote, the status surface and the top-up action all
+    /// read, so "needs a top-up" can't mean one thing in the summary and
+    /// another in the detail underneath.
+    pub(crate) fn needs_top_up(deposited_plur: u128) -> bool {
+        shortfall(deposited_plur) > 0
+    }
+
+    /// xBZZ (PLUR) a storage buy has to end up acquiring: the plan's own
+    /// cost plus whatever the chequebook is still short, less what the
+    /// wallet already holds.
+    ///
+    /// This is the accounting half of #73 — a buy that sizes its swap
+    /// from the plan alone spends every xBZZ it acquires on the batch and
+    /// leaves the deposit at zero, which is exactly the collapse the
+    /// benchmark measured.
+    pub(crate) fn bzz_to_acquire(
+        plan_plur: u128,
+        deposit_shortfall_plur: u128,
+        wallet_bzz: u128,
+    ) -> u128 {
+        plan_plur
+            .saturating_add(deposit_shortfall_plur)
+            .saturating_sub(wallet_bzz)
+    }
+}
 
 /// Swarm chunk size in bytes (capacity math).
 #[cfg(feature = "chain")]
@@ -609,11 +665,14 @@ const BYTES_PER_CHUNK: u64 = 4096;
 const WEI_PER_XDAI: u128 = 1_000_000_000_000_000_000;
 
 /// Gas reserve (wei) we keep aside / ask the user to fund on top of the
-/// swap input, covering the up-to-four txs a first xDAI buy submits
-/// (helper deploy + swap + approve + createBatch) at Gnosis gas prices.
-/// 0.01 xDAI is several times the real cost.
+/// swap input, covering the up-to-six txs a first xDAI buy submits
+/// (helper deploy + swap + approve + createBatch, then the one-time
+/// chequebook deploy + its settlement deposit transfer) at Gnosis gas
+/// prices — ~0.007 xDAI at the 2 gwei default. 0.015 xDAI keeps that
+/// comfortable: running the wallet dry right before the chequebook step
+/// would leave settlement off, which is the very failure #73 fixes.
 #[cfg(feature = "chain")]
-const GAS_RESERVE_WEI: u128 = 10_000_000_000_000_000;
+const GAS_RESERVE_WEI: u128 = 15_000_000_000_000_000;
 
 /// Slippage + fee buffer applied to the fair-value swap input: we send
 /// `fair × 105 / 100` xDAI so the 0.3% pool fee and a few percent of
@@ -629,6 +688,13 @@ const SWAP_BUFFER_DEN: u128 = 100;
 /// plan lasting `days` costs. Returns everything the "payment
 /// information" screen needs to show cost vs. the account's funds. No
 /// transaction is sent.
+///
+/// The all-in figures (`needed_bzz` / `xdai_required` / `xdai_to_send` /
+/// `sufficient_funds`) include the one-time settlement deposit this
+/// account's chequebook still needs (`settlement_deposit_plur`, zero once
+/// it is funded), because activating a plan is also what deploys and
+/// funds that chequebook — see [`deposit`] and [`ensure_settlement`].
+/// `total_cost_plur` / `total_cost_bzz` stay the plan's own cost.
 #[cfg(feature = "chain")]
 pub(crate) fn storage_quote(
     h: &AntHandle,
@@ -637,6 +703,7 @@ pub(crate) fn storage_quote(
     days: u64,
 ) -> Result<String, DriveError> {
     let eth = h.eth;
+    let data_dir = h.data_dir.clone();
     h.runtime.block_on(async move {
         let client = ant_chain::ChainClient::new(rpc);
         let price = client
@@ -658,9 +725,15 @@ pub(crate) fn storage_quote(
         let total_plur = amount_per_chunk.saturating_mul(1u128 << depth);
         let capacity_bytes = (1u64 << depth).saturating_mul(BYTES_PER_CHUNK);
 
+        // Activating a plan also brings settlement up, and a chequebook
+        // that backs no cheque stalls publishing a few tens of thousands
+        // of chunks in (#73), so the deposit it still needs is part of
+        // this plan's all-in price — not a surprise the user meets later.
+        let deposit_shortfall = quote_deposit_shortfall(&client, &data_dir, &eth).await;
+
         // xDAI-only flow: the user funds plain xDAI, the node swaps the
         // shortfall into xBZZ. Total to hold = swap input + gas reserve.
-        let needed_bzz = total_plur.saturating_sub(bzz);
+        let needed_bzz = deposit::bzz_to_acquire(total_plur, deposit_shortfall, bzz);
         let swap_input = if needed_bzz > 0 {
             buffered_swap_input(&client, needed_bzz).await?
         } else {
@@ -675,6 +748,8 @@ pub(crate) fn storage_quote(
             amount_per_chunk: amount_per_chunk.to_string(),
             total_cost_plur: total_plur.to_string(),
             total_cost_bzz: format_bzz(total_plur),
+            settlement_deposit_plur: deposit_shortfall.to_string(),
+            settlement_deposit_bzz: format_bzz(deposit_shortfall),
             capacity_bytes,
             account_bzz: bzz.to_string(),
             account_bzz_display: format_bzz(bzz),
@@ -739,6 +814,12 @@ pub(crate) fn storage_topup_quote(
             amount_per_chunk: amount_per_chunk.to_string(),
             total_cost_plur: total_plur.to_string(),
             total_cost_bzz: format_bzz(total_plur),
+            // Extending a plan neither deploys nor funds a chequebook —
+            // it is pure postage — so no settlement deposit is folded
+            // into this price. A chequebook that needs one is surfaced
+            // (and topped up) on its own, via [`settlement_deposit`].
+            settlement_deposit_plur: "0".to_string(),
+            settlement_deposit_bzz: format_bzz(0),
             capacity_bytes,
             account_bzz: bzz.to_string(),
             account_bzz_display: format_bzz(bzz),
@@ -1039,9 +1120,11 @@ pub(crate) fn storage_buy(
 /// swaps the xBZZ shortfall through the on-chain helper, then runs the
 /// same `approve` + `createBatch` flow as [`storage_buy`].
 ///
-/// Submits up to four real Gnosis transactions (one-time helper deploy,
-/// swap, approve, createBatch) and spends real funds, so the app gates
-/// it behind explicit confirmation.
+/// Submits up to six real Gnosis transactions (one-time helper deploy,
+/// swap, approve, createBatch, then the one-time chequebook deploy and
+/// its settlement deposit) and spends real funds, so the app gates it
+/// behind explicit confirmation. The swap is sized to cover the deposit
+/// too — see [`deposit::bzz_to_acquire`].
 #[cfg(feature = "chain")]
 pub(crate) fn storage_buy_xdai(
     h: &AntHandle,
@@ -1076,12 +1159,18 @@ pub(crate) fn storage_buy_xdai(
             .checked_mul(1u128 << depth)
             .ok_or_else(|| DriveError::Op("plan cost overflows".into()))?;
 
-        // 1) Top up xBZZ by swapping xDAI for the shortfall, if any.
+        // 1) Top up xBZZ by swapping xDAI for the shortfall, if any. The
+        //    shortfall covers the plan *and* the settlement deposit the
+        //    chequebook still needs (step 3 below): sizing the swap from
+        //    the plan alone spends every acquired xBZZ on the batch and
+        //    leaves the chequebook backing nothing (#73). Same expression
+        //    the quote priced with, so the user pays what they were shown.
         let have_bzz = client
             .erc20_balance_of_lower128(ant_chain::GNOSIS_BZZ_TOKEN, &owner)
             .await
             .unwrap_or(0);
-        let needed_bzz = total_plur.saturating_sub(have_bzz);
+        let deposit_shortfall = quote_deposit_shortfall(&client, &data_dir, &owner).await;
+        let needed_bzz = deposit::bzz_to_acquire(total_plur, deposit_shortfall, have_bzz);
         if needed_bzz > 0 {
             let xdai = client
                 .eth_get_balance_lower128(&owner)
@@ -1162,12 +1251,18 @@ pub(crate) fn storage_buy_xdai(
 ///      adopt + persist it rather than stranding its balance.
 ///   3. **Auto-deploy** — first run with a funded wallet: deploy a
 ///      fresh factory-registered chequebook (issuer = node EOA),
-///      persist it, leave it unfunded (bee still accepts the cheques;
-///      it's cashed once the user deposits BZZ).
+///      persist it, and fund it with [`deposit::TARGET_PLUR`] xBZZ so
+///      the cheques it signs are actually backed.
+///
+/// A chequebook reached through step 1 or 2 predates this and can be
+/// sitting at deposit 0 (every install before #73 is), so it is topped
+/// up to the same target from spare wallet xBZZ before settlement is
+/// switched on.
 ///
 /// Best-effort: never fails the surrounding storage purchase. A thin
-/// wallet (no spare xDAI for the one-time deploy) or flaky RPC just
-/// logs a warning; settlement enables on the next buy or app launch.
+/// wallet (no spare xDAI for the one-time deploy, no spare xBZZ for the
+/// deposit) or flaky RPC just logs a warning; settlement enables — and
+/// the deposit lands — on the next buy or app launch.
 /// The node wallet both pays gas and is the issuer, so no external key
 /// is ever introduced.
 #[cfg(feature = "chain")]
@@ -1179,8 +1274,8 @@ pub(crate) async fn ensure_settlement(
     swap_secret: [u8; 32],
     node_eth: [u8; 20],
 ) {
-    let chequebook = match resolve_or_deploy_chequebook(client, wallet, data_dir, node_eth).await {
-        Ok(Some(cb)) => cb,
+    let resolved = match resolve_or_deploy_chequebook(client, wallet, data_dir, node_eth).await {
+        Ok(Some(r)) => r,
         Ok(None) => return,
         Err(e) => {
             tracing::warn!(
@@ -1191,6 +1286,13 @@ pub(crate) async fn ensure_settlement(
             return;
         }
     };
+    let chequebook = resolved.address;
+    // A chequebook we just deployed was funded as part of the deploy; an
+    // adopted one carries whatever deposit it already had, which for
+    // anything deployed before #73 is nothing at all.
+    if !resolved.deployed {
+        fund_chequebook_best_effort(client, wallet, &node_eth, &chequebook).await;
+    }
 
     let (ack_tx, ack_rx) = oneshot::channel();
     if send(
@@ -1263,14 +1365,298 @@ pub(crate) fn settlement_status(h: &AntHandle) -> Result<String, DriveError> {
     })
 }
 
+/// The chequebook this account owns on this device, if any: the
+/// persisted association, checked against `owner` so a record left by a
+/// different account is never adopted (bee only honours a cheque signed
+/// by the chequebook's own issuer). A record we can't read is reported
+/// as "none" — non-destructive, and the caller then treats the account
+/// as one whose chequebook is still to come.
+#[cfg(feature = "chain")]
+fn persisted_chequebook(data_dir: &std::path::Path, owner: &[u8; 20]) -> Option<[u8; 20]> {
+    let path = data_dir.join("chequebook.json");
+    match ant_chain::chequebook_store::load_persisted_chequebook_for(&path, owner) {
+        Ok(cb) => cb,
+        Err(e) => {
+            tracing::warn!(target: "ant-ffi", "read chequebook association: {e}");
+            None
+        }
+    }
+}
+
+/// The xBZZ (PLUR) currently behind `chequebook` — the contract's own
+/// xBZZ balance, which is exactly what its `balance()` view reports and
+/// what a cashed cheque is paid out of.
+#[cfg(feature = "chain")]
+async fn chequebook_deposit_plur(
+    client: &ant_chain::ChainClient,
+    chequebook: &[u8; 20],
+) -> Result<u128, DriveError> {
+    client
+        .erc20_balance_of_lower128(ant_chain::GNOSIS_BZZ_TOKEN, chequebook)
+        .await
+        .map_err(|e| DriveError::Op(format!("read settlement deposit: {e}")))
+}
+
+/// The settlement deposit a storage buy should price in for this
+/// account: the full target when no chequebook exists yet (the buy
+/// deploys one, funded), otherwise whatever the existing one is short.
+///
+/// Best-effort like the balance reads around it: when the deposit can't
+/// be read we quote the plan alone rather than charging for a deposit we
+/// couldn't size — an under-quote is recoverable through the top-up
+/// path, an over-quote takes the user's money for nothing.
+#[cfg(feature = "chain")]
+async fn quote_deposit_shortfall(
+    client: &ant_chain::ChainClient,
+    data_dir: &std::path::Path,
+    owner: &[u8; 20],
+) -> u128 {
+    let Some(cb) = persisted_chequebook(data_dir, owner) else {
+        return deposit::TARGET_PLUR;
+    };
+    match chequebook_deposit_plur(client, &cb).await {
+        Ok(have) => deposit::shortfall(have),
+        Err(e) => {
+            tracing::warn!(
+                target: "ant-ffi",
+                "could not read the settlement deposit; pricing the plan alone: {e}",
+            );
+            0
+        }
+    }
+}
+
+/// Bring `chequebook` up to [`deposit::TARGET_PLUR`] from the node
+/// wallet's spare xBZZ. Best-effort in every direction: an already-funded
+/// chequebook, an unreadable balance, an empty wallet or a failed
+/// transfer all just log — the caller is a storage flow that must not
+/// fail over settlement housekeeping. A partial deposit (thin wallet) is
+/// deliberately kept: some backing beats none.
+#[cfg(feature = "chain")]
+async fn fund_chequebook_best_effort(
+    client: &ant_chain::ChainClient,
+    wallet: &ant_chain::tx::Wallet,
+    node_eth: &[u8; 20],
+    chequebook: &[u8; 20],
+) {
+    use primitive_types::U256;
+
+    let have = match chequebook_deposit_plur(client, chequebook).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(target: "ant-ffi", "settlement deposit left as-is: {e}");
+            return;
+        }
+    };
+    let short = deposit::shortfall(have);
+    if short == 0 {
+        return;
+    }
+    let wallet_bzz = client
+        .erc20_balance_of_lower128(ant_chain::GNOSIS_BZZ_TOKEN, node_eth)
+        .await
+        .unwrap_or(0);
+    let amount = short.min(wallet_bzz);
+    if amount == 0 {
+        tracing::warn!(
+            target: "ant-ffi",
+            chequebook = %format!("0x{}", hex::encode(chequebook)),
+            "chequebook holds no settlement deposit and the wallet has no spare xBZZ; \
+             uploads will stall once peers stop extending credit — top it up from the Storage tab",
+        );
+        return;
+    }
+    match wallet
+        .erc20_transfer(
+            client,
+            &ant_chain::chequebook::GNOSIS_BZZ_TOKEN_BYTES,
+            chequebook,
+            U256::from(amount),
+        )
+        .await
+    {
+        Ok(r) => tracing::info!(
+            target: "ant-ffi",
+            chequebook = %format!("0x{}", hex::encode(chequebook)),
+            deposit_plur = amount,
+            tx = %format!("0x{}", hex::encode(r.tx_hash)),
+            "funded the chequebook so its cheques are backed",
+        ),
+        Err(e) => tracing::warn!(
+            target: "ant-ffi",
+            "settlement deposit transfer failed; the chequebook still works but backs no cheque: {e}",
+        ),
+    }
+}
+
+/// The chequebook's settlement deposit, read from chain, plus what a
+/// top-up to [`deposit::TARGET_PLUR`] would cost — the "is this
+/// chequebook actually backing its cheques?" card in the Storage tab,
+/// and the migration path for every install that deployed one at deposit
+/// 0 (issue #73).
+///
+/// Returns JSON `{"enabled","chequebook","deposit_plur","deposit_bzz",
+/// "target_plur","target_bzz","shortfall_plur","shortfall_bzz",
+/// "needs_top_up","xdai_required","xdai_required_display","xdai_to_send",
+/// "xdai_to_send_display","sufficient_funds"}`. `enabled=false` (with
+/// zeroed fields) when this account has no chequebook yet — there is
+/// nothing to top up then; buying or connecting a plan deploys one,
+/// funded. Two or three light `eth_call`s, so it belongs on an explicit
+/// refresh, not on every status poll.
+#[cfg(feature = "chain")]
+pub(crate) fn settlement_deposit(h: &AntHandle, rpc: String) -> Result<String, DriveError> {
+    let data_dir = h.data_dir.clone();
+    let owner = h.eth;
+    h.runtime.block_on(async move {
+        let Some(cb) = persisted_chequebook(&data_dir, &owner) else {
+            return to_json(&SettlementDeposit::none());
+        };
+        let client = ant_chain::ChainClient::new(rpc);
+        let deposited = chequebook_deposit_plur(&client, &cb).await?;
+        settlement_deposit_json(&client, &owner, &cb, deposited).await
+    })
+}
+
+/// Fund the node's chequebook up to [`deposit::TARGET_PLUR`], funding
+/// **only with xDAI**: swap the xBZZ shortfall through the on-chain
+/// helper if the wallet doesn't already hold it, then transfer the
+/// deposit to the chequebook. The explicit top-up path — a deposit is
+/// only read at deploy time, so an already-deployed chequebook can be
+/// funded no other way.
+///
+/// Idempotent: a chequebook already at the target is a no-op. Returns the
+/// refreshed [`settlement_deposit`] JSON. Submits real Gnosis
+/// transactions and spends real funds, so the app gates it behind an
+/// explicit confirmation.
+#[cfg(feature = "chain")]
+pub(crate) fn settlement_topup_xdai(h: &AntHandle, rpc: String) -> Result<String, DriveError> {
+    let data_dir = h.data_dir.clone();
+    let owner = h.eth;
+    let secret = h.signing_secret;
+    h.runtime.block_on(async move {
+        use primitive_types::U256;
+
+        let cb = persisted_chequebook(&data_dir, &owner).ok_or_else(|| {
+            DriveError::Op(
+                "no chequebook for this account yet — connect or buy a storage plan first".into(),
+            )
+        })?;
+        let client = ant_chain::ChainClient::new(rpc);
+        let deposited = chequebook_deposit_plur(&client, &cb).await?;
+        let short = deposit::shortfall(deposited);
+        if short == 0 {
+            return settlement_deposit_json(&client, &owner, &cb, deposited).await;
+        }
+
+        let wallet = ant_chain::tx::Wallet::new(secret, GNOSIS_CHAIN_ID)
+            .map_err(|e| DriveError::Op(format!("wallet: {e}")))?;
+        let have_bzz = client
+            .erc20_balance_of_lower128(ant_chain::GNOSIS_BZZ_TOKEN, &owner)
+            .await
+            .unwrap_or(0);
+        let to_acquire = short.saturating_sub(have_bzz);
+        if to_acquire > 0 {
+            let xdai = client
+                .eth_get_balance_lower128(&owner)
+                .await
+                .map_err(|e| DriveError::Op(format!("read xDAI balance: {e}")))?;
+            let swap_input = buffered_swap_input(&client, to_acquire).await?;
+            let required = swap_input.saturating_add(GAS_RESERVE_WEI);
+            if xdai < required {
+                return Err(DriveError::Op(format!(
+                    "not enough xDAI: send {} more xDAI to your account, then try again",
+                    format_native(required - xdai)
+                )));
+            }
+            let helper = wallet
+                .ensure_swap_helper(&client)
+                .await
+                .map_err(|e| DriveError::Op(format!("prepare swap: {e}")))?;
+            wallet
+                .swap_xdai_for_bzz(
+                    &client,
+                    &helper,
+                    &owner,
+                    U256::from(swap_input),
+                    U256::from(to_acquire),
+                )
+                .await
+                .map_err(|e| DriveError::Op(format!("swap xDAI for xBZZ: {e}")))?;
+        }
+
+        wallet
+            .erc20_transfer(
+                &client,
+                &ant_chain::chequebook::GNOSIS_BZZ_TOKEN_BYTES,
+                &cb,
+                U256::from(short),
+            )
+            .await
+            .map_err(|e| DriveError::Op(format!("deposit into chequebook: {e}")))?;
+
+        // Re-read rather than assuming: the card should show what the
+        // chain says the deposit is now, not what we intended it to be.
+        let deposited = chequebook_deposit_plur(&client, &cb).await?;
+        settlement_deposit_json(&client, &owner, &cb, deposited).await
+    })
+}
+
+/// Render the settlement-deposit card payload for a known chequebook,
+/// pricing the outstanding top-up the same way the plan quote prices a
+/// buy (swap input for the missing xBZZ + gas reserve, against the
+/// account's xDAI).
+#[cfg(feature = "chain")]
+async fn settlement_deposit_json(
+    client: &ant_chain::ChainClient,
+    owner: &[u8; 20],
+    chequebook: &[u8; 20],
+    deposited: u128,
+) -> Result<String, DriveError> {
+    let short = deposit::shortfall(deposited);
+    let wallet_bzz = client
+        .erc20_balance_of_lower128(ant_chain::GNOSIS_BZZ_TOKEN, owner)
+        .await
+        .unwrap_or(0);
+    let to_acquire = short.saturating_sub(wallet_bzz);
+    let swap_input = if to_acquire > 0 {
+        buffered_swap_input(client, to_acquire).await?
+    } else {
+        0
+    };
+    // Nothing to fund → nothing to ask for, not "a gas reserve please".
+    let xdai_required = if short > 0 {
+        swap_input.saturating_add(GAS_RESERVE_WEI)
+    } else {
+        0
+    };
+    let xdai = client.eth_get_balance_lower128(owner).await.unwrap_or(0);
+    let xdai_to_send = xdai_required.saturating_sub(xdai);
+    to_json(&SettlementDeposit {
+        enabled: true,
+        chequebook: Some(format!("0x{}", hex::encode(chequebook))),
+        deposit_plur: deposited.to_string(),
+        deposit_bzz: format_bzz(deposited),
+        target_plur: deposit::TARGET_PLUR.to_string(),
+        target_bzz: format_bzz(deposit::TARGET_PLUR),
+        shortfall_plur: short.to_string(),
+        shortfall_bzz: format_bzz(short),
+        needs_top_up: deposit::needs_top_up(deposited),
+        xdai_required: xdai_required.to_string(),
+        xdai_required_display: format_native(xdai_required),
+        xdai_to_send: xdai_to_send.to_string(),
+        xdai_to_send_display: format_native(xdai_to_send),
+        sufficient_funds: xdai >= xdai_required,
+    })
+}
+
 /// Deploy (or return the already-persisted) node-owned chequebook for the
 /// iOS publish-setup checklist's "chequebook deployed" step. Idempotent:
 /// if `<data_dir>/chequebook.json` already records a chequebook, it's
-/// returned without a redeploy; otherwise this signs an on-chain
-/// `factory.deploySimpleSwap` deployed **unfunded** (xDAI gas only, zero
-/// xBZZ deposit — bee still accepts the cheques and the user's xBZZ stays
-/// in their wallet), persists the association, and returns the new
-/// address. Blocks on the handle's tokio runtime.
+/// returned without a redeploy (though a chequebook still short of its
+/// settlement deposit is topped up); otherwise this signs an on-chain
+/// `factory.deploySimpleSwap`, funds it with [`deposit::TARGET_PLUR`]
+/// xBZZ so its cheques are backed, persists the association, and returns
+/// the new address. Blocks on the handle's tokio runtime.
 ///
 /// Returns `{"chequebookAddress":"0x<40hex>"}` JSON. The caller restarts
 /// the gateway afterwards so [`crate::ant_start_gateway`] reloads the
@@ -1293,9 +1679,18 @@ pub(crate) fn deploy_chequebook(h: &AntHandle, rpc: String) -> Result<String, Dr
         // already deployed a chequebook (e.g. on desktop with the same
         // vault) is adopted rather than duplicated.
         match resolve_or_deploy_chequebook(&client, &wallet, &data_dir, node_eth).await? {
-            Some(cb) => to_json(&DeployedChequebook {
-                chequebook_address: format!("0x{}", hex::encode(cb)),
-            }),
+            Some(resolved) => {
+                // An adopted chequebook may still be at deposit 0 — fund
+                // it here too, so this checklist step means the same
+                // thing whichever branch produced the address.
+                if !resolved.deployed {
+                    fund_chequebook_best_effort(&client, &wallet, &node_eth, &resolved.address)
+                        .await;
+                }
+                to_json(&DeployedChequebook {
+                    chequebook_address: format!("0x{}", hex::encode(resolved.address)),
+                })
+            }
             None => Err(DriveError::Op(
                 "chequebook could not be deployed — wallet has no xDAI for gas".into(),
             )),
@@ -1303,20 +1698,33 @@ pub(crate) fn deploy_chequebook(h: &AntHandle, rpc: String) -> Result<String, Dr
     })
 }
 
+/// A chequebook resolved for this account, and how we got to it.
+#[cfg(feature = "chain")]
+struct ResolvedChequebook {
+    /// The 20-byte chequebook contract address.
+    address: [u8; 20],
+    /// `true` when *this* call deployed it — and therefore already
+    /// funded it with [`deposit::TARGET_PLUR`] as part of the deploy.
+    /// `false` for a persisted / rediscovered chequebook, whose deposit
+    /// is whatever it happens to hold (zero, for anything deployed
+    /// before #73).
+    deployed: bool,
+}
+
 /// Reuse / rediscover / deploy a chequebook for `node_eth`, persisting
 /// the association so future launches reload it directly. Returns the
-/// 20-byte chequebook address, or `None` when the wallet can't afford
-/// the one-time deploy (a soft skip, not an error). The persist /
+/// resolved chequebook, or `None` when the wallet can't afford the
+/// one-time deploy (a soft skip, not an error). The persist /
 /// rediscover / deploy mechanics are shared with `antd` via
 /// [`ant_chain::chequebook_store`]; only the resolution *order* (no
-/// operator-flag branches) and the unfunded deploy policy live here.
+/// operator-flag branches) and the deposit sizing live here.
 #[cfg(feature = "chain")]
 async fn resolve_or_deploy_chequebook(
     client: &ant_chain::ChainClient,
     wallet: &ant_chain::tx::Wallet,
     data_dir: &std::path::Path,
     node_eth: [u8; 20],
-) -> Result<Option<[u8; 20]>, DriveError> {
+) -> Result<Option<ResolvedChequebook>, DriveError> {
     use ant_chain::chequebook_store::{self, ChequebookError, ChequebookFile};
 
     let persist_path = data_dir.join("chequebook.json");
@@ -1328,7 +1736,10 @@ async fn resolve_or_deploy_chequebook(
     if let Some(cb) = chequebook_store::load_persisted_chequebook_for(&persist_path, &node_eth)
         .map_err(map_cb_err)?
     {
-        return Ok(Some(cb));
+        return Ok(Some(ResolvedChequebook {
+            address: cb,
+            deployed: false,
+        }));
     }
 
     // 2. Rediscover a chequebook this node EOA already owns on-chain
@@ -1355,21 +1766,35 @@ async fn resolve_or_deploy_chequebook(
                 chequebook = %format!("0x{}", hex::encode(cb)),
                 "rediscovered node-owned chequebook on-chain; adopting it",
             );
-            return Ok(Some(cb));
+            return Ok(Some(ResolvedChequebook {
+                address: cb,
+                deployed: false,
+            }));
         }
         Ok(None) => {}
         Err(e) => tracing::warn!(target: "ant-ffi", "chequebook rediscovery scan failed: {e}"),
     }
 
-    // 3. Auto-deploy, unfunded (deposit 0): bee still accepts the
-    //    cheques, and not draining the user's xBZZ keeps their whole
-    //    balance available for the postage batch they came to buy.
-    //    Insufficient gas is a soft skip — settlement turns on once the
-    //    wallet has a little more xDAI.
-    match chequebook_store::auto_deploy_chequebook(client, wallet, &node_eth, 0, &persist_path)
-        .await
+    // 3. Auto-deploy, funded with [`deposit::TARGET_PLUR`]: bee accepts
+    //    the cheques either way, but a chequebook backing nothing only
+    //    publishes until the peers' payment tolerance runs out and then
+    //    stalls (#73) — so the deposit goes in at deploy time, capped by
+    //    the wallet's xBZZ balance (a thin wallet gets a smaller deposit
+    //    rather than a failed transfer). Insufficient gas is a soft skip
+    //    — settlement turns on once the wallet has a little more xDAI.
+    match chequebook_store::auto_deploy_chequebook(
+        client,
+        wallet,
+        &node_eth,
+        deposit::TARGET_PLUR,
+        &persist_path,
+    )
+    .await
     {
-        Ok(cb) => Ok(Some(cb)),
+        Ok(cb) => Ok(Some(ResolvedChequebook {
+            address: cb,
+            deployed: true,
+        })),
         Err(ChequebookError::InsufficientGas { need, .. }) => {
             tracing::warn!(
                 target: "ant-ffi",
@@ -1459,6 +1884,68 @@ struct SettlementStatus {
     chequebook: Option<String>,
 }
 
+/// Wire shape for [`settlement_deposit`] / [`settlement_topup_xdai`]:
+/// what actually stands behind this account's cheques, and what closing
+/// the gap would cost.
+#[cfg(feature = "chain")]
+#[derive(Serialize)]
+struct SettlementDeposit {
+    /// `true` once a chequebook exists for this account — i.e. there is
+    /// something a deposit could go into.
+    enabled: bool,
+    /// `0x`-prefixed chequebook contract address when enabled.
+    chequebook: Option<String>,
+    /// xBZZ currently behind the chequebook (PLUR, and a short display
+    /// string). Zero is the pre-#73 state: cheques are issued and
+    /// accepted, but nothing backs them.
+    deposit_plur: String,
+    deposit_bzz: String,
+    /// The deposit we aim for — [`deposit::TARGET_PLUR`].
+    target_plur: String,
+    target_bzz: String,
+    /// What is still missing (`target − deposit`, saturating).
+    shortfall_plur: String,
+    shortfall_bzz: String,
+    /// `shortfall > 0`, via [`deposit::needs_top_up`] — the one
+    /// predicate the UI summary and the top-up action both read.
+    needs_top_up: bool,
+    /// Total xDAI (wei + display) the account must hold to run the
+    /// top-up: the swap input for the missing xBZZ plus a gas reserve.
+    /// Zero when nothing is missing.
+    xdai_required: String,
+    xdai_required_display: String,
+    /// Additional xDAI the user still needs to send (`required −
+    /// balance`).
+    xdai_to_send: String,
+    xdai_to_send_display: String,
+    sufficient_funds: bool,
+}
+
+#[cfg(feature = "chain")]
+impl SettlementDeposit {
+    /// The "no chequebook on this device yet" payload: nothing to top
+    /// up, because buying or connecting a plan deploys one already
+    /// funded.
+    fn none() -> Self {
+        Self {
+            enabled: false,
+            chequebook: None,
+            deposit_plur: "0".into(),
+            deposit_bzz: format_bzz(0),
+            target_plur: deposit::TARGET_PLUR.to_string(),
+            target_bzz: format_bzz(deposit::TARGET_PLUR),
+            shortfall_plur: "0".into(),
+            shortfall_bzz: format_bzz(0),
+            needs_top_up: false,
+            xdai_required: "0".into(),
+            xdai_required_display: format_native(0),
+            xdai_to_send: "0".into(),
+            xdai_to_send_display: format_native(0),
+            sufficient_funds: true,
+        }
+    }
+}
+
 /// Wire shape for [`deploy_chequebook`]: the resolved (persisted or
 /// freshly deployed) chequebook contract address.
 #[cfg(feature = "chain")]
@@ -1490,6 +1977,14 @@ struct Quote {
     amount_per_chunk: String,
     total_cost_plur: String,
     total_cost_bzz: String,
+    /// One-time xBZZ this purchase also puts behind the node's
+    /// chequebook so its cheques are backed (PLUR + display string).
+    /// `0` when the chequebook is already funded, or for a plan
+    /// extension, which deploys nothing. Included in `needed_bzz` /
+    /// `xdai_required` / `xdai_to_send` / `sufficient_funds`, not in
+    /// `total_cost_*`.
+    settlement_deposit_plur: String,
+    settlement_deposit_bzz: String,
     capacity_bytes: u64,
     account_bzz: String,
     account_bzz_display: String,
@@ -1539,4 +2034,69 @@ fn to_json<T: Serialize>(v: &T) -> Result<String, DriveError> {
 
 fn unexpected(ack: &ControlAck) -> DriveError {
     DriveError::Op(format!("unexpected node response: {ack:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::deposit;
+    use super::PLUR_PER_BZZ;
+
+    /// The default deposit is 0.001 xBZZ — the figure the #67 benchmark
+    /// measured backing 65 K+ cheques. Pinned against the PLUR scale so a
+    /// decimals slip (xBZZ has 16, not 18) can't quietly turn it into
+    /// 0.1 xBZZ of the user's money, or into dust that stalls again.
+    #[test]
+    fn deposit_target_is_one_thousandth_of_a_bzz() {
+        assert_eq!(deposit::TARGET_PLUR, 10_000_000_000_000);
+        assert_eq!(deposit::TARGET_PLUR * 1_000, PLUR_PER_BZZ);
+    }
+
+    #[test]
+    fn shortfall_is_what_is_missing_and_never_negative() {
+        // The pre-#73 chequebook: deployed, backing nothing.
+        assert_eq!(deposit::shortfall(0), deposit::TARGET_PLUR);
+        assert!(deposit::needs_top_up(0));
+        // Partially funded (a thin wallet got a capped deposit).
+        assert_eq!(
+            deposit::shortfall(deposit::TARGET_PLUR / 4),
+            deposit::TARGET_PLUR - deposit::TARGET_PLUR / 4
+        );
+        assert!(deposit::needs_top_up(deposit::TARGET_PLUR / 4));
+        // At or above target: nothing owed, and no second charge.
+        assert_eq!(deposit::shortfall(deposit::TARGET_PLUR), 0);
+        assert!(!deposit::needs_top_up(deposit::TARGET_PLUR));
+        assert_eq!(deposit::shortfall(deposit::TARGET_PLUR * 10), 0);
+        assert!(!deposit::needs_top_up(deposit::TARGET_PLUR * 10));
+    }
+
+    #[test]
+    fn buy_acquires_the_plan_plus_the_missing_deposit() {
+        let plan = 5 * PLUR_PER_BZZ;
+        // Fresh account: nothing in the wallet, nothing behind the
+        // chequebook — the buy has to acquire both, or it spends
+        // everything on postage and deploys a chequebook backing nothing.
+        assert_eq!(
+            deposit::bzz_to_acquire(plan, deposit::shortfall(0), 0),
+            plan + deposit::TARGET_PLUR
+        );
+        // Chequebook already funded: the plan alone, no double charge.
+        assert_eq!(
+            deposit::bzz_to_acquire(plan, deposit::shortfall(deposit::TARGET_PLUR), 0),
+            plan
+        );
+        // Wallet already holds the deposit: only the plan is missing.
+        assert_eq!(
+            deposit::bzz_to_acquire(plan, deposit::shortfall(0), deposit::TARGET_PLUR),
+            plan
+        );
+        // Wallet covers everything: nothing to swap.
+        assert_eq!(
+            deposit::bzz_to_acquire(plan, deposit::shortfall(0), plan + deposit::TARGET_PLUR),
+            0
+        );
+        assert_eq!(
+            deposit::bzz_to_acquire(plan, deposit::shortfall(0), u128::MAX),
+            0
+        );
+    }
 }

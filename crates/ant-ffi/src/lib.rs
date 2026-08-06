@@ -2071,6 +2071,105 @@ pub unsafe extern "C" fn ant_storage_settlement_status(
     }
 }
 
+/// Settlement-deposit status as JSON `{"enabled","chequebook",
+/// "deposit_plur","deposit_bzz","target_plur","target_bzz",
+/// "shortfall_plur","shortfall_bzz","needs_top_up","xdai_required",
+/// "xdai_required_display","xdai_to_send","xdai_to_send_display",
+/// "sufficient_funds"}`.
+///
+/// [`ant_storage_settlement_status`] answers "is a chequebook deployed?";
+/// this answers "does it actually back the cheques it signs?". A
+/// chequebook at deposit 0 — what every install before this deployed —
+/// publishes fine until the peers' payment tolerance runs out, then
+/// collapses into pushsync timeouts, so the Storage tab reads this to
+/// detect that state and offer a top-up ([`ant_storage_settlement_topup`]).
+/// `enabled=false` (zeroed, `needs_top_up=false`) when this account has
+/// no chequebook yet; buying or connecting a plan deploys one, funded.
+///
+/// Reads chain (two or three light `eth_call`s), so call it on an
+/// explicit refresh rather than every status poll. Requires the `chain`
+/// build feature.
+///
+/// # Safety
+///
+/// See [`ant_upload_start`]. `gnosis_rpc` must be a valid NUL-terminated
+/// UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn ant_storage_settlement_deposit(
+    handle: *const AntHandle,
+    gnosis_rpc: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_storage_settlement_deposit", || {
+            let h = handle.as_ref().ok_or_else(null_handle)?;
+            let rpc = cstr_to_string(gnosis_rpc)?;
+            #[cfg(feature = "chain")]
+            {
+                if rpc.trim().is_empty() {
+                    return Err("ant_storage_settlement_deposit: gnosis_rpc required".to_string());
+                }
+                drive::settlement_deposit(h, rpc).map_err(|e| e.to_string())
+            }
+            #[cfg(not(feature = "chain"))]
+            {
+                let _ = (h, rpc);
+                Err(
+                    "this build has no chain support (rebuild ant-ffi with --features chain)"
+                        .to_string(),
+                )
+            }
+        })
+    }
+}
+
+/// Fund this account's chequebook up to the settlement deposit target
+/// (0.001 xBZZ), funding **only with xDAI**: the node swaps the xBZZ
+/// shortfall on-chain if it doesn't already hold it, then transfers the
+/// deposit to the chequebook. The explicit top-up path — a chequebook's
+/// deposit is only read at deploy time, so an already-deployed one can be
+/// funded no other way.
+///
+/// Idempotent: a chequebook already at the target is a no-op. Errors when
+/// this account has no chequebook yet. Returns the refreshed
+/// [`ant_storage_settlement_deposit`] JSON. **Submits real transactions
+/// and spends real funds** and **blocks** until they confirm, so the app
+/// gates it behind explicit confirmation. Requires the `chain` build
+/// feature.
+///
+/// # Safety
+///
+/// See [`ant_upload_start`]. `gnosis_rpc` must be a valid NUL-terminated
+/// UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn ant_storage_settlement_topup(
+    handle: *const AntHandle,
+    gnosis_rpc: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    unsafe {
+        run_string_call(out_err, "ant_storage_settlement_topup", || {
+            let h = handle.as_ref().ok_or_else(null_handle)?;
+            let rpc = cstr_to_string(gnosis_rpc)?;
+            #[cfg(feature = "chain")]
+            {
+                if rpc.trim().is_empty() {
+                    return Err("ant_storage_settlement_topup: gnosis_rpc required".to_string());
+                }
+                drive::settlement_topup_xdai(h, rpc).map_err(|e| e.to_string())
+            }
+            #[cfg(not(feature = "chain"))]
+            {
+                let _ = (h, rpc);
+                Err(
+                    "this build has no chain support (rebuild ant-ffi with --features chain)"
+                        .to_string(),
+                )
+            }
+        })
+    }
+}
+
 /// Deep read-back propagation check for an uploaded `reference`.
 ///
 /// Resolves the manifest at `reference` to its data root, enumerates the
@@ -2302,13 +2401,14 @@ pub unsafe extern "C" fn ant_storage_discover(
 /// iOS publish-setup checklist's "chequebook deployed" step can complete.
 ///
 /// Idempotent: if this device already deployed a chequebook (persisted at
-/// `<data_dir>/chequebook.json`) it's returned as-is, no redeploy.
-/// Otherwise this signs an on-chain `factory.deploySimpleSwap` (issuer =
-/// node EOA) deployed **unfunded** — xDAI gas only, zero xBZZ deposit
-/// (bee still accepts the cheques; the user's xBZZ stays in their
-/// wallet) — persists the association, and returns the new address. This
-/// is an on-chain transaction: it spends gas and **blocks** until the tx
-/// confirms. Light-mode (`chain`-feature) builds only.
+/// `<data_dir>/chequebook.json`) it's returned as-is, no redeploy —
+/// though one still short of its settlement deposit is topped up from
+/// spare xBZZ. Otherwise this signs an on-chain `factory.deploySimpleSwap`
+/// (issuer = node EOA), funds it with the 0.001 xBZZ settlement deposit
+/// so its cheques are actually backed, persists the association, and
+/// returns the new address. These are on-chain transactions: they spend
+/// gas plus the deposit and **block** until confirmed. Light-mode
+/// (`chain`-feature) builds only.
 ///
 /// Returns a heap C string `{"chequebookAddress":"0x<40hex>"}` on success
 /// (free with [`ant_free_string`]), or `NULL` with an error written to
@@ -2348,10 +2448,15 @@ pub unsafe extern "C" fn ant_deploy_chequebook(
 }
 
 /// Price a storage plan: returns a JSON object with the plan cost
-/// (`total_cost_plur` / `total_cost_bzz`), the account's xBZZ / xDAI
-/// balances, and whether they cover it — the "payment information" the
-/// Get Started flow shows before activating. No transaction is sent.
-/// Requires the `chain` build feature.
+/// (`total_cost_plur` / `total_cost_bzz`), the one-time settlement
+/// deposit the account's chequebook still needs
+/// (`settlement_deposit_plur` / `settlement_deposit_bzz`, zero once it is
+/// funded), the account's xBZZ / xDAI balances, and whether they cover
+/// the lot — the "payment information" the Get Started flow shows before
+/// activating. The all-in figures (`needed_bzz`, `xdai_required`,
+/// `xdai_to_send`, `sufficient_funds`) include the deposit, because
+/// activating a plan is also what deploys and funds the chequebook. No
+/// transaction is sent. Requires the `chain` build feature.
 ///
 /// # Safety
 ///

@@ -41,6 +41,10 @@ final class AntNode: ObservableObject {
     @Published private(set) var plan: StoragePlan?
     @Published private(set) var account: AccountInfo?
     @Published private(set) var settlement: SettlementInfo?
+    /// Whether the deployed chequebook actually backs its cheques.
+    /// Fetched on demand (`refreshSettlementDeposit`) since it reads
+    /// chain; `nil` until then.
+    @Published private(set) var settlementDeposit: SettlementDeposit?
     /// Remaining lifetime of the connected plan. Fetched on demand
     /// (`refreshValidity`) since it needs a chain RPC; `nil` until then.
     @Published private(set) var validity: StorageValidity?
@@ -600,11 +604,16 @@ final class AntNode: ObservableObject {
     }
 
     func refreshPlan() async {
+        // Keep an installed screenshot sample from being clobbered by a
+        // real read (which on a fresh runner account returns "no plan").
+        if screenshotSampleActive { return }
         if let json = try? await ffiString(name: "storage status", { h, errPtr in
             ant_storage_status(h, errPtr)
         }) {
             let decoded = StreamDecoder.plan(from: json)
-            if decoded != plan { plan = decoded }
+            // Re-check after the await: a sample may have been installed
+            // while this read was in flight.
+            if !screenshotSampleActive, decoded != plan { plan = decoded }
         }
     }
 
@@ -629,12 +638,94 @@ final class AntNode: ObservableObject {
     }
 
     func refreshSettlement() async {
+        if screenshotSampleActive { return }
         if let json = try? await ffiString(name: "settlement status", { h, errPtr in
             ant_storage_settlement_status(h, errPtr)
         }) {
             let decoded = StreamDecoder.settlement(from: json)
-            if decoded != settlement { settlement = decoded }
+            if !screenshotSampleActive, decoded != settlement { settlement = decoded }
         }
+    }
+
+    /// Read from chain how much xBZZ stands behind the chequebook. Needs a
+    /// Gnosis RPC URL and a deployed chequebook; best-effort, so a flaky
+    /// RPC leaves the previous value rather than clearing the card.
+    func refreshSettlementDeposit(rpc: String) async {
+        if screenshotSampleActive { return }
+        guard !rpc.isEmpty, settlement?.enabled == true else { return }
+        if let json = try? await ffiString(name: "settlement deposit", { h, errPtr in
+            rpc.withCString { ant_storage_settlement_deposit(h, $0, errPtr) }
+        }), let d = StreamDecoder.settlementDeposit(from: json) {
+            settlementDeposit = d
+        }
+    }
+
+    /// Fund the chequebook up to the settlement deposit, paying with xDAI
+    /// (the node swaps for the xBZZ it needs). Spends real funds. Publishes
+    /// the refreshed deposit so the card updates in place.
+    func topUpSettlementDeposit(rpc: String) async throws {
+        let json = try await ffiString(name: "top up settlement deposit") { h, errPtr in
+            rpc.withCString { ant_storage_settlement_topup(h, $0, errPtr) }
+        }
+        if let d = StreamDecoder.settlementDeposit(from: json) { settlementDeposit = d }
+        await refreshAll()
+    }
+
+    // MARK: - Screenshot hooks (antstream-visual CI)
+
+    /// Set once a screenshot sample has been installed, so the periodic /
+    /// scene-phase refreshes that would otherwise reset `plan` and the
+    /// settlement fields to their real (empty) runner state leave the
+    /// sample in place for the capture. Never set outside the shot path.
+    private var screenshotSampleActive = false
+
+    /// Drive the Storage tab to the deposit-0 top-up state for a CI
+    /// screenshot.
+    ///
+    /// The settlement-deposit card is the migration surface for every
+    /// pre-funding install: a chequebook that is deployed but holds no
+    /// xBZZ. It renders only when a plan is connected *and* the on-chain
+    /// deposit read comes back under target — and a fresh simulator
+    /// account has neither a plan nor a chequebook, so that state can't be
+    /// reached from real state on the runner. This publishes representative
+    /// sample values so `antstream-visual` can capture the card.
+    ///
+    /// Sample only, and only ever called behind `-antstream-shot-deposit`:
+    /// it moves no funds and is never reached in normal use. The account
+    /// address the card copies is left as the node's real one (set by
+    /// `refreshAccount`), so only the settlement figures are synthetic.
+    func installDepositTopUpSample() {
+        screenshotSampleActive = true
+        // A modest connected plan so `plan.enabled` gates the card in, and
+        // the storage meter shows a populated bar rather than "no plan".
+        plan = StoragePlan(
+            enabled: true,
+            batchId: "0x0000000000000000000000000000000000000000000000000000000000000000",
+            batchDepth: 22,
+            immutable: false,
+            totalCapacityChunks: 1_250_000,   // ~5 GB at 4 KiB/chunk
+            issuedChunks: 40_000,             // ~160 MB used
+            worstCaseRemainingChunks: 1_210_000
+        )
+        // A deployed chequebook (settlement enabled) …
+        settlement = SettlementInfo(
+            enabled: true,
+            chequebook: "0x370e6965000000000000000000000000000000e1"
+        )
+        // … that is empty: the exact deposit-0 branch #73 fixes, and the
+        // figures the read returns for it (target 0.0010 xBZZ, all of it
+        // missing, ~0.0150 xDAI to fund it — matching the PR's verified
+        // on-chain probe of a real unfunded chequebook).
+        settlementDeposit = SettlementDeposit(
+            enabled: true,
+            chequebook: "0x370e6965000000000000000000000000000000e1",
+            depositBzz: "0.0000",
+            targetBzz: "0.0010",
+            shortfallBzz: "0.0010",
+            needsTopUp: true,
+            xdaiToSendDisplay: "0.0150",
+            sufficientFunds: false
+        )
     }
 
     // MARK: - Polling

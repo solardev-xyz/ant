@@ -7,9 +7,10 @@ import SwiftUI
 ///
 /// Deliberately consumer-flavoured: "plans", not "postage batches";
 /// "activate", not "createBatch". The Rust side does the heavy lifting —
-/// `ant_storage_quote` prices a plan against the live chain, and
+/// `ant_storage_quote` prices a plan against the live chain — including
+/// the one-time deposit that backs the node's cheques — and
 /// `ant_storage_buy_xdai` swaps the xBZZ shortfall, buys the batch, and
-/// deploys the chequebook (`ensure_settlement`) in one call.
+/// deploys *and funds* the chequebook (`ensure_settlement`) in one call.
 struct GetStartedView: View {
     @EnvironmentObject var node: AntNode
     @Environment(\.dismiss) private var dismiss
@@ -49,8 +50,44 @@ struct GetStartedView: View {
         }
         .preferredColorScheme(.dark)
         .interactiveDismissDisabled(step == .activating)
-        .task { await loadPlans() }
+        .task {
+            // antstream-visual: `-antstream-shot-getstarted-pay` opens the
+            // flow straight on the payment step with a representative
+            // quote, so CI can capture the buy-flow cost breakdown — the
+            // "Send xDAI" card and the new one-time settlement-deposit
+            // line — without the live quote a fresh runner may not be able
+            // to fetch. Live pricing (`loadPlans`) otherwise.
+            if RootView.shotArgs.contains("-antstream-shot-getstarted-pay") {
+                selected = StoragePlanTier.all.first
+                quote = Self.screenshotSampleQuote
+                step = .payment
+            } else {
+                await loadPlans()
+            }
+        }
     }
+
+    /// A representative Starter-plan quote for the payment-step screenshot
+    /// (`-antstream-shot-getstarted-pay`). Its deposit fields are non-zero,
+    /// so `includesSettlementDeposit` is true and the deposit line renders
+    /// — the whole point of the capture. Sample only; the real flow always
+    /// prices against the live chain.
+    private static let screenshotSampleQuote = StorageQuote(
+        depth: 21,
+        days: 30,
+        amountPerChunk: "0",
+        totalCostBzz: "0.0500",
+        settlementDepositPlur: "10000000000000",
+        settlementDepositBzz: "0.0010",
+        capacityBytes: 2_000_000_000,
+        accountBzzDisplay: "0.0000",
+        accountXdai: "0",
+        accountXdaiDisplay: "0.0000",
+        neededBzzDisplay: "0.0510",
+        xdaiRequiredDisplay: "0.60",
+        xdaiToSendDisplay: "0.60",
+        sufficientFunds: false
+    )
 
     @ViewBuilder private var content: some View {
         switch step {
@@ -220,8 +257,26 @@ struct GetStartedView: View {
                     }
                     .buttonStyle(.plain)
                 }
+                if includesSettlementDeposit(quote) {
+                    // Say what the extra buys. The price also covers a
+                    // one-time deposit the node puts behind the account it
+                    // pays the network from — without it publishing stalls
+                    // once peers stop extending credit.
+                    Text("Includes a one-time \(quote.settlementDepositBzz) xBZZ network deposit that keeps your broadcast flowing.")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.6))
+                        .multilineTextAlignment(.center)
+                }
             }
         }
+    }
+
+    /// Whether this price carries the one-time settlement deposit — i.e.
+    /// the chequebook it deploys still needs funding. Zero once it is
+    /// funded, and the note is then left off rather than claiming a
+    /// charge that isn't there.
+    private func includesSettlementDeposit(_ quote: StorageQuote) -> Bool {
+        (UInt64(quote.settlementDepositPlur) ?? 0) > 0
     }
 
     // MARK: Step 3 — activating
