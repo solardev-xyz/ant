@@ -538,6 +538,20 @@ struct PublisherReport: Codable, Equatable {
         let total = Int(durationS.rounded())
         return String(format: "%d:%02d", total / 60, total % 60)
     }
+
+    /// Whether `keptUp` is a verdict about anything. It is a conjunction
+    /// whose first clause is "at least one segment published", so a
+    /// broadcast that published nothing reports `keptUp == false` — and
+    /// rendering that as "fell behind" would blame the uplink for a
+    /// broadcast that never started. Mirrors the first clause of Rust's
+    /// `PublisherReport::kept_up`, the same three-state treatment
+    /// `BenchReport.hasMeasurement` gives the throughput verdict.
+    var hasVerdict: Bool { segmentsPublished > 0 }
+
+    var verdictLabel: String {
+        guard hasVerdict else { return "Broadcast ended without publishing" }
+        return keptUp ? "Broadcast kept up" : "Broadcast fell behind"
+    }
 }
 
 enum StreamDecoder {

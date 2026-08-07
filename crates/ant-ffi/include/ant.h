@@ -902,8 +902,9 @@ char *ant_publisher_progress(const AntHandle *handle, char **out_err);
  * published — the last seconds of a broadcast are real content — and
  * the playlist is closed with EXT-X-ENDLIST so viewers see a finished
  * recording rather than a stream that stopped updating. Bounded at
- * ~75 s; call it off the main thread. Safe to call on an
- * already-finished broadcast.
+ * ~130 s — two rounds of the 60 s per-segment publish deadline (the
+ * in-flight window, then the backlog behind it); call it off the main
+ * thread. Safe to call on an already-finished broadcast.
  */
 char *ant_publisher_stop(const AntHandle *handle, char **out_err);
 

@@ -3027,11 +3027,16 @@ pub unsafe extern "C" fn ant_bench_stop(
 // ---------------------------------------------------------------------------
 
 /// How long [`ant_publisher_stop`] waits for a cancelled broadcast to
-/// settle before returning the report anyway. Stopping drains the
-/// captured-but-unsent backlog, and each upload is bounded by the
-/// publisher's own 60 s deadline, so a broadcast that hasn't closed out
-/// by then is not going to.
-const PUBLISHER_STOP_GRACE: Duration = Duration::from_secs(75);
+/// settle before returning the report anyway.
+///
+/// Stopping publishes what is already captured, which is at worst two
+/// rounds of the publisher's own 60 s per-segment deadline: the
+/// in-flight window, then the backlog behind it (both are capped at
+/// `max_in_flight` / `max_backlog`, so the backlog cannot grow past one
+/// extra round). A broadcast that has not closed out by then is not
+/// going to, and the report is returned regardless — the loop then
+/// finishes in the background and releases its slot.
+const PUBLISHER_STOP_GRACE: Duration = Duration::from_secs(130);
 
 /// Poll interval while waiting for a cancelled broadcast to settle.
 const PUBLISHER_STOP_POLL: Duration = Duration::from_millis(50);
@@ -3230,8 +3235,9 @@ pub unsafe extern "C" fn ant_publisher_progress(
 /// published (the last seconds of a broadcast are real content, not a
 /// truncated measurement) and the playlist is closed with
 /// `#EXT-X-ENDLIST` so viewers see a finished recording rather than a
-/// stream that just stopped updating. Bounded at ~75 s; call it off the
-/// UI thread.
+/// stream that just stopped updating. Bounded at ~130 s (two rounds of
+/// the 60 s per-segment publish deadline — the in-flight window, then
+/// the backlog behind it); call it off the UI thread.
 ///
 /// Safe to call on an already-finished broadcast: it returns the same
 /// report.

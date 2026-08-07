@@ -233,9 +233,9 @@ struct LiveView: View {
     private func summaryCard(_ report: PublisherReport) -> some View {
         GlassCard {
             VStack(alignment: .leading, spacing: 10) {
-                Text(report.keptUp ? "Broadcast kept up" : "Broadcast fell behind")
+                Text(report.verdictLabel)
                     .font(.headline)
-                    .foregroundStyle(report.keptUp ? .green : .orange)
+                    .foregroundStyle(verdictTint(report))
                 Text("\(report.durationLabel) · \(report.segmentsPublished) segments · "
                      + "\(report.feedUpdates) feed updates · "
                      + String(format: "%.2f Mbit/s", report.sustainedMbitS))
@@ -255,6 +255,14 @@ struct LiveView: View {
                 }
             }
         }
+    }
+
+    /// Three-state, like the throughput bench's: a broadcast that
+    /// published nothing has no verdict to give, so it is neither green
+    /// nor an accusation that the uplink fell behind.
+    private func verdictTint(_ report: PublisherReport) -> Color {
+        guard report.hasVerdict else { return .white.opacity(0.8) }
+        return report.keptUp ? .green : .orange
     }
 
     // MARK: controls
