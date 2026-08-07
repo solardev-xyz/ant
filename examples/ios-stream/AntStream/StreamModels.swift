@@ -420,6 +420,9 @@ struct PublisherSnapshot: Codable, Equatable {
     let feedIndex: UInt64
     let segmentsPushed: UInt64
     let segmentsPublished: UInt64
+    /// Of those, the ones that reached a published playlist — what a
+    /// viewer could actually play.
+    let segmentsListed: UInt64
     let segmentsFailed: UInt64
     /// Segments the live-edge discipline dropped rather than falling
     /// further behind. Visible on screen: a broadcast that is shedding
@@ -449,6 +452,7 @@ struct PublisherSnapshot: Codable, Equatable {
         case feedIndex = "feed_index"
         case segmentsPushed = "segments_pushed"
         case segmentsPublished = "segments_published"
+        case segmentsListed = "segments_listed"
         case segmentsFailed = "segments_failed"
         case segmentsDropped = "segments_dropped"
         case bytesPublished = "bytes_published"
@@ -486,6 +490,9 @@ struct PublisherReport: Codable, Equatable {
     let durationS: Double
     let segmentsPushed: UInt64
     let segmentsPublished: UInt64
+    /// Of those, the ones that reached a published playlist. This — not
+    /// `segmentsPublished` — is what `keptUp` counts.
+    let segmentsListed: UInt64
     let segmentsFailed: UInt64
     let segmentsDropped: UInt64
     let bytesPublished: UInt64
@@ -515,6 +522,7 @@ struct PublisherReport: Codable, Equatable {
         case durationS = "duration_s"
         case segmentsPushed = "segments_pushed"
         case segmentsPublished = "segments_published"
+        case segmentsListed = "segments_listed"
         case segmentsFailed = "segments_failed"
         case segmentsDropped = "segments_dropped"
         case bytesPublished = "bytes_published"
@@ -541,12 +549,14 @@ struct PublisherReport: Codable, Equatable {
 
     /// Whether `keptUp` is a verdict about anything. It is a conjunction
     /// whose first clause is "at least one segment published", so a
-    /// broadcast that published nothing reports `keptUp == false` — and
+    /// broadcast that played nothing reports `keptUp == false` — and
     /// rendering that as "fell behind" would blame the uplink for a
     /// broadcast that never started. Mirrors the first clause of Rust's
-    /// `PublisherReport::kept_up`, the same three-state treatment
-    /// `BenchReport.hasMeasurement` gives the throughput verdict.
-    var hasVerdict: Bool { segmentsPublished > 0 }
+    /// `PublisherReport::kept_up` **verbatim**, including its use of
+    /// `segments_listed` rather than `segments_published`; the same
+    /// three-state treatment `BenchReport.hasMeasurement` gives the
+    /// throughput verdict.
+    var hasVerdict: Bool { segmentsListed > 0 }
 
     var verdictLabel: String {
         guard hasVerdict else { return "Broadcast ended without publishing" }

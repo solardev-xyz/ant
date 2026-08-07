@@ -344,10 +344,14 @@ enum Committed {
         discontinuity: bool,
         captured_at: Instant,
     },
-    /// Dropped before it was ever uploaded (backlog full).
+    /// Dropped before it was ever uploaded (backlog full). Only media
+    /// segments are ever dropped.
     Dropped,
-    /// Upload failed.
-    Failed,
+    /// Upload failed. The kind matters: a failed *initialization*
+    /// segment retires the `#EXT-X-MAP` currently in force, because the
+    /// writer that emitted it has already been replaced and its map does
+    /// not describe what follows.
+    Failed(SegmentKind),
 }
 
 // ---------------------------------------------------------------------------
@@ -393,6 +397,11 @@ struct PublisherState {
 
     segments_pushed: u64,
     segments_published: u64,
+    /// Media segments that made it into a *published* playlist, i.e.
+    /// that a viewer could actually play. Distinct from
+    /// `segments_published`: a segment whose initialization segment
+    /// never landed uploads fine and is still unplayable.
+    segments_listed: u64,
     segments_failed: u64,
     segments_dropped: u64,
     bytes_published: u64,
@@ -458,7 +467,16 @@ impl PublisherState {
                         self.gap_since_last_listed = true;
                     }
                 }
-                Committed::Dropped | Committed::Failed => {
+                Committed::Dropped | Committed::Failed(SegmentKind::Media) => {
+                    self.gap_since_last_listed = true;
+                }
+                Committed::Failed(SegmentKind::Init) => {
+                    // Listing later segments under the *previous*
+                    // writer's map would hand a player an initialization
+                    // segment that does not describe them. Better a
+                    // shorter playlist than an unplayable one: nothing
+                    // is listed again until a fresh init lands.
+                    self.init_uri = None;
                     self.gap_since_last_listed = true;
                 }
                 Committed::Media {
@@ -481,6 +499,7 @@ impl PublisherState {
                             .back()
                             .is_some_and(|prev| prev.init_uri != init_uri);
                     self.gap_since_last_listed = false;
+                    self.segments_listed += 1;
                     self.playlist.push_back(MediaEntry {
                         number: self.next_number,
                         uri,
@@ -578,6 +597,9 @@ pub struct PublisherSnapshot {
     pub feed_index: u64,
     pub segments_pushed: u64,
     pub segments_published: u64,
+    /// Of those, the ones that reached a published playlist — what a
+    /// viewer could actually play.
+    pub segments_listed: u64,
     pub segments_failed: u64,
     /// Segments the live-edge discipline dropped rather than falling
     /// further behind.
@@ -615,6 +637,11 @@ pub struct PublisherReport {
     pub duration_s: f64,
     pub segments_pushed: u64,
     pub segments_published: u64,
+    /// Of those, the ones that reached a published playlist. This — not
+    /// `segments_published` — is what [`PublisherReport::kept_up`]
+    /// counts, because a segment that uploaded but never got listed was
+    /// never playable.
+    pub segments_listed: u64,
     pub segments_failed: u64,
     pub segments_dropped: u64,
     pub bytes_published: u64,
@@ -732,6 +759,7 @@ impl LiveRun {
             feed_index: state.feed_index,
             segments_pushed: state.segments_pushed,
             segments_published: state.segments_published,
+            segments_listed: state.segments_listed,
             segments_failed: state.segments_failed,
             segments_dropped: state.segments_dropped,
             bytes_published: state.bytes_published,
@@ -794,6 +822,7 @@ impl LiveRun {
             duration_s: elapsed,
             segments_pushed: state.segments_pushed,
             segments_published: state.segments_published,
+            segments_listed: state.segments_listed,
             segments_failed: state.segments_failed,
             segments_dropped: state.segments_dropped,
             bytes_published: state.bytes_published,
@@ -817,9 +846,14 @@ impl LiveRun {
             // viewer saw: every media segment that was captured reached
             // a published playlist, at least one feed update landed, and
             // the last one did so inside the lag budget.
+            //
+            // The count is `segments_listed`, not `segments_published`:
+            // a segment whose initialization segment never landed
+            // uploads perfectly well and is still unplayable, so
+            // counting uploads here would let that pass as "kept up".
             kept_up: state.feed_updates > 0
-                && state.segments_published > 0
-                && state.segments_published == media_pushed
+                && state.segments_listed > 0
+                && state.segments_listed == media_pushed
                 && state.lag_ms_last <= lag_budget_ms(self.config.segment_ms),
             errors: state.errors.clone(),
             error_count: state.error_count,
@@ -1033,7 +1067,9 @@ async fn publish_pending(ctx: &RunCtx, pending: Pending) {
                     pending.kind.as_str(),
                     pending.seq,
                 ));
-                state.done.insert(pending.seq, Committed::Failed);
+                state
+                    .done
+                    .insert(pending.seq, Committed::Failed(pending.kind));
             }
         }
     }
@@ -1592,7 +1628,7 @@ mod tests {
         // The initialization segment failed to upload: listing the media
         // segments anyway would produce a playlist no player can start.
         let mut state = PublisherState::default();
-        state.done.insert(0, Committed::Failed);
+        state.done.insert(0, Committed::Failed(SegmentKind::Init));
         state.done.insert(1, media("/bzz/bb/seg-1.m4s", false));
         assert!(state.advance(3).is_none());
         assert!(state.playlist.is_empty());
@@ -1982,6 +2018,33 @@ mod tests {
         // No playlist can be built without an initialization segment, so
         // nothing bogus was published either.
         assert_eq!(report.playlists_published, 0);
+    }
+
+    #[test]
+    fn a_segment_that_uploaded_but_never_got_listed_is_not_kept_up() {
+        // The narrow case `segments_published` alone would let pass: a
+        // *later* initialization segment fails, so the media segments
+        // after it upload fine and are counted published — but they
+        // carry no `#EXT-X-MAP` and can never be listed, i.e. no viewer
+        // can play them.
+        let mut state = PublisherState::default();
+        state.done.insert(
+            0,
+            Committed::Init {
+                uri: "/bzz/aa/init.mp4".into(),
+            },
+        );
+        state.done.insert(1, media("/bzz/b1/seg-1.m4s", false));
+        state.advance(6);
+        assert_eq!(state.segments_listed, 1);
+        // Writer restart whose initialization segment fails to upload.
+        state.done.insert(2, Committed::Failed(SegmentKind::Init));
+        state.done.insert(3, media("/bzz/b3/seg-3.m4s", false));
+        state.advance(6);
+        // Listed count did not move even though the upload succeeded,
+        // which is what keeps `kept_up` honest.
+        assert_eq!(state.segments_listed, 1);
+        assert_eq!(state.playlist.len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

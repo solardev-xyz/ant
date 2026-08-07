@@ -184,7 +184,7 @@ struct LiveView: View {
     private func metrics(_ progress: PublisherSnapshot) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 18) {
-                metric("PUBLISHED", "\(progress.segmentsPublished)")
+                metric("PLAYABLE", "\(progress.segmentsListed)")
                 metric("DROPPED", "\(progress.segmentsDropped)",
                        tint: progress.segmentsDropped > 0 ? .orange : nil)
                 metric("FAILED", "\(progress.segmentsFailed)",
@@ -236,7 +236,7 @@ struct LiveView: View {
                 Text(report.verdictLabel)
                     .font(.headline)
                     .foregroundStyle(verdictTint(report))
-                Text("\(report.durationLabel) · \(report.segmentsPublished) segments · "
+                Text("\(report.durationLabel) · \(report.segmentsListed) playable segments · "
                      + "\(report.feedUpdates) feed updates · "
                      + String(format: "%.2f Mbit/s", report.sustainedMbitS))
                     .font(.subheadline)

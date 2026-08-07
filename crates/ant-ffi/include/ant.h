@@ -876,7 +876,8 @@ int32_t ant_publisher_push_segment(const AntHandle *handle,
  *    "topic":"<64 hex>","owner":"<40 hex>",
  *    "channel_reference":"<64 hex>","playlist_reference":"<64 hex>",
  *    "feed_index":21,"segments_pushed":22,"segments_published":21,
- *    "segments_failed":0,"segments_dropped":0,"bytes_published":4725000,
+ *    "segments_listed":21,"segments_failed":0,"segments_dropped":0,
+ *    "bytes_published":4725000,
  *    "playlists_published":21,"publish_ms_p50":900,"publish_ms_p95":2100,
  *    "lag_ms":2400,"lag_ms_max":3100,"keeping_up":true,
  *    "sustained_mbit_s":0.9,"peers":114,"last_error":"","error_count":0}
@@ -896,7 +897,11 @@ char *ant_publisher_progress(const AntHandle *handle, char **out_err);
  * publish_ms_p50|p95|max, lag_ms_p50|p95|max|final, the first few error
  * strings, and a "kept_up" verdict (at least one feed update landed AND
  * every captured media segment reached a published playlist AND the
- * last one did so inside 3 x segment_ms).
+ * last one did so inside 3 x segment_ms). The count it uses is
+ * "segments_listed", not "segments_published": a segment whose
+ * initialization segment never landed uploads fine and is still
+ * unplayable, so hosts rendering a verdict should key "is there a
+ * verdict at all?" off segments_listed too.
  *
  * BLOCKING: stopping is cooperative. Segments already captured are
  * published — the last seconds of a broadcast are real content — and
