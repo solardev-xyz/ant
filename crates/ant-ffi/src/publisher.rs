@@ -739,6 +739,11 @@ impl LiveRun {
     /// Hand a finished capture segment to the publisher. Never blocks:
     /// the capture pipeline must not be stalled by the uplink, which is
     /// what the drop-oldest backlog is for.
+    ///
+    /// Call order is the broadcast order: the sequence handed out here
+    /// is the commit order, which fixes both the playlist order and the
+    /// `#EXT-X-MAP` a media segment is listed under. Callers must push
+    /// in capture order.
     #[must_use]
     pub fn push(
         &self,
@@ -1682,6 +1687,11 @@ mod tests {
             "{playlist}"
         );
         assert!(playlist.contains("#EXT-X-MAP:URI=\"/bzz/cc/init-2.mp4\""));
+        // The old writer's last segment stays under the *old* map — the
+        // reason the capture-side hand-off has to be order-preserving.
+        let old_segment = playlist.find("/bzz/bb/seg-1.m4s").unwrap();
+        let new_map = playlist.find("/bzz/cc/init-2.mp4").unwrap();
+        assert!(old_segment < new_map, "{playlist}");
     }
 
     #[test]

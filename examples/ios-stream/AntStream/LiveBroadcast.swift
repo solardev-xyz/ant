@@ -11,6 +11,11 @@ import UIKit
 /// capture pipeline stalled on the uplink drops frames, so backpressure
 /// is the node's drop-oldest backlog, not this class.
 ///
+/// The hand-off is a single ordered queue rather than a task per
+/// segment, because the publisher numbers segments by the order the
+/// pushes arrive and that number decides both playlist order and which
+/// `#EXT-X-MAP` each segment is listed under.
+///
 /// It also owns the foreground keep-alive a broadcast needs: the idle
 /// timer is held off for the duration (a screen that sleeps mid-stream
 /// takes the camera with it) and the audio session is configured for
@@ -38,13 +43,22 @@ final class LiveBroadcast: ObservableObject {
     @Published private(set) var capture: CaptureEngine.State = .idle
     @Published private(set) var progress: PublisherSnapshot?
     @Published private(set) var report: PublisherReport?
-    /// How many segments the *capture* side produced. Distinct from the
-    /// publisher's counters: the gap between them is exactly what the
-    /// drop-oldest discipline shed.
+    /// How many segments the *capture* side produced and this class has
+    /// handed on. Distinct from the publisher's counters: the gap
+    /// between them is exactly what the drop-oldest discipline shed.
     @Published private(set) var capturedSegments: UInt64 = 0
 
     private(set) var engine: CaptureEngine?
     private var pollTask: Task<Void, Never>?
+    /// The capture → publisher hand-off queue. The writer's delivery
+    /// queue enqueues into it synchronously and ``pumpTask`` is its only
+    /// consumer, so segments reach `ant_publisher_push_segment` in
+    /// exactly the order the writer finished them.
+    private var segmentFeed: AsyncStream<CaptureEngine.Segment>.Continuation?
+    private var pumpTask: Task<Void, Never>?
+    /// Set by the pump once the feed is closed *and* drained, so ``stop``
+    /// knows the last segment has reached the publisher.
+    private var pumpDrained = true
     private var idleTimerHeld = false
 
     /// The rendition. Defaults are the stage-1 go/no-go row — 360p at
@@ -106,15 +120,33 @@ final class LiveBroadcast: ObservableObject {
                 Task { await self.stop(node: node, failure: message) }
             }
         }
-        engine.onSegment = { [weak self] segment in
-            // The callback arrives on the writer's queue; hop to the
-            // main actor to reach the node handle, then the FFI call
-            // itself runs detached.
-            Task { @MainActor [weak self] in
+        // Capture → publisher is one ordered queue, not a task per
+        // segment. The publisher numbers segments by the order its
+        // `push_segment` calls arrive, and that number is both the
+        // playlist order and the `#EXT-X-MAP` a segment is listed
+        // under — so at a writer restart the old writer's last media
+        // segment and the new writer's initialization segment must not
+        // race. An unbounded buffer keeps the enqueue non-blocking:
+        // backpressure stays the node's drop-oldest backlog.
+        let (feed, sink) = AsyncStream<CaptureEngine.Segment>.makeStream(
+            bufferingPolicy: .unbounded
+        )
+        segmentFeed = sink
+        engine.onSegment = { segment in
+            // Arrives on the writer's delivery queue; enqueueing is
+            // synchronous and FIFO, so the order is settled right here.
+            sink.yield(segment)
+        }
+        pumpDrained = false
+        pumpTask = Task { @MainActor [weak self] in
+            for await segment in feed {
                 guard let self else { return }
                 self.capturedSegments += 1
+                // Awaited one at a time: the next segment is not handed
+                // over until this one has reached the FFI.
                 await node.pushSegment(segment)
             }
+            self?.pumpDrained = true
         }
         self.engine = engine
         engine.start()
@@ -140,16 +172,22 @@ final class LiveBroadcast: ObservableObject {
             }
         }
         engine = nil
-        // `onSegment` hands each segment over through a main-actor hop,
-        // so the final one can still be in flight here. Wait for the
-        // publisher's own counter to catch up with what capture
-        // produced, bounded so a wedged push can't hang the stop button.
-        for _ in 0..<20 {
-            guard let snapshot = await node.publisherProgress(),
-                  snapshot.segmentsPushed < capturedSegments
-            else { break }
+        // The writer has delivered its last segment, so the hand-off
+        // queue now holds everything capture produced. Close it and let
+        // the pump drain: every queued segment must reach the publisher
+        // before `ant_publisher_stop` closes its queue, or the last
+        // seconds of the broadcast are captured, encoded and then thrown
+        // away. The drain is finite — each push returns a disposition,
+        // failures included — but it is still bounded here so a wedged
+        // push can't hang the stop button.
+        segmentFeed?.finish()
+        segmentFeed = nil
+        for _ in 0..<40 {
+            if pumpDrained { break }
             try? await Task.sleep(nanoseconds: 50_000_000)
         }
+        pumpTask?.cancel()
+        pumpTask = nil
         releaseIdleTimer()
         deactivateAudioSession()
         do {

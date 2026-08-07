@@ -3130,6 +3130,13 @@ pub unsafe extern "C" fn ant_publisher_start(
 /// media segment after it. `duration_ms` is the segment's real duration
 /// (ignored for the initialization segment).
 ///
+/// **Call order is the broadcast order.** Segments are numbered as these
+/// calls arrive, and that number fixes both the playlist order and which
+/// `#EXT-X-MAP` a media segment is listed under — so the caller must
+/// push in capture order, from one thread or an ordered queue. Getting
+/// it wrong around a writer restart lists the old writer's last segment
+/// under the new writer's map, which no player can decode.
+///
 /// **Never blocks**: a capture pipeline stalled on the uplink drops
 /// frames. When the publisher is already a window behind, the oldest
 /// pending segment is dropped instead — the live-edge discipline the

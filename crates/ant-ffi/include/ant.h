@@ -850,6 +850,13 @@ bool ant_publisher_start(const AntHandle *handle,
  * the initialization segment). The bytes are copied; the caller may
  * free `data` as soon as this returns.
  *
+ * CALL ORDER IS THE BROADCAST ORDER — segments are numbered as these
+ * calls arrive, and that number fixes both the playlist order and which
+ * EXT-X-MAP a media segment is listed under. Push in capture order,
+ * from one thread or an ordered queue: getting it wrong around a writer
+ * restart lists the old writer's last segment under the new writer's
+ * map, which no player can decode.
+ *
  * NEVER BLOCKS — a capture pipeline stalled on the uplink drops frames.
  * When the publisher is already a window behind, the oldest pending
  * segment is dropped instead (live-edge discipline).
