@@ -111,10 +111,13 @@ struct LiveView: View {
         }
     }
 
-    /// LIVE + the publish lag, in one badge. Colour is the verdict: the
-    /// node's own `keeping_up` (lag inside three segment durations, the
-    /// same budget the throughput bench uses), so the badge can never
-    /// disagree with the report.
+    /// LIVE + the live-edge lag, in one badge. Colour is the verdict:
+    /// the node's own `keeping_up` (lag inside three segment durations,
+    /// the same budget the throughput bench uses), so the badge can
+    /// never disagree with the report. The lag it shows is the age of
+    /// the newest playable segment, so a broadcast whose feed updates
+    /// stop landing goes amber instead of sitting green on a stale
+    /// figure.
     private var liveBadge: some View {
         HStack(spacing: 8) {
             Circle()

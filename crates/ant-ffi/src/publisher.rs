@@ -422,8 +422,21 @@ struct PublisherState {
 
     publish_ms: VecDeque<u64>,
     lag_ms: VecDeque<u64>,
-    lag_ms_last: u64,
     lag_ms_max: u64,
+    /// **The live edge**: the capture instant of the newest media
+    /// segment a viewer can actually play, i.e. the one carried by the
+    /// last feed update that *landed*. Its age is the live-edge lag, so
+    /// it keeps growing while updates fail — unlike the lag of the last
+    /// landed update, which freezes the moment they stop landing.
+    ///
+    /// Bootstrapped in [`PublisherState::advance`] with the first
+    /// committed segment, so a broadcast whose very first feed update
+    /// never lands measures its lag from the content nobody saw rather
+    /// than from nothing at all.
+    live_edge: Option<Instant>,
+    /// [`PublisherState::live_edge_lag_ms`] frozen when the run
+    /// finished, so a report read later does not keep ageing.
+    lag_frozen_ms: Option<u64>,
 
     errors: Vec<String>,
     last_error: Option<String>,
@@ -448,10 +461,29 @@ impl PublisherState {
         queue.push_back(value);
     }
 
-    fn note_lag(&mut self, value: u64) {
+    /// A feed update landed, making `captured_at`'s segment playable:
+    /// record its latency and move the live edge up to it.
+    fn note_lag(&mut self, captured_at: Instant) {
+        let value = ms(captured_at.elapsed());
         Self::record_latency(&mut self.lag_ms, value);
-        self.lag_ms_last = value;
         self.lag_ms_max = self.lag_ms_max.max(value);
+        self.live_edge = Some(captured_at);
+    }
+
+    /// How far behind live a viewer is **right now**: the age of the
+    /// newest segment a landed feed update made playable.
+    ///
+    /// Deliberately not "the lag of the last update that landed": that
+    /// figure only moves when an update succeeds, so once the feed
+    /// stops updating — a failing `POST /soc`, a playlist that will not
+    /// upload — it freezes at its last good value and the badge stays
+    /// green while the viewer is stuck on an old playlist. This one
+    /// grows for exactly as long as nothing new reaches a viewer.
+    fn live_edge_lag_ms(&self) -> u64 {
+        if let Some(frozen) = self.lag_frozen_ms {
+            return frozen;
+        }
+        self.live_edge.map_or(0, |at| ms(at.elapsed()))
     }
 
     /// Fold every already-finished outcome from `next_commit` forward
@@ -513,6 +545,12 @@ impl PublisherState {
                         init_uri,
                     });
                     self.next_number += 1;
+                    // Start the live-edge clock at the first segment
+                    // that could have been seen. Later segments do not
+                    // move it — only a landed feed update does, in
+                    // `note_lag` — because a segment nobody can resolve
+                    // yet is not the live edge.
+                    self.live_edge.get_or_insert(captured_at);
                     while self.playlist.len() > window {
                         if let Some(evicted) = self.playlist.pop_front() {
                             if evicted.discontinuity {
@@ -614,9 +652,16 @@ pub struct PublisherSnapshot {
     /// Publish latency of one `POST /bzz`, milliseconds.
     pub publish_ms_p50: u64,
     pub publish_ms_p95: u64,
-    /// **The live-edge lag**: capture → the feed update that makes the
-    /// segment playable. This is what the on-screen indicator shows.
+    /// **The live-edge lag**: how far behind live a viewer is right
+    /// now, i.e. the age of the newest segment a landed feed update
+    /// made playable. This is what the on-screen indicator shows.
+    ///
+    /// It is an age, not the latency of the last update that landed, so
+    /// a broadcast whose feed updates stop landing keeps climbing here
+    /// instead of freezing at its last good figure while the segments
+    /// go on uploading.
     pub lag_ms: u64,
+    /// Highest capture → playable latency any single update recorded.
     pub lag_ms_max: u64,
     /// `lag_ms` inside the three-segment budget the stage-1 predicate
     /// uses. The indicator turns from "live" to "behind" on this.
@@ -661,9 +706,12 @@ pub struct PublisherReport {
     pub lag_ms_p50: u64,
     pub lag_ms_p95: u64,
     pub lag_ms_max: u64,
+    /// The live-edge lag where the broadcast ended: the age of the
+    /// newest playable segment at stop, frozen there so a report read
+    /// later still describes the broadcast.
     pub lag_ms_final: u64,
     /// Every media segment reached a viewer-visible playlist and the
-    /// last one did so inside the lag budget — the live-edge equivalent
+    /// live edge ended inside the lag budget — the live-edge equivalent
     /// of the bench's `keeps_up`.
     pub kept_up: bool,
     pub errors: Vec<String>,
@@ -771,10 +819,10 @@ impl LiveRun {
             playlists_published: state.playlists_published,
             publish_ms_p50: percentile(&publish_ms, 50),
             publish_ms_p95: percentile(&publish_ms, 95),
-            lag_ms: state.lag_ms_last,
+            lag_ms: state.live_edge_lag_ms(),
             lag_ms_max: state.lag_ms_max,
             keeping_up: state.feed_updates > 0
-                && state.lag_ms_last <= lag_budget_ms(self.config.segment_ms),
+                && state.live_edge_lag_ms() <= lag_budget_ms(self.config.segment_ms),
             sustained_mbit_s: throughput_mbit_s(state.bytes_published, elapsed),
             peers: state.peers,
             last_error: state.last_error.clone().unwrap_or_default(),
@@ -846,20 +894,25 @@ impl LiveRun {
             lag_ms_p50: percentile(&lag_ms, 50),
             lag_ms_p95: percentile(&lag_ms, 95),
             lag_ms_max: state.lag_ms_max,
-            lag_ms_final: state.lag_ms_last,
+            lag_ms_final: state.live_edge_lag_ms(),
             // Same shape as the stage-1 predicate, scoped to what a
             // viewer saw: every media segment that was captured reached
             // a published playlist, at least one feed update landed, and
-            // the last one did so inside the lag budget.
+            // the live edge finished inside the lag budget.
             //
             // The count is `segments_listed`, not `segments_published`:
             // a segment whose initialization segment never landed
             // uploads perfectly well and is still unplayable, so
             // counting uploads here would let that pass as "kept up".
+            //
+            // The lag is the *live edge*, not the last landed update's
+            // latency: segments keep uploading and listing while the
+            // feed is stuck, so a frozen latency would call a broadcast
+            // no viewer could follow "kept up".
             kept_up: state.feed_updates > 0
                 && state.segments_listed > 0
                 && state.segments_listed == media_pushed
-                && state.lag_ms_last <= lag_budget_ms(self.config.segment_ms),
+                && state.live_edge_lag_ms() <= lag_budget_ms(self.config.segment_ms),
             errors: state.errors.clone(),
             error_count: state.error_count,
         }
@@ -974,7 +1027,17 @@ async fn drive(ctx: Arc<RunCtx>) {
     if let Some(sampler) = sampler {
         sampler.abort();
     }
-    lock(&ctx.state).finished = true;
+    // The lag is an age, so a report read a minute after the broadcast
+    // ended must still describe the broadcast rather than how long the
+    // host waited to ask. The committer normally freezes it with the
+    // last content; this is the fallback for a run that never got that
+    // far.
+    {
+        let mut state = lock(&ctx.state);
+        let lag = state.live_edge_lag_ms();
+        state.lag_frozen_ms.get_or_insert(lag);
+        state.finished = true;
+    }
 }
 
 fn spawn_peer_sampler(ctx: &RunCtx) -> Option<tokio::task::JoinHandle<()>> {
@@ -1117,6 +1180,14 @@ async fn commit_loop(ctx: Arc<RunCtx>) {
         }
         notified.await;
     }
+    // Freeze the live-edge lag *with the last content*, before the
+    // closing playlist: what follows is bookkeeping, and a slow final
+    // upload must not read as a broadcast that fell behind.
+    {
+        let mut state = lock(&ctx.state);
+        let lag = state.live_edge_lag_ms();
+        state.lag_frozen_ms = Some(lag);
+    }
     // Final playlist: `#EXT-X-ENDLIST` turns the live channel into a
     // finished recording for anyone still resolving the feed.
     if !lock(&ctx.state).playlist.is_empty() {
@@ -1167,8 +1238,7 @@ async fn publish_playlist(ctx: &RunCtx, endlist: bool, captured_at: Option<Insta
             state.feed_index += 1;
             state.feed_updates += 1;
             if let Some(captured_at) = captured_at {
-                let lag = ms(captured_at.elapsed());
-                state.note_lag(lag);
+                state.note_lag(captured_at);
             }
         }
         Err(message) => {
@@ -1729,6 +1799,9 @@ mod tests {
         /// URIs are distinguishable.
         next_reference: u64,
         fail_bzz: bool,
+        /// Refuse every feed update from now on, the segments
+        /// themselves still uploading fine.
+        fail_soc: bool,
     }
 
     /// A gateway stub that answers bee-shaped `{"reference":...}` to
@@ -1775,7 +1848,8 @@ mod tests {
                                 let fail = {
                                     let mut slot = lock(&log);
                                     slot.seen.push(request.clone());
-                                    slot.fail_bzz && request.method_path.contains("/bzz")
+                                    (slot.fail_bzz && request.method_path.contains("/bzz"))
+                                        || (slot.fail_soc && request.method_path.contains("/soc/"))
                                 };
                                 tokio::time::sleep(delay).await;
                                 let response = if fail {
@@ -1864,6 +1938,12 @@ mod tests {
         assert!(report.feed_updates > 0);
         assert!(!report.channel_reference.is_empty());
         assert!(report.kept_up, "{report:?}");
+        // The lag is an age, frozen with the run: asking again later
+        // must still describe the broadcast, not the wait.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let again = run.report();
+        assert_eq!(again.lag_ms_final, report.lag_ms_final, "{again:?}");
+        assert!(again.kept_up, "{again:?}");
 
         let seen = lock(&log).seen.clone();
         // 1. the channel's feed manifest.
@@ -2041,6 +2121,65 @@ mod tests {
         // No playlist can be built without an initialization segment, so
         // nothing bogus was published either.
         assert_eq!(report.playlists_published, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_feed_that_stops_updating_stops_keeping_up() {
+        // The failure the last landed update's latency cannot see: the
+        // segments keep uploading and listing, so every count still
+        // looks perfect, but no feed update lands — a viewer is frozen
+        // on the playlist the last one pointed at. Lag is an age, not a
+        // latency, so it must keep growing.
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let addr = stub_gateway(Arc::clone(&log), Duration::ZERO).await;
+        let mut config = config();
+        config.gateway = format!("http://{addr}");
+        // Lag budget of 3 × 300 ms, so the stall below clears it.
+        config.segment_ms = 300;
+        let run = start(
+            &tokio::runtime::Handle::current(),
+            config,
+            TEST_SECRET,
+            test_owner(),
+            None,
+        )
+        .unwrap();
+
+        let _ = run.push(SegmentKind::Init, vec![7u8; 64], 0, false);
+        let _ = run.push(SegmentKind::Media, vec![0u8; 64], 300, false);
+        for _ in 0..100 {
+            if run.snapshot().feed_index > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let live = run.snapshot();
+        assert!(live.keeping_up, "a broadcast at the live edge: {live:?}");
+
+        // From here every `POST /soc` is refused; the segments still
+        // upload and still get listed.
+        lock(&log).fail_soc = true;
+        for i in 1..5u32 {
+            let _ = run.push(SegmentKind::Media, vec![i as u8; 64], 300, false);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+
+        let stalled = run.snapshot();
+        assert!(
+            stalled.lag_ms > 900,
+            "lag must age with the stall: {stalled:?}",
+        );
+        assert!(!stalled.keeping_up, "{stalled:?}");
+
+        run.cancel();
+        settle(&run).await;
+        let report = run.report();
+        assert!(!report.kept_up, "{report:?}");
+        // Every other input to the verdict still reads clean — the lag
+        // is the only thing standing between this run and a "kept up".
+        assert!(report.feed_updates > 0, "{report:?}");
+        assert_eq!(report.segments_listed, report.segments_published);
+        assert_eq!(report.segments_failed + report.segments_dropped, 0);
     }
 
     #[test]

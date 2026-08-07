@@ -882,11 +882,15 @@ int32_t ant_publisher_push_segment(const AntHandle *handle,
  *    "lag_ms":2400,"lag_ms_max":3100,"keeping_up":true,
  *    "sustained_mbit_s":0.9,"peers":114,"last_error":"","error_count":0}
  *
- * "lag_ms" is the publish lag the on-screen indicator shows: capture ->
- * the feed update that makes the segment playable. "keeping_up" is that
- * lag inside three segment durations, the same budget the bench verdict
- * uses. Non-blocking; poll it about once a second. Returns NULL + an
- * error when this node is not broadcasting.
+ * "lag_ms" is the live-edge lag the on-screen indicator shows: how far
+ * behind live a viewer is right now, i.e. the age of the newest segment
+ * a landed feed update made playable. It is an age, not the latency of
+ * the last update that landed, so a broadcast whose feed updates stop
+ * landing keeps climbing here (and turns "keeping_up" false) instead of
+ * freezing at its last good figure while segments go on uploading.
+ * "keeping_up" is that lag inside three segment durations, the same
+ * budget the bench verdict uses. Non-blocking; poll it about once a
+ * second. Returns NULL + an error when this node is not broadcasting.
  */
 char *ant_publisher_progress(const AntHandle *handle, char **out_err);
 
@@ -897,7 +901,10 @@ char *ant_publisher_progress(const AntHandle *handle, char **out_err);
  * publish_ms_p50|p95|max, lag_ms_p50|p95|max|final, the first few error
  * strings, and a "kept_up" verdict (at least one feed update landed AND
  * every captured media segment reached a published playlist AND the
- * last one did so inside 3 x segment_ms). The count it uses is
+ * live edge ended inside 3 x segment_ms). "lag_ms_final" is that live
+ * edge — the age of the newest playable segment at stop, frozen there
+ * so a report read later still describes the broadcast rather than how
+ * long the host waited to ask. The count it uses is
  * "segments_listed", not "segments_published": a segment whose
  * initialization segment never landed uploads fine and is still
  * unplayable, so hosts rendering a verdict should key "is there a

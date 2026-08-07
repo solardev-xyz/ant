@@ -432,9 +432,14 @@ struct PublisherSnapshot: Codable, Equatable {
     let playlistsPublished: UInt64
     let publishMsP50: UInt64
     let publishMsP95: UInt64
-    /// Publish lag: capture → the feed update that makes the segment
-    /// playable. The number the on-screen indicator shows.
+    /// Live-edge lag: how far behind live a viewer is right now — the
+    /// age of the newest segment a landed feed update made playable.
+    /// The number the on-screen indicator shows. An age, not the
+    /// latency of the last update that landed, so it keeps climbing
+    /// while the feed is stuck rather than freezing at its last good
+    /// value.
     let lagMs: UInt64
+    /// Highest capture → playable latency any one update recorded.
     let lagMsMax: UInt64
     /// `lagMs` inside three segment durations — the same budget the
     /// stage-1 bench verdict uses.
@@ -507,6 +512,8 @@ struct PublisherReport: Codable, Equatable {
     let lagMsP50: UInt64
     let lagMsP95: UInt64
     let lagMsMax: UInt64
+    /// The live edge where the broadcast ended: the age of the newest
+    /// playable segment at stop, frozen there.
     let lagMsFinal: UInt64
     let keptUp: Bool
     let errors: [String]
