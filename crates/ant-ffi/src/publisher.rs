@@ -413,6 +413,11 @@ struct PublisherState {
     /// index rather than leaving a hole the finder would stop at.
     feed_index: u64,
     channel_reference: Option<String>,
+    /// A `POST /feeds` is already in flight. The start-time attempt and
+    /// the committer's retry would otherwise both fire while the first
+    /// one is still on the wire — harmless (the manifest is
+    /// content-addressed) but a wasted upload on the live path.
+    channel_manifest_in_flight: bool,
     playlist_reference: Option<String>,
 
     publish_ms: VecDeque<u64>,
@@ -947,16 +952,24 @@ async fn drive(ctx: Arc<RunCtx>) {
     let sampler = spawn_peer_sampler(&ctx);
     // The channel's feed manifest: one immutable reference a viewer can
     // be handed (`bzz://<ref>`) that resolves through any bee gateway to
-    // whatever the latest feed update points at. Best-effort at start —
-    // the feed updates themselves are what carry the stream, so a
-    // manifest that could not be created (e.g. peers still warming up)
-    // is retried by the committer rather than failing the broadcast.
-    ensure_channel_manifest(&ctx).await;
+    // whatever the latest feed update points at.
+    //
+    // Concurrent with the loop, not before it: this is a real upload and
+    // can sit on the 60 s publish deadline if the peer set is still
+    // warming up, and the first minute of a broadcast must not be spent
+    // waiting for a reference nobody has been given yet. It is
+    // best-effort for the same reason — the feed updates are what carry
+    // the stream — and the committer retries it until it lands.
+    let manifest = {
+        let ctx = Arc::clone(&ctx);
+        tokio::spawn(async move { ensure_channel_manifest(&ctx).await })
+    };
 
     let pump = tokio::spawn(pump(Arc::clone(&ctx)));
     let committer = tokio::spawn(commit_loop(Arc::clone(&ctx)));
     let _ = pump.await;
     let _ = committer.await;
+    manifest.abort();
 
     if let Some(sampler) = sampler {
         sampler.abort();
@@ -1178,6 +1191,13 @@ const PLAYLIST_NAME: &str = "stream.m3u8";
 /// bee-js `createFeedManifest`). Idempotent in effect: the manifest is
 /// content-addressed, so re-creating it yields the same reference.
 async fn ensure_channel_manifest(ctx: &RunCtx) {
+    {
+        let mut state = lock(&ctx.state);
+        if state.channel_reference.is_some() || state.channel_manifest_in_flight {
+            return;
+        }
+        state.channel_manifest_in_flight = true;
+    }
     let path = format!(
         "{}/feeds/{}/{}",
         ctx.target.prefix,
@@ -1185,9 +1205,12 @@ async fn ensure_channel_manifest(ctx: &RunCtx) {
         hex::encode(ctx.topic),
     );
     let headers = [("swarm-postage-batch-id".to_string(), hex::encode(ctx.batch))];
-    match post_reference(&ctx.target, &path, &headers, &[]).await {
-        Ok(reference) => lock(&ctx.state).channel_reference = Some(reference),
-        Err(message) => lock(&ctx.state).record_error(format!("channel manifest: {message}")),
+    let outcome = post_reference(&ctx.target, &path, &headers, &[]).await;
+    let mut state = lock(&ctx.state);
+    state.channel_manifest_in_flight = false;
+    match outcome {
+        Ok(reference) => state.channel_reference = Some(reference),
+        Err(message) => state.record_error(format!("channel manifest: {message}")),
     }
 }
 
