@@ -682,8 +682,9 @@ final class AntNode: ObservableObject {
     ///
     /// `ant_publisher_stop` blocks while the already-captured segments
     /// are published and the playlist is closed with `#EXT-X-ENDLIST`
-    /// (up to ~75 s), so this must not run on the main actor's thread —
-    /// ``ffiString`` already hops onto a detached task for that reason.
+    /// (up to ~130 s, its stop grace), so this must not run on the main
+    /// actor's thread — ``ffiString`` already hops onto a detached task
+    /// for that reason.
     func stopPublisher() async throws -> PublisherReport {
         let json = try await ffiString(name: "stop broadcast") { h, errPtr in
             ant_publisher_stop(h, errPtr)

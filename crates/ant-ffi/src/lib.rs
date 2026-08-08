@@ -3029,13 +3029,15 @@ pub unsafe extern "C" fn ant_bench_stop(
 /// How long [`ant_publisher_stop`] waits for a cancelled broadcast to
 /// settle before returning the report anyway.
 ///
-/// Stopping publishes what is already captured, which is at worst two
-/// rounds of the publisher's own 60 s per-segment deadline: the
-/// in-flight window, then the backlog behind it (both are capped at
-/// `max_in_flight` / `max_backlog`, so the backlog cannot grow past one
-/// extra round). A broadcast that has not closed out by then is not
-/// going to, and the report is returned regardless — the loop then
-/// finishes in the background and releases its slot.
+/// Stopping publishes what is already captured. With every upload
+/// timing out that drain is at worst *three* rounds of the publisher's
+/// 60 s per-segment deadline — the in-flight window, a segment the
+/// pump had already popped behind it, then the backlog (capped at
+/// `max_backlog`, so at most one further round) — so a fully wedged
+/// uplink can outlive this grace. That is deliberate: a drain that
+/// slow means the tail is lost regardless, so the call returns at
+/// ~130 s with an honest report and the loop finishes in the
+/// background and releases its slot.
 const PUBLISHER_STOP_GRACE: Duration = Duration::from_secs(130);
 
 /// Poll interval while waiting for a cancelled broadcast to settle.
@@ -3242,12 +3244,15 @@ pub unsafe extern "C" fn ant_publisher_progress(
 /// published (the last seconds of a broadcast are real content, not a
 /// truncated measurement) and the playlist is closed with
 /// `#EXT-X-ENDLIST` so viewers see a finished recording rather than a
-/// stream that just stopped updating. Bounded at ~130 s (two rounds of
-/// the 60 s per-segment publish deadline — the in-flight window, then
-/// the backlog behind it); call it off the UI thread.
+/// stream that just stopped updating. Returns after
+/// [`PUBLISHER_STOP_GRACE`] (~130 s) at the latest — a worst-case
+/// drain can still be finishing in the background past that (see the
+/// constant) — so call it off the UI thread.
 ///
-/// Safe to call on an already-finished broadcast: it returns the same
-/// report.
+/// Calling it on a broadcast that already finished on its own returns
+/// that broadcast's report. Once a stop call has *returned* and
+/// released the slot, a second call fails with "not broadcasting" —
+/// keep the report from the first call rather than re-fetching it.
 ///
 /// # Safety
 ///

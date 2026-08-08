@@ -920,10 +920,17 @@ char *ant_publisher_progress(const AntHandle *handle, char **out_err);
  * BLOCKING: stopping is cooperative. Segments already captured are
  * published — the last seconds of a broadcast are real content — and
  * the playlist is closed with EXT-X-ENDLIST so viewers see a finished
- * recording rather than a stream that stopped updating. Bounded at
- * ~130 s — two rounds of the 60 s per-segment publish deadline (the
- * in-flight window, then the backlog behind it); call it off the main
- * thread. Safe to call on an already-finished broadcast.
+ * recording rather than a stream that stopped updating. Returns after
+ * ~130 s at the latest; a worst-case drain (the in-flight window, a
+ * segment the pump had already popped behind it, then the backlog —
+ * up to three rounds of the 60 s per-segment publish deadline) can
+ * still be finishing in the background past that, with the report
+ * returned honestly either way. Call it off the main thread.
+ *
+ * Calling it on a broadcast that already finished on its own returns
+ * that broadcast's report. Once a stop call has returned and released
+ * the slot, a second call fails with "not broadcasting" — keep the
+ * report from the first call rather than re-fetching it.
  */
 char *ant_publisher_stop(const AntHandle *handle, char **out_err);
 
