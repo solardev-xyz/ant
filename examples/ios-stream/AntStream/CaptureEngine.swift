@@ -378,7 +378,11 @@ final class CaptureEngine: NSObject {
             seconds: settings.segmentSeconds,
             preferredTimescale: 600
         )
-        writer.initialSegmentStartTime = .zero
+        // `initialSegmentStartTime` is set in `beginSession` — it must
+        // equal the source time passed to `startSession`, and that time
+        // is the first sample's own clock (seconds since boot on the
+        // camera path, the running frame counter on the test pattern),
+        // which is not known until the sample arrives.
         writer.delegate = self
 
         var compression: [String: Any] = [
@@ -436,17 +440,40 @@ final class CaptureEngine: NSObject {
         }
 
         sessionStarted = false
+        self.writer = writer
+    }
+
+    /// Start writing at the first video sample's own timestamp.
+    ///
+    /// Apple's fragmented-MP4 authoring contract anchors segmentation
+    /// boundaries at `initialSegmentStartTime`, so it and the
+    /// `startSession` source time must be the same instant — a `.zero`
+    /// start against capture-clock timestamps (hours since boot) risks
+    /// a wrong first-segment duration or an immediate cut. Setting it
+    /// here, just before `startWriting`, keeps the two in agreement on
+    /// every path, including a writer restarted mid-broadcast whose
+    /// first sample is nowhere near time zero.
+    private func beginSession(of writer: AVAssetWriter, at time: CMTime) -> Bool {
+        writer.initialSegmentStartTime = time
         guard writer.startWriting() else {
             state = .failed(writer.error?.localizedDescription ?? "The video encoder did not start.")
-            return
+            return false
         }
-        self.writer = writer
+        writer.startSession(atSourceTime: time)
+        sessionStarted = true
+        return true
     }
 
     /// Finish the writer so the segment in progress is emitted complete.
     private func finishWriter() {
         guard let writer, writer.status == .writing else {
+            // A writer that never saw a video sample never started
+            // writing (see `beginSession`); nothing to flush.
             self.writer = nil
+            videoInput = nil
+            audioInput = nil
+            pixelAdaptor = nil
+            sessionStarted = false
             return
         }
         restarting = true
@@ -627,18 +654,18 @@ final class CaptureEngine: NSObject {
     }
 
     private func emitTestFrame() {
-        guard let adaptor = pixelAdaptor, let input = videoInput, input.isReadyForMoreMediaData,
-              let writer, writer.status == .writing, !restarting
-        else { return }
-        guard let buffer = makeTestPixelBuffer() else { return }
+        guard let writer, !restarting else { return }
         let time = CMTime(
             value: CMTimeValue(testPatternFrame),
             timescale: CMTimeScale(max(1, settings.frameRate))
         )
         if !sessionStarted {
-            writer.startSession(atSourceTime: time)
-            sessionStarted = true
+            guard beginSession(of: writer, at: time) else { return }
         }
+        guard writer.status == .writing,
+              let adaptor = pixelAdaptor, let input = videoInput, input.isReadyForMoreMediaData,
+              let buffer = makeTestPixelBuffer()
+        else { return }
         adaptor.append(buffer, withPresentationTime: time)
         testPatternFrame += 1
     }
@@ -725,16 +752,16 @@ extension CaptureEngine: AVCaptureVideoDataOutputSampleBufferDelegate,
         didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
-        guard !restarting, let writer, writer.status == .writing else { return }
+        guard !restarting, let writer else { return }
         let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         if !sessionStarted {
             // Video first: starting the session on an audio sample can
             // leave the first video frames before the session start and
             // the writer rejects them.
             guard output is AVCaptureVideoDataOutput else { return }
-            writer.startSession(atSourceTime: time)
-            sessionStarted = true
+            guard beginSession(of: writer, at: time) else { return }
         }
+        guard writer.status == .writing else { return }
         let input = output is AVCaptureVideoDataOutput ? videoInput : audioInput
         guard let input, input.isReadyForMoreMediaData else { return }
         input.append(sampleBuffer)
