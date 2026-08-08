@@ -160,9 +160,11 @@ pub struct PublisherConfig {
     /// [`PublisherConfig::topic`]).
     pub channel: String,
     /// Feed topic, 32-byte hex (`0x` optional). Empty derives a topic
-    /// unique to this broadcast — `keccak256("antstream/<channel>/<unix>")`
-    /// — so a second broadcast of the same channel starts a fresh feed at
-    /// index 0 instead of having to discover the previous head.
+    /// unique to this broadcast —
+    /// `keccak256("antstream/<channel>/<unix_ms>/<nonce>")`, the nonce a
+    /// process-wide counter — so a second broadcast of the same channel
+    /// starts a fresh feed at index 0 instead of having to discover the
+    /// previous head (or, restarted quickly, overwriting it).
     #[serde(default)]
     pub topic: String,
     /// Gateway base URL, `http://host:port` (loopback: the in-process
@@ -244,14 +246,21 @@ impl PublisherConfig {
     /// The feed topic this broadcast writes to: the configured one, or a
     /// per-broadcast derivation of the channel name.
     fn resolve_topic(&self) -> Result<[u8; 32], PublisherError> {
+        // A wall-clock seed alone is not unique enough: stop + restart
+        // of the same channel inside one clock tick would silently reuse
+        // the topic, and the new broadcast's index 0 would overwrite the
+        // old feed's head. The process-wide counter makes every
+        // derivation distinct regardless of clock granularity.
+        static TOPIC_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let trimmed = self.topic.trim();
         if trimmed.is_empty() {
-            let unix = SystemTime::now()
+            let unix_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_secs();
+                .as_millis();
+            let nonce = TOPIC_NONCE.fetch_add(1, Ordering::Relaxed);
             return Ok(ant_crypto::keccak256(
-                format!("antstream/{}/{unix}", self.channel).as_bytes(),
+                format!("antstream/{}/{unix_ms}/{nonce}", self.channel).as_bytes(),
             ));
         }
         parse_hex32(trimmed).map_err(|e| PublisherError::Config(format!("topic {e}")))
@@ -437,6 +446,18 @@ struct PublisherState {
     /// [`PublisherState::live_edge_lag_ms`] frozen when the run
     /// finished, so a report read later does not keep ageing.
     lag_frozen_ms: Option<u64>,
+    /// When the run finished, so the duration (and the throughput
+    /// figures divided by it) freezes with the broadcast — the same
+    /// principle as `lag_frozen_ms`: a report read a minute later must
+    /// describe the broadcast, not how long the host waited to ask.
+    ended_at: Option<Instant>,
+    /// Longest media segment ever listed, in ms. Drives
+    /// `#EXT-X-TARGETDURATION`, which RFC 8216 §6.2.1 says MUST NOT
+    /// change across playlist reloads — so it is a run-max that can
+    /// only ratchet up (a keyframe-aligned cut routinely overruns the
+    /// configured target), never drop back when the long segment slides
+    /// out of the window.
+    longest_listed_ms: u32,
 
     errors: Vec<String>,
     last_error: Option<String>,
@@ -537,6 +558,7 @@ impl PublisherState {
                             .is_some_and(|prev| prev.init_uri != init_uri);
                     self.gap_since_last_listed = false;
                     self.segments_listed += 1;
+                    self.longest_listed_ms = self.longest_listed_ms.max(duration_ms);
                     self.playlist.push_back(MediaEntry {
                         number: self.next_number,
                         uri,
@@ -567,15 +589,8 @@ impl PublisherState {
 
     /// Render the current playlist. `endlist` closes the broadcast.
     fn render_playlist(&self, target_ms: u32, endlist: bool) -> String {
-        let target_s = self
-            .playlist
-            .iter()
-            .map(|e| e.duration_ms)
-            .max()
-            .unwrap_or(target_ms)
-            .max(target_ms)
-            .div_ceil(1000)
-            .max(1);
+        // Run-max, not window-max: see `longest_listed_ms`.
+        let target_s = self.longest_listed_ms.max(target_ms).div_ceil(1000).max(1);
         use std::fmt::Write as _;
         let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n");
         // Writing into a `String` is infallible, so the `write!` results
@@ -684,6 +699,9 @@ pub struct PublisherReport {
     pub target_bitrate_kbps: u32,
     pub segment_ms: u32,
     pub max_in_flight: usize,
+    /// Broadcast duration. Frozen when the run finished (like
+    /// `lag_ms_final`), so it — and the sustained figures divided by
+    /// it — stays put no matter how much later the report is read.
     pub duration_s: f64,
     pub segments_pushed: u64,
     pub segments_published: u64,
@@ -758,6 +776,17 @@ impl LiveRun {
         let mut dropped_oldest = false;
         {
             let mut state = lock(&self.state);
+            // `cancel()` can land between the check above and this lock.
+            // Once the pump has done its final sweep nothing will ever
+            // pop `pending` again, so enqueueing now would orphan the
+            // segment — reported queued, but never published, failed or
+            // dropped. The sweep and `pump_finished` are set under this
+            // same lock, so the race has exactly two outcomes: enqueue
+            // before the sweep (and be swept up as dropped) or observe
+            // the flag here and refuse.
+            if state.pump_finished {
+                return PushOutcome::Closed;
+            }
             let seq = state.next_seq;
             state.next_seq += 1;
             state.segments_pushed += 1;
@@ -799,11 +828,21 @@ impl LiveRun {
         }
     }
 
+    /// Elapsed broadcast time: still ticking while the run is live,
+    /// frozen at `ended_at` once it finished.
+    fn elapsed_s(&self, state: &PublisherState) -> f64 {
+        state
+            .ended_at
+            .unwrap_or_else(Instant::now)
+            .duration_since(self.started_at)
+            .as_secs_f64()
+    }
+
     /// Live progress. Cheap: locks the state, folds, releases.
     #[must_use]
     pub fn snapshot(&self) -> PublisherSnapshot {
         let state = lock(&self.state);
-        let elapsed = self.started_at.elapsed().as_secs_f64();
+        let elapsed = self.elapsed_s(&state);
         let mut publish_ms: Vec<u64> = state.publish_ms.iter().copied().collect();
         publish_ms.sort_unstable();
         PublisherSnapshot {
@@ -858,7 +897,7 @@ impl LiveRun {
     #[must_use]
     pub fn report(&self) -> PublisherReport {
         let state = lock(&self.state);
-        let elapsed = self.started_at.elapsed().as_secs_f64();
+        let elapsed = self.elapsed_s(&state);
         let mut publish_ms: Vec<u64> = state.publish_ms.iter().copied().collect();
         let mut lag_ms: Vec<u64> = state.lag_ms.iter().copied().collect();
         publish_ms.sort_unstable();
@@ -1041,6 +1080,11 @@ async fn drive(ctx: Arc<RunCtx>) {
         let mut state = lock(&ctx.state);
         let lag = state.live_edge_lag_ms();
         state.lag_frozen_ms.get_or_insert(lag);
+        // Duration freezes with the run for the same reason the lag
+        // does: `duration_s` and the throughput figures divided by it
+        // must describe the broadcast, not the wait before the report
+        // was read.
+        state.ended_at.get_or_insert_with(Instant::now);
         state.finished = true;
     }
 }
@@ -1095,7 +1139,23 @@ async fn pump(ctx: Arc<RunCtx>) {
     // The pump is the only producer of commit work; publish that it is
     // done and wake the committer so it can fold in the final segments
     // and close the playlist.
-    lock(&ctx.state).pump_finished = true;
+    //
+    // The sweep and the flag are one critical section: a `push` that
+    // raced `cancel()` past its entry check either enqueued before this
+    // lock (its segment is swept up as dropped here, with the committer
+    // still waiting on `done`) or acquires the lock after it, observes
+    // `pump_finished`, and refuses — so no segment can sit in `pending`
+    // with nobody left to pop it.
+    {
+        let mut state = lock(&ctx.state);
+        while let Some(victim) = state.pending.pop_front() {
+            if victim.kind == SegmentKind::Media {
+                state.segments_dropped += 1;
+            }
+            state.done.insert(victim.seq, Committed::Dropped);
+        }
+        state.pump_finished = true;
+    }
     ctx.commit_notify.notify_one();
 }
 
@@ -1203,7 +1263,7 @@ async fn commit_loop(ctx: Arc<RunCtx>) {
 /// Upload the current playlist and publish its reference as the next
 /// feed update. `captured_at`, when present, is the newest committed
 /// segment — its live-edge lag is only known once the feed update lands.
-async fn publish_playlist(ctx: &RunCtx, endlist: bool, captured_at: Option<Instant>) {
+async fn publish_playlist(ctx: &Arc<RunCtx>, endlist: bool, captured_at: Option<Instant>) {
     let body = {
         let state = lock(&ctx.state);
         state.render_playlist(ctx.config.segment_ms, endlist)
@@ -1252,9 +1312,14 @@ async fn publish_playlist(ctx: &RunCtx, endlist: bool, captured_at: Option<Insta
     }
     // A channel manifest that could not be created at start is retried
     // here, so a broadcast that began before the peer set was warm still
-    // ends up with a shareable reference.
+    // ends up with a shareable reference — but *spawned*, never awaited:
+    // this runs on the committer, and a `POST /feeds` hanging on its
+    // 60 s deadline must not stall the playlist and feed updates for
+    // segments that already landed. `channel_manifest_in_flight` keeps
+    // it to one attempt at a time, same as at start.
     if lock(&ctx.state).channel_reference.is_none() {
-        ensure_channel_manifest(ctx).await;
+        let ctx = Arc::clone(ctx);
+        tokio::spawn(async move { ensure_channel_manifest(&ctx).await });
     }
 }
 
@@ -1727,6 +1792,48 @@ mod tests {
     }
 
     #[test]
+    fn target_duration_never_decreases_when_a_long_segment_slides_out() {
+        // RFC 8216 §6.2.1: `EXT-X-TARGETDURATION` MUST NOT change across
+        // reloads. Keyframe-aligned cutting routinely overruns the
+        // configured target, so a window-max would raise the tag while
+        // the long segment is listed and lower it again when it slides
+        // out — strict players size reload timers off it and treat that
+        // as a malformed live stream.
+        let mut state = PublisherState::default();
+        state.done.insert(
+            0,
+            Committed::Init {
+                uri: "/bzz/aa/init.mp4".into(),
+            },
+        );
+        state.done.insert(1, media("/bzz/b1/seg-1.m4s", false));
+        state.done.insert(
+            2,
+            Committed::Media {
+                uri: "/bzz/b2/seg-2.m4s".into(),
+                duration_ms: 3400,
+                discontinuity: false,
+                captured_at: Instant::now(),
+            },
+        );
+        state.advance(2);
+        assert!(
+            state
+                .render_playlist(2000, false)
+                .contains("#EXT-X-TARGETDURATION:4\n"),
+            "an overrunning segment must raise the target",
+        );
+        // Two more nominal segments slide the 3.4 s one out of the
+        // window; the tag must stay ratcheted rather than dropping back.
+        state.done.insert(3, media("/bzz/b3/seg-3.m4s", false));
+        state.done.insert(4, media("/bzz/b4/seg-4.m4s", false));
+        state.advance(2);
+        let playlist = state.render_playlist(2000, false);
+        assert!(!playlist.contains("seg-2.m4s"), "{playlist}");
+        assert!(playlist.contains("#EXT-X-TARGETDURATION:4\n"), "{playlist}");
+    }
+
+    #[test]
     fn media_before_its_init_segment_is_never_listed() {
         // The initialization segment failed to upload: listing the media
         // segments anyway would produce a playlist no player can start.
@@ -1773,6 +1880,11 @@ mod tests {
         c.topic = String::new();
         let a = c.resolve_topic().unwrap();
         assert_ne!(a, [0u8; 32]);
+        // Two derivations must differ even inside one clock tick —
+        // otherwise a quick stop + restart of the same channel would
+        // write its fresh index 0 over the old feed's head.
+        let b = c.resolve_topic().unwrap();
+        assert_ne!(a, b, "derived topics must be per-broadcast");
         // An explicit topic is honoured verbatim, with or without `0x`.
         c.topic = "cd".repeat(32);
         assert_eq!(c.resolve_topic().unwrap(), [0xcd; 32]);
@@ -1948,12 +2060,25 @@ mod tests {
         assert!(report.feed_updates > 0);
         assert!(!report.channel_reference.is_empty());
         assert!(report.kept_up, "{report:?}");
-        // The lag is an age, frozen with the run: asking again later
-        // must still describe the broadcast, not the wait.
+        // The lag is an age and the duration a stopwatch, both frozen
+        // with the run: asking again later must still describe the
+        // broadcast, not the wait.
         tokio::time::sleep(Duration::from_millis(300)).await;
         let again = run.report();
         assert_eq!(again.lag_ms_final, report.lag_ms_final, "{again:?}");
         assert!(again.kept_up, "{again:?}");
+        assert!(
+            (again.duration_s - report.duration_s).abs() < 1e-9,
+            "duration kept ticking after the run: {} vs {}",
+            again.duration_s,
+            report.duration_s,
+        );
+        assert!(
+            (again.sustained_mbit_s - report.sustained_mbit_s).abs() < 1e-9,
+            "throughput drifted after the run: {} vs {}",
+            again.sustained_mbit_s,
+            report.sustained_mbit_s,
+        );
 
         let seen = lock(&log).seen.clone();
         // 1. the channel's feed manifest.
