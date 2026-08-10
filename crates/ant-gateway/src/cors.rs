@@ -79,6 +79,15 @@ pub struct CorsConfig {
     allow_null: bool,
     /// Exact origins (already lowercased, e.g. `https://app.example`).
     origins: Vec<String>,
+    /// Wildcard-subdomain entries (`https://*.bzz.example` →
+    /// `("https://", ".bzz.example")`): every direct-or-deeper
+    /// subdomain of the suffix matches, the apex itself does not.
+    /// Freedom's mobile `WebView` serves each dweb content root from its
+    /// own synthetic https origin under a fixed suffix, so the allowed
+    /// set is unbounded by construction and can't be enumerated as
+    /// exact origins. (Extension over bee, which only knows `*` /
+    /// `null` / exact matches; bee configs parse unchanged.)
+    suffixes: Vec<(String, String)>,
 }
 
 impl CorsConfig {
@@ -99,6 +108,17 @@ impl CorsConfig {
             match o {
                 "*" => cfg.allow_all = true,
                 _ if o.eq_ignore_ascii_case("null") => cfg.allow_null = true,
+                // `scheme://*.host` → wildcard-subdomain entry.
+                _ if o.contains("://*.") => {
+                    let lower = o.to_ascii_lowercase();
+                    if let Some(star) = lower.find("://*.") {
+                        let prefix = lower[..star + 3].to_string();
+                        let suffix = lower[star + 4..].to_string();
+                        if suffix.len() > 1 {
+                            cfg.suffixes.push((prefix, suffix));
+                        }
+                    }
+                }
                 // Origins are compared case-insensitively on scheme+host
                 // (RFC 6454); lowercasing the whole token is sufficient
                 // because origins never contain a path.
@@ -112,7 +132,7 @@ impl CorsConfig {
     /// CORS headers at all.
     #[must_use]
     pub fn is_disabled(&self) -> bool {
-        !self.allow_all && !self.allow_null && self.origins.is_empty()
+        !self.allow_all && !self.allow_null && self.origins.is_empty() && self.suffixes.is_empty()
     }
 
     /// Resolve the `Access-Control-Allow-Origin` value to echo for a
@@ -128,9 +148,29 @@ impl CorsConfig {
             return Some(origin.to_string());
         }
         let lower = origin.to_ascii_lowercase();
-        self.origins
+        if self.origins.iter().any(|o| o == &lower) {
+            return Some(origin.to_string());
+        }
+        self.suffixes
             .iter()
-            .any(|o| o == &lower)
+            .any(|(prefix, suffix)| {
+                let Some(host) = lower.strip_prefix(prefix) else {
+                    return false;
+                };
+                let Some(label) = host.strip_suffix(suffix) else {
+                    return false;
+                };
+                // At least one subdomain label, and nothing that could
+                // smuggle a lookalike past the suffix check: an origin
+                // host may only contain LDH characters and dots, and in
+                // particular no port (the virtual origins never carry
+                // one, and `evil.example:443` must not match a
+                // portless suffix).
+                !label.is_empty()
+                    && label
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+            })
             .then(|| origin.to_string())
     }
 }
@@ -262,6 +302,42 @@ mod tests {
         );
         // `*` also covers the opaque origin.
         assert_eq!(cfg.allow_origin_value("null").as_deref(), Some("null"));
+    }
+
+    #[test]
+    fn wildcard_subdomain_matches_labels_not_apex() {
+        let cfg = CorsConfig::new(["https://*.bzz.freedom.baby"]);
+        // Single label (plain ref) and two labels (encrypted ref).
+        assert_eq!(
+            cfg.allow_origin_value("https://3kescpg.bzz.freedom.baby")
+                .as_deref(),
+            Some("https://3kescpg.bzz.freedom.baby"),
+        );
+        assert_eq!(
+            cfg.allow_origin_value("https://aa.bb.bzz.freedom.baby")
+                .as_deref(),
+            Some("https://aa.bb.bzz.freedom.baby"),
+        );
+        // The apex itself is not a content origin.
+        assert_eq!(cfg.allow_origin_value("https://bzz.freedom.baby"), None);
+        // Lookalikes, wrong scheme, trailing port: all rejected.
+        assert_eq!(
+            cfg.allow_origin_value("https://x.bzz.freedom.baby.evil.example"),
+            None,
+        );
+        assert_eq!(cfg.allow_origin_value("http://x.bzz.freedom.baby"), None);
+        assert_eq!(
+            cfg.allow_origin_value("https://x.bzz.freedom.baby:8443"),
+            None,
+        );
+        // Unrelated origins and `null` stay blocked.
+        assert_eq!(cfg.allow_origin_value("https://app.example"), None);
+        assert_eq!(cfg.allow_origin_value("null"), None);
+    }
+
+    #[test]
+    fn wildcard_subdomain_entry_enables_cors() {
+        assert!(!CorsConfig::new(["https://*.bzz.freedom.baby"]).is_disabled());
     }
 
     #[test]

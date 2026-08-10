@@ -227,10 +227,26 @@ pub unsafe extern "C" fn ant_start_gateway(
             // writer on iOS (no `antop` Retrieval tab consuming it).
             activity: GatewayActivity::new(),
             tags: Arc::new(TagRegistry::new()),
-            // Freedom's dweb pages fetch/upload from an opaque (`null`)
-            // origin, so the gateway must echo `null` in CORS — matches
-            // bee started with `--cors-allowed-origins=null`.
-            cors: Arc::new(CorsConfig::new(["null"])),
+            // Freedom's dweb pages fetch/upload from two origin shapes,
+            // both of which the gateway must allow in CORS:
+            //  - iOS (WKWebView custom schemes): the page origin
+            //    serializes as the opaque `null` — matches bee started
+            //    with `--cors-allowed-origins=null`.
+            //  - Android (WebView virtual origins): each content root
+            //    is served from its own synthetic https origin under
+            //    the pinned freedom.baby suffixes, so the browser sends
+            //    a real `Origin:` header the exact-match policy could
+            //    never enumerate — covered by wildcard-subdomain
+            //    entries. Deliberately NOT `*`: the API is loopback,
+            //    but CORS is what keeps drive-by pages in *other*
+            //    browsers on the same device from reading /wallet etc.
+            cors: Arc::new(CorsConfig::new([
+                "null",
+                "https://*.bzz.freedom.baby",
+                "https://*.ipfs.freedom.baby",
+                "https://*.ipns.freedom.baby",
+                "https://*.ens.freedom.baby",
+            ])),
             // The FFI path resolves its chain wiring before starting
             // the gateway, so the slot is preset — no chain-init 503
             // window here. On-chain reader/writer when built with the
